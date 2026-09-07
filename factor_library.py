@@ -82,13 +82,42 @@ def build_adj_close(df: pd.DataFrame) -> pd.Series:
 #   _mf_net_score. 语义与旧版一致 (线性裁切映射到 0..1), 使 realtime_engine 可导入.
 # ---------------------------------------------------------------------------
 def selector_weights() -> dict:
-    """旧打分权重: 返回 config.SCORE_WEIGHTS 副本."""
+    """旧打分权重: 返回 config.SCORE_WEIGHTS 副本, 并经因子健康处置 (失效因子隔离)."""
     try:
         from config import SCORE_WEIGHTS
-        return dict(SCORE_WEIGHTS)
+        W = dict(SCORE_WEIGHTS)
     except Exception:
-        return {"signal": 0.34, "trend": 0.14, "govern": 0.16, "liquidity": 0.08,
-                "vol": 0.10, "mom_rev": 0.0, "pb_rev": 0.06, "roe": 0.06, "mf_net": 0.06}
+        W = {"signal": 0.34, "trend": 0.14, "govern": 0.16, "liquidity": 0.08,
+             "vol": 0.10, "mom_rev": 0.0, "pb_rev": 0.06, "roe": 0.06, "mf_net": 0.06}
+    _apply_factor_health(W)
+    return W
+
+
+# 已打印的隔离原因 (避免同原因重复刷屏)
+_health_logged: dict = {}
+
+
+def _apply_factor_health(W: dict) -> None:
+    """(2026-09-07) 因子健康处置: 短期方向翻转/强度收敛(反转义失效)的因子, 打分权重置 0.
+
+    由 factor_gate.factor_health_flags 依据 data/ic 曲线判定; 环境变量
+    FACTOR_HEALTH_ENABLED=0 可关闭. 任何异常静默降级(不影响选股主链路).
+    """
+    if os.environ.get("FACTOR_HEALTH_ENABLED", "1") == "0":
+        return
+    try:
+        from factor_gate import factor_health_flags
+        flags = factor_health_flags()
+    except Exception:
+        return
+    for key, info in (flags.get("isolated") or {}).items():
+        if key in W and float(W.get(key) or 0.0) > 0.0:
+            W[key] = 0.0
+            reason = str(info.get("reason", "方向失效"))
+            if _health_logged.get(key) != reason:
+                _health_logged[key] = reason
+                print(f"[factor_health] 失效因子隔离: {key} 权重 -> 0 ({reason})",
+                      flush=True)
 
 
 def _clip_score(x: float, lo: float, hi: float, invert: bool = False) -> float:

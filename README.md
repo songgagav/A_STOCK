@@ -8,7 +8,8 @@ A 股量化选股与风控研究系统:全市场日频因子选股、盘中模�
 
 - 全 A 轮动:候选池过滤(市值/换手/ST/次新)→ 因子融合打分 → Top-N 等权/加权持仓,只做多、T+1
 - 因子融合:基本面/反转因子 ICIR 加权融合(`factor_fusion.py`),可叠加 GP 挖掘(`factor_mine/`)
-- IC 门控(`factor_gate.py`):融合 IC 联合判据 + 风险滞后进入/退出,单日亏损防御,个体因子 IC 漂移监控,Sharpe 变点检测
+- IC 门控(`factor_gate.py`):融合 IC 联合判据 + 风险滞后进入/退出,单日亏损防御,个体因子 IC 漂移监控(方向有效性语义),Sharpe 变点检测
+- 因子健康处置(`factor_gate.factor_health_flags` → `selector_weights`):方向翻转/强度收敛(反转义失效)的因子自动从打分权重中隔离,`FACTOR_HEALTH_ENABLED=0` 可关闭
 - DRL 动态权重(`factor_dynamic_weights.py` / `drl_train.py`):CVaR-PPO 生成六维因子权重,signal 权重带硬边界约束
 - 过拟合检测(`overfitting_test.py`):CPCV / PBO / 置换检验 / 市场状态依赖 / 参数稳定性 / 策略健康度
 - 盘中引擎与看板:实时撮合(`realtime_engine.py`)、绩效归因(`performance_report.py`)、Web 面板(`dashboard.py`)

@@ -82,7 +82,8 @@ R = _Results()
 # 数据加载
 # ====================================================================
 def _load_vnpy_results() -> list:
-    fp = os.path.join(DATA_DIR, "vnpy_backtest_rerun_results.json")
+    # 支持切换窗口样本源 (如 scripts/nonoverlap_rerun.py 生成的非重叠窗口)
+    fp = os.environ.get("OVERFIT_RESULTS_FILE") or os.path.join(DATA_DIR, "vnpy_backtest_rerun_results.json")
     if not os.path.exists(fp):
         return []
     with open(fp) as f:

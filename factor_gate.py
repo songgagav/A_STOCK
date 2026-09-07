@@ -217,6 +217,83 @@ def check_factor_ic_drift(
 
 
 # ------------------------------------------------------------------
+# 因子健康 -> 打分权重处置 (2026-09-07): 失效因子隔离
+# 监控曲线名(vol/mom_20) -> selector 打分键(vol/mom_rev).
+# ------------------------------------------------------------------
+_DRIFT_CURVE_TO_SCORE_KEY = {"vol": "vol", "mom_20": "mom_rev"}
+
+
+def load_factor_ic_from_curves(cfg: _Cfg | None = None) -> dict:
+    """从 data/ic/ic_curve_*_k20.csv 读近 121/近 20 交易日 ic_h20 均值.
+
+    口径与 overfitting 6c 一致: long = 近 ic_drift_long_window(默认121) 日,
+    short = 近 20 日. 无曲线/样本不足的因子不返回.
+    """
+    import csv as _csv
+    c = cfg or _Cfg()
+    long_w = c.ic_drift_long_window
+    out = {}
+    ic_dir = os.path.join(_BASE, "data", "ic")
+    for name in _DRIFT_CURVE_TO_SCORE_KEY:
+        p = os.path.join(ic_dir, f"ic_curve_{name}_k20.csv")
+        if not os.path.exists(p):
+            continue
+        try:
+            vals = []
+            with open(p, encoding="utf-8") as f:
+                for row in _csv.DictReader(f):
+                    v = row.get("ic_h20")
+                    if v in (None, ""):
+                        continue
+                    try:
+                        vals.append(float(v))
+                    except ValueError:
+                        continue
+            if len(vals) < 30:
+                continue
+            long_m = float(np.mean(vals[-long_w:])) if len(vals) >= long_w else float(np.mean(vals))
+            short_m = float(np.mean(vals[-20:]))
+            out[name] = {"long_mean": long_m, "short_mean": short_m}
+        except Exception:
+            continue
+    return out
+
+
+def factor_health_flags(factor_ics: dict[str, dict] | None = None,
+                        cfg: _Cfg | None = None) -> dict:
+    """按方向有效性给出打分键处置建议 (供 selector_weights 消费).
+
+    - isolate: 因子短期方向翻转或强度收敛归零 (反转义失效), 打分权重应置 0;
+    - keep:    方向保持 (含反转义负 IC 加深 = 更有效).
+
+    Args:
+        factor_ics: {因子名: {"long_mean","short_mean"}}; None 时自动读 IC 曲线.
+    Returns:
+        {"enabled": bool, "isolated": {打分键: {"action","reason"}},
+         "unstable": [因子名], "drift_detail": {}}
+    """
+    c = cfg or _Cfg()
+    # None = 自动读 IC 曲线; 传入 dict(可为空)则按给定数据判定
+    fics = factor_ics if factor_ics is not None else load_factor_ic_from_curves(c)
+    if not fics:
+        return {"enabled": True, "isolated": {},
+                "unstable": [], "drift_detail": {},
+                "reason": "无因子 IC 曲线数据, 不做健康处置"}
+    res = check_factor_ic_drift(fics, cfg=c)
+    isolated = {}
+    for name in res["unstable_factors"]:
+        key = _DRIFT_CURVE_TO_SCORE_KEY.get(name)
+        if key:
+            isolated[key] = {
+                "action": "isolate",
+                "reason": res["drift_detail"][name].get("reason", "方向失效"),
+            }
+    return {"enabled": True, "isolated": isolated,
+            "unstable": res["unstable_factors"],
+            "drift_detail": res["drift_detail"]}
+
+
+# ------------------------------------------------------------------
 # Sharpe 变点检测 (2026-09-07 新增)
 # ------------------------------------------------------------------
 def detect_sharpe_change_point(

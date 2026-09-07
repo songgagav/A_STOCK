@@ -1,0 +1,35 @@
+# ============================================================
+# CI: 轻量快速回归 (纯逻辑, 无需行情数据 / ArcticDB / DRL 依赖)
+# 覆盖: IC 门控 / 滑点模型 / 因子融合与加权
+# 重型测试(依赖 torch/stable-baselines3/本地数据)见 tests/, 建议本地运行.
+# ============================================================
+name: ci-light
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy scikit-learn pytest
+      - name: Run core regression tests
+        working-directory: .
+        run: |
+          python -m pytest tests/test_factor_gate.py \
+            tests/test_slippage_model.py \
+            tests/test_weighting_and_fusion.py \
+            -q
