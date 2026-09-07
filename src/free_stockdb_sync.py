@@ -41,6 +41,13 @@ import pandas as pd
 
 _LOG = logging.getLogger("free_stockdb_sync")
 
+def _lake_root() -> str:
+    """本地行情数据根目录 (可移植: 由 STOCKDB_ROOT 环境变量指定)."""
+    _r = os.environ.get("STOCKDB_ROOT", "").strip()
+    if _r:
+        return _r
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "stockdb")
+
 # 路径配置
 FREE_STOCKDB_DIR = _lake_root()
 KLINE_PARTS_DIR = os.path.join(FREE_STOCKDB_DIR, "kline_parts")
