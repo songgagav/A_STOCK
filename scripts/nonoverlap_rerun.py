@@ -44,6 +44,12 @@ def main() -> None:
         stats = res.get("stats") or {}
         ok = res.get("ok", False)
         print(f"  状态: {'OK' if ok else 'FAIL'}  耗时 {time.time() - t0:.1f}s")
+        if not ok:
+            # 常见原因: 该历史终点无当日 selection.json/target_plan(需当时落盘产物),
+            # 无法凭空重建 -> 提示改在真实运行过的日期上取窗口.
+            print(f"  失败原因: {res.get('error') or res.get('reason') or '未知'}")
+            print("  提示: vnpy 回测依赖当日的 selection/target_plan; 历史非重叠窗口"
+                  "仅在数据源保留了当日选股产物时可重建.")
         if ok:
             print(f"  Sharpe={stats.get('sharpe_ratio')}  CAGR={stats.get('annual_return')}%  "
                   f"回撤={stats.get('max_ddpercent')}%")
