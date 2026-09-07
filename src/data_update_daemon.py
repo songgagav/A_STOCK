@@ -38,9 +38,11 @@ INTERVAL_S = int(os.environ.get("DATA_UPDATE_INTERVAL_S", "300"))
 T_DAILY = 15 * 60 + 45
 T_VALU = 16 * 60 + 40
 T_NB = 16 * 60 + 45
-T_MARGIN = 17 * 60 + 20
-# 主 daemon 收盘触发时刻 (应早于它完成数据准备)
+T_MF = 16 * 60 + 50          # 板块资金流快照
+T_MARGIN = 17 * 60 + 20      # 两融 (SSE 当日可见; 深/京 T+1 由次日运行补齐)
 T_CLOSE_HINT = 19 * 60 + 10
+# 阶段失败后的重试节流(秒)
+FAIL_THROTTLE_S = int(os.environ.get("DATA_UPDATE_FAIL_THROTTLE_S", "1800"))
 
 
 def _log(msg: str) -> None:
@@ -120,11 +122,38 @@ def _run_once(stage: str, args: list[str], day: str | None = None) -> dict:
         cmd += ["--day", day]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1500)
-        tail = (r.stdout or "")[-160:] + (r.stderr or "")[-160:]
-        ok = r.returncode == 0
-        return {"ok": ok, "stage": stage, "day": day, "tail": tail}
+        return {"ok": r.returncode == 0, "stage": stage, "day": day,
+                "out": (r.stdout or "")[-2000:], "err": (r.stderr or "")[-300:]}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "stage": stage, "day": day, "tail": str(e)[:200]}
+        return {"ok": False, "stage": stage, "day": day, "err": str(e)[:200]}
+
+
+# 收盘后窗口与盘前窗口 (分钟, 用于估值/两融: 源仅在数据商发布后才可及)
+_EVENING = (16 * 60, 22 * 60 + 30)
+_MORNING = (6 * 60 + 30, 9 * 60)
+
+
+def _in_publish_windows() -> bool:
+    m = _now_min()
+    return any(lo <= m <= hi for lo, hi in (_EVENING, _MORNING))
+
+
+def _due(st: dict, stage: str, force: bool) -> bool:
+    """失败节流: 距上次失败 >= FAIL_THROTTLE_S 才允许重试."""
+    if force:
+        return True
+    lf = (st.get("fail") or {}).get(stage)
+    if not lf:
+        return True
+    try:
+        last = datetime.fromisoformat(lf)
+        return (datetime.now() - last).total_seconds() >= FAIL_THROTTLE_S
+    except Exception:
+        return True
+
+
+def _mark_fail(st: dict, stage: str) -> None:
+    st.setdefault("fail", {})[stage] = datetime.now().isoformat()
 
 
 def run_round(force: bool = False) -> dict:
@@ -133,24 +162,49 @@ def run_round(force: bool = False) -> dict:
     t0 = _now_min()
     out = {}
 
+    def after(T: int) -> bool:
+        return force or t0 >= T
+
     # 1) 日线缺口回补 (15:45 后; 每缺口日一次)
-    if force or t0 >= T_DAILY:
+    if after(T_DAILY):
         for d in _daily_missing():
             key = f"daily:{d}"
             if st.get(key) == today and not force:
                 continue
             out[key] = _run_once("daily", ["scripts/backfill_daily.py"], day=d)
-            st[key] = today if out[key]["ok"] else st.get(key, "")
-    # 2) 估值快照 (16:40 后)
-    if force or t0 >= T_VALU:
+            if out[key]["ok"]:
+                st[key] = today
+            else:
+                _mark_fail(st, "daily")
+    # 2) 估值快照 (16:40 后; 东财不可达时失败并节流重试)
+    if after(T_VALU):
         d = _valu_stale_day()
         if d:
             key = f"valuation:{d}"
-            if st.get(key) != today or force:
+            if (st.get(key) != today or force) and _due(st, "valuation", force):
                 out[key] = _run_once("valuation", ["scripts/backfill_valuation.py"], day=d)
                 if out[key]["ok"]:
                     st[key] = today
-    # 3) 收盘主流程 (若由本守护在 19:10 后兜底触发? 主 daemon 负责, 这里只提示)
+                    (st.get("fail") or {}).pop("valuation", None)
+                else:
+                    _mark_fail(st, "valuation")
+    # 3) 板块资金流快照 (16:50 后; 同日幂等, 失败节流重试)
+    if after(T_MF) and _due(st, "money_flow", force):
+        out["money_flow"] = _run_once("money_flow", ["src/money_flow_sync.py", "sync"])
+        if out["money_flow"]["ok"]:
+            (st.get("fail") or {}).pop("money_flow", None)
+        else:
+            _mark_fail(st, "money_flow")
+    # 4) 两融 (17:20 后且处于发布窗口; margin_sync 自带幂等/水位; 深京 T+1 次日自愈)
+    if after(T_MARGIN) and (force or _in_publish_windows()) and _due(st, "margin", force):
+        out["margin"] = _run_once("margin", ["src/margin_sync.py", "sync", "--days", "2"])
+        _o = out["margin"].get("out") or ""
+        # 成功判定: 退出码 0 且无缺腿(缺腿=SSE/深/京当日未发布, 视为未完成以便节流续试)
+        incomplete = '"missing_legs": {' not in _o or '"missing_legs": {}' in _o
+        if out["margin"]["ok"] and incomplete:
+            (st.get("fail") or {}).pop("margin", None)
+        else:
+            _mark_fail(st, "margin")
     if force or t0 >= T_CLOSE_HINT:
         out["_note"] = "收盘主流程由 daemon.py 在收盘窗口执行 (见 daemon.py)"
     _save(st)
@@ -171,7 +225,8 @@ def main() -> None:
             rep = run_round()
             for k, v in rep.items():
                 if isinstance(v, dict) and "ok" in v:
-                    _log(f"{k}: ok={v['ok']} ({v.get('tail', '')[:90]})")
+                    tail = (v.get("out") or v.get("err") or "")[:90]
+                    _log(f"{k}: ok={v['ok']} ({tail})")
         except Exception as e:  # noqa: BLE001
             _log(f"轮询异常: {e}")
         time.sleep(INTERVAL_S)
