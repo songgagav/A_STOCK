@@ -57,7 +57,10 @@ STOP_FILE = os.path.join(LOG_DIR, "daemon.stop")
 
 # 交易日关键节点
 MARKET_OPEN = dtime(8, 30)      # 盘前健康检查 + 启动盘中引擎
-MARKET_CLOSE = dtime(15, 5)     # 收盘选股
+# [2026-09-08] 收盘选股自 15:05 后移至 19:10: 数据商在收盘后 1-4 小时才完成
+# 日线/估值更新, 过早触发会因数据未就绪而失败; data_update_daemon 在 15:45/16:40
+# 分窗口补齐数据, 19:10 再跑 run_daily(mode=full) 成功率更高.
+MARKET_CLOSE = dtime(19, 10)    # 收盘选股 (数据就绪后)
 DONE_WINDOW = dtime(22, 0)      # 收盘任务运行最晚窗口
 
 # 盘前健康检查脚本(与本守护同项目, 用 _TRAE_PY 跑)
