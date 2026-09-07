@@ -42,7 +42,7 @@
 
 ## 运行
 
-- `daemon.py`: `--status` 查看状态,`--stop` 停止(重启 = 直接 `python daemon.py`)。
+- `daemon.py`: `--status` 查看状态,`--stop` 停止(重启 = 直接 `python src/daemon.py`)。
 - `realtime_engine.py`: `--once/--interval N/--no-intraday`。
 - `dashboard.py`: `--port 8000`,轮询 `data/live_state.json`。
 

@@ -18,7 +18,7 @@ for ($i = 0; $i -lt $segments.Count; $i++) {
     $e = $segments[$i].end
     Write-Output ""
     Write-Output ("--- segment " + ($i+1) + "/" + $segments.Count + ": " + $s + " .. " + $e + " ---")
-    python -u update_db.py --day $Day --days 1 --only $Table --start-symbol $s --end-symbol $e
+    python -u src\update_db.py --day $Day --days 1 --only $Table --start-symbol $s --end-symbol $e
     if ($LASTEXITCODE -ne 0) {
         Write-Output ("segment " + $s + ".." + $e + " failed, continue next")
     }

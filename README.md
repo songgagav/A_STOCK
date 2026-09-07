@@ -75,7 +75,7 @@ quant-llm-drl-system/
 └── requirements_314.txt              # Python 3.14 核心依赖清单
 ```
 
-> 说明:本仓库为长期演进的**扁平源码布局**(`config.py`、`factor_gate.py` 等位于根目录),上表将其按逻辑层归入 `src/` 便于理解,文件一一对应真实源码。物理迁移到 `src/` 会改动全部相对 import,需在停止守护/非交易时段执行,见 `docs/architecture.md` 的演进章节。
+> 说明:本仓库源码已**物理迁移到 `src/`**(单层平铺,扁平 import 保持,便于守护与工具直接引用);上表将 `src/` 内文件按逻辑层归入 `data/factor/strategy/risk/validation/engine` 便于理解,文件一一对应真实路径。运行入口统一为 `python src/<脚本>.py`;`tests/` 通过根 `conftest.py` 注入 `src/`。如需进一步把 `src/` 拆成子层(包路径 import),需同步改全量相对引用,见 `docs/architecture.md`。
 
 ## 关键模块说明
 
@@ -100,11 +100,11 @@ quant-llm-drl-system/
 ```bash
 pip install -r requirements_314.txt
 python -m pytest tests/ -q                       # 单元测试
-python refresh_gate_ic.py                        # 刷新融合 IC 缓存
-python rerun_vnpy_all.py                         # 滚动窗口回测
-python backtest_with_gate.py                     # 门控重放对照
-python overfitting_test.py --html                # 过拟合检测
-python run_daily.py                              # 日频主流程
+python src/refresh_gate_ic.py                    # 刷新融合 IC 缓存
+python src/rerun_vnpy_all.py                     # 滚动窗口回测
+python src/backtest_with_gate.py                 # 门控重放对照
+python src/overfitting_test.py --html            # 过拟合检测
+python src/run_daily.py                          # 日频主流程
 ```
 
 ## 贡献指南

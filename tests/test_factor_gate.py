@@ -192,7 +192,7 @@ class TestEngineSourceSmoke(unittest.TestCase):
     """接线语法/钩子冒烟: 不做整模块 import."""
 
     def _engine_src(self) -> str:
-        p = os.path.join(_BASE, "realtime_engine.py")
+        p = os.path.join(_BASE, "src", "realtime_engine.py")
         with open(p, encoding="utf-8") as f:
             return f.read()
 

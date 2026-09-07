@@ -31,19 +31,19 @@ python -m pytest tests/ -q        # 自检
 
 ```bash
 # 一次性/日频
-python run_daily.py                    # 收盘选股主流程
-python gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
-python daemon.py                       # 交易日守护: 引擎 08:30 / 收盘 15:05 / 崩溃自动拉起
-python realtime_engine.py --once       # 盘中撮合单次
-python dashboard.py --port 8000        # Web 面板
+python src/run_daily.py                    # 收盘选股主流程
+python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
+python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘 15:05 / 崩溃自动拉起
+python src/realtime_engine.py --once       # 盘中撮合单次
+python src/dashboard.py --port 8000        # Web 面板
 ```
 
 ## 4. 回测与检测
 
 ```bash
-python rerun_vnpy_all.py                 # 滚动窗口回测样本
-python backtest_with_gate.py             # 门控连续重放(当前配置)
-python overfitting_test.py --html        # 过拟合与稳健性检测
+python src/rerun_vnpy_all.py                 # 滚动窗口回测样本
+python src/backtest_with_gate.py             # 门控连续重放(当前配置)
+python src/overfitting_test.py --html        # 过拟合与稳健性检测
 python scripts/nonoverlap_rerun.py       # 非重叠窗口样本(盘后/空闲时)
 ```
 

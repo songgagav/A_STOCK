@@ -41,7 +41,7 @@ def test_default_config():
 
 def test_cli_help():
     result = subprocess.run(
-        [sys.executable, "drl_train.py", "--help"],
+        [sys.executable, os.path.join(_BASE, "src", "drl_train.py"), "--help"],
         capture_output=True, text=True, cwd=_BASE,
     )
     assert "--cvar_alpha" in result.stdout, "CLI --cvar_alpha 未在 help 中"

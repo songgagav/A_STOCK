@@ -27,11 +27,9 @@
 4. **DRL** `drl_train.py`:CVaR-PPO 在 FactorValueEnv 上生成 signal/trend/govern/liquidity/vol/mom_rev 六维权重;signal 权重硬边界 `[0.10, 0.39]`,约束后其余权重重新归一化。
 5. **评估闭环** `overfitting_test.py`(7 维度)→ 输出 JSON/HTML;`backtest_with_gate.py` 用同一 `factor_gate` 逻辑做无前视连续重放,验证门控对回撤的收窄(当前基线→门控最大回撤 8.23%→7.69%)。
 
-## 演进计划(物理迁移到 src/)
+## 源码布局与演进(2026-09-07 已完成 src/ 迁移)
 
-当前所有源码位于仓库根(便于长期增量演进与守护直接 `sys.path` 引用)。若需物理迁移为 `src/{data,factor,strategy,risk,validation,engine}/`,步骤:
-
-1. 在**停止守护/非交易时段**执行(收盘任务依赖实时模块加载)。
-2. 同步修改每个文件顶部的 `sys.path.insert` 与 `from config import …`(改为 `src.…` 包引用或把 `src` 加入路径)。
-3. 更新 `daemon.py`/`run_daily.py`/`realtime_engine.py` 的 `_BASE` 与脚本路径常量。
-4. 迁移后先跑 `python -m pytest tests/ -q` 全量回归,再启动守护。
+- 全部 Python 源码已迁移至 `src/`(单层平铺,扁平 import 不变;`factor_mine/` 位于 `src/factor_mine/`)。
+- 运行入口:统一 `python src/<脚本>.py`;`src/daemon.py`/`run_daily.py`/`realtime_engine.py` 等互以 `src/` 内路径 spawn。
+- `data/`、`logs/` 位于仓库根,代码经 `config.BASE`(仓库根)定位;`tests/` 依赖根 `conftest.py` 把 `src/` 注入 `sys.path`。
+- 若未来需把 `src/` 拆为子层(包路径),步骤:1) 停止守护/非交易时段执行;2) 同步改全部 `from X import …` 为包引用或每层注入 `sys.path`;3) 全量回归后重启守护。
