@@ -1,0 +1,106 @@
+# ============================================================
+# .gitignore — A_stock_OS 公开仓库忽略规则
+# 分类: 原始数据 / 密钥 / 数据库 / 日志 / 缓存 / IDE / 大模型权重
+# ============================================================
+
+# ---- 1. 原始数据 & 运行时数据 (体积大 / 含行情与实盘痕迹) ----
+# 说明: data/ 整目录忽略(含 state/回执/报告/IC缓存/数据湖). 相关默认配置
+#       factor_gate_config.json 在代码内均有默认值兜底, 缺失不影响运行.
+data/
+logs/
+*.parquet
+*.csv
+*.lmdb
+*.feather
+*.arrow
+
+# 因子挖掘运行账本 / 运行时 jsonl 事件流
+factor_mine/*.jsonl
+*.jsonl
+
+# ---- 2. 配置文件(含密钥 / 本地环境) ----
+.env
+.env.*
+!.env.example
+config_local.json
+config.local.json
+*secret*.json
+*credentials*.json
+*_key.json
+*.pem
+*.key
+id_rsa*
+*.token
+
+# ---- 3. 数据库 / 本地数据湖文件 (持仓、交易记录) ----
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.h5
+*.hdf5
+*.h5i
+*.arctic
+
+# ---- 4. 日志文件 ----
+logs/
+*.log
+*.log.*
+*.err
+*.out
+nohup.out
+
+# ---- 5. Python 缓存 / 构建产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+.ipynb_checkpoints/
+
+# ---- 6. 虚拟环境 ----
+venv/
+.venv/
+.venv314/
+.venv-*/
+env/
+ENV/
+*.venv/
+
+# ---- 7. IDE / 编辑器 / 临时文件 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sess
+*.tmp
+.ropeproject/
+.vs/
+
+# ---- 8. 大体积模型权重 (建议云盘或 Git LFS; 小权重可用 git add -f 强制提交) ----
+*.pt
+*.pth
+*.onnx
+*.pkl.bak
+
+# ---- 9. 系统 / 杂项 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+~$*
+
+# ---- 10. 个人运行痕迹 (一次性/垃圾文件) ----
+=
+
+# ---- 11. 个人/一次性脚本与笔记 (本地保留, 不随公开仓库发布) ----
+/_*.py
+/scripts/_*.py
+盘中运行说明.md

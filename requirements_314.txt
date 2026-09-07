@@ -1,0 +1,11 @@
+# Python 3.14 核心依赖 — ai-factor-lab / QuantGplearn / FactorMiner
+numpy>=2.0
+pandas>=2.3
+scipy>=1.14
+scikit-learn>=1.7
+deap>=1.4
+matplotlib>=3.10
+seaborn>=0.13
+pyarrow>=18
+h5py>=3.12
+requests>=2.32
