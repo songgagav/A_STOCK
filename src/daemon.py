@@ -172,7 +172,7 @@ def _sync_sub_logs():
 def _start_engine(day: date):
     """启动盘中引擎, 输出重定向到 ENGINE_LOG, 记录 pid."""
     out = open(ENGINE_LOG, "a", encoding="utf-8")
-    p = subprocess.Popen([PY, os.path.join(_BASE, "realtime_engine.py"),
+    p = subprocess.Popen([PY, os.path.join(_BASE, "src", "realtime_engine.py"),
                           "--interval", "15"],
                          cwd=_BASE, stdout=out, stderr=out,
                          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
