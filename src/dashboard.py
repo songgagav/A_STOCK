@@ -1236,6 +1236,12 @@ def read_riskops():
         out["ops"]["today_trades"] = {"buy": sum(1 for t in tx if t.get("type") == "buy"),
                                       "sell": sum(1 for t in tx if t.get("type") == "sell"),
                                       "fee": round(sum(float(t.get("fee") or 0) for t in tx), 2)}
+        # 持仓敞口 = 多头持仓市值/总权益 (现货无融资, 规范'当前杠杆水平'的现货等价口径: 杠杆恒 ×1.0)
+        _eq, _cash = st.get("equity"), st.get("cash")
+        if isinstance(_eq, (int, float)) and _eq > 0:
+            _mv = max(_eq - (_cash or 0), 0.0)
+            out["metrics"]["exposure_pct"] = round(_mv / _eq * 100, 2)
+            out["metrics"]["leverage"] = 1.0
     except Exception:
         pass
     # 引擎 tick 处理耗时统计 (成交处理延迟, 由 realtime_engine 每 tick 埋点写入)
@@ -5358,6 +5364,7 @@ async function loadRiskview(){
     html+=kpiCard('最大回撤', m.max_dd!=null?fmt(m.max_dd,2)+'%':'—', '#ff6b6b');
     html+=kpiCard('胜率', m.win_rate!=null?fmt(m.win_rate,1)+'%':'—', '#e6edf7');
     html+=kpiCard('盈亏比', fmtn(m.pl_ratio), '#e6edf7');
+    html+=kpiCard('持仓敞口/杠杆', (m.exposure_pct!=null?fmt(m.exposure_pct,1)+'%':'—')+'<br><span style="font-size:11px;color:#8b98b3">现货无融资 · 杠杆 ×1.0</span>', '#e6edf7');
     const op=rk.ops||{};
     html+=kpiCard('错误计数(24h)', op.err_24h!=null?op.err_24h:'—', (op.err_24h||0)>0?'#ff6b6b':'#3dd68c');
     const tt=op.today_trades||{};
