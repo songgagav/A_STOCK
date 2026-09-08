@@ -120,7 +120,8 @@ def write_snapshot(day: str, df: pd.DataFrame) -> dict:
     df["is_st"] = ""
     df = df[keep].sort_values(["ts", "symbol"])
 
-    schema = db._get_table_schema("valuation_snapshot")
+    schema = (db._get_table_schema("valuation_snapshot")
+              if hasattr(db, "_get_table_schema") else None)
     table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
     db.append("valuation_snapshot", table)
     print(f"  append valuation_snapshot rows: {len(df)}")
