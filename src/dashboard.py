@@ -2906,6 +2906,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self):
         path = self.path.split("?")[0]
+        if path == "/api/db_stats/latest":
+            try:
+                import db_stats as _dbs
+                import tasks_db as _tdb
+                hist = _dbs.history_frame(limit=300)
+                last = {nm: pts[-1] for nm, pts in hist.items()}
+                return self._json({"ok": True, "last": last, "history": hist,
+                                   "update": _tdb._read_state()})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
+        if path == "/api/db_stats/refresh":
+            try:
+                import db_stats as _dbs
+                rec = _dbs.append_history()
+                return self._json({"ok": True, "snap_ts": rec["ts"]})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
+        if path == "/api/db_stats/manual":
+            if self.command != "POST":
+                return self._json({"ok": False, "error": "use POST"})
+            try:
+                import tasks_db as _tdb
+                return self._json(_tdb.enqueue_update())
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
         if path == "/api/health":
             # 健康检查端点: dashboard_keepalive.py 用此判定服务可用性
             # 顺便检查 DuckDB / ArcticDB 是否能连, 提供给运维 dashboard.
@@ -3643,6 +3668,7 @@ PAGE = r"""<!DOCTYPE html>
       <button class="tabBtn" data-tab="regime"><span class="ico">∿</span>市场环境<span class="badge-count" id="cnt-regime">·</span></button>
       <button class="tabBtn" data-tab="abnormal"><span class="ico">⚡</span>异动监控<span class="badge-count" id="cnt-abnormal">·</span></button>
       <button class="tabBtn" data-tab="dbpanel"><span class="ico">▥</span>数据板块<span class="badge-count" id="cnt-dbpanel">·</span></button>
+      <button class="tabBtn" data-tab="dbmon"><span class="ico">◉</span>DB监控<span class="badge-count" id="cnt-dbmon">·</span></button>
     </div>
 
   <!-- ===================== 市场看板 (Dashboard) ===================== -->
@@ -4048,6 +4074,36 @@ PAGE = r"""<!DOCTYPE html>
       <div id="dbpanelBody"><div class="muted">加载中...</div></div>
     </div>
   </div><!-- /view-dbpanel -->
+
+  <div id="view-dbmon" class="tabView">
+    <div class="panel">
+      <h3>数据库监控 <span class="muted" style="font-weight:400;font-size:12px">h5i 表统计 · 质量指标 · 趋势快照 · Celery 异步全量更新</span></h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="btnDbStatsRefresh">⟳ 刷新统计</button>
+        <button class="btn" id="btnDbStatsManual">⏻ 手动全量更新</button>
+        <span id="dbmonUpd" class="muted" style="font-size:12px"></span>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        Prometheus: <a href="http://localhost:9090/" target="_blank">localhost:9090</a> ·
+        /metrics 端点: <a href="http://localhost:9101/metrics" target="_blank">9101</a> ·
+        趋势快照 data/db_stats_history.jsonl · 24h 滞后由 Prometheus 规则 alert_rules.yml 告警
+      </div>
+    </div>
+    <div class="panel">
+      <h3>表状态 <span class="muted" style="font-weight:400;font-size:12px">行数 / 最后更新 / 空值率 / 重复对</span></h3>
+      <div id="dbmonTable"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>行数趋势 <span class="muted" style="font-weight:400;font-size:12px">按历史快照(每60s)</span></h3>
+        <div id="dbmonTrend"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>质量与告警 <span class="muted" style="font-weight:400;font-size:12px">空值率 / 重复 / 滞后&gt;24h</span></h3>
+        <div id="dbmonAlerts"><div class="muted">加载中...</div></div>
+      </div>
+    </div>
+  </div><!-- /view-dbmon -->
 
   <footer>全A轮动模拟盘 · 只做多 / T+1 / 涨停不可买 跌停不可卖 停牌跳过 滑点万分5 · 数据源 AKShare+DuckDB · 每3秒刷新</footer>
 </div>
@@ -5560,8 +5616,105 @@ function switchTab(name){
   if(name==='riskview' && !rvLoaded){ rvLoaded=true; initRiskview(); }
   if(name==='flab' && !flLoaded){ flLoaded=true; initF(); }
   if(name==='pscan' && !psLoaded){ psLoaded=true; initScan(); }
+  if(name==='dbmon' && !dbmLoaded){ dbmLoaded=true; initDbmon(); }
 }
 document.querySelectorAll('.tabBtn').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
+
+// ===================== DB 监控 (dbmon) =====================
+let dbmLoaded=false, _dbmTimer=null;
+async function dbmFetch(url, opt){
+  const r = await fetch(url, opt||{}); return r.json();
+}
+function dbmRelAge(v){
+  if(!v) return {label:'—', cls:'muted'};
+  const s = new Date(v.replace(' ','T')).getTime();
+  if(isNaN(s)) return {label:String(v), cls:''};
+  const h = (Date.now()-s)/3600000;
+  if(h>24) return {label:h.toFixed(0)+'h前', cls:'warnText'};
+  return {label:(h<1?Math.round(h*60)+'min前':h.toFixed(1)+'h前'), cls:''};
+}
+function dbmSvg(points, w, h, color){
+  if(!points||points.length<2) return '<span class="muted">—</span>';
+  const mn=Math.min(...points), mx=Math.max(...points), rng=(mx-mn)||1;
+  const step=w/(points.length-1);
+  const d=points.map((p,i)=>{
+    const x=i*step, y=h-2-((p-mn)/rng)*(h-6);
+    return (i?'L':'M')+x.toFixed(1)+' '+y.toFixed(1);
+  }).join(' ');
+  return '<svg width="'+w+'" height="'+h+'" style="display:block"><path d="'+d+'" fill="none" stroke="'+(color||'#5aa9ff')+'" stroke-width="1.4"/></svg>';
+}
+function dbmonStatus(upd){
+  if(!upd || upd.running===undefined) return '空闲';
+  if(upd.running) return upd.current?('更新中: '+upd.current):'更新中...';
+  const fin = upd.finished?upd.finished.slice(11,19):'';
+  const okn = upd.detail?Object.values(upd.detail).filter(d=>d&&d.ok).length:0;
+  const tot = upd.detail?Object.keys(upd.detail).length:0;
+  return '上次完成 '+fin+'  ok '+okn+'/'+tot+(upd.elapsed_s?(' · '+upd.elapsed_s+'s'):'');
+}
+function dbmonRender(d){
+  const last = d.last||{}, hist = d.history||{};
+  // 表状态表
+  const box=document.getElementById('dbmonTable');
+  let html='<table class="tbl"><thead><tr><th>表/文件</th><th>行数</th><th>最后更新</th><th>空值率</th><th>重复对%</th></tr></thead><tbody>';
+  Object.keys(last).forEach(nm=>{
+    const s=last[nm]||{}, age=dbmRelAge(s.last_day);
+    const na=Object.entries(s.na||{}).map(([c,v])=>c+':'+(v==null?'—':(v>10?'<b style="color:#ff6b6b">'+v+'%</b>':v+'%'))).join(' ');
+    html+='<tr><td>'+esc(nm)+'</td><td>'+(s.rows==null?'—':fmt(s.rows,0))+'</td>'
+      +'<td class="'+age.cls+'">'+esc(age.label)+(s.last_day?'<br><span class="muted" style="font-size:11px">'+esc(s.last_day)+'</span>':'')+'</td>'
+      +'<td class="muted" style="font-size:12px">'+(na||'—')+'</td>'
+      +'<td>'+(s.dup_pairs!=null?(s.dup_pairs>0?'<b style="color:#f0b400">'+s.dup_pairs+'%</b>':'0%'):'—')+'</td></tr>';
+  });
+  box.innerHTML=html+'</tbody></table>';
+  // 趋势
+  const tr=document.getElementById('dbmonTrend');
+  let th='';
+  Object.keys(hist).forEach(nm=>{
+    const pts=hist[nm].map(p=>p.rows).filter(v=>v!=null);
+    if(!pts.length) return;
+    const cur=pts[pts.length-1];
+    th+='<div style="display:flex;gap:10px;align-items:center;padding:3px 0;border-bottom:1px dashed rgba(255,255,255,.06)">'
+      +'<span style="flex:0 0 150px;font-size:12px">'+esc(nm)+'</span>'
+      +'<span style="flex:0 0 90px;text-align:right;font-size:12px">'+fmt(cur,0)+'</span>'
+      +dbmSvg(pts.slice(-60), 160, 26)+'</div>';
+  });
+  tr.innerHTML=th||'<div class="muted">暂无趋势数据</div>';
+  // 质量与告警
+  const al=document.getElementById('dbmonAlerts');
+  let ah='';
+  const now=Date.now();
+  Object.keys(last).forEach(nm=>{
+    const s=last[nm]||{};
+    const age=dbmRelAge(s.last_day);
+    const issues=[];
+    if(age.cls==='warnText') issues.push('最后更新超过24h');
+    Object.entries(s.na||{}).forEach(([c,v])=>{ if(v!=null&&v>10) issues.push(c+'空值率'+v+'%'); });
+    if(s.dup_pairs!=null&&s.dup_pairs>0) issues.push('重复对'+s.dup_pairs+'%');
+    if(!issues.length) return;
+    const c=age.cls==='warnText'?'#ff6b6b':'#f0b400';
+    ah+='<div style="padding:4px 0;border-bottom:1px dashed rgba(255,255,255,.07);color:'+c+'">'
+      +'<b>'+esc(nm)+'</b>: '+esc(issues.join('; '))+'</div>';
+  });
+  al.innerHTML=ah||'<div style="color:#3dd68c">● 无异常 · 各表数据健康</div>';
+  // 更新状态
+  const ue=document.getElementById('dbmonUpd');
+  if(ue) ue.innerHTML='<b>更新:</b> '+esc(dbmonStatus(d.update||{}));
+  if(d.update&&d.update.running&&!_dbmTimer){
+    _dbmTimer=setInterval(loadDbmon,5000);
+  } else if((!d.update||!d.update.running)&&_dbmTimer){ clearInterval(_dbmTimer); _dbmTimer=null; }
+}
+async function loadDbmon(){
+  try{
+    const d=await dbmFetch('/api/db_stats/latest');
+    if(d.ok) dbmonRender(d);
+  }catch(e){ const b=document.getElementById('dbmonTable'); if(b) b.innerHTML='<div class="muted">加载失败 '+esc(String(e).slice(0,80))+'</div>'; }
+}
+function initDbmon(){
+  const r=document.getElementById('btnDbStatsRefresh'), m=document.getElementById('btnDbStatsManual');
+  if(r) r.addEventListener('click', async ()=>{ r.textContent='采集中...'; try{ await dbmFetch('/api/db_stats/refresh'); loadDbmon(); }finally{ r.textContent='⟳ 刷新统计'; } });
+  if(m) m.addEventListener('click', async ()=>{ m.textContent='投递中...'; try{ const d=await dbmFetch('/api/db_stats/manual',{method:'POST'}); const ue=document.getElementById('dbmonUpd'); if(ue) ue.innerHTML='<b>更新:</b> '+esc(d.msg||(d.error||''))+(d.ok&&!d.async?'(同步完成)':''); loadDbmon(); }finally{ m.textContent='⏻ 手动全量更新'; } });
+  loadDbmon();
+  setInterval(loadDbmon, 15000);
+}
 
 // ===================== 8 个新面板渲染函数 =====================
 
