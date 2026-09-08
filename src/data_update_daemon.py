@@ -176,13 +176,13 @@ def run_round(force: bool = False) -> dict:
                 st[key] = today
             else:
                 _mark_fail(st, "daily")
-    # 2) 估值快照 (16:40 后; 东财不可达时失败并节流重试)
+    # 2) 估值快照 (16:40 后; 东财全市场接口 2026-09-08 起被反爬断连, 改用腾讯 qt.gtimg 源)
     if after(T_VALU):
         d = _valu_stale_day()
         if d:
             key = f"valuation:{d}"
             if (st.get(key) != today or force) and _due(st, "valuation", force):
-                out[key] = _run_once("valuation", ["scripts/backfill_valuation.py"], day=d)
+                out[key] = _run_once("valuation", ["scripts/tencent_valuation.py"], day=d)
                 if out[key]["ok"]:
                     st[key] = today
                     (st.get("fail") or {}).pop("valuation", None)
