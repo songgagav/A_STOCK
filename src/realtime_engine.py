@@ -20,6 +20,7 @@ import argparse
 import traceback
 from datetime import datetime, date, timedelta
 
+import numpy as np
 import pandas as pd
 
 # ---- 路径 ----
