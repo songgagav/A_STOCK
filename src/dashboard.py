@@ -947,6 +947,143 @@ def read_overview():
     return out
 
 
+def read_kline(sym: str, days: int = 200):
+    """单标的 K 线 + 技术指标 (h5i daily_bars).
+
+    返回正序 bars: {date,o,h,l,c,vol, amount, ma5/10/20/60, dif/dea/macd(12,26,9), rsi(14)}.
+    """
+    code = str(sym or "").strip().upper().split(".")[0]
+    if len(code) != 6 or not code.isdigit():
+        return {"ok": False, "error": f"无效代码: {sym}"}
+    days = max(30, min(int(days or 200), 300))
+    try:
+        import pandas as pd
+        import factor_fusion as ff
+        n = days + 90  # 额外 90 日作指标回看
+        df = ff._sql(
+            f"SELECT CAST(ts AS DATE) d, open, high, low, close, volume, amount "
+            f"FROM daily_bars WHERE symbol='{code}' "
+            f"ORDER BY d DESC LIMIT {n}")
+    except Exception as e:
+        return {"ok": False, "error": f"读取行情失败: {e}"}
+    if df is None or df.empty:
+        return {"ok": False, "error": f"库中无 {code} 行情"}
+    df = df.sort_values("d").reset_index(drop=True)
+    for c in ("open", "high", "low", "close", "volume", "amount"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["ma5"] = df["close"].rolling(5).mean()
+    df["ma10"] = df["close"].rolling(10).mean()
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["dif"] = ema12 - ema26
+    df["dea"] = df["dif"].ewm(span=9, adjust=False).mean()
+    df["macd"] = (df["dif"] - df["dea"]) * 2
+    # RSI(14) Wilder
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    ag = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    al = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    df["rsi"] = 100 - 100 / (1 + ag / al.replace(0, 1e-12))
+    df = df.tail(days)
+    out = {"ok": True, "sym": code, "name": code, "bars": []}
+    for r in df.itertuples():
+        b = {"date": str(r.d), "o": _f(r.open), "h": _f(r.high),
+             "l": _f(r.low), "c": _f(r.close), "v": _f(r.volume),
+             "amount": _f(r.amount), "ma5": _f(r.ma5), "ma10": _f(r.ma10),
+             "ma20": _f(r.ma20), "ma60": _f(r.ma60), "dif": _f(r.dif),
+             "dea": _f(r.dea), "macd": _f(r.macd), "rsi": _f(r.rsi)}
+        out["bars"].append(b)
+    return out
+
+
+def _f(v):
+    """float NaN -> None (供 json)."""
+    import math
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        if hasattr(v, "item"):
+            x = v.item()
+            if isinstance(x, float) and math.isnan(x):
+                return None
+            return x
+        return v
+    except Exception:
+        return v
+
+
+def _equity_series():
+    """逐日回执 equity 序列 (data/daily/*/daily_summary.json), 按日去重升序.
+
+    兼容两种结构: 顶层 {equity} 或新格式 {summary:{equity}}.
+    """
+    seq = {}
+    for d in sorted(glob.glob(os.path.join(DAILY_DIR, "*"))):
+        if os.path.basename(d) in ("day",):
+            continue  # 历史误创建的占位目录
+        sp = os.path.join(d, "daily_summary.json")
+        if not os.path.exists(sp):
+            continue
+        try:
+            with open(sp, encoding="utf-8") as f:
+                j = json.load(f)
+        except Exception:
+            continue
+        day = j.get("day") or os.path.basename(d)
+        eq = j.get("equity")
+        if eq is None:
+            s = j.get("summary")
+            if isinstance(s, dict):
+                eq = s.get("equity")
+        if not day or eq is None:
+            continue
+        # 兼容 YYYYMMDD / YYYY-MM-DD 目录
+        if isinstance(day, str) and len(day) == 8 and day.isdigit():
+            day = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+        seq[str(day)] = float(eq)
+    return [{"day": k, "equity": v} for k, v in sorted(seq.items())]
+
+
+def read_curve():
+    """组合净值/回撤序列 (相对首日净值 + 历史回撤)."""
+    rows = _equity_series()
+    if len(rows) < 2:
+        return {"ok": False, "error": "回执样本不足", "rows": rows}
+    base = rows[0]["equity"]
+    peak = -1e18
+    out = []
+    for r in rows:
+        nav = r["equity"] / base
+        peak = max(peak, nav)
+        dd = (nav / peak - 1) * 100 if peak else 0
+        out.append({"day": r["day"], "equity": r["equity"],
+                    "nav": nav, "dd": dd})
+    return {"ok": True, "rows": out}
+
+
+def read_monthly():
+    """月度收益矩阵 (基于逐日回执 equity 月末值)."""
+    rows = _equity_series()
+    if len(rows) < 2:
+        return {"ok": False, "error": "样本不足", "months": [], "years": []}
+    bym = {}
+    for r in rows:
+        m = r["day"][:7]
+        bym.setdefault(m, []).append(r["equity"])
+    ms = sorted(bym)
+    cells = {}
+    prev_last = rows[0]["equity"]
+    for m in ms:
+        last = bym[m][-1]
+        cells[m] = (last / prev_last - 1) * 100 if prev_last else None
+        prev_last = last
+    years = sorted({m[:4] for m in ms})
+    return {"ok": True, "years": years, "cells": cells}
+
+
 def read_health():
     """读取盘前健康检查结果: data/health/premarket.json."""
     p = os.path.join(DATA_DIR, "health", "premarket.json")
@@ -2465,6 +2602,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_regime())
         if path == "/api/overview":
             return self._json(read_overview())
+        if path == "/api/kline":
+            qs = self.path.split("?", 1)
+            import urllib.parse
+            params = urllib.parse.parse_qs(qs[1]) if len(qs) > 1 else {}
+            sym = (params.get("sym") or [""])[0]
+            try:
+                days = int((params.get("days") or ["200"])[0])
+            except Exception:
+                days = 200
+            return self._json(read_kline(sym=sym, days=days))
+        if path == "/api/curve":
+            return self._json(read_curve())
+        if path == "/api/monthly_returns":
+            return self._json(read_monthly())
         if path == "/api/abnormal":
             qs = self.path.split("?", 1)
             limit = 50
@@ -3040,6 +3191,7 @@ PAGE = r"""<!DOCTYPE html>
       <button class="tabBtn active" data-tab="overview"><span class="ico">◎</span>概览</button>
       <button class="tabBtn" data-tab="dashboard"><span class="ico">▦</span>市场看板<span class="badge-count" id="cnt-dashboard">·</span></button>
       <button class="tabBtn" data-tab="market"><span class="ico">≋</span>市场情绪<span class="badge-count" id="cnt-market">·</span></button>
+      <button class="tabBtn" data-tab="deep"><span class="ico">◈</span>深度分析<span class="badge-count" id="cnt-deep">·</span></button>
       <button class="tabBtn" data-tab="perf"><span class="ico">⌬</span>绩效归因<span class="badge-count" id="cnt-perf">·</span></button>
       <button class="tabBtn" data-tab="backtest"><span class="ico">↻</span>回测<span class="badge-count" id="cnt-backtest">·</span></button>
       <button class="tabBtn" data-tab="concept"><span class="ico">◇</span>概念分析<span class="badge-count" id="cnt-concept">·</span></button>
@@ -3331,6 +3483,63 @@ PAGE = r"""<!DOCTYPE html>
   </div><!-- /view-abnormal -->
 
   <!-- ===================== 数据板块 ===================== -->
+  <div id="view-deep" class="tabView">
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        组合净值 · 回撤
+        <span class="muted" style="font-weight:400;font-size:12px">(逐日回执权益; 悬停查看十字值)</span>
+        <span id="eqRange" class="btn" style="gap:0;padding:2px">
+          <button class="btn" data-r="all" style="padding:3px 9px">全部</button>
+          <button class="btn" data-r="120" style="padding:3px 9px">120日</button>
+          <button class="btn" data-r="60" style="padding:3px 9px">60日</button>
+          <button class="btn" data-r="20" style="padding:3px 9px">20日</button>
+        </span>
+      </h3>
+      <canvas id="eqCanvas" width="1200" height="330" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="eqTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+    </div>
+
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        K线 · 技术指标
+        <span class="muted" style="font-weight:400;font-size:12px">(h5i 日线; MA/MACD/RSI; ◀ ▶ 平移 · 放大/缩小 · 悬停十字)</span>
+        <select id="kSymSel" class="input-dark" style="font-size:12px;padding:2px 6px"></select>
+        <input id="kSymInput" class="input-dark" placeholder="代码 如 600519" style="width:120px;font-size:12px">
+        <button id="kGo" class="btn" style="padding:3px 9px">加载</button>
+        <select id="kInd" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="macd">MACD</option><option value="rsi">RSI</option>
+        </select>
+        <span style="margin-left:auto"></span>
+        <button id="kPrev" class="btn" style="padding:3px 9px">◀ 更早</button>
+        <button id="kNext" class="btn" style="padding:3px 9px">更新 ▶</button>
+        <button id="kZoomIn" class="btn" style="padding:3px 9px">+</button>
+        <button id="kZoomOut" class="btn" style="padding:3px 9px">−</button>
+      </h3>
+      <canvas id="kCanvas" width="1200" height="470" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="kTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+    </div>
+
+    <div class="row2">
+      <div class="panel">
+        <h3>月度收益热力图 <span class="muted" style="font-weight:400;font-size:12px">(月末回执环比)</span></h3>
+        <div id="mHeat"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>持仓分布 · 盈亏贡献 <span class="muted" style="font-weight:400;font-size:12px">(市值占比 / 浮盈贡献)</span></h3>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div id="holdPie" style="flex:1;min-width:230px"><div class="muted">加载中...</div></div>
+          <div id="holdBar" style="flex:1;min-width:200px"><div class="muted">加载中...</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <h3 style="margin:0">一键复盘报告</h3>
+      <span class="muted" style="font-size:12px">聚合当前持仓/净值/绩效/门控/因子 为 Markdown, 便于复盘与分享</span>
+      <button id="btnExport" class="btn primary" style="margin-left:auto">导出复盘报告 (.md)</button>
+    </div>
+  </div>
+
   <div id="view-dbpanel" class="tabView">
     <div class="panel">
       <h3>本地数据库表头情况 <span class="muted" style="font-weight:400;font-size:12px">DuckDB + ArcticDB 全部表</span></h3>
@@ -4243,6 +4452,327 @@ async function refreshTabBadges(){
   } catch(e) { _setBadge('industry', null); }
 }
 
+// ===================== 深度分析 (K线/净值/月收益/持仓/导出) =====================
+const UP='#ff6b6b', DOWN='#3dd68c', AXIS='#8b98b3', GRID='rgba(255,255,255,.07)';
+const MA_COL={ma5:'#f0b400',ma10:'#4f8cff',ma20:'#c678dd',ma60:'#26d0ce'};
+let deepLoaded=false;
+
+function deepColors(){
+  const cs=getComputedStyle(document.documentElement);
+  const r=cs.getPropertyValue('--base')||'224 232 245';
+  return 'hsl('+r+')';
+}
+function axisLabel(ctx,x,y,txt,align){
+  ctx.fillStyle=AXIS; ctx.font='10px ui-monospace,Consolas,monospace'; ctx.textAlign=align||'center';
+  ctx.fillText(txt,x,y);
+}
+function gridLines(ctx,vals,x0,x1,y,y0){
+  ctx.strokeStyle=GRID; ctx.lineWidth=1;
+  for(const v of vals){ const yy=y0+(v-y0)/1; ctx.beginPath(); ctx.moveTo(x0, yy); ctx.lineTo(x1, yy); ctx.stroke(); }
+}
+function niceMinMax(a,b,n){
+  const pad=(b-a)*0.08||1; let lo=a-pad, hi=b+pad;
+  return [lo,hi];
+}
+
+// ---------- 组合净值·回撤 ----------
+let eqCache=null;
+async function loadEq(){
+  try{ const d=await fetch('/api/curve').then(r=>r.json()); eqCache=d; drawEq(ksRange); }
+  catch(e){ const t=document.getElementById('eqTip'); if(t)t.textContent='净值加载失败: '+e; }
+}
+let ksRange='all';
+function drawEq(range){
+  const cv=document.getElementById('eqCanvas'); if(!cv||!eqCache||!eqCache.ok){return;}
+  const ctx=cv.getContext('2d'); const W=cv.width,H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  let rows=eqCache.rows;
+  const nMax = range==='all'?rows.length:(+range);
+  rows=rows.slice(-nMax);
+  if(rows.length<2){ const t=document.getElementById('eqTip'); if(t)t.textContent='回执样本不足, 暂无法绘制'; return; }
+  const L=70,R=16,T=14,B=24, M=T+14;
+  const mainBtm=H-B-((H-T-B)*0.26);
+  // 上:净值; 下:回撤面积
+  const navs=rows.map(r=>r.nav), dds=rows.map(r=>r.dd);
+  const [lo,hi]=niceMinMax(Math.min.apply(0,navs),Math.max.apply(0,navs),10);
+  const x=i=>L+i*(W-L-R)/(rows.length-1);
+  const yN=v=>M+(1-(v-lo)/(hi-lo))*(mainBtm-M);
+  // 回撤区 (负数)
+  const yD0=H-B-8, ddTop=H-B-(H-T-B)*0.26;
+  // grid & axis nav
+  const gridN=6;
+  for(let i=0;i<=gridN;i++){ const v=lo+(hi-lo)*i/gridN; const yy=yN(v);
+    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(L,yy); ctx.lineTo(W-R,yy); ctx.stroke();
+    axisLabel(ctx,L-6,yy+3,v.toFixed(3),'right'); }
+  // 净值线
+  ctx.strokeStyle='#4f8cff'; ctx.lineWidth=1.6; ctx.beginPath();
+  rows.forEach((r,i)=>{ const px=x(i),py=yN(r.nav); i?ctx.lineTo(px,py):ctx.moveTo(px,py); });
+  ctx.stroke();
+  // 首日基准虚线
+  ctx.strokeStyle='rgba(255,255,255,.25)'; ctx.setLineDash([4,4]); ctx.beginPath();
+  ctx.moveTo(L,yN(1)); ctx.lineTo(W-R,yN(1)); ctx.stroke(); ctx.setLineDash([]);
+  axisLabel(ctx,L+4,yN(1)-4,'1.00 (基准)','left');
+  // 回撤填充(底部区)
+  const dLo=Math.min.apply(0,dds), dHi=0;
+  ctx.fillStyle='rgba(255,107,107,.20)'; ctx.beginPath();
+  ctx.moveTo(x(0),yD0);
+  dds.forEach((v,i)=>ctx.lineTo(x(i), yD0-(v-dLo)/((dHi-dLo)||1)*(yD0-ddTop)));
+  ctx.lineTo(x(rows.length-1),yD0); ctx.closePath(); ctx.fill();
+  // 回撤轴
+  for(let i=0;i<=3;i++){ const v=dLo+(0-dLo)*i/3; const yy=yD0-(v-dLo)/((dHi-dLo)||1)*(yD0-ddTop);
+    axisLabel(ctx,L-6,yy+3,v.toFixed(1)+'%','right'); }
+  axisLabel(ctx,L,ddTop-4,'回撤%','left');
+  // x 轴日期
+  const step=Math.max(1,Math.floor(rows.length/8));
+  for(let i=0;i<rows.length;i+=step){ axisLabel(ctx,x(i),H-6,rows[i].day.slice(2),'center'); }
+  axisLabel(ctx,L,10,'净值','left');
+  // hover
+  cv._rows=rows; cv._xf=x; cv._yf=yN; cv._type='eq';
+}
+function fmtPct(v){ return (v>=0?'+':'')+fmt(v,2)+'%'; }
+
+// ---------- K线 · 技术指标 ----------
+const ks={bars:[],winStart:0,winLen:110,ind:'macd'};
+async function loadK(sym){
+  const code=(sym||document.getElementById('kSymInput').value||'600519').trim();
+  if(!/^\d{6}$/.test(code.split('.')[0])){ return; }
+  try{
+    const d=await fetch('/api/kline?sym='+encodeURIComponent(code)+'&days=260').then(r=>r.json());
+    if(!d.ok){ const t=document.getElementById('kTip'); if(t)t.textContent=d.error||'K线加载失败'; return; }
+    ks.bars=d.bars; ks.winLen=Math.min(ks.winLen,d.bars.length);
+    ks.winStart=Math.max(0,d.bars.length-ks.winLen);
+    drawK(-1);
+  }catch(e){ const t=document.getElementById('kTip'); if(t)t.textContent='K线加载失败: '+e; }
+}
+function drawK(hoverIdx){
+  const cv=document.getElementById('kCanvas'); if(!cv||!ks.bars.length){return;}
+  const ctx=cv.getContext('2d'); const W=cv.width,H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  const bars=ks.bars.slice(ks.winStart, ks.winStart+ks.winLen);
+  if(!bars.length) return;
+  const L=70,R=16,T=12,B=20;
+  const topH=Math.round((H-T-B)*0.52), volTop=T+topH+6, volH=Math.round((H-T-B)*0.14),
+        indTop=volTop+volH+8, indH=H-B-indTop-4;
+  // 主区
+  const hs=bars.map(b=>b.h).filter(v=>v!=null), ls=bars.map(b=>b.l).filter(v=>v!=null);
+  let mn=Math.min.apply(0,ls), mx=Math.max.apply(0,hs);
+  const [lo,hi]=niceMinMax(mn,mx,12);
+  const cw=(W-L-R)/bars.length, bw=Math.max(1,Math.min(10,cw*0.62));
+  const x=i=>L+i*cw+cw/2, yP=v=>T+(1-(v-lo)/(hi-lo))*topH;
+  // grid & price axis
+  for(let i=0;i<=6;i++){ const v=lo+(hi-lo)*i/6; const yy=yP(v);
+    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(L,yy); ctx.lineTo(W-R,yy); ctx.stroke();
+    axisLabel(ctx,L-6,yy+3,v.toFixed(2),'right'); }
+  // candles
+  bars.forEach((b,i)=>{
+    if(b.o==null||b.c==null) return;
+    const up=b.c>=b.o, col=up?UP:DOWN;
+    const yy=yP;
+    ctx.strokeStyle=col; ctx.fillStyle=col;
+    ctx.beginPath(); ctx.moveTo(x(i),yP(b.h)); ctx.lineTo(x(i),yP(b.l)); ctx.stroke();
+    const yO=yP(b.o),yC=yP(b.c),yy0=Math.min(yO,yC),hh=Math.max(1,Math.abs(yO-yC));
+    ctx.fillRect(x(i)-bw/2, yy0, bw, hh);
+  });
+  // MA lines (主区)
+  for(const k of ['ma5','ma10','ma20','ma60']){
+    const col=MA_COL[k]; ctx.strokeStyle=col; ctx.lineWidth=1.1; ctx.beginPath(); let started=false;
+    bars.forEach((b,i)=>{ const v=b[k]; if(v==null){started=false;return;} const px=x(i),py=yP(v);
+      if(!started){ctx.moveTo(px,py);started=true;} else ctx.lineTo(px,py); });
+    ctx.stroke();
+  }
+  // 成交量
+  let vmax=0; bars.forEach(b=>{ if(b.v!=null && b.v>vmax) vmax=b.v; });
+  bars.forEach((b,i)=>{
+    if(b.o==null||b.c==null) return;
+    const up=b.c>=b.o; const col=up?UP:DOWN;
+    const hh=b.v!=null? (b.v/vmax)*volH : 0;
+    ctx.fillStyle=up?col:col;
+    ctx.globalAlpha=.55; ctx.fillRect(x(i)-bw/2, volTop+volH-hh, bw, hh); ctx.globalAlpha=1;
+  });
+  axisLabel(ctx,L,volTop-4,'量','left');
+  // 副图指标
+  axisLabel(ctx,L,indTop-4,ks.ind.toUpperCase(),'left');
+  if(ks.ind==='macd'){
+    const vs=bars.map(b=>[b.dif,b.dea,b.macd]).flat().filter(v=>v!=null);
+    let mi=Math.min.apply(0,vs), ma=Math.max.apply(0,vs); const pad=(ma-mi)*.1||1; mi-=pad; ma+=pad;
+    const yy=v=>indTop+indH-(v-mi)/(ma-mi)*indH;
+    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(L,yy(0)); ctx.lineTo(W-R,yy(0)); ctx.stroke();
+    bars.forEach((b,i)=>{ if(b.macd==null)return; const c=b.macd>=0?UP:DOWN;
+      ctx.fillStyle=c; const y0=yy(0),ym=yy(b.macd); ctx.fillRect(x(i)-bw/2,Math.min(y0,ym),bw,Math.max(1,Math.abs(ym-y0))); });
+    for(const k of ['dif','dea']){ const col=k==='dif'?'#f0b400':'#4f8cff'; ctx.strokeStyle=col; ctx.lineWidth=1.1;
+      ctx.beginPath(); let s=false; bars.forEach((b,i)=>{ const v=b[k]; if(v==null){s=false;return;} const px=x(i),py=yy(v); if(!s){ctx.moveTo(px,py);s=true;} else ctx.lineTo(px,py); }); ctx.stroke(); }
+  } else { // rsi
+    const yy=v=>indTop+(1-v/100)*indH;
+    ctx.strokeStyle=GRID; [30,70].forEach(v=>{ ctx.beginPath(); ctx.moveTo(L,yy(v)); ctx.lineTo(W-R,yy(v)); ctx.stroke(); });
+    ctx.strokeStyle='#4f8cff'; ctx.lineWidth=1.3; ctx.beginPath(); let s=false;
+    bars.forEach((b,i)=>{ const v=b.rsi; if(v==null){s=false;return;} const px=x(i),py=yy(v); if(!s){ctx.moveTo(px,py);s=true;} else ctx.lineTo(px,py); }); ctx.stroke();
+  }
+  // x 轴日期
+  const step=Math.max(1,Math.floor(bars.length/8));
+  for(let i=0;i<bars.length;i+=step) axisLabel(ctx,x(i),H-6,bars[i].date.slice(2),'center');
+  // 图例
+  let leg='<span style="color:#8b98b3">MA5</span> ';
+  for(const k of ['ma5','ma10','ma20','ma60']) leg+='<span style="color:'+MA_COL[k]+'">'+k.toUpperCase()+'</span> ';
+  ctx.fillStyle='#e6edf7'; ctx.font='11px sans-serif'; ctx.fillText('MA5 MA10 MA20 MA60', L+4, T+2);
+  cv._bars=bars; cv._x=x; cv._info={
+    lo,hi,topH,T,L,R,W,B, top:topH, volTop,volTop2:volTop+volH, indTop, indH, indBottom:indTop+indH
+  };
+}
+function kTipText(b){
+  if(!b) return '';
+  const chg = (b.c!=null && b.o!=null && b.o!==0)? (b.c/b.o-1)*100 : null;
+  return esc(b.date)+'  O '+fmt(b.o,2)+'  H '+fmt(b.h,2)+'  L '+fmt(b.l,2)+'  C '+fmt(b.c,2)
+    +'  涨跌 '+(chg==null?'—':'<b style="color:'+(chg>=0?UP:DOWN)+'">'+fmtPct(chg)+'</b>')
+    +'  量 '+fmt((b.v||0)/1e6,2)+'M  MA20 '+fmt(b.ma20,2)
+    +'  DIF '+fmt(b.dif,3)+' DEA '+fmt(b.dea,3)+' MACD '+fmt(b.macd,3)+' RSI '+fmt(b.rsi,1);
+}
+function bindDeep(){
+  const eq=document.getElementById('eqCanvas'), kv=document.getElementById('kCanvas');
+  const eqTip=document.getElementById('eqTip'), kTip=document.getElementById('kTip');
+  const ratio=cv=>{const r=cv.getBoundingClientRect(); return r.width?cv.width/r.width:1;};
+  if(eq) eq.addEventListener('mousemove',e=>{
+    const r=eq.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(eq);
+    if(!eq._rows) return; const rows=eq._rows, xf=eq._xf;
+    const i=Math.round((rx-xf(0))/(xf(rows.length-1)-xf(0))*(rows.length-1));
+    if(i<0||i>=rows.length) return; const row=rows[i];
+    eqTip.innerHTML='<span style="color:#4f8cff">'+esc(row.day)+'</span> 权益 '+fmt(row.equity,2)
+      +'  净值 '+fmt(row.nav,4)+'  回撤 <b style="color:'+(row.dd<0?UP:AXIS)+'">'+fmt(row.dd,2)+'%</b>';
+  });
+  if(kv) kv.addEventListener('mousemove',e=>{
+    const r=kv.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(kv);
+    const bars=kv._bars, xf=kv._x; if(!bars||!bars.length) return;
+    const i=Math.round((rx-xf(0))/(xf(bars.length-1)-xf(0))*(bars.length-1));
+    if(i<0||i>=bars.length) return;
+    kTip.innerHTML=kTipText(bars[i]);
+  });
+  const one=(id,fn)=>{const el=document.getElementById(id); if(el) el.addEventListener('click',fn);};
+  one('kPrev',()=>{ ks.winStart=Math.max(0,ks.winStart-Math.round(ks.winLen*0.8)); drawK(-1); });
+  one('kNext',()=>{ ks.winStart=Math.min(Math.max(0,ks.bars.length-ks.winLen),ks.winStart+Math.round(ks.winLen*0.8)); drawK(-1); });
+  one('kZoomIn',()=>{ ks.winLen=Math.max(20,Math.floor(ks.winLen*0.7)); ks.winStart=Math.min(ks.winStart,Math.max(0,ks.bars.length-ks.winLen)); drawK(-1); });
+  one('kZoomOut',()=>{ ks.winLen=Math.min(ks.bars.length,Math.ceil(ks.winLen*1.4)); ks.winStart=Math.min(ks.winStart,Math.max(0,ks.bars.length-ks.winLen)); drawK(-1); });
+  one('kGo',()=>loadK(''));
+  const kSel=document.getElementById('kSymSel'), kInd=document.getElementById('kInd');
+  if(kSel) kSel.addEventListener('change',()=>loadK(kSel.value));
+  if(kInd) kInd.addEventListener('change',()=>{ ks.ind=kInd.value; drawK(-1); });
+  const indInput=document.getElementById('kSymInput');
+  if(indInput) indInput.addEventListener('keydown',e=>{ if(e.key==='Enter') loadK(''); });
+  const rangeBtns=document.querySelectorAll('#eqRange button');
+  rangeBtns.forEach(b=>b.addEventListener('click',()=>{
+    rangeBtns.forEach(x=>x.style.opacity=x===b?1:.5);
+    ksRange=b.dataset.r; drawEq(ksRange);
+  }));
+  one('btnExport', exportMd);
+}
+async function loadHolds(){
+  let st=window._lastState;
+  try{
+    if(!st){ st=await fetch('/api/live').then(r=>r.json()); }
+    const pos=(st.positions||[]).filter(p=>p&&p.qty>0);
+    const box=document.getElementById('holdPie'), bar=document.getElementById('holdBar');
+    if(!pos.length){ if(box)box.innerHTML='<div class="muted">暂无持仓</div>'; if(bar)bar.innerHTML=''; return; }
+    const tot=pos.reduce((a,p)=>a+(p.mv||0),0);
+    if(box){
+      let ang=-Math.PI/2, svg='<svg viewBox="0 0 200 200" style="max-width:210px;display:block;margin:0 auto">';
+      const pal=['#4f8cff','#26d0ce','#f0b400','#c678dd','#ff6b6b','#3dd68c','#f88c4f'];
+      pos.forEach((p,i)=>{
+        const frac=(p.mv||0)/tot, a2=ang+frac*Math.PI*2;
+        const x1=100+88*Math.cos(ang), y1=100+88*Math.sin(ang), x2=100+88*Math.cos(a2), y2=100+88*Math.sin(a2);
+        svg+='<path d="M100 100 L'+x1.toFixed(1)+' '+y1.toFixed(1)+' A88 88 0 '+(frac>0.5?1:0)+' 1 '+x2.toFixed(1)+' '+y2.toFixed(1)+' Z" fill="'+pal[i%pal.length]+'" opacity=".85"><title>'+esc(p.canon)+' '+(frac*100).toFixed(1)+'%</title></path>';
+        ang=a2;
+      });
+      svg+='</svg>';
+      box.innerHTML=svg+'<div style="text-align:center;font-size:11px;color:#8b98b3;margin-top:4px">持仓市值 '+fmt(tot,0)+' (共'+pos.length+'只)</div>';
+    }
+    if(bar){
+      pos.sort((a,b)=>(b.pnl_amt||0)-(a.pnl_amt||0));
+      bar.innerHTML=pos.map(p=>{
+        const w=Math.max(4,Math.min(100,Math.abs((p.pnl_amt||0)/Math.max(1,Math.max.apply(0,pos.map(x=>Math.abs(x.pnl_amt||0))))*100)));
+        const c=(p.pnl_amt||0)>=0?UP:DOWN;
+        return '<div style="margin:5px 0"><div style="display:flex;justify-content:space-between;font-size:12px"><span>'+esc(p.name||p.canon)+'</span><span style="color:'+c+'">'+fmt(p.pnl_amt||0,0)+' ('+fmt(p.pnl_pct||0,2)+'%)</span></div>'
+          +'<div style="background:rgba(255,255,255,.08);height:6px;border-radius:3px"><div style="background:'+c+';width:'+w+'%;height:6px;border-radius:3px"></div></div></div>';
+      }).join('');
+    }
+  }catch(e){ /* 忽略 */ }
+}
+async function loadMonthly(){
+  const box=document.getElementById('mHeat'); if(!box)return;
+  try{
+    const d=await fetch('/api/monthly_returns').then(r=>r.json());
+    if(!d.ok||!d.cells){ box.innerHTML='<div class="muted">回执样本不足(需跨月数据)</div>'; return; }
+    const months=Object.keys(d.cells).sort();
+    let html='<table class="tbl"><thead><tr><th>月份</th><th>收益</th><th>色阶</th></tr></thead><tbody>';
+    months.forEach(m=>{
+      const v=d.cells[m]; const abs=Math.min(2,Math.abs(v||0)/2);
+      const col=v>=0?'rgba(255,80,80,'+(0.15+abs*0.75)+')':'rgba(80,220,140,'+(0.15+abs*0.75)+')';
+      html+='<tr><td>'+esc(m)+'</td><td style="color:'+(v>=0?UP:DOWN)+'">'+fmtPct(v)+'</td>'
+        +'<td style="background:'+col+'"></td></tr>';
+    });
+    html+='</tbody></table>';
+    box.innerHTML=html;
+  }catch(e){ box.innerHTML='<div class="muted">加载失败</div>'; }
+}
+async function exportMd(){
+  try{
+    const [live,perf,ov]=await Promise.all([
+      fetch('/api/live').then(r=>r.json()).catch(()=>null),
+      fetch('/api/perf').then(r=>r.json()).catch(()=>null),
+      fetch('/api/overview').then(r=>r.json()).catch(()=>null)]);
+    const C=(live&&live.capital)||{};
+    const rows=(eqCache&&eqCache.rows)||[];
+    const nav=(rows.length?rows[rows.length-1].nav:null);
+    const dds=rows.map(r=>r.dd||0);
+    const md=[];
+    md.push('# A股轮动 · 模拟盘复盘', '');
+    md.push('生成时间: '+new Date().toLocaleString('zh-CN'), '');
+    md.push('## 账户概览');
+    md.push('| 权益 | 现金 | 仓位 | 持仓 | 累计收益 |');
+    md.push('|---|---|---|---|---|');
+    md.push('| '+fmt(C.equity,2)+' | '+fmt(C.cash,2)+' | '+(C.cash_ratio!=null?fmt((1-C.cash_ratio)*100,1)+'%':'—')+' | '+(C.open_positions||0)+' 只 | '+(C.total_pnl_pct!=null?fmtPct(C.total_pnl_pct):'—')+' |','');
+    md.push('## 持仓');
+    const pos=(live&&live.positions||[]).filter(p=>p&&p.qty>0);
+    if(pos.length){
+      md.push('| 代码 | 数量 | 成本 | 现价 | 浮盈 | 仓位 |');
+      md.push('|---|---|---|---|---|---|');
+      pos.forEach(p=>md.push('| '+esc(p.canon)+' | '+p.qty+' | '+fmt(p.avg_cost,3)+' | '+fmt(p.last_price,2)+' | '+fmt(p.pnl_amt,1)+' ('+fmt(p.pnl_pct,2)+'%) | '+fmt((p.weight||0)*100,1)+'% |'));
+    } else md.push('(空仓)');
+    md.push('','## 绩效');
+    if(perf&&perf.ok!==false&&perf.metrics){
+      const m=perf.metrics;
+      md.push('| 累计收益 | 年化 | 夏普 | 最大回撤 |');
+      md.push('|---|---|---|---|');
+      md.push('| '+(m.total_return!=null?fmtPct(m.total_return):'—')+' | '+(m.cagr!=null?fmt(m.cagr,2)+'%':'—')+' | '+(m.sharpe_annual!=null?fmt(m.sharpe_annual,2):'—')+' | '+(m.max_drawdown!=null?fmt(m.max_drawdown,2)+'%':'—')+' |');
+    } else {
+      md.push('最新净值: '+(nav?fmt(nav,4):'—')+' | 当前回撤: '+fmtPct(dds.length?dds[dds.length-1]:0));
+    }
+    md.push('','## 门控与系统');
+    const g=(ov&&ov.gate)||{};
+    md.push('- IC 门控: '+(g.regime||'—')+' | 暴露 ×'+(g.exposure_mult!=null?g.exposure_mult:1)+' | IC均值 '+fmt(g.ic_mean,4)+(g.ic_as_of?' (as_of '+esc(g.ic_as_of)+')':''));
+    const dt=(ov&&ov.data)||{};
+    if(dt.stale) md.push('- 数据滞后表: '+(dt.stale.length?dt.stale.join(', '):'无'));
+    if(g.reasons&&g.reasons.length) md.push('- 门控原因: '+g.reasons.join('; '));
+    md.push('','*本报告由系统自动生成, 仅供研究复盘, 不构成投资建议.*');
+    const blob=new Blob(['\ufeff'+md.join('\n')],{type:'text/markdown;charset=utf-8'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='复盘_'+new Date().toISOString().slice(0,10)+'.md';
+    document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},300);
+  }catch(e){ if(typeof console!=='undefined') console.error('export err',e); }
+}
+function initDeep(){
+  bindDeep();
+  loadEq(); loadMonthly(); loadHolds();
+  // K线初始标的: 持仓第一只, 否则固定示例
+  const st=window._lastState||{};
+  const opts=(st.positions||[]).filter(p=>p.qty>0).map(p=>p.canon);
+  const tgt=(st.targets||st.top_targets||[]).map(t=>typeof t==='string'?t:(t&&t.canon));
+  const all=[...new Set([...(opts||[]),...(tgt||[]).filter(Boolean)])].slice(0,12);
+  const sel=document.getElementById('kSymSel');
+  if(sel){
+    sel.innerHTML=all.map(s=>'<option value="'+esc(s)+'">'+esc(s)+'</option>').join('')
+      +'<option value="600519">600519 贵州茅台</option><option value="000001">000001 平安银行</option>';
+    if(!all.length) sel.innerHTML='<option value="600519">600519 贵州茅台</option>';
+  }
+  loadK(all[0]||'600519');
+}
 function switchTab(name){
   document.querySelectorAll('.tabBtn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
   document.querySelectorAll('.tabView').forEach(v=>v.classList.toggle('active', v.id==='view-'+name));
@@ -4279,6 +4809,7 @@ function switchTab(name){
   if(name==='regime' && !regLoaded){ regLoaded=true; loadRegime(); }
   if(name==='abnormal' && !abnLoaded){ abnLoaded=true; loadAbnormal(); }
   if(name==='dbpanel' && !dbpLoaded){ dbpLoaded=true; loadDbPanel(); }
+  if(name==='deep' && !deepLoaded){ deepLoaded=true; initDeep(); }
 }
 document.querySelectorAll('.tabBtn').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
 
