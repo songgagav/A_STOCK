@@ -1084,6 +1084,90 @@ def read_monthly():
     return {"ok": True, "years": years, "cells": cells}
 
 
+_INDUSTRY_MAP = None
+
+
+def _industry_map():
+    """惰性加载同花顺行业映射 (industry_map.json: canon -> {name, tags[三级]})."""
+    global _INDUSTRY_MAP
+    if _INDUSTRY_MAP is None:
+        try:
+            p = os.path.join(DATA_DIR, "industry_map.json")
+            with open(p, encoding="utf-8") as f:
+                _INDUSTRY_MAP = (json.load(f) or {}).get("map") or {}
+        except Exception:
+            _INDUSTRY_MAP = {}
+    return _INDUSTRY_MAP
+
+
+def read_holdings_profile():
+    """持仓的行业 / 市值双维分布.
+
+    行业: industry_map.json (同花顺一级行业, 按持仓市值聚合)
+    市值: valuation_snapshot 最新快照 total_mv(float_mv), 分 小盘<100 / 中盘100-500 / 大盘>=500 亿
+    """
+    lv = os.path.join(DATA_DIR, "live_state.json")
+    pos = []
+    try:
+        with open(lv, encoding="utf-8") as f:
+            lj = json.load(f)
+        pos = [p for p in (lj.get("positions") or []) if p and p.get("qty", 0) > 0]
+    except Exception:
+        pass
+    if not pos:
+        return {"ok": True, "positions": [], "message": "空仓", "industries": [], "caps": []}
+    total = sum((p.get("mv") or 0) for p in pos) or 1
+    imap = _industry_map()
+    # 市值: 最新估值快照
+    code6 = [str(p.get("canon", "")).split(".")[0] for p in pos]
+    inlist = ",".join(f"'{c}'" for c in code6)
+    mv_map = {}
+    try:
+        import factor_fusion as ff
+        df = ff._sql(
+            f"SELECT symbol, total_mv, float_mv FROM valuation_snapshot "
+            f"WHERE CAST(ts AS DATE) = (SELECT MAX(CAST(ts AS DATE)) FROM valuation_snapshot) "
+            f"AND symbol IN ({inlist})")
+        for r in df.itertuples():
+            mv_map[str(r.symbol)] = {"total_mv": _f(r.total_mv), "float_mv": _f(r.float_mv)}
+    except Exception:
+        pass
+
+    inds, capb = {}, {"大盘": [], "中盘": [], "小盘": []}
+    out_pos = []
+    for p in pos:
+        canon = str(p.get("canon", ""))
+        rec = imap.get(canon) or {}
+        tags = rec.get("tags") or []
+        ind1 = tags[0].split("-")[0] if tags else None
+        mv = p.get("mv") or 0
+        cap = (mv_map.get(canon.split(".")[0]) or {}).get("total_mv")
+        bucket = None
+        if cap is not None:
+            bucket = "大盘" if cap >= 500 else ("中盘" if cap >= 100 else "小盘")
+        out_pos.append({
+            "canon": canon, "name": rec.get("name") or p.get("name") or canon,
+            "qty": p.get("qty"), "mv": mv, "weight_pct": mv / total * 100,
+            "pnl_amt": p.get("pnl_amt"), "pnl_pct": p.get("pnl_pct"),
+            "industry": ind1, "industry_full": tags[0] if tags else None,
+            "total_mv": cap, "cap_bucket": bucket})
+        if ind1:
+            inds.setdefault(ind1, {"mv": 0.0, "codes": []})
+            inds[ind1]["mv"] += mv
+            inds[ind1]["codes"].append(canon.split(".")[0])
+        if bucket:
+            capb[bucket].append({"canon": canon, "mv": mv})
+    ind_rows = [{"name": k, "mv": v["mv"], "weight_pct": v["mv"] / total * 100,
+                 "codes": v["codes"]} for k, v in
+                sorted(inds.items(), key=lambda x: -x[1]["mv"])]
+    cap_rows = [{"bucket": k, "positions": v,
+                 "weight_pct": (sum(x["mv"] for x in v) / total * 100) if v else 0,
+                 "count": len(v)} for k, v in
+                (("大盘", capb["大盘"]), ("中盘", capb["中盘"]), ("小盘", capb["小盘"]))]
+    return {"ok": True, "positions": out_pos, "industries": ind_rows,
+            "caps": cap_rows}
+
+
 def read_health():
     """读取盘前健康检查结果: data/health/premarket.json."""
     p = os.path.join(DATA_DIR, "health", "premarket.json")
@@ -2616,6 +2700,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_curve())
         if path == "/api/monthly_returns":
             return self._json(read_monthly())
+        if path == "/api/holdings_profile":
+            return self._json(read_holdings_profile())
         if path == "/api/abnormal":
             qs = self.path.split("?", 1)
             limit = 50
@@ -3530,6 +3616,17 @@ PAGE = r"""<!DOCTYPE html>
           <div id="holdPie" style="flex:1;min-width:230px"><div class="muted">加载中...</div></div>
           <div id="holdBar" style="flex:1;min-width:200px"><div class="muted">加载中...</div></div>
         </div>
+      </div>
+    </div>
+
+    <div class="row2">
+      <div class="panel">
+        <h3>持仓行业分布 <span class="muted" style="font-weight:400;font-size:12px">(同花顺一级行业 · 按持仓市值)</span></h3>
+        <div id="holdInd"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>持仓市值分布 <span class="muted" style="font-weight:400;font-size:12px">(公司总市值: 小盘&lt;100 / 中盘100-500 / 大盘≥500亿)</span></h3>
+        <div id="holdCap"><div class="muted">加载中...</div></div>
       </div>
     </div>
 
@@ -4694,6 +4791,39 @@ async function loadHolds(){
     }
   }catch(e){ /* 忽略 */ }
 }
+async function loadProfile(){
+  const indBox=document.getElementById('holdInd'), capBox=document.getElementById('holdCap');
+  if(!indBox&&!capBox) return;
+  const none=b=>{ if(b) b.innerHTML='<div class="muted">暂无持仓</div>'; };
+  try{
+    const d=await fetch('/api/holdings_profile').then(r=>r.json());
+    if(!d.ok||!d.positions||!d.positions.length){ none(indBox); none(capBox); return; }
+    if(indBox){
+      const inds=d.industries||[];
+      if(!inds.length){ indBox.innerHTML='<div class="muted">无行业映射</div>'; }
+      else indBox.innerHTML=inds.map(x=>{
+        return '<div style="margin:7px 0"><div style="display:flex;justify-content:space-between;font-size:12px">'
+          +'<span>'+esc(x.name)+' <span class="muted" style="font-size:11px">'+esc(x.codes.join(' '))+'</span></span>'
+          +'<span>'+fmt(x.weight_pct,1)+'%</span></div>'
+          +'<div style="background:rgba(255,255,255,.08);height:8px;border-radius:4px">'
+          +'<div style="width:'+Math.max(2,Math.min(100,x.weight_pct))+'%;height:8px;border-radius:4px;background:#4f8cff"></div></div></div>';
+      }).join('');
+    }
+    if(capBox){
+      const caps=(d.caps||[]).filter(c=>c.count>0);
+      const pal={大盘:'#c678dd',中盘:'#f0b400',小盘:'#26d0ce'};
+      if(!caps.length){ capBox.innerHTML='<div class="muted">市值数据缺失(估值快照滞后)</div>'; }
+      else capBox.innerHTML=caps.map(c=>{
+        const sub=(c.positions||[]).map(p=>p.canon.split('.')[0]).join(' ');
+        return '<div style="margin:7px 0"><div style="display:flex;justify-content:space-between;font-size:12px">'
+          +'<span style="color:'+pal[c.bucket]+'">'+c.bucket+'</span><span>'+c.count+' 只 · '+fmt(c.weight_pct,1)+'%</span></div>'
+          +'<div style="background:rgba(255,255,255,.08);height:8px;border-radius:4px">'
+          +'<div style="width:'+Math.max(2,Math.min(100,c.weight_pct))+'%;height:8px;border-radius:4px;background:'+pal[c.bucket]+'"></div></div>'
+          +'<div class="muted" style="font-size:11px">'+esc(sub)+'</div></div>';
+      }).join('');
+    }
+  }catch(e){ const b=document.getElementById('holdInd'); if(b) b.innerHTML='<div class="muted">加载失败</div>'; }
+}
 async function loadMonthly(){
   const box=document.getElementById('mHeat'); if(!box)return;
   try{
@@ -4759,7 +4889,7 @@ async function exportMd(){
 }
 function initDeep(){
   bindDeep();
-  loadEq(); loadMonthly(); loadHolds();
+  loadEq(); loadMonthly(); loadHolds(); loadProfile();
   // K线初始标的: 持仓第一只, 否则固定示例
   const st=window._lastState||{};
   const opts=(st.positions||[]).filter(p=>p.qty>0).map(p=>p.canon);
