@@ -1418,6 +1418,71 @@ def _send_push(channel: str, message: str) -> dict:
     return {"ok": False, "error": f"未知通道: {channel}"}
 
 
+_SCAN_COMBOS = [
+    {"name": "基线", "desc": "现行门控参数", "ov": {}},
+    {"name": "全暴露", "desc": "caution/risk 暴露 ×1.0", "ov": {"exp_caution": 1.0, "exp_risk": 1.0}},
+    {"name": "保守", "desc": "caution×0.85 / risk×0.60", "ov": {"exp_caution": 0.85, "exp_risk": 0.60}},
+    {"name": "严风控", "desc": "risk 暴露 ×0.50", "ov": {"exp_risk": 0.50}},
+    {"name": "快调仓", "desc": "risk 档 2 日即调", "ov": {"int_risk_step": 2}},
+    {"name": "漂移敏感", "desc": "因子 IC 漂移阈值 0.10", "ov": {"factor_ic_drift": 0.10}},
+    {"name": "常态高阈值", "desc": "normal 判定 IC>0.010", "ov": {"ic_normal_mean": 0.010}},
+]
+
+
+def read_bt_scan(force: bool = False) -> dict:
+    """门控参数扫描 (轻量: 单次重放 ~0.1s, 全部 ~1s). 结果缓存 data/backtest_scan.json."""
+    cache = os.path.join(DATA_DIR, "backtest_scan.json")
+    if not force and os.path.exists(cache):
+        try:
+            age = datetime.now().timestamp() - os.path.getmtime(cache)
+            if age < 86400 * 3:
+                with open(cache, encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+    try:
+        import backtest_with_gate as bg
+    except Exception as e:
+        return {"ok": False, "error": f"backtest_with_gate 导入失败: {e}"}
+    try:
+        ds = bg.load_dataset()
+        if not ds.get("ok"):
+            return {"ok": False, "error": ds.get("error")}
+        rows = []
+        for c in _SCAN_COMBOS:
+            try:
+                r = bg.simulate(ds, c["ov"])
+                g = r.get("gated") or {}
+                b = r.get("baseline") or {}
+                gs = r.get("gate_stats") or {}
+                rows.append({
+                    "name": c["name"], "desc": c["desc"], "ok": r.get("ok"),
+                    "gated": {"sharpe": g.get("sharpe"), "cagr": g.get("cagr"),
+                              "mdd_pct": (g.get("max_drawdown") or 0) * 100,
+                              "pos_day": g.get("pos_day_share"),
+                              "top5": g.get("top5_share"),
+                              "recovery": g.get("recovery")},
+                    "baseline": {"sharpe": b.get("sharpe"), "cagr": b.get("cagr"),
+                                 "mdd_pct": (b.get("max_drawdown") or 0) * 100},
+                    "gate_stats": {"regime": gs.get("regime_days") or gs.get("regime") or {},
+                                   "n_plan": gs.get("n_plan")},
+                })
+            except Exception as e:
+                rows.append({"name": c["name"], "desc": c["desc"], "ok": False,
+                             "error": str(e)[:160]})
+        out = {"ok": True, "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "range": {"start": str(ds.get("start")), "end": str(ds.get("end"))},
+               "rows": rows}
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        return {"ok": False, "error": f"扫描失败: {e}"}
+
+
 def read_health():
     """读取盘前健康检查结果: data/health/premarket.json."""
     p = os.path.join(DATA_DIR, "health", "premarket.json")
@@ -2965,6 +3030,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 days = 300
             return self._json(read_factor_lab(days=days))
+        if path == "/api/bt_scan":
+            qs = self.path.split("?", 1)
+            force = "force" in (qs[1] if len(qs) > 1 else "")
+            return self._json(read_bt_scan(force=force))
         if path == "/api/push":
             try:
                 ln = int(self.headers.get("Content-Length") or 0)
@@ -3552,6 +3621,7 @@ PAGE = r"""<!DOCTYPE html>
       <button class="tabBtn" data-tab="deep"><span class="ico">◈</span>深度分析<span class="badge-count" id="cnt-deep">·</span></button>
       <button class="tabBtn" data-tab="riskview"><span class="ico">⚠</span>风控告警<span class="badge-count" id="cnt-riskview">·</span></button>
       <button class="tabBtn" data-tab="flab"><span class="ico">∷</span>因子实验室<span class="badge-count" id="cnt-flab">·</span></button>
+      <button class="tabBtn" data-tab="pscan"><span class="ico">⌬</span>参数扫描<span class="badge-count" id="cnt-pscan">·</span></button>
       <button class="tabBtn" data-tab="perf"><span class="ico">⌬</span>绩效归因<span class="badge-count" id="cnt-perf">·</span></button>
       <button class="tabBtn" data-tab="backtest"><span class="ico">↻</span>回测<span class="badge-count" id="cnt-backtest">·</span></button>
       <button class="tabBtn" data-tab="concept"><span class="ico">◇</span>概念分析<span class="badge-count" id="cnt-concept">·</span></button>
@@ -5471,6 +5541,7 @@ function switchTab(name){
   if(name==='deep' && !deepLoaded){ deepLoaded=true; initDeep(); }
   if(name==='riskview' && !rvLoaded){ rvLoaded=true; initRiskview(); }
   if(name==='flab' && !flLoaded){ flLoaded=true; initF(); }
+  if(name==='pscan' && !psLoaded){ psLoaded=true; initScan(); }
 }
 document.querySelectorAll('.tabBtn').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
 
