@@ -159,6 +159,89 @@ def enqueue_update(day: str | None = None) -> dict:
     return {"ok": r.get("ok"), "async": False, "msg": "同步执行完成"}
 
 
+RUN_DAILY_STATE = os.path.join(_BASE, "data", "run_daily_task_state.json")
+
+
+def _rd_state() -> dict:
+    try:
+        with open(RUN_DAILY_STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _rd_write(**kw) -> dict:
+    st = _rd_state()
+    st.update(kw)
+    st["ts"] = datetime.now().isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(RUN_DAILY_STATE), exist_ok=True)
+    tmp = RUN_DAILY_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, RUN_DAILY_STATE)
+    return st
+
+
+def read_run_daily_state() -> dict:
+    return _rd_state()
+
+
+def run_daily_now(day: str | None = None, mode: str = "full") -> dict:
+    """子进程执行 run_daily.py (full 或 maint), 状态写入 run_daily_task_state.json.
+
+    run_daily 整条管道(数据拉取+模型训练)可能长达数十分钟~1h, 仅应在后台任务调用.
+    """
+    import subprocess
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    _rd_write(running=True, day=day, mode=mode, stage="start", ok=None,
+              finished=None)
+    cmd = [PY, os.path.join(_BASE, "src", "run_daily.py")]
+    if mode == "maint":
+        cmd.append("--maint")
+    else:
+        cmd.append(day)
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=_BASE, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=3600)
+        tail = (p.stdout or "")[-1500:] + (p.stderr or "")[-300:]
+        _rd_write(running=False, stage="done", ok=(p.returncode == 0),
+                  returncode=p.returncode, tail=tail[-1600:],
+                  finished=datetime.now().isoformat(timespec="seconds"),
+                  elapsed_s=round(time.time() - t0, 1))
+        return {"ok": p.returncode == 0, "day": day, "mode": mode,
+                "returncode": p.returncode}
+    except subprocess.TimeoutExpired:
+        _rd_write(running=False, stage="timeout", ok=False,
+                  error="run_daily 超时(>3600s)", elapsed_s=3600)
+        return {"ok": False, "error": "timeout"}
+    except Exception as e:  # noqa: BLE001
+        _rd_write(running=False, stage="error", ok=False, error=str(e)[:200])
+        return {"ok": False, "error": str(e)[:200]}
+
+
+if _celery_ok and app is not None:
+    @app.task(bind=True, name="astock_db.run_daily_full")
+    def run_daily_full_task(self, day: str | None = None, mode: str = "full"):
+        return run_daily_now(day=day, mode=mode)
+
+
+def enqueue_run_daily(day: str | None = None, mode: str = "full") -> dict:
+    """投递 Celery 异步 run_daily 任务; 已运行则拒绝, 无 celery 时同步降级."""
+    st = _rd_state()
+    if st.get("running"):
+        return {"ok": False, "error": "已有 run_daily 任务在运行"}
+    if _celery_ok and app is not None:
+        try:
+            run_daily_full_task.delay(day=day, mode=mode)
+            return {"ok": True, "async": True,
+                    "msg": "run_daily 后台任务已投递 (%s)" % mode}
+        except Exception as e:  # noqa: BLE001
+            _rd_write(note=str(e)[:120])
+    r = run_daily_now(day=day, mode=mode)
+    return {"ok": r.get("ok"), "async": False, "msg": "run_daily 同步执行完成"}
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()

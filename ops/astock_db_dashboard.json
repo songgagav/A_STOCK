@@ -1,116 +1,507 @@
 {
-  "annotations": {"list": []},
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 1,
-  "id": null,
-  "links": [],
-  "panels": [
+ "annotations": {
+  "list": []
+ },
+ "editable": true,
+ "fiscalYearStartMonth": 0,
+ "graphTooltip": 1,
+ "id": null,
+ "links": [],
+ "panels": [
+  {
+   "id": 105,
+   "type": "row",
+   "title": "策略绩效 (Prometheus astock_strategy_*)",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 15
+   },
+   "collapsed": false,
+   "panels": []
+  },
+  {
+   "id": 1,
+   "type": "table",
+   "title": "表行数 / 最后更新",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
     {
-      "id": 1,
-      "type": "table",
-      "title": "表行数 / 最后更新",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "datasource": {"type": "prometheus", "uid": ""},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "astock_db_rows",
-          "format": "table",
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {"custom": {"align": "auto", "filterable": true}},
-        "overrides": []
-      },
-      "options": {"showHeader": true}
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "行数趋势",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "datasource": {"type": "prometheus", "uid": ""},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "astock_db_rows",
-          "legendFormat": "{{table}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 1}},
-        "overrides": []
-      },
-      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
-    },
-    {
-      "id": 3,
-      "type": "timeseries",
-      "title": "最后更新时间滞后(小时) — >24h 即异常",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "datasource": {"type": "prometheus", "uid": ""},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "(time() - astock_db_lastday_ts) / 3600 > 0",
-          "legendFormat": "{{table}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "h",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 24}
-            ]
-          },
-          "custom": {"drawStyle": "line", "fillOpacity": 5, "lineWidth": 1}
-        },
-        "overrides": []
-      },
-      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "全量更新任务",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "datasource": {"type": "prometheus", "uid": ""},
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "astock_update_running",
-          "legendFormat": "running(1=更新中)"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 0.1}
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"]}}
+     "refId": "A",
+     "expr": "astock_db_rows",
+     "format": "table",
+     "instant": true
     }
-  ],
-  "refresh": "15s",
-  "schemaVersion": 39,
-  "tags": ["astock", "db"],
-  "templating": {"list": []},
-  "time": {"from": "now-6h", "to": "now"},
-  "timepicker": {},
-  "timezone": "browser",
-  "title": "A股轮动 · 数据库监控",
-  "uid": "astock-db-mon",
-  "version": 1
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "align": "auto",
+      "filterable": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showHeader": true
+   }
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "行数趋势",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_db_rows",
+     "legendFormat": "{{table}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 8,
+      "lineWidth": 1
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "最后更新时间滞后(小时) — >24h 即异常",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "(time() - astock_db_lastday_ts) / 3600 > 0",
+     "legendFormat": "{{table}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "h",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 24
+       }
+      ]
+     },
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 5,
+      "lineWidth": 1
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "全量更新任务",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_update_running",
+     "legendFormat": "running(1=更新中)"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 0.1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "账户净值",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 0,
+    "y": 16
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_equity",
+     "legendFormat": "账户净值"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyCNY",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "累计收益%",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 4,
+    "y": 16
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_total_return",
+     "legendFormat": "累计收益%"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "%",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "滚动Sharpe(60d)",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 8,
+    "y": 16
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_sharpe",
+     "legendFormat": "滚动Sharpe(60d)"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "最大回撤%",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 0,
+    "y": 22
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_max_dd",
+     "legendFormat": "最大回撤%"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "%",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "持仓数量",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 4,
+    "y": 22
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_positions",
+     "legendFormat": "持仓数量"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "当日盈亏%",
+   "gridPos": {
+    "h": 6,
+    "w": 4,
+    "x": 8,
+    "y": 22
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": ""
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "astock_strategy_daily_pnl_pct",
+     "legendFormat": "当日盈亏%"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "%",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  }
+ ],
+ "refresh": "15s",
+ "schemaVersion": 39,
+ "tags": [
+  "astock",
+  "db"
+ ],
+ "templating": {
+  "list": []
+ },
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "timepicker": {},
+ "timezone": "browser",
+ "title": "A股轮动 · 数据库监控",
+ "uid": "astock-db-mon",
+ "version": 1
 }

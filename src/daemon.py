@@ -256,6 +256,8 @@ def _obs_procs() -> dict:
             out.setdefault("metrics", p.pid)
         elif "alert_hook" in cl:
             out.setdefault("hook", p.pid)
+        elif "flower" in cl and "celery" in cl and "worker" not in cl:
+            out.setdefault("flower", p.pid)
         elif "celery" in cl and "tasks_db" in cl:
             out.setdefault("celery", p.pid)
     return out
@@ -303,6 +305,10 @@ def _ensure_obs_stack() -> None:
         if "hook" not in run and os.path.exists(_OBS_ALERT_HOOK):
             _start_obs_component("alert-hook",
                                  [PY, _OBS_ALERT_HOOK, "--port", "9111"])
+        if "flower" not in run:
+            _start_obs_component("flower",
+                                 [PY, "-m", "celery", "-A", "src.tasks_db",
+                                  "flower", "--port=5555"])
         if "metrics" not in run:
             _start_obs_component("metrics",
                                  [PY, os.path.join(_BASE, "src", "metrics_server.py"),
@@ -310,8 +316,9 @@ def _ensure_obs_stack() -> None:
         if "celery" not in run:
             _start_obs_component("celery",
                                  [PY, "-m", "celery", "-A", "src.tasks_db", "worker",
-                                  "--pool=solo", "-l", "warning", "--without-gossip",
-                                  "--without-mingle", "--without-heartbeat"])
+                                  "--pool=solo", "-E", "-l", "warning",
+                                  "--without-gossip", "--without-mingle",
+                                  "--without-heartbeat"])
     except Exception as e:  # noqa: BLE001
         _log(f"观测栈托管异常: {e}")
 
