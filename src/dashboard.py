@@ -2913,7 +2913,8 @@ class Handler(BaseHTTPRequestHandler):
                 hist = _dbs.history_frame(limit=300)
                 last = {nm: pts[-1] for nm, pts in hist.items()}
                 return self._json({"ok": True, "last": last, "history": hist,
-                                   "update": _tdb._read_state()})
+                                   "update": _tdb._read_state(),
+                                   "run_daily": _tdb.read_run_daily_state()})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:200]})
         if path == "/api/db_stats/refresh":
@@ -2929,6 +2930,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import tasks_db as _tdb
                 return self._json(_tdb.enqueue_update())
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
+        if path == "/api/db_stats/run_daily":
+            if self.command != "POST":
+                return self._json({"ok": False, "error": "use POST"})
+            try:
+                import tasks_db as _tdb
+                return self._json(_tdb.enqueue_run_daily())
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:200]})
         if path == "/api/health":
@@ -4081,8 +4090,10 @@ PAGE = r"""<!DOCTYPE html>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <button class="btn" id="btnDbStatsRefresh">⟳ 刷新统计</button>
         <button class="btn" id="btnDbStatsManual">⏻ 手动全量更新</button>
+        <button class="btn" id="btnDbStatsRunDaily" title="Celery 后台异步执行 run_daily.py 完整收盘管道(数据+模型, 可能长达 1h); LLM 额度恢复后可用于重跑补点评">▶ 异步 run_daily</button>
         <span id="dbmonUpd" class="muted" style="font-size:12px"></span>
       </div>
+      <div class="muted" style="font-size:11px;margin-top:4px" id="dbmonRd"></div>
       <div class="muted" style="font-size:11px;margin-top:6px">
         Prometheus: <a href="http://localhost:9090/" target="_blank">localhost:9090</a> ·
         /metrics 端点: <a href="http://localhost:9101/metrics" target="_blank">9101</a> ·
@@ -5698,9 +5709,19 @@ function dbmonRender(d){
   // 更新状态
   const ue=document.getElementById('dbmonUpd');
   if(ue) ue.innerHTML='<b>更新:</b> '+esc(dbmonStatus(d.update||{}));
-  if(d.update&&d.update.running&&!_dbmTimer){
+  const rdn=document.getElementById('dbmonRd');
+  if(rdn){
+    const rd=d.run_daily||{};
+    let rtxt='run_daily: '+(rd.running
+      ?'运行中 · '+esc(rd.stage||'')+(rd.day?' ('+esc(rd.day)+' '+esc(rd.mode||'')+')':'')
+      :(rd.finished?('上次 '+(rd.finished||'').slice(0,16)+' ok='+rd.ok+(rd.elapsed_s?(' · '+rd.elapsed_s+'s'):'')):'空闲'));
+    if(rd.tail) rtxt+=' <span style="color:#8b98b3">· '+esc(String(rd.tail).slice(-110))+'</span>';
+    rdn.innerHTML=rtxt;
+  }
+  const busy=(d.update&&d.update.running)||(d.run_daily&&d.run_daily.running);
+  if(busy&&!_dbmTimer){
     _dbmTimer=setInterval(loadDbmon,5000);
-  } else if((!d.update||!d.update.running)&&_dbmTimer){ clearInterval(_dbmTimer); _dbmTimer=null; }
+  } else if(!busy&&_dbmTimer){ clearInterval(_dbmTimer); _dbmTimer=null; }
 }
 async function loadDbmon(){
   try{
@@ -5712,6 +5733,8 @@ function initDbmon(){
   const r=document.getElementById('btnDbStatsRefresh'), m=document.getElementById('btnDbStatsManual');
   if(r) r.addEventListener('click', async ()=>{ r.textContent='采集中...'; try{ await dbmFetch('/api/db_stats/refresh'); loadDbmon(); }finally{ r.textContent='⟳ 刷新统计'; } });
   if(m) m.addEventListener('click', async ()=>{ m.textContent='投递中...'; try{ const d=await dbmFetch('/api/db_stats/manual',{method:'POST'}); const ue=document.getElementById('dbmonUpd'); if(ue) ue.innerHTML='<b>更新:</b> '+esc(d.msg||(d.error||''))+(d.ok&&!d.async?'(同步完成)':''); loadDbmon(); }finally{ m.textContent='⏻ 手动全量更新'; } });
+  const rd=document.getElementById('btnDbStatsRunDaily');
+  if(rd) rd.addEventListener('click', async ()=>{ rd.textContent='投递中...'; try{ const d=await dbmFetch('/api/db_stats/run_daily',{method:'POST'}); const ue=document.getElementById('dbmonUpd'); if(ue) ue.innerHTML='<b>run_daily:</b> '+esc(d.msg||(d.error||'')); loadDbmon(); }finally{ rd.textContent='▶ 异步 run_daily'; } });
   loadDbmon();
   setInterval(loadDbmon, 15000);
 }
