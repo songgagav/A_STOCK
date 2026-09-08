@@ -1168,6 +1168,256 @@ def read_holdings_profile():
             "caps": cap_rows}
 
 
+def read_riskops():
+    """风险-绩效指标 + 运维计数 (回执日收益口径).
+
+    含: VaR95/99(历史分位, 样本短时注明)、单日盈亏、滚动夏普(近20/60日)、
+    Sortino、胜率、盈亏比、最大回撤; 错误计数(近24h 守护/引擎日志);
+    当日成交统计.
+    """
+    import numpy as np
+    rows = _equity_series()
+    out = {"ok": True, "n_days": len(rows), "note": None, "metrics": {}, "ops": {}}
+    if len(rows) < 3:
+        out["ok"] = False
+        out["note"] = "回执样本不足(需≥3个交易日), 指标不可靠"
+        return out
+    eq = [r["equity"] for r in rows]
+    rets = np.array([eq[i + 1] / eq[i] - 1 for i in range(len(eq) - 1)]) * 100
+    m = out["metrics"]
+    m["daily_pnl"] = float(eq[-1] - eq[-2])
+    m["daily_pnl_pct"] = float((eq[-1] / eq[-2] - 1) * 100)
+    m["max_dd"] = float(min(r["dd"] for r in read_curve().get("rows", []))) if len(rows) >= 2 else 0.0
+    if len(rets) >= 5:
+        m["var95"] = float(np.percentile(rets, 5))
+        m["var99"] = float(np.percentile(rets, 1))
+    else:
+        m["var95"] = m["var99"] = None
+    sd = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
+    m["vol_annual"] = sd * np.sqrt(252) if sd else None
+    m["sharpe60"] = (float(np.mean(rets)) / sd * np.sqrt(252)) if sd else None
+    # 短样本滚动夏普仅近 20/60 日
+    for w in (20, 60):
+        rw = rets[-w:]
+        sw = float(np.std(rw, ddof=1)) if len(rw) > 2 else 0.0
+        m[f"sharpe_w{w}"] = (float(np.mean(rw)) / sw * np.sqrt(252)) if sw else None
+    # Sortino (downside)
+    down = rets[rets < 0]
+    dsd = float(np.std(down, ddof=1)) if len(down) > 1 else 0.0
+    m["sortino"] = (float(np.mean(rets)) / dsd * np.sqrt(252)) if dsd else None
+    gains = rets[rets > 0]
+    losses = rets[rets < 0]
+    m["win_rate"] = float(len(gains) / len(rets)) * 100 if len(rets) else None
+    m["pl_ratio"] = (float(np.mean(gains)) / abs(float(np.mean(losses)))
+                     if len(gains) and len(losses) and np.mean(losses) else None)
+    if len(rets) < 20:
+        m["_short_sample"] = True
+    # ops: 错误计数(24h)
+    log_dir = os.path.join(_BASE, "logs")
+    kws = ("error", "traceback", "exception", " failed", "失败")
+    err24 = 0
+    for fn in ("daemon_tail.log", "live_engine.log"):
+        p = os.path.join(log_dir, fn)
+        try:
+            if os.path.exists(p) and (datetime.now().timestamp() - os.path.getmtime(p)) < 86400 * 2:
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()[-4000:]
+                err24 += sum(1 for ln in lines if any(k in ln.lower() for k in kws))
+        except Exception:
+            pass
+    out["ops"]["err_24h"] = err24
+    # 当日成交统计 (state.json trades_history today)
+    try:
+        with open(os.path.join(DATA_DIR, "state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        th = st.get("trades_history") or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        tx = th.get(today) or th.get(datetime.now().strftime("%Y%m%d")) or []
+        out["ops"]["today_trades"] = {"buy": sum(1 for t in tx if t.get("type") == "buy"),
+                                      "sell": sum(1 for t in tx if t.get("type") == "sell"),
+                                      "fee": round(sum(float(t.get("fee") or 0) for t in tx), 2)}
+    except Exception:
+        pass
+    return out
+
+
+def read_alerts():
+    """告警中心: 规则评估 (门控/进程/引擎心跳/数据滞后/回撤/单日亏损/冻结)."""
+    out = {"ok": True, "alerts": [], "critical": 0, "warn": 0}
+    adds = lambda level, rule, detail: out["alerts"].append(
+        {"level": level, "rule": rule, "detail": detail,
+         "ts": datetime.now().strftime("%H:%M:%S")})
+    # 进程 / 引擎心跳 / 门控 (复用 read_overview 之文件源, 避免递归请求)
+    gp = os.path.join(DATA_DIR, "factor_gate_state.json")
+    try:
+        with open(gp, encoding="utf-8") as f:
+            g = json.load(f)
+    except Exception:
+        g = {}
+    regime = g.get("regime")
+    if regime in ("risk",):
+        adds("critical", "IC门控档位", f"regime={regime} exposure×{g.get('exposure_mult')}")
+    elif regime in ("caution",):
+        adds("warn", "IC门控档位", f"regime={regime} exposure×{g.get('exposure_mult')}")
+    if g.get("freeze_new_buys"):
+        adds("critical", "冻结新买入", "今日触发单日亏损防御, 暂停开新仓")
+    # 进程/心跳
+    log_dir = os.path.join(_BASE, "logs")
+    for name, pidfile in (("守护", "daemon.pid"), ("盘中引擎", "engine.pid"), ("仪表台", "dashboard.pid")):
+        p = os.path.join(log_dir, pidfile)
+        pid = None
+        try:
+            if os.path.exists(p):
+                pid = int(open(p, encoding="utf-8").read().strip() or 0)
+        except Exception:
+            pid = None
+        alive = _proc_alive(pid) if pid else False
+        if not alive:
+            adds("critical", f"{name}进程", f"pid={pid} 未存活")
+    try:
+        with open(os.path.join(DATA_DIR, "live_state.json"), encoding="utf-8") as f:
+            lv = json.load(f)
+        upd = lv.get("updated") or ""
+        if upd:
+            try:
+                age = (datetime.now() - datetime.strptime(upd, "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if lv.get("in_session") and age > 120:
+                    adds("warn", "引擎心跳", f"盘中状态但 {int(age)}s 未刷新")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 数据滞后
+    rep = os.path.join(DATA_DIR, "check_data_report.json")
+    try:
+        with open(rep, encoding="utf-8") as f:
+            j = json.load(f)
+        stale = [h["table"] for h in j.get("health", []) if not h.get("ok")]
+        if stale:
+            adds("warn", "数据滞后", "滞后表: " + ", ".join(stale))
+    except Exception:
+        pass
+    # 回撤 / 单日亏损 (从回执现算)
+    rk = read_riskops()
+    if rk.get("ok"):
+        m = rk["metrics"]
+        dd = m.get("max_dd") or 0
+        if dd <= -8:
+            adds("critical", "历史回撤", f"最大回撤 {dd:.2f}% ≤ -8%")
+        elif dd <= -5:
+            adds("warn", "历史回撤", f"最大回撤 {dd:.2f}% ≤ -5%")
+        if (m.get("daily_pnl_pct") or 0) <= -2:
+            adds("critical", "单日亏损", f"今日 {m['daily_pnl_pct']:.2f}% ≤ -2%")
+    out["critical"] = sum(1 for a in out["alerts"] if a["level"] == "critical")
+    out["warn"] = sum(1 for a in out["alerts"] if a["level"] == "warn")
+    return out
+
+
+def read_factor_lab(days: int = 300):
+    """因子实验室: 3 因子 IC 时序 (data/ic/ic_curve_*.csv) + 最新截面五分位.
+
+    五分位来自 v_factor_scores_daily 最新交易日各因子得分分箱(截面分布,
+    非未来收益); IC 时序为真实历史(2013~, ic_h1/3/5/10/20).
+    """
+    import glob as _g
+    import math
+    fames = {"vol": "波动率(反转义)", "mom_20": "动量(反转义)", "reversal": "反转"}
+    factors = []
+    for f in sorted(_g.glob(os.path.join(DATA_DIR, "ic", "ic_curve_*.csv"))):
+        base = os.path.basename(f)
+        key = base.replace("ic_curve_", "").replace("_k20.csv", "")
+        try:
+            import pandas as _pd
+            df = _pd.read_csv(f)
+        except Exception:
+            continue
+        df = df.tail(max(60, int(days)))
+        rec = {"key": key, "zh": fames.get(key, key), "series": [], "stats": {}}
+        for r in df.itertuples():
+            d = str(r.day)
+            d = f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
+            rec["series"].append({"d": d, "h1": _f(r.ic_h1), "h3": _f(r.ic_h3),
+                                  "h5": _f(r.ic_h5), "h10": _f(r.ic_h10), "h20": _f(r.ic_h20)})
+        for h in ("h1", "h3", "h5", "h10", "h20"):
+            col = df[f"ic_{h}"].dropna()
+            if len(col):
+                rec["stats"][h] = {"mean": float(col.mean()), "std": float(col.std()),
+                                   "win": float((col > 0).mean() * 100),
+                                   "last": float(col.iloc[-1])}
+        factors.append(rec)
+    # 五分位 (最新日截面)
+    q = []
+    fp = os.path.join(DATA_DIR, "h5i", "views", "v_factor_scores_daily.parquet")
+    try:
+        import pandas as _pd
+        df = _pd.read_parquet(fp)
+        mx = df["date"].max()
+        df = df[df["date"] == mx].copy()
+        for col, zh in (("f_signal", "综合信号"), ("f_trend", "趋势"), ("f_govern", "治理"),
+                        ("f_liquidity", "流动性"), ("f_vol", "波动(反转义)"), ("f_mom_rev", "动量(反转义)")):
+            if col not in df.columns:
+                continue
+            s = _pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(s) < 10:
+                continue
+            try:
+                qq = _pd.qcut(s, 5, labels=[0, 1, 2, 3, 4], duplicates="drop")
+            except Exception:
+                continue
+            bins = []
+            for qi in range(5):
+                grp = s[qq == qi]
+                if len(grp):
+                    bins.append({"q": qi, "n": int(len(grp)),
+                                 "lo": float(grp.min()), "hi": float(grp.max()),
+                                 "mean": float(grp.mean())})
+            if bins:
+                q.append({"factor": col, "zh": zh, "date": str(mx), "bins": bins})
+    except Exception:
+        pass
+    return {"ok": True, "factors": factors, "quantiles": q}
+
+
+def _send_push(channel: str, message: str) -> dict:
+    """外部推送通道: 钉钉机器人 / SMTP 邮件 (均从环境变量读配置, 未配置返回错误)."""
+    import os as _os
+    message = (message or "")[:600]
+    if channel == "dingtalk":
+        url = _os.environ.get("DINGTALK_WEBHOOK", "").strip()
+        if not url:
+            return {"ok": False, "error": "未配置 DINGTALK_WEBHOOK 环境变量"}
+        try:
+            import requests
+            r = requests.post(url, json={"msgtype": "text",
+                                         "text": {"content": message}}, timeout=8)
+            return {"ok": r.ok, "status": r.status_code,
+                    "body": (r.text or "")[:200]}
+        except Exception as e:
+            return {"ok": False, "error": f"钉钉推送失败: {e}"}
+    if channel == "email":
+        host = _os.environ.get("SMTP_HOST", "").strip()
+        user = _os.environ.get("SMTP_USER", "").strip()
+        pwd = _os.environ.get("SMTP_PASS", "").strip()
+        to = _os.environ.get("SMTP_TO", "").strip()
+        if not (host and to):
+            return {"ok": False, "error": "未配置 SMTP_HOST/SMTP_TO (可选 USER/PASS)"}
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(message, "plain", "utf-8")
+            msg["Subject"] = "[A股轮动] 仪表台告警"
+            msg["From"] = user or host
+            msg["To"] = to
+            with smtplib.SMTP(host, int(_os.environ.get("SMTP_PORT", "25") or 25), timeout=10) as s:
+                if user:
+                    s.login(user, pwd)
+                s.sendmail(user or host, [to], msg.as_string())
+            return {"ok": True, "status": "sent"}
+        except Exception as e:
+            return {"ok": False, "error": f"邮件发送失败: {e}"}
+    return {"ok": False, "error": f"未知通道: {channel}"}
+
+
 def read_health():
     """读取盘前健康检查结果: data/health/premarket.json."""
     p = os.path.join(DATA_DIR, "health", "premarket.json")
@@ -2702,6 +2952,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_monthly())
         if path == "/api/holdings_profile":
             return self._json(read_holdings_profile())
+        if path == "/api/riskops":
+            return self._json(read_riskops())
+        if path == "/api/alerts":
+            return self._json(read_alerts())
+        if path == "/api/factor_lab":
+            qs = self.path.split("?", 1)
+            import urllib.parse
+            params = urllib.parse.parse_qs(qs[1]) if len(qs) > 1 else {}
+            try:
+                days = int((params.get("days") or ["300"])[0])
+            except Exception:
+                days = 300
+            return self._json(read_factor_lab(days=days))
+        if path == "/api/push":
+            try:
+                ln = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(ln).decode("utf-8") if ln else "{}"
+                body = json.loads(raw or "{}")
+            except Exception:
+                body = {}
+            return self._json(_send_push(str(body.get("channel", "")),
+                                         str(body.get("message", ""))))
         if path == "/api/abnormal":
             qs = self.path.split("?", 1)
             limit = 50
@@ -3278,6 +3550,8 @@ PAGE = r"""<!DOCTYPE html>
       <button class="tabBtn" data-tab="dashboard"><span class="ico">▦</span>市场看板<span class="badge-count" id="cnt-dashboard">·</span></button>
       <button class="tabBtn" data-tab="market"><span class="ico">≋</span>市场情绪<span class="badge-count" id="cnt-market">·</span></button>
       <button class="tabBtn" data-tab="deep"><span class="ico">◈</span>深度分析<span class="badge-count" id="cnt-deep">·</span></button>
+      <button class="tabBtn" data-tab="riskview"><span class="ico">⚠</span>风控告警<span class="badge-count" id="cnt-riskview">·</span></button>
+      <button class="tabBtn" data-tab="flab"><span class="ico">∷</span>因子实验室<span class="badge-count" id="cnt-flab">·</span></button>
       <button class="tabBtn" data-tab="perf"><span class="ico">⌬</span>绩效归因<span class="badge-count" id="cnt-perf">·</span></button>
       <button class="tabBtn" data-tab="backtest"><span class="ico">↻</span>回测<span class="badge-count" id="cnt-backtest">·</span></button>
       <button class="tabBtn" data-tab="concept"><span class="ico">◇</span>概念分析<span class="badge-count" id="cnt-concept">·</span></button>
@@ -3634,6 +3908,54 @@ PAGE = r"""<!DOCTYPE html>
       <h3 style="margin:0">一键复盘报告</h3>
       <span class="muted" style="font-size:12px">聚合当前持仓/净值/绩效/门控/因子 为 Markdown, 便于复盘与分享</span>
       <button id="btnExport" class="btn primary" style="margin-left:auto">导出复盘报告 (.md)</button>
+      <button id="btnPrintPDF" class="btn">导出 PDF (打印)</button>
+    </div>
+  </div>
+
+  <div id="view-riskview" class="tabView">
+    <div class="panel">
+      <h3>风险 · 绩效指标 <span class="muted" style="font-weight:400;font-size:12px">VaR / 单日盈亏 / 滚动夏普 / Sortino / 胜率盈亏比 / 运维计数 (回执日收益口径)</span></h3>
+      <div class="grid" id="riskKpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))"><div class="muted">加载中...</div></div>
+      <div id="riskNote" class="muted" style="font-size:12px;margin-top:6px"></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>告警中心 <span class="muted" style="font-weight:400;font-size:12px">门控 / 进程 / 心跳 / 数据滞后 / 回撤 / 单日亏损 · 15s 刷新</span></h3>
+        <div id="alertBox"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>告警推送 <span class="muted" style="font-weight:400;font-size:12px">可选扩展(当前无需外部推送, 不配置即可正常使用)</span></h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="pushChannel" class="input-dark"><option value="dingtalk">钉钉</option><option value="email">邮件</option></select>
+          <button id="btnPushTest" class="btn">发送测试告警</button>
+          <button id="btnPushNow" class="btn primary">推送当前告警</button>
+        </div>
+        <div id="pushResult" class="muted" style="font-size:12px;margin-top:8px"></div>
+        <div class="muted" style="font-size:11px;margin-top:6px">如需启用: 钉钉 <code>DINGTALK_WEBHOOK</code>; 邮件 <code>SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_TO</code>(均环境变量)</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-flab" class="tabView">
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        因子 IC 时序
+        <span class="muted" style="font-weight:400;font-size:12px">(2013~ 真实历史 IC · 悬停查看 · 点击因子隐藏/显示)</span>
+        <select id="flabHorizon" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="h5">5日IC</option><option value="h1">1日IC</option><option value="h3">3日IC</option>
+          <option value="h10">10日IC</option><option value="h20">20日IC</option>
+        </select>
+        <select id="flabRange" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="120">近120日</option><option value="300">近300日</option><option value="500">近500日</option>
+        </select>
+      </h3>
+      <canvas id="flabCanvas" width="1200" height="360" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="flabTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+      <div id="flabStats" style="display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:6px"></div>
+    </div>
+    <div class="panel">
+      <h3>因子五分位 · 最新截面 <span class="muted" style="font-weight:400;font-size:12px">(v_factor_scores_daily 最新日 5 等分箱均值/区间 · 截面分布, 非未来收益)</span></h3>
+      <div id="flabQ"><div class="muted">加载中...</div></div>
     </div>
   </div>
 
@@ -4579,7 +4901,8 @@ async function loadEq(){
   catch(e){ const t=document.getElementById('eqTip'); if(t)t.textContent='净值加载失败: '+e; }
 }
 let ksRange='all';
-function drawEq(range){
+function drawEq(range, hoverIdx){
+  hoverIdx = (hoverIdx==null)?-1:hoverIdx;
   const cv=document.getElementById('eqCanvas'); if(!cv||!eqCache||!eqCache.ok){return;}
   const ctx=cv.getContext('2d'); const W=cv.width,H=cv.height;
   ctx.clearRect(0,0,W,H);
@@ -4623,6 +4946,16 @@ function drawEq(range){
   const step=Math.max(1,Math.floor(rows.length/8));
   for(let i=0;i<rows.length;i+=step){ axisLabel(ctx,x(i),H-6,rows[i].day.slice(2),'center'); }
   axisLabel(ctx,L,10,'净值','left');
+  // 十字光标
+  if(hoverIdx>=0 && hoverIdx<rows.length){
+    const px=x(hoverIdx);
+    ctx.strokeStyle='rgba(255,255,255,.45)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, H-B); ctx.stroke();
+    const py=yN(rows[hoverIdx].nav);
+    ctx.beginPath(); ctx.moveTo(L, py); ctx.lineTo(W-R, py); ctx.stroke();
+    ctx.fillStyle='#4f8cff';
+    ctx.beginPath(); ctx.arc(px, py, 3.2, 0, Math.PI*2); ctx.fill();
+  }
   // hover
   cv._rows=rows; cv._xf=x; cv._yf=yN; cv._type='eq';
 }
@@ -4711,6 +5044,14 @@ function drawK(hoverIdx){
   let leg='<span style="color:#8b98b3">MA5</span> ';
   for(const k of ['ma5','ma10','ma20','ma60']) leg+='<span style="color:'+MA_COL[k]+'">'+k.toUpperCase()+'</span> ';
   ctx.fillStyle='#e6edf7'; ctx.font='11px sans-serif'; ctx.fillText('MA5 MA10 MA20 MA60', L+4, T+2);
+  // 十字光标 (hover)
+  if(hoverIdx>=0 && hoverIdx<bars.length){
+    const px=x(hoverIdx), b=bars[hoverIdx];
+    ctx.strokeStyle='rgba(255,255,255,.4)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, H-B); ctx.stroke();
+    if(b.c!=null){ const py=yP(b.c);
+      ctx.beginPath(); ctx.moveTo(L, py); ctx.lineTo(W-R, py); ctx.stroke(); }
+  }
   cv._bars=bars; cv._x=x; cv._info={
     lo,hi,topH,T,L,R,W,B, top:topH, volTop,volTop2:volTop+volH, indTop, indH, indBottom:indTop+indH
   };
@@ -4727,21 +5068,29 @@ function bindDeep(){
   const eq=document.getElementById('eqCanvas'), kv=document.getElementById('kCanvas');
   const eqTip=document.getElementById('eqTip'), kTip=document.getElementById('kTip');
   const ratio=cv=>{const r=cv.getBoundingClientRect(); return r.width?cv.width/r.width:1;};
-  if(eq) eq.addEventListener('mousemove',e=>{
-    const r=eq.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(eq);
-    if(!eq._rows) return; const rows=eq._rows, xf=eq._xf;
-    const i=Math.round((rx-xf(0))/(xf(rows.length-1)-xf(0))*(rows.length-1));
-    if(i<0||i>=rows.length) return; const row=rows[i];
-    eqTip.innerHTML='<span style="color:#4f8cff">'+esc(row.day)+'</span> 权益 '+fmt(row.equity,2)
-      +'  净值 '+fmt(row.nav,4)+'  回撤 <b style="color:'+(row.dd<0?UP:AXIS)+'">'+fmt(row.dd,2)+'%</b>';
-  });
-  if(kv) kv.addEventListener('mousemove',e=>{
-    const r=kv.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(kv);
-    const bars=kv._bars, xf=kv._x; if(!bars||!bars.length) return;
-    const i=Math.round((rx-xf(0))/(xf(bars.length-1)-xf(0))*(bars.length-1));
-    if(i<0||i>=bars.length) return;
-    kTip.innerHTML=kTipText(bars[i]);
-  });
+  if(eq){
+    eq.addEventListener('mousemove',e=>{
+      const r=eq.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(eq);
+      if(!eq._rows||!eq._rows.length) return; const rows=eq._rows, xf=eq._xf;
+      const i=Math.round((rx-xf(0))/(xf(rows.length-1)-xf(0))*(rows.length-1));
+      if(i<0||i>=rows.length) return; const row=rows[i];
+      drawEq(ksRange, i);  // 重绘带十字
+      eqTip.innerHTML='<span style="color:#4f8cff">'+esc(row.day)+'</span> 权益 '+fmt(row.equity,2)
+        +'  净值 '+fmt(row.nav,4)+'  回撤 <b style="color:'+(row.dd<0?UP:AXIS)+'">'+fmt(row.dd,2)+'%</b>';
+    });
+    eq.addEventListener('mouseleave',()=>{ drawEq(ksRange, -1); });
+  }
+  if(kv){
+    kv.addEventListener('mousemove',e=>{
+      const r=kv.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(kv);
+      const bars=kv._bars, xf=kv._x; if(!bars||!bars.length) return;
+      const i=Math.round((rx-xf(0))/(xf(bars.length-1)-xf(0))*(bars.length-1));
+      if(i<0||i>=bars.length) return;
+      drawK(i);
+      kTip.innerHTML=kTipText(bars[i]);
+    });
+    kv.addEventListener('mouseleave',()=>{ drawK(-1); kTip.innerHTML=''; });
+  }
   const one=(id,fn)=>{const el=document.getElementById(id); if(el) el.addEventListener('click',fn);};
   one('kPrev',()=>{ ks.winStart=Math.max(0,ks.winStart-Math.round(ks.winLen*0.8)); drawK(-1); });
   one('kNext',()=>{ ks.winStart=Math.min(Math.max(0,ks.bars.length-ks.winLen),ks.winStart+Math.round(ks.winLen*0.8)); drawK(-1); });
@@ -4903,6 +5252,186 @@ function initDeep(){
   }
   loadK(all[0]||'600519');
 }
+// ===================== 风控告警 (riskview) =====================
+let rvLoaded=false, _pushBound=false;
+function kpiCard(label, val, color){
+  return '<div style="background:hsl(var(--elevated));border:1px solid hsl(var(--border));border-radius:var(--radius-sm);padding:10px 12px">'
+    +'<div class="muted" style="font-size:11px;margin-bottom:3px">'+esc(label)+'</div>'
+    +'<div style="font-size:19px;font-weight:600;color:'+(color||'#e6edf7')+'">'+val+'</div></div>';
+}
+async function loadRiskview(){
+  const box=document.getElementById('riskKpis'); if(!box) return;
+  try{
+    const [rk,al]=await Promise.all([
+      fetch('/api/riskops').then(r=>r.json()),
+      fetch('/api/alerts').then(r=>r.json())]);
+    const m=rk.metrics||{};
+    const fmtp=v=>v==null?'—':fmtPct(v);
+    const fmtn=v=>v==null?'—':fmt(v,2);
+    const up=v=>v!=null&&v>=0?'#3dd68c':'#ff6b6b';
+    let html='';
+    html+=kpiCard('今日盈亏', fmtp(m.daily_pnl_pct), up(m.daily_pnl_pct));
+    html+=kpiCard('今日盈亏额', m.daily_pnl!=null?fmt(m.daily_pnl,0):'—', up(m.daily_pnl));
+    html+=kpiCard('VaR95 (日)', fmtp(m.var95), '#f0b400');
+    html+=kpiCard('VaR99 (日)', fmtp(m.var99), '#ff6b6b');
+    html+=kpiCard('滚动Sharpe(60日)', fmtn(m.sharpe_w60), m.sharpe_w60!=null&&m.sharpe_w60>=0?'#3dd68c':'#ff6b6b');
+    html+=kpiCard('Sharpe(近20日)', fmtn(m.sharpe_w20), m.sharpe_w20!=null&&m.sharpe_w20>=0?'#3dd68c':'#ff6b6b');
+    html+=kpiCard('Sortino(年化)', fmtn(m.sortino), '#e6edf7');
+    html+=kpiCard('年化波动', m.vol_annual!=null?fmt(m.vol_annual,2)+'%':'—', '#e6edf7');
+    html+=kpiCard('最大回撤', m.max_dd!=null?fmt(m.max_dd,2)+'%':'—', '#ff6b6b');
+    html+=kpiCard('胜率', m.win_rate!=null?fmt(m.win_rate,1)+'%':'—', '#e6edf7');
+    html+=kpiCard('盈亏比', fmtn(m.pl_ratio), '#e6edf7');
+    const op=rk.ops||{};
+    html+=kpiCard('错误计数(24h)', op.err_24h!=null?op.err_24h:'—', (op.err_24h||0)>0?'#ff6b6b':'#3dd68c');
+    const tt=op.today_trades||{};
+    html+=kpiCard('今日成交', (tt.buy!=null?('买'+tt.buy+' 卖'+tt.sell):'—')+(tt.fee?' (费'+tt.fee+')':''), '#e6edf7');
+    box.innerHTML=html;
+    const note=document.getElementById('riskNote');
+    if(note) note.innerHTML=(rk.note?('⚠ '+esc(rk.note)+' '):'')+'(回执 '+(rk.n_days||0)+' 个交易日)';
+    // 告警
+    const ab=document.getElementById('alertBox'); if(ab){
+      const al_=al.alerts||[];
+      if(!al_.length){ ab.innerHTML='<div style="color:#3dd68c">● 无活跃告警 · 系统运行正常</div>'; }
+      else{
+        ab.innerHTML=al_.map(a=>{
+          const c=a.level==='critical'?'#ff6b6b':(a.level==='warn'?'#f0b400':'#e6edf7');
+          return '<div style="display:flex;gap:8px;padding:5px 0;border-bottom:1px dashed rgba(255,255,255,.08);align-items:center">'
+            +'<span style="color:'+c+';flex:0 0 52px;font-size:11px">['+a.level.toUpperCase()+']</span>'
+            +'<b style="flex:0 0 130px">'+esc(a.rule)+'</b><span class="muted" style="flex:1">'+esc(a.detail)+'</span>'
+            +'<span class="muted" style="font-size:11px">'+esc(a.ts)+'</span></div>';
+        }).join('');
+      }
+    }
+    window._alertsNow=al;
+  }catch(e){ box.innerHTML='<div class="muted">加载失败: '+esc(String(e).slice(0,80))+'</div>'; }
+}
+async function sendPush(channel, msg){
+  const box=document.getElementById('pushResult'); if(box) box.innerHTML='发送中...';
+  try{
+    const r=await fetch('/api/push',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel:channel,message:msg})}).then(r=>r.json());
+    if(box) box.innerHTML=r.ok?('✅ 已发送 ('+(r.status||r.body||'')+')')
+      :('<b style="color:#f66">发送失败:</b> '+esc(r.error||''));
+  }catch(e){ if(box) box.innerHTML='<b style="color:#f66">请求失败:</b> '+esc(String(e).slice(0,120)); }
+}
+function bindPush(){
+  if(_pushBound) return; _pushBound=true;
+  const ch=()=>{const s=document.getElementById('pushChannel'); return s?s.value:'dingtalk';};
+  const bt=document.getElementById('btnPushTest'), bn=document.getElementById('btnPushNow');
+  if(bt) bt.addEventListener('click',()=>sendPush(ch(),'【测试】A股轮动仪表台告警通道测试 '+new Date().toLocaleString('zh-CN')));
+  if(bn) bn.addEventListener('click',()=>{
+    const al=(window._alertsNow&&window._alertsNow.alerts)||[];
+    const msg = al.length?('【A股轮动告警】当前 '+al.length+' 条:\n'+al.map(a=>'['+a.level+'] '+a.rule+' - '+a.detail).join('\n'))
+      :('【A股轮动】当前无活跃告警, 系统运行正常。');
+    sendPush(ch(), msg);
+  });
+}
+// ===================== 因子实验室 (flab) =====================
+let flLoaded=false, flCache=null, flHidden={}, flRange=120, flHorizon='h5';
+const FCOL={vol:'#f0b400',mom_20:'#4f8cff',reversal:'#c678dd'};
+async function loadF(){
+  const cv=document.getElementById('flabCanvas'); if(!cv) return;
+  try{
+    const d=await fetch('/api/factor_lab?days='+flRange).then(r=>r.json());
+    flCache=d;
+    // stats 文本 + legend
+    const st=document.getElementById('flabStats');
+    if(st){
+      let html='';
+      (d.factors||[]).forEach(f=>{
+        const s=(f.stats||{})[flHorizon]||{};
+        html+='<span style="font-size:12px;cursor:pointer;opacity:'+(flHidden[f.key]?'.35':'1')+'" data-f="'+f.key+'" class="flLeg" '
+          +'style2="">'
+          +'<b style="color:'+FCOL[f.key]+'">'+esc(f.zh)+'</b> '
+          +'近IC '+(s.last!=null?fmt(s.last,3):'—')+' | 均值 '+((s.mean!=null)?fmt(s.mean,3):'—')
+          +' | 胜率 '+((s.win!=null)?fmt(s.win,0)+'%':'—')+'</span>';
+      });
+      st.innerHTML=html;
+      st.querySelectorAll('.flLeg').forEach(el=>el.addEventListener('click',()=>{
+        const k=el.dataset.f; flHidden[k]=!flHidden[k]; loadF(); }));
+    }
+    // quantiles
+    const qb=document.getElementById('flabQ');
+    if(qb){
+      const qs=d.quantiles||[];
+      if(!qs.length) qb.innerHTML='<div class="muted">五分位数据不可用(视图最新日)</div>';
+      else{
+        let h='<table class="tbl"><thead><tr><th>因子</th><th>Q1(低)</th><th>Q2</th><th>Q3</th><th>Q4</th><th>Q5(高)</th></tr></thead><tbody>';
+        qs.forEach(f=>{
+          const cells=[0,1,2,3,4].map(qi=>{
+            const b=f.bins.find(x=>x.q===qi);
+            if(!b) return '<td>—</td>';
+            const col=b.mean>=0?'rgba(61,214,140,'+(0.15+Math.min(.55,Math.abs(b.mean))*0.5)+')'
+                            :'rgba(255,107,107,'+(0.15+Math.min(.55,Math.abs(b.mean))*0.5)+')';
+            return '<td style="background:'+col+'">'+fmt(b.mean,2)+'<br><span class="muted" style="font-size:10px">n='+b.n+' ['+fmt(b.lo,2)+','+fmt(b.hi,2)+']</span></td>';
+          });
+          h+='<tr><td>'+esc(f.zh)+'<br><span class="muted" style="font-size:10px">'+esc(String(f.date))+'</span></td>'+cells.join('')+'</tr>';
+        });
+        h+='</tbody></table>';
+        qb.innerHTML=h;
+      }
+    }
+    drawF(-1);
+  }catch(e){ const t=document.getElementById('flabTip'); if(t)t.textContent='因子数据加载失败: '+e; }
+}
+function drawF(hoverIdx){
+  const cv=document.getElementById('flabCanvas'); if(!cv||!flCache) return;
+  const ctx=cv.getContext('2d'); const W=cv.width,H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  const L=70,R=16,T=14,B=22;
+  const data=[];
+  (flCache.factors||[]).forEach(f=>{ if(!flHidden[f.key]) data.push({f:f,h:flHorizon}); });
+  if(!data.length){ return; }
+  const all=[];
+  data.forEach(d=>d.f.series.forEach(s=>{const v=s[d.h]; if(v!=null) all.push(v);}));
+  if(!all.length) return;
+  let lo=Math.min.apply(0,all), hi=Math.max.apply(0,all); const pad=(hi-lo)*.1||.05; lo-=pad; hi+=pad;
+  const series=data[0].f.series;
+  const x=i=>L+i*(W-L-R)/(series.length-1), y=v=>T+(1-(v-lo)/(hi-lo))*(H-B-T);
+  ctx.strokeStyle=GRID; [0].forEach(v=>{ const yy=y(v); ctx.beginPath(); ctx.moveTo(L,yy); ctx.lineTo(W-R,yy); ctx.stroke(); });
+  for(let i=0;i<=5;i++){ const v=lo+(hi-lo)*i/5; const yy=y(v);
+    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(L,yy); ctx.lineTo(W-R,yy); ctx.stroke();
+    axisLabel(ctx,L-6,yy+3,v.toFixed(2),'right'); }
+  const step=Math.max(1,Math.floor(series.length/8));
+  for(let i=0;i<series.length;i+=step) axisLabel(ctx,x(i),H-4,series[i].d.slice(2),'center');
+  data.forEach(d=>{
+    const col=FCOL[d.f.key]||'#4f8cff'; ctx.strokeStyle=col; ctx.lineWidth=1.4; ctx.beginPath();
+    let started=false;
+    d.f.series.forEach((s,i)=>{ const v=s[d.h]; if(v==null){started=false;return;}
+      const px=x(i),py=y(v); if(!started){ctx.moveTo(px,py);started=true;} else ctx.lineTo(px,py); });
+    ctx.stroke();
+  });
+  ctx.fillStyle='#e6edf7'; ctx.font='11px sans-serif';
+  ctx.fillText(data.map(d=>d.f.zh+'('+d.h.toUpperCase()+')').join('  '), L+4, T+2);
+  if(hoverIdx>=0 && hoverIdx<series.length){
+    const px=x(hoverIdx);
+    ctx.strokeStyle='rgba(255,255,255,.4)'; ctx.beginPath(); ctx.moveTo(px,T); ctx.lineTo(px,H-B); ctx.stroke();
+  }
+  cv._fs=series; cv._fx=x; cv._fd=data;
+}
+function flTipText(i){
+  if(!flCache) return '';
+  const series=flCache.factors[0].series; if(i<0||i>=series.length) return '';
+  let t='<span style="color:#4f8cff">'+esc(series[i].d)+'</span>';
+  flCache.factors.forEach(f=>{ const s=f.series[i]; const v=s?s[flHorizon]:null;
+    if(v!=null) t+='  <span style="color:'+FCOL[f.key]+'">'+esc(f.zh)+' '+fmt(v,4)+'</span>'; });
+  return t;
+}
+function bindFlab(){
+  const cv=document.getElementById('flabCanvas'), tip=document.getElementById('flabTip');
+  const ratio=cv2=>{const r=cv2.getBoundingClientRect(); return r.width?cv2.width/r.width:1;};
+  if(cv) cv.addEventListener('mousemove',e=>{
+    const r=cv.getBoundingClientRect(), rx=(e.clientX-r.left)*ratio(cv);
+    const s=cv._fs, xf=cv._fx; if(!s||!s.length) return;
+    const i=Math.round((rx-xf(0))/(xf(s.length-1)-xf(0))*(s.length-1));
+    drawF(i); if(tip) tip.innerHTML=flTipText(i);
+  });
+  const hz=document.getElementById('flabHorizon'), rg=document.getElementById('flabRange');
+  if(hz) hz.addEventListener('change',()=>{ flHorizon=hz.value; loadF(); });
+  if(rg) rg.addEventListener('change',()=>{ flRange=parseInt(rg.value,10)||120; loadF(); });
+}
+function initRiskview(){ bindPush(); loadRiskview(); setInterval(loadRiskview,15000); }
+function initF(){ bindFlab(); loadF(); }
 function switchTab(name){
   document.querySelectorAll('.tabBtn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
   document.querySelectorAll('.tabView').forEach(v=>v.classList.toggle('active', v.id==='view-'+name));
@@ -4940,6 +5469,8 @@ function switchTab(name){
   if(name==='abnormal' && !abnLoaded){ abnLoaded=true; loadAbnormal(); }
   if(name==='dbpanel' && !dbpLoaded){ dbpLoaded=true; loadDbPanel(); }
   if(name==='deep' && !deepLoaded){ deepLoaded=true; initDeep(); }
+  if(name==='riskview' && !rvLoaded){ rvLoaded=true; initRiskview(); }
+  if(name==='flab' && !flLoaded){ flLoaded=true; initF(); }
 }
 document.querySelectorAll('.tabBtn').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
 
