@@ -838,6 +838,115 @@ def read_weights():
     return {"ok": False, "weights": {}, "meta": {}}
 
 
+def _proc_alive(pid):
+    """探测 pid 进程是否存活 (Windows: OpenProcess; 其它: os.kill(pid,0))."""
+    if not pid:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_overview():
+    """系统总览: 门控 + 进程健康 + 数据水位 + 风控事件流.
+    (对照专业仪表盘"系统状态与AI洞察"与"风险风控"面板.)"""
+    out = {"ok": True, "ts": _now()}
+    # 1) 门控状态 (IC 门控当前档位/暴露/IC)
+    gp = os.path.join(DATA_DIR, "factor_gate_state.json")
+    try:
+        with open(gp, encoding="utf-8") as f:
+            g = json.load(f)
+        out["gate"] = {k: g.get(k) for k in (
+            "regime", "raw_regime", "exposure_mult", "freeze_new_buys",
+            "interval_days", "ic_mean", "ic_neg_share", "ic_ir",
+            "ic_as_of", "daily_loss", "loss_flag")}
+        out["gate"]["reasons"] = g.get("reasons") or []
+        out["gate"]["hyst"] = g.get("hyst") or {}
+    except Exception as e:
+        out["gate"] = {"error": str(e)}
+    # 2) 进程健康 (pid 文件 + 引擎心跳)
+    log_dir = os.path.join(_BASE, "logs")
+    procs = {}
+    for name, pidfile in (("daemon", "daemon.pid"),
+                          ("engine", "engine.pid"),
+                          ("dashboard", "dashboard.pid")):
+        p = os.path.join(log_dir, pidfile)
+        pid = None
+        try:
+            if os.path.exists(p):
+                pid = int(open(p, encoding="utf-8").read().strip() or 0)
+        except Exception:
+            pid = None
+        procs[name] = {"pid": pid, "alive": _proc_alive(pid) if pid else None}
+    out["procs"] = procs
+    lv = os.path.join(DATA_DIR, "live_state.json")
+    try:
+        with open(lv, encoding="utf-8") as f:
+            lj = json.load(f)
+        out["engine_heartbeat"] = {
+            "updated": lj.get("updated"), "day": lj.get("day"),
+            "in_session": lj.get("in_session"), "mode": lj.get("mode")}
+    except Exception as e:
+        out["engine_heartbeat"] = {"error": str(e)}
+    try:
+        with open(os.path.join(DATA_DIR, "data_update_last.json"),
+                  encoding="utf-8") as f:
+            out["data_update_mark"] = json.load(f)
+    except Exception:
+        out["data_update_mark"] = None
+    # 3) 数据水位 (巡检报告 check_data_report.json)
+    rep = os.path.join(DATA_DIR, "check_data_report.json")
+    try:
+        with open(rep, encoding="utf-8") as f:
+            j = json.load(f)
+        stale = [h["table"] for h in j.get("health", []) if not h.get("ok")]
+        out["data"] = {
+            "report_ts": j.get("run_ts"), "base": j.get("base_trade_day"),
+            "stale": stale,
+            "checks": {"ok": sum(1 for c in j.get("checks", [])
+                                 if c["status"] == "ok"),
+                       "total": len(j.get("checks", []))}}
+    except Exception as e:
+        out["data"] = {"error": str(e)}
+    # 4) 风控事件流 (守护/引擎日志尾部关键字)
+    import re
+    kw = re.compile(
+        r"(IC_GATE|门控|IC门控|熔断|CIRCUIT|回撤|风控|止损|变点|factor_health|隔离|freeze|异常退出)",
+        re.I)
+    events = []
+    for fn in ("daemon_tail.log", "live_engine.log"):
+        p = os.path.join(log_dir, fn)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()[-400:]
+        except Exception:
+            continue
+        for ln in reversed(lines):
+            if kw.search(ln):
+                events.append({"ts": ln[:19], "src": fn.split(".")[0],
+                               "line": ln.strip()[:180]})
+                if len(events) >= 8:
+                    break
+    out["risk_events"] = events
+    return out
+
+
 def read_health():
     """读取盘前健康检查结果: data/health/premarket.json."""
     p = os.path.join(DATA_DIR, "health", "premarket.json")
@@ -2354,6 +2463,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_monitor())
         if path == "/api/regime":
             return self._json(read_regime())
+        if path == "/api/overview":
+            return self._json(read_overview())
         if path == "/api/abnormal":
             qs = self.path.split("?", 1)
             limit = 50
@@ -2977,6 +3088,17 @@ PAGE = r"""<!DOCTYPE html>
 
   <div id="view-overview" class="tabView active">
   <section class="grid" id="cards"></section>
+
+  <div class="row2">
+    <div class="panel">
+      <h3>系统健康 · 门控 <span class="muted" style="font-weight:400;font-size:12px">进程 / 引擎心跳 / 数据水位 / IC门控档位</span></h3>
+      <div id="sysGate"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="panel">
+      <h3>风控事件流 <span class="muted" style="font-weight:400;font-size:12px">门控 / 熔断 / 止损 / 引擎异常 · 最近</span></h3>
+      <div id="riskEvents"><div class="muted">加载中...</div></div>
+    </div>
+  </div>
 
   <div class="panel" id="rulesPanel">
     <h3>交易规则面板 <span class="muted" style="font-weight:400;font-size:12px">(实时生效)</span></h3>
@@ -3948,7 +4070,56 @@ async function load(){
 }
 load(); setInterval(load, 3000);
 loadLogs(); setInterval(loadLogs, 3000);
+loadOverview(); setInterval(loadOverview, 15000);
 loadBacktestHistory();  // 回测历史面板首屏即加载 (与用户是否切 tab 无关)
+// 系统健康 · 门控 与 风控事件流 (对应规范"系统状态"与"风险风控"面板)
+async function loadOverview(){
+  try{
+    const d = await fetch('/api/overview').then(r=>r.json());
+    const G = document.getElementById('sysGate');
+    if(G && d.gate){
+      const g = d.gate;
+      if(g.error){ G.innerHTML='<div class="muted">门控数据缺失: '+esc(g.error)+'</div>'; }
+      else{
+        const col = g.regime==='risk' ? '#f66' : (g.regime==='caution' ? '#fa0' : '#2d7');
+        const dot = n => { const v=(d.procs||{})[n];
+          if(!v||v.alive===null) return '<span style="color:#888">●</span>';
+          return v.alive?'<span style="color:#2d7">●</span>':'<span style="color:#f66">●</span>'; };
+        const dt = d.data||{};
+        const stale = (dt.stale&&dt.stale.length) ? dt.stale.join(', ') : '无';
+        const hb = d.engine_heartbeat||{};
+        G.innerHTML =
+          '<div style="display:flex;flex-wrap:wrap;gap:8px 22px;align-items:center">'
+          +'<span>IC门控 <b style="color:'+col+'">'+esc(g.regime||'—')+'</b></span>'
+          +'<span>暴露 ×'+fmt(g.exposure_mult!=null?g.exposure_mult:1,2)+'</span>'
+          +'<span>调仓间隔 '+esc(g.interval_days||'—')+'日</span>'
+          +'<span>IC均值 '+fmt(g.ic_mean,4)+' (as_of '+esc(g.ic_as_of||'—')+')</span>'
+          +'<span>冻结新买 '+(g.freeze_new_buys?'<b style="color:#f66">是</b>':'否')+'</span>'
+          +'</div>'
+          +'<div style="margin-top:8px;font-size:12px">'
+          +'守护 '+dot('daemon')+' 引擎 '+dot('engine')+' 仪表台 '+dot('dashboard')
+          +' <span class="muted">|</span> 引擎心跳 '+esc(hb.updated||'—')
+          +' <span class="muted">|</span> 模式 '+esc(hb.mode||'—')
+          +'<br>数据巡检 '+esc(dt.report_ts||'未生成')+' · 基准 '+esc(dt.base||'—')
+          +' · 规范表 '+((dt.checks)?dt.checks.ok+'/'+dt.checks.total+' 通过':'—')
+          +' · 滞后表: <b style="color:'+(stale==='无'?'#2d7':'#f66')+'">'+esc(stale)+'</b>'
+          +'</div>';
+      }
+    }
+    const R = document.getElementById('riskEvents');
+    if(R){
+      const ev = d.risk_events||[];
+      if(!ev.length){ R.innerHTML='<div class="muted">暂无风控/门控/异常事件</div>'; }
+      else{
+        R.innerHTML = ev.map(e=>
+          '<div style="font-size:12px;padding:3px 0;border-bottom:1px dashed rgba(255,255,255,.08)">'
+          +'<span class="muted">'+esc(e.ts||'')+'</span> [<b>'+esc(e.src)+'</b>] '+esc(e.line)+'</div>'
+        ).join('');
+      }
+    }
+  }catch(e){ /* 概览面板加载失败不阻塞主流程 */ }
+}
+
 // tab 徽章数: 启动后延迟 800ms 首次刷新, 此后每 15s 一次
 setTimeout(refreshTabBadges, 800);
 setInterval(refreshTabBadges, 15000);
