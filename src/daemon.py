@@ -223,6 +223,99 @@ def _ensure_dashboard():
         return False
 
 
+# -------------------------------------------------------------------------
+# 观测栈托管 (redis / prometheus / grafana / alertmanager / metrics / celery)
+# 2026-09-08: 数据库监控模块 (db_stats/Celery/Prometheus) 挂入本守护周期自愈.
+# -------------------------------------------------------------------------
+_OBS_DIR = os.path.normpath(os.path.join(_BASE, "..", "obs-stack"))
+_OBS_ALERT_HOOK = os.path.join(_BASE, "ops", "alert_hook.py")
+
+
+def _obs_procs() -> dict:
+    """按进程名/命令行识别观测栈各组件 pid."""
+    try:
+        import psutil
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            nm = (p.info.get("name") or "").lower()
+            cl = " ".join(p.info.get("cmdline") or [])
+        except Exception:
+            continue
+        if "redis-server" in nm or "redis-server" in cl.lower():
+            out.setdefault("redis", p.pid)
+        elif "alertmanager" in nm:
+            out.setdefault("alertmanager", p.pid)
+        elif "prometheus" in nm and "promtool" not in nm:
+            out.setdefault("prom", p.pid)
+        elif "grafana-server" in nm:
+            out.setdefault("grafana", p.pid)
+        elif "metrics_server" in cl:
+            out.setdefault("metrics", p.pid)
+        elif "alert_hook" in cl:
+            out.setdefault("hook", p.pid)
+        elif "celery" in cl and "tasks_db" in cl:
+            out.setdefault("celery", p.pid)
+    return out
+
+
+def _start_obs_component(name: str, cmd: list[str], cwd: str = None) -> bool:
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd or _BASE,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        _log(f"观测栈 {name} 未运行, 已拉起 pid={p.pid}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log(f"拉起观测栈 {name} 失败: {e}")
+        return False
+
+
+def _ensure_obs_stack() -> None:
+    """崩溃自愈: 每轮周期检查观测栈组件, 缺谁拉起谁."""
+    try:
+        run = _obs_procs()
+        missing = []
+        if "redis" not in run:
+            _start_obs_component("redis", [os.path.join(_OBS_DIR, "redis", "redis-server.exe")],
+                                 cwd=os.path.join(_OBS_DIR, "redis"))
+        if "prom" not in run:
+            prom_exe = os.path.join(_OBS_DIR, "prom", "prometheus-2.53.2.windows-amd64", "prometheus.exe")
+            if os.path.exists(prom_exe):
+                _start_obs_component("prometheus",
+                                     [prom_exe, "--config.file=prometheus.yml",
+                                      "--storage.tsdb.path=prom/data"],
+                                     cwd=_OBS_DIR)
+        if "grafana" not in run:
+            g_home = os.path.join(_OBS_DIR, "grafana", "grafana-v11.1.0")
+            g_exe = os.path.join(g_home, "bin", "grafana-server.exe")
+            if os.path.exists(g_exe):
+                _start_obs_component("grafana", [g_exe, "--homepath", g_home, "server"],
+                                     cwd=g_home)
+        if "alertmanager" not in run:
+            am_exe = os.path.join(_OBS_DIR, "alertmanager", "alertmanager.exe")
+            if os.path.exists(am_exe):
+                _start_obs_component("alertmanager",
+                                     [am_exe, "--config.file=alertmanager.yml",
+                                      "--storage.path=am/data"],
+                                     cwd=_OBS_DIR)
+        if "hook" not in run and os.path.exists(_OBS_ALERT_HOOK):
+            _start_obs_component("alert-hook",
+                                 [PY, _OBS_ALERT_HOOK, "--port", "9111"])
+        if "metrics" not in run:
+            _start_obs_component("metrics",
+                                 [PY, os.path.join(_BASE, "src", "metrics_server.py"),
+                                  "--port", "9101"])
+        if "celery" not in run:
+            _start_obs_component("celery",
+                                 [PY, "-m", "celery", "-A", "src.tasks_db", "worker",
+                                  "--pool=solo", "-l", "warning", "--without-gossip",
+                                  "--without-mingle", "--without-heartbeat"])
+    except Exception as e:  # noqa: BLE001
+        _log(f"观测栈托管异常: {e}")
+
+
 def _run_daily(day: date, mode: str = "full"):
     """收盘选股 / 非交易日维护.
     mode='full'  : 交易日完整管道(数据拉取+选股+归档+模型训练).
@@ -344,11 +437,12 @@ def run_loop():
             _log("收到停止请求, 守护主循环退出(引擎子进程保留)")
             break
 
-        # 周期性看护 Web 可视化: 每 20 轮(约 5 分钟)检查一次, 挂了自动拉起
+        # 周期性看护 Web 可视化 + 观测栈: 每 20 轮(约 5 分钟)检查一次, 挂了自动拉起
         dash_tick += 1
         if dash_tick >= 20:
             dash_tick = 0
             _ensure_dashboard()
+            _ensure_obs_stack()
 
         # 非交易日(周末/节假日): 不启动盘中引擎, 不跑收盘选股.
         # 仅在维护窗口(15:05~22:00)每天跑一次 maint 维护管道 = 数据拉取+模型训练.
