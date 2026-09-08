@@ -1,0 +1,11 @@
+groups:
+  - name: astock_db_stale
+    rules:
+      - alert: TableStale24h
+        expr: (time() - astock_db_lastday_ts) / 86400 > 1 and astock_db_lastday_ts > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "表 {{ $labels.table }} 最后更新已超过24小时"
+          description: "astock_db_lastday_ts={{ $value | humanizeTimestamp }} 距今超过 24h, 请检查数据窗口任务"

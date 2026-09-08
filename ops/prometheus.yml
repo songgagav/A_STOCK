@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: astock-rotation
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: "astock-db"
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
+        labels:
+          app: astock-rotation
