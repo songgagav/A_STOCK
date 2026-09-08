@@ -1,0 +1,17 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ["alertname"]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  receiver: astock-hook
+
+receivers:
+  - name: astock-hook
+    webhook_configs:
+      - url: "http://127.0.0.1:9111/hook"
+        send_resolved: true
+
+inhibit_rules: []
