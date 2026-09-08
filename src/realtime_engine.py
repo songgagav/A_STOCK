@@ -374,6 +374,10 @@ def load_targets(day: str):
 class RealtimeEngine:
     def __init__(self, interval: float = 15.0, intraday_only: bool = True):
         self.interval = interval
+        # (2026-09-08) 成交处理耗时埋点: 每 tick 处理毫秒环形缓冲(近 ~1h),
+        # 由 _write_state 计算 p50/p90/p95/p99 写入 live_state.ops.tick_ms.
+        from collections import deque
+        self._tick_ms = deque(maxlen=240)
         self.push_only_in_session = intraday_only
         self.pb = PaperBook()
         self.pb.restore(load_state())           # 延续历史现金/持仓
@@ -1011,6 +1015,18 @@ class RealtimeEngine:
                 "board_limits": {"主板/ST": "±10%", "创业板/科创板": "±20%", "北交所": "±30%"},
             },
         }
+        # (2026-09-08) 成交处理耗时统计 (每 tick 毫秒; 环形缓冲近 ~240 ticks)
+        if self._tick_ms:
+            _a = np.asarray(list(self._tick_ms), dtype=float)
+            _q = np.percentile(_a, [50, 90, 95, 99])
+            live["ops"] = {"tick_ms": {"n": int(len(_a)),
+                                       "p50": round(float(_q[0]), 1),
+                                       "p90": round(float(_q[1]), 1),
+                                       "p95": round(float(_q[2]), 1),
+                                       "p99": round(float(_q[3]), 1),
+                                       "last": round(float(_a[-1]), 1)}}
+        else:
+            live["ops"] = {"tick_ms": None}
         _atomic_write_json(LIVE_STATE, live)
 
         # 回写累计状态
@@ -1051,10 +1067,12 @@ class RealtimeEngine:
                 if (not _is_td) or (now.hour > 15 or (now.hour == 15 and now.minute >= 3)):
                     log("已收盘或非交易日, 引擎自动停止(次日由守护进程调度重启)")
                     break
+                t0 = time.perf_counter()
                 try:
                     self.run_tick()
                 except Exception:
                     traceback.print_exc()
+                self._tick_ms.append((time.perf_counter() - t0) * 1000.0)
                 time.sleep(self.interval)
         except KeyboardInterrupt:
             log("引擎停止(手动)")
