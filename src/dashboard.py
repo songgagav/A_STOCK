@@ -1238,6 +1238,13 @@ def read_riskops():
                                       "fee": round(sum(float(t.get("fee") or 0) for t in tx), 2)}
     except Exception:
         pass
+    # 引擎 tick 处理耗时统计 (成交处理延迟, 由 realtime_engine 每 tick 埋点写入)
+    try:
+        with open(os.path.join(DATA_DIR, "live_state.json"), encoding="utf-8") as f:
+            _lj = json.load(f)
+        out["ops"]["tick_ms"] = (_lj.get("ops") or {}).get("tick_ms")
+    except Exception:
+        out["ops"]["tick_ms"] = None
     return out
 
 
@@ -5355,6 +5362,10 @@ async function loadRiskview(){
     html+=kpiCard('错误计数(24h)', op.err_24h!=null?op.err_24h:'—', (op.err_24h||0)>0?'#ff6b6b':'#3dd68c');
     const tt=op.today_trades||{};
     html+=kpiCard('今日成交', (tt.buy!=null?('买'+tt.buy+' 卖'+tt.sell):'—')+(tt.fee?' (费'+tt.fee+')':''), '#e6edf7');
+    const tm=op.tick_ms;
+    html+=kpiCard('引擎tick延迟(ms)', tm&&tm.p50!=null
+      ?('p50 '+fmt(tm.p50,0)+' · p90 '+fmt(tm.p90,0)+' · p95 '+fmt(tm.p95,0)+' · p99 '+fmt(tm.p99,0)+'<br><span style="font-size:11px;color:#8b98b3">最近 '+fmt(tm.last,0)+' ms · n='+tm.n+'</span>')
+      :'— (引擎重启后生效)', '#e6edf7');
     box.innerHTML=html;
     const note=document.getElementById('riskNote');
     if(note) note.innerHTML=(rk.note?('⚠ '+esc(rk.note)+' '):'')+'(回执 '+(rk.n_days||0)+' 个交易日)';
