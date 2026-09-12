@@ -193,6 +193,15 @@ def _universe_asof_h5i(as_of) -> pd.DataFrame:
     v = _valuation_asof_h5i(as_of)
     if not v.empty:
         m = m.merge(v, on="symbol", how="left")
+        # 市值兜底(2026-09-12): valuation.free_cap 在 2019 ~ 2025-07 区间全缺(0%),
+        # 但 float_shares 覆盖 99.9%, 故用 float_shares x price 复原 PIT 流通市值(亿),
+        # 使早期历史窗口的市值过滤/选股可用(否则 filter_universe 会把整池滤空).
+        if "float_shares" in m.columns:
+            fs = pd.to_numeric(m["float_shares"], errors="coerce")
+            px = pd.to_numeric(m["price"], errors="coerce")
+            est = fs * px / 1e8
+            m["float_mv"] = pd.to_numeric(m["float_mv"], errors="coerce").fillna(est)
+            m["total_mv"] = pd.to_numeric(m["total_mv"], errors="coerce").fillna(m["float_mv"])
     m["canon"] = m.apply(lambda r: _db_to_canon(r["symbol"], r["market"]), axis=1)
     keep = ["symbol", "market", "list_date", "price", "amount", "canon",
             "pe_ttm", "pb", "ps_ttm", "total_mv", "float_mv", "float_shares", "is_st"]
@@ -854,8 +863,10 @@ def filter_universe(df: pd.DataFrame, as_of=None) -> pd.DataFrame:
             out = out.copy()
             out["float_mv"] = fv / 1e8
             fv = pd.to_numeric(out["float_mv"], errors="coerce")
-        out = out[(fv >= p["min_float_market_cap"] / 1e8) &
-                  (fv <= p["max_float_market_cap"] / 1e8)]
+        # 缺失值保留(2026-09-12): 历史区间市值可能整体缺失, 若按 NaN 剔除会
+        # 把候选池清空(PIT 回退后曾出现"现场选股 0 只"), 故 NaN 不参与该过滤。
+        out = out[fv.isna() | ((fv >= p["min_float_market_cap"] / 1e8) &
+                               (fv <= p["max_float_market_cap"] / 1e8))]
 
     # 换手率过滤 (turnover 单位=%) -- px turnover在快照里是%
     if "turnover" in out.columns and p["min_avg_turnover"]:
