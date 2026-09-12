@@ -65,23 +65,68 @@ def missing_targets(days: int) -> dict[str, set[str]]:
     return out
 
 
-def fetch_one(symbol: str, wanted: set[str], retry: int = 3, sleep: float = 0.25):
-    """拉取单只股票历史估值, 返回目标日期子集 DataFrame(已映射列名)."""
+def _fetch_baidu(symbol: str, wanted: set[str]):
+    """备用源: 百度股市通「市盈率(TTM)」历史 (2026-09-13 新增).
+
+    东财 stock_value_em 对部分标的(近期停牌/退市整理/北交所)内部解析异常
+    (TypeError: 'NoneType' object is not subscriptable), 此时回退本源.
+    仅提供 pe_ttm, hub 缺失字段置 NaN(不污染主表已有的 pb/市值).
+    """
     import akshare as ak
+    try:
+        df = ak.stock_zh_valuation_baidu(symbol=symbol, indicator="市盈率(TTM)",
+                                         period="近十年")
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}:{str(e)[:70]}"
+    if df is None or df.empty:
+        return None, "empty"
+    df = df.rename(columns={"date": "ts", "value": "pe_ttm"})
+    df["ts"] = pd.to_datetime(df["ts"]).astype("datetime64[us]")
+    df = df[df["ts"].dt.strftime("%Y-%m-%d").isin(wanted)]
+    if df.empty:
+        return None, "no_overlap"
+    df = df.copy()
+    df["symbol"] = str(symbol).zfill(6)
+    df["source"] = "baidu_hist"
+    for c in ("pb", "ps_ttm", "pcf_ncf_ttm", "market_cap", "free_cap", "float_shares"):
+        df[c] = np.nan
+    df["is_st"] = False
+    for c in ("pe_ttm", "pb", "ps_ttm", "pcf_ncf_ttm", "market_cap",
+              "free_cap", "float_shares"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    return df[KEEP].sort_values(["ts", "symbol"]), None
+
+
+def fetch_one(symbol: str, wanted: set[str], retry: int = 3, sleep: float = 0.25):
+    """拉取单只股票历史估值, 返回目标日期子集 DataFrame(已映射列名).
+
+    主源东财失败或无重叠时, 自动回退百度源(仅 pe_ttm)。
+    """
+    import akshare as ak
+    last_err = None
+    df = None
     for i in range(retry):
         try:
             df = ak.stock_value_em(symbol=symbol)
             break
         except Exception as e:  # noqa: BLE001
-            if i == retry - 1:
-                return None, f"{type(e).__name__}:{str(e)[:80]}"
-            time.sleep(sleep * (i + 1))
+            last_err = f"{type(e).__name__}:{str(e)[:80]}"
+            if i < retry - 1:
+                time.sleep(sleep * (i + 1))
     if df is None or df.empty:
-        return None, "empty"
+        bdf, berr = _fetch_baidu(symbol, wanted)
+        if bdf is not None:
+            return bdf, None
+        return None, f"em:{last_err} | baidu:{berr}"
     df = df.rename(columns=COLMAP)
     if "ts" not in df.columns:
         return None, "no_date_col"
     df["ts"] = df["ts"].astype(str).str[:10]
+    if not df["ts"].isin(wanted).any():
+        bdf, berr = _fetch_baidu(symbol, wanted)
+        if bdf is not None:
+            return bdf, None
+        return None, f"no_overlap | baidu:{berr}"
     df = df[df["ts"].isin(wanted)]
     if df.empty:
         return None, "no_overlap"
@@ -125,6 +170,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 只(调试)")
     ap.add_argument("--dry", action="store_true", help="只计算与校验, 不写库")
     ap.add_argument("--resume", action="store_true", help="断点续跑(跳过已完成 symbol)")
+    ap.add_argument("--symbols", type=str, default=None,
+                    help="仅处理指定 symbol(逗号分隔), 用于补跑失败标的")
     ap.add_argument("--sleep", type=float, default=0.25, help="请求重试间隔基数秒")
     ap.add_argument("--workers", type=int, default=6, help="并发拉取线程数")
     ap.add_argument("--flush", type=int, default=2000000, help="每批写库行数(默认单批)")
@@ -142,6 +189,9 @@ def main() -> None:
             pass
 
     syms = [s for s in sorted(need) if s not in done]
+    if args.symbols:
+        want = {s.strip().zfill(6) for s in args.symbols.split(",") if s.strip()}
+        syms = [s for s in syms if s in want]
     if args.limit:
         syms = syms[:args.limit]
     print(f"本次待处理: {len(syms)} 只 (dry={args.dry})")
