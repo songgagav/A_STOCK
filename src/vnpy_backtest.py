@@ -135,6 +135,90 @@ def _load_selection(day_dir: str) -> list[dict]:
     return sel.get("top_n", []) or sel.get("targets", []) or []
 
 
+# PIT 现场选股的磁盘缓存目录 (2026-09-13)
+PIT_SEL_CACHE_DIR = os.path.join(DATA_DIR, "pit", "selection_cache")
+
+
+def _pit_cache_path(day: str, n: int) -> str:
+    return os.path.join(PIT_SEL_CACHE_DIR, f"{day}_n{int(n)}.json")
+
+
+def _out_dir(day_dir: str, out_tag: str = "") -> str:
+    """回测产物目录. out_tag 非空时隔离到 <day_dir>__<tag>/, 避免参数扫描
+    (PBO 的 config×window 矩阵)覆盖正式 OOS 窗口产物。"""
+    name = f"{day_dir}__{out_tag}" if out_tag else day_dir
+    return os.path.join(DATA_DIR, "vnpy_backtest", name)
+
+
+def _make_weights(targets: list[dict], mode: str = "equal") -> list[float]:
+    """按配置构造目标权重(和为 1)。PBO 参数扫描的第二根轴。
+
+    equal  : 等权(实盘默认, 与改动前一致)
+    signal : 按候选 signal 归一化(信号越强仓位越重)
+    rank   : 按 signal 降序线性递减加权(最强 n 份 ... 最弱 1 份)
+
+    signal 缺失或非正时回退等权, 保证任何情况下权重都合法(非负且和为 1)。
+    """
+    n = len(targets)
+    if n == 0:
+        return []
+    if mode in ("signal", "rank"):
+        s = np.array([float(t.get("signal") or 0.0) for t in targets], dtype=np.float64)
+        s = np.where(np.isfinite(s), s, 0.0)
+        if mode == "signal":
+            s = np.clip(s, 0.0, None)
+            tot = float(s.sum())
+            if tot > 1e-12:
+                return [float(x) for x in (s / tot)]
+        elif np.ptp(s) > 1e-12:
+            order = np.argsort(-s, kind="mergesort")
+            lin = np.arange(n, 0, -1, dtype=np.float64)     # n, n-1, ..., 1
+            w = np.empty(n, dtype=np.float64)
+            w[order] = lin
+            return [float(x) for x in (w / w.sum())]
+    return [1.0 / n] * n
+
+
+def _load_pit_selection_cached(day: str, n: int = 10) -> list[dict]:
+    """PIT 现场选股(带按 day 的磁盘缓存), 返回 top_n 列表; 失败返回 [].
+
+    为何缓存: PBO 参数扫描需要对同一窗口跑多组配置, 而 PIT 选股占单次回测耗时的
+    大头(实测 ~85~270s, 而纯仿真仅 ~10s), 且选股结果与 top_n/lookback_days 无关
+    (top_n 只是事后切片) -> 按 day 缓存后, 同窗口的第 2..N 组配置可完全复用。
+    缓存 key 含 n: 选股深度不同(如为 top_n 扫描取 20)会得到不同的列表, 取足够大
+    的 n 后各配置按需切片即可。
+    """
+    fp = _pit_cache_path(day, n)
+    if os.path.exists(fp):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("targets"):
+                return d["targets"]
+        except Exception:  # noqa: BLE001  缓存损坏则重算
+            pass
+    try:
+        from db import StockDB
+        from selector import RotationSelector
+        sel = RotationSelector(StockDB(), n=int(n)).select(hist_day=day)
+        if not sel or sel.get("error"):
+            return []
+        targets = sel.get("top_n") or []
+    except Exception as e:  # noqa: BLE001
+        _log(f"PIT 现场选股回退失败: {type(e).__name__}: {str(e)[:150]}")
+        return []
+    if targets:
+        try:
+            os.makedirs(PIT_SEL_CACHE_DIR, exist_ok=True)
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump({"day": day, "n": int(n), "targets": targets,
+                           "generated_at": dt.datetime.now().isoformat()},
+                          f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001  缓存写失败不影响回测
+            pass
+    return targets
+
+
 def _load_bars(symbol6: str, end_day: dt.date, days: int = 120) -> pd.DataFrame:
     """加载日线数据, 包含 change_pct 用于复权重建.
     返回 DataFrame 含列: date, open, high, low, close, volume, amount, change_pct, adj_close.
@@ -333,7 +417,10 @@ def _inject_risk_ratios(stats_dict: dict, balances: list) -> None:
                     mean_r / down * np.sqrt(252.0), 4)
 
 
-def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> dict:
+def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
+                      sel_n: int = 0, out_tag: str = "",
+                      persist_arctic: bool = True,
+                      weight_mode: str = "equal") -> dict:
     from vnpy.trader.constant import Exchange
     day_dt = dt.datetime.strptime(day, "%Y-%m-%d").date()
     day_dir = day.replace("-", "")
@@ -345,16 +432,16 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
         # 判 FAIL, 导致非重叠滚动样本外验证无法覆盖历史区间(过拟合检测要求 >=4 窗口).
         # 现回退到 PIT 现场选股(selector._select_hist: 行情/财务/估值全部 <= day,
         # 无前视), 使任意历史交易日都能重建当日目标池.
-        try:
-            from db import StockDB
-            from selector import RotationSelector
-            sel = RotationSelector(StockDB()).select(hist_day=day)
-            if sel and not sel.get("error"):
-                targets = sel.get("top_n") or []
-                pool_source = "onsite_pit"
-                _log(f"无当日 selection 产物, 已回退 PIT 现场选股: {len(targets)} 只")
-        except Exception as e:  # noqa: BLE001
-            _log(f"PIT 现场选股回退失败: {type(e).__name__}: {str(e)[:150]}")
+        # 2026-09-13: 改走 _load_pit_selection_cached(按 day 落盘缓存). PBO 参数扫描
+        # 需对同一窗口跑多组配置, 而选股占单次回测耗时大头且与 top_n/lookback 无关,
+        # 缓存后同窗口第 2..N 组配置仅需纯仿真(~10s)。sel_n 用于取足够深的选股列表。
+        _n = max(int(sel_n), int(top_n), 10)
+        _hit = os.path.exists(_pit_cache_path(day, _n))
+        targets = _load_pit_selection_cached(day, _n)
+        if targets:
+            pool_source = "onsite_pit"
+            _log(f"无当日 selection 产物, 已回退 PIT 现场选股: {len(targets)} 只 "
+                 f"(n={_n}, {'缓存命中' if _hit else '现场计算'})")
     if not targets:
         return {"ok": False, "error": "selection.json 无目标池", "rows": 0}
     targets = targets[:top_n]
@@ -374,7 +461,7 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
 
     # vnpy 4.4: vt_symbol = symbol.exchange (BarData.vt_symbol 公式)
     vt_symbols = [f"{s6}.{_ex_of(s6).value}" for s6 in symbol6_list]
-    weights = [1.0 / len(targets)] * len(targets)
+    weights = _make_weights(targets, weight_mode)
 
     bar_map: dict[str, pd.DataFrame] = {}
     for s6 in symbol6_list:
@@ -521,7 +608,7 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
         except Exception:
             stats_dict = {"raw": str(stats)}
 
-        out_dir = os.path.join(DATA_DIR, "vnpy_backtest", day_dir)
+        out_dir = _out_dir(day_dir, out_tag)
         os.makedirs(out_dir, exist_ok=True)
         summary = {
             "ok": bool(stats.get("total_return") is not None or stats),
@@ -532,6 +619,7 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
             "n_bars": len(all_bars),
             "n_symbols": len(bar_map),
             "lookback_days": lookback_days,
+            "weight_mode": weight_mode,
             "stats": stats_dict,
             "curve_points": len(curve),
             "dynamic_slippage": round(dynamic_slippage_rate, 6),
@@ -552,13 +640,15 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
         with open(os.path.join(out_dir, "curve.json"), "w", encoding="utf-8") as f:
             json.dump(curve, f, ensure_ascii=False, indent=2, default=str)
         # ===== ArcticDB 持久化: bars 缓存 + trade_records + daily_summary =====
-        _persist_to_arctic(
-            day=day,
-            bar_map=bar_map,
-            strategy=strategy_cls,
-            summary=summary,
-            engine=eng,
-        )
+        # 参数扫描(out_tag 非空)时跳过持久化, 避免把扫描产物写进正式台账
+        if persist_arctic:
+            _persist_to_arctic(
+                day=day,
+                bar_map=bar_map,
+                strategy=strategy_cls,
+                summary=summary,
+                engine=eng,
+            )
         _log(f"vnpy 回测完成: {len(bar_map)} 标的, {len(all_bars)} bars, "
              f"curve={len(curve)}pts, fallback={summary.get('fallback', False)}")
         return summary
@@ -569,7 +659,7 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
         # 主链路失败, 直接 fallback
         try:
             fallback = _fallback_backtest(bar_map, symbol6_list, weights, day_dt)
-            out_dir = os.path.join(DATA_DIR, "vnpy_backtest", day_dir)
+            out_dir = _out_dir(day_dir, out_tag)
             os.makedirs(out_dir, exist_ok=True)
             summary = {
                 "ok": True, "day": day, "engine": "fallback_simple",
