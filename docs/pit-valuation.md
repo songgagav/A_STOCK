@@ -37,8 +37,12 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
 
 ## 待补齐（下一步优先级）
 
-1. **`pe_ttm` 近一年缺口**：2025-08 起仅 4~5%，属估值源字段未落库。补齐方式可选
-   ①从估值源补采 PE 字段；②由 `pb` 与 `financials.roe` 推算（PE≈PB/ROE，需标注为估算）。
+1. ~~**`pe_ttm` 近一年缺口**~~ **已回补（2026-09-12）**：`scripts/backfill_pe_ttm.py`
+   用东财个股历史估值接口（`ak.stock_value_em`）逐只拉取 PE(TTM)/市净率/市销率/市值，
+   仅对缺 `pe_ttm` 的 (ts, symbol) 生成补丁，落 `data/pit/pe_patch/*.parquet`；
+   读取端 `db._pe_patch_asof()` 按 `<= as_of` 合并（无前视）。
+   原因：h5i `valuation` 主表 append 受"时间单调且 min(ts) ≥ 表 max(ts)"约束，且无公开
+   建表 API，历史行无法回填，故采用"独立补丁 + 读取合并"。缺口规模：5320 只 / 135.7 万行。
 2. **`free_cap` 2025-06/07 与 2019 段缺口**：影响该区间的市值过滤。
 3. **ST/名称过滤**：`filter_universe` 依赖 `name6`（来自 `valuation_snapshot.name`），
    `valuation` 表无名称列，历史路径该过滤仍受限；`is_st` 已随 PIT 列提供，
