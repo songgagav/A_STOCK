@@ -1,9 +1,12 @@
 # ============================================================
-# CI: 轻量快速回归 (纯逻辑, 无需行情数据 / ArcticDB / DRL 依赖)
-# 覆盖: IC 门控 / 滑点模型 / 因子融合与加权
-# 重型测试(依赖 torch/stable-baselines3/本地数据)见 tests/, 建议本地运行.
+# CI: 全量回归
+#   regression-core : 不依赖 torch/DRL 的全部测试(含 IC 门控/滑点/加权融合/
+#                     因子健康/归因/风控配置/执行分解 等), 多 Python 版本矩阵
+#   regression-drl  : 依赖 torch + stable-baselines3 + gymnasium 的 DRL 测试
+# 说明: 本地开发环境为 Python 3.14(.venv314 + requirements_314.txt);
+#       CI 使用 3.11/3.12 以获得最完整的 wheel 覆盖。
 # ============================================================
-name: ci-light
+name: ci-regression
 
 on:
   push:
@@ -11,7 +14,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  regression-core:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -25,11 +28,39 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas scipy scikit-learn pytest
-      - name: Run core regression tests
-        working-directory: .
+          pip install -r requirements_314.txt pytest
+      - name: Run full regression (excluding torch/DRL suites)
         run: |
-          python -m pytest tests/test_factor_gate.py \
-            tests/test_slippage_model.py \
-            tests/test_weighting_and_fusion.py \
+          python -m pytest tests -q \
+            --ignore=tests/test_factor_dynamic_weights.py \
+            --ignore=tests/test_factor_value_env.py \
+            --ignore=tests/test_llm_drl_integration.py \
+            --ignore=tests/test_regime_aware.py \
+            --ignore=tests/test_risk_factor_integration.py \
+            --ignore=tests/test_risk_factor_optimizer.py \
+            --ignore=tests/test_run_factor_value_drl_risk.py
+
+  regression-drl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_314.txt pytest
+          pip install gymnasium
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install stable-baselines3
+      - name: Run DRL regression
+        run: |
+          python -m pytest tests/test_factor_dynamic_weights.py \
+            tests/test_factor_value_env.py \
+            tests/test_llm_drl_integration.py \
+            tests/test_regime_aware.py \
+            tests/test_risk_factor_integration.py \
+            tests/test_risk_factor_optimizer.py \
+            tests/test_run_factor_value_drl_risk.py \
             -q

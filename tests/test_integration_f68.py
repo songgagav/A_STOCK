@@ -222,6 +222,8 @@ class TestFactorValueDRLIntegration(unittest.TestCase):
 
     def test_factor_value_env_with_real_data(self):
         """使用真实形态数据创建 FactorValueEnv 并完整 rollout."""
+        if not self.sb3_ok:
+            self.skipTest("SB3/torch 不可用")
         T = 80
         n_factors = 4
         np.random.seed(42)
@@ -271,6 +273,8 @@ class TestFactorValueDRLIntegration(unittest.TestCase):
 
     def test_factor_value_env_regime_evolution(self):
         """市场状态变化时, 观测向量最后 3 维同步变化."""
+        if not self.sb3_ok:
+            self.skipTest("SB3/torch 不可用")
         T = 200
         n_factors = 4
         np.random.seed(42)
@@ -443,6 +447,8 @@ class TestFactorValueDRLIntegration(unittest.TestCase):
 
     def test_factor_value_reward_bounded(self):
         """FactorValueEnv 奖励始终在 [-5, 5] 范围内."""
+        if not self.sb3_ok:
+            self.skipTest("SB3/torch 不可用")
         T = 100
         n_factors = 4
         np.random.seed(42)
