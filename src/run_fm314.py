@@ -92,7 +92,7 @@ for r in rows:
         if not os.path.exists(reg):
             print("factor_registry.json 不存在")
             sys.exit(1)
-        with open(reg) as f:
+        with open(reg, encoding="utf-8") as f:
             d = json.load(f)
         print(f"FactorRegistry v{d.get('version')}  (更新: {d.get('updated_at')})")
         print(f"  Library: {len(d.get('library',{}).get('factors',{}))} 个因子")
