@@ -102,7 +102,7 @@ def test_signal_consistency():
         if not os.path.exists(sel_path):
             R.check("回测选股结果存在", False, f"{sel_path} 不存在")
             return
-        with open(sel_path) as f:
+        with open(sel_path, encoding="utf-8") as f:
             sel = json.load(f)
         bt_codes = set(s.get("canon", "") for s in sel.get("top_n", []))
 
@@ -145,7 +145,7 @@ def test_signal_consistency():
         # 检查是否有 DRL 模型版本差异
         plan_path = os.path.join(_BASE, "data", "daily", day_dir, "target_plan.json")
         if os.path.exists(plan_path):
-            with open(plan_path) as f:
+            with open(plan_path, encoding="utf-8") as f:
                 plan = json.load(f)
             meta = plan.get("meta", {})
             plan_src = meta.get("generator", meta.get("source", "unknown"))
@@ -704,7 +704,7 @@ def test_reconnection():
         test_file = os.path.join(TEMP_DIR, "atomic_test.json")
         try:
             _atomic_write_json(test_file, {"test": True, "ts": time.time()})
-            with open(test_file) as f:
+            with open(test_file, encoding="utf-8") as f:
                 data = json.load(f)
             R.check("原子写入正常", data.get("test") is True, f"内容: {data}")
         except Exception as e:

@@ -31,7 +31,7 @@ def log(msg):
 
 def _read_pid(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return int(f.read().strip())
     except Exception:
         return None
@@ -56,7 +56,7 @@ def _proc_alive(pid):
 
 def _write_pid(path, pid):
     os.makedirs(PID_DIR, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(str(pid))
 
 

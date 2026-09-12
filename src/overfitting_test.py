@@ -86,7 +86,7 @@ def _load_vnpy_results() -> list:
     fp = os.environ.get("OVERFIT_RESULTS_FILE") or os.path.join(DATA_DIR, "vnpy_backtest_rerun_results.json")
     if not os.path.exists(fp):
         return []
-    with open(fp) as f:
+    with open(fp, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -97,7 +97,7 @@ def _load_drl_weights() -> list:
         fp = os.path.join(base, d, "target_plan.json")
         if os.path.exists(fp):
             try:
-                with open(fp) as f:
+                with open(fp, encoding="utf-8") as f:
                     plan = json.load(f)
                 w = plan.get("weights_used", {})
                 w["day"] = d
@@ -112,7 +112,7 @@ def _load_drl_weights() -> list:
 def _load_performance_report() -> dict:
     fp = os.path.join(DATA_DIR, "performance_report.json")
     if os.path.exists(fp):
-        with open(fp) as f:
+        with open(fp, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
@@ -120,7 +120,7 @@ def _load_performance_report() -> dict:
 def _load_backtest_gated() -> dict:
     fp = os.path.join(DATA_DIR, "backtest_gated.json")
     if os.path.exists(fp):
-        with open(fp) as f:
+        with open(fp, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
