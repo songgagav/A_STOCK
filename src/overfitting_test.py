@@ -354,12 +354,29 @@ def test_cpcv_and_rolling():
 
 
 # ====================================================================
-# 2) 过拟合概率 (PBO) 检验 — Bailey et al. (2016)
+# 2) 过拟合概率 (PBO) 检验 — CSCV / Bailey et al. (2014)
 # ====================================================================
+PBO_RESULT_FILE = os.path.join(DATA_DIR, "pbo", "pbo_result.json")
+
+
+def _load_pbo_result() -> dict:
+    """读取 scripts/pbo_sweep.py 产出的 CSCV-PBO 结果; 不存在则返回 {}."""
+    if not os.path.exists(PBO_RESULT_FILE):
+        return {}
+    try:
+        with open(PBO_RESULT_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and "pbo" in d else {}
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] PBO 结果读取失败: {type(e).__name__}: {e}")
+        return {}
+
+
 def test_pbo():
     print("\n" + "=" * 60)
     print("  [2] 过拟合概率 (PBO) 检验")
-    print("      方法: Bailey et al. (2016) 基于排名分布的过拟合概率估计")
+    print("      方法: CSCV 组合对称交叉验证 (Bailey et al. 2014)")
+    print("      数据: scripts/pbo_sweep.py 的 配置×时间 收益矩阵")
     print("=" * 60)
 
     vnpy = _load_vnpy_results()
@@ -371,59 +388,93 @@ def test_pbo():
 
     sharpes = [float(v["stats"]["sharpe_ratio"]) for v in vnpy]
     n = len(sharpes)
-    # (2026-09-07) 统计功效: <12 个窗口时 PBO 估计方差过大, 不作 FAIL 判定
-    n_ok = n >= 12
-
-    # PBO: 通过蒙特卡洛模拟估计过拟合概率
-    # 思路: 生成 N 个随机策略, 看真实策略在随机策略中的排名
-    # 如果真实策略的 Sharpe 在随机策略中排名靠前, 则过拟合概率低
-    n_sim = 10000
     best_sharpe = max(sharpes)
 
-    # 模拟: 每个窗口生成 n_sim 个随机策略的 Sharpe
-    # 随机策略 Sharpe 分布: 以真实 Sharpe 为均值, 加上噪声
-    rng = np.random.RandomState(42)
-    random_best = []
-    for _ in range(n_sim):
-        # 从真实 Sharpe 分布中采样, 加噪声模拟随机策略
-        noise = rng.normal(0, np.std(sharpes) * 0.5, n)
-        shuffled = rng.choice(sharpes, n, replace=False) + noise
-        random_best.append(max(shuffled))
+    # ------------------------------------------------------------------
+    # [核心] CSCV-PBO
+    #
+    # 2026-09-13 替换旧实现。旧实现 (见 git 历史) 用
+    #   shuffled = choice(sharpes, n, replace=False) + N(0, 0.5*std(sharpes))
+    #   rank = P(max(shuffled) < max(sharpes)); pbo = 1 - rank
+    # 而 choice(replace=False) 只是置换、max 恒等于 max(sharpes), 判据退化为
+    # "噪声是否把其他配置抬过最大值" -> rank <= 1/2, **pbo >= 0.5 恒成立**,
+    # `pbo < 50%` 永不可能通过; 且 0.5*std 是写死常数, 与策略优劣无关。
+    # 现改为标准 CSCV: 需要"配置×时间"矩阵, 由 scripts/pbo_sweep.py 扫描产出。
+    # ------------------------------------------------------------------
+    res = _load_pbo_result()
+    if not res:
+        R.check(
+            "过拟合概率 PBO(CSCV) < 50%",
+            None,
+            "尚未生成 CSCV 结果 -> 先运行: python scripts/pbo_sweep.py "
+            "(12 个非重叠窗口 × 18 组配置, 约 45 分钟, 可断点续跑); "
+            f"结果文件 {os.path.relpath(PBO_RESULT_FILE, os.path.dirname(os.path.dirname(PBO_RESULT_FILE)))}",
+            measured="未运行", threshold="< 50%", category="PBO",
+        )
+        pbo = None
+        rank_pct = None
+    else:
+        pbo = float(res["pbo"])
+        S = res.get("n_blocks")
+        N = res.get("n_configs")
+        # 组合数越多/配置越多, ω 分辨率越高, 估计越稳
+        n_ok = (isinstance(S, int) and S >= 8 and isinstance(N, int) and N >= 10)
+        print(f"  时间块 S={S}  配置 N={N}  组合数={res.get('n_combos')}")
+        print(f"  PBO = {pbo:.4f} ({pbo*100:.2f}%)   [越低越好; >50% 视为过拟合]")
+        print(f"  λ 分布: mean={res.get('lambda_mean'):.3f} "
+              f"p05={res.get('lambda_p05'):.3f} p50={res.get('lambda_p50'):.3f} "
+              f"p95={res.get('lambda_p95'):.3f}")
+        print(f"  归一化 OOS 排名均值 w̄={res.get('omega_mean'):.3f} (0.5=无筛选力)")
+        print(f"  IS 最优配置 OOS 亏损概率={res.get('prob_oos_loss'):.3f}")
+        print(f"  IS 最优: IS Sharpe={res.get('is_best_mean_is'):.3f} -> "
+              f"OOS Sharpe={res.get('is_best_mean_oos'):.3f}")
+        print(f"  OOS~IS 回归斜率={res.get('is_oos_slope'):.3f} (过拟合时趋 0/负)")
+        print(f"  结果时间: {res.get('run_ts')}  "
+              f"({'充足' if n_ok else 'S<8 或 N<10, 功效不足 → WARN'})")
 
-    # 真实策略的 max Sharpe 在随机策略 max Sharpe 分布中的百分位
-    rank = sum(1 for rb in random_best if rb < best_sharpe) / n_sim
-    pbo = 1.0 - rank  # 过拟合概率
+        R.check(
+            "过拟合概率 PBO(CSCV) < 50% (策略未过拟合搜索噪声)",
+            None if not n_ok else pbo < 0.50,
+            f"PBO={pbo:.4f} ({pbo*100:.2f}%), S={S} 块 / N={N} 配置 / "
+            f"{res.get('n_combos')} 组合; IS 最优 OOS 排名均值 w̄="
+            f"{res.get('omega_mean'):.3f}; IS→OOS 斜率={res.get('is_oos_slope'):.3f}"
+            f"{'' if n_ok else ' [功效不足, 不作 FAIL]'}",
+            measured=f"PBO={pbo:.4f} ({pbo*100:.2f}%)",
+            threshold="< 50%",
+            category="PBO",
+        )
 
-    print(f"  真实策略最优 Sharpe: {best_sharpe:.3f}")
-    print(f"  随机策略最优 Sharpe 均值: {np.mean(random_best):.3f}")
-    print(f"  PBO (过拟合概率): {pbo:.4f} ({pbo*100:.2f}%)")
-    print(f"  真实策略在随机策略中排名: {rank*100:.1f} 百分位")
-    print(f"  样本量: n={n} ({'充足, ≥12' if n_ok else '不足, <12 → WARN'})")
+        R.check(
+            "IS 最优配置在 OOS 亏损的概率 < 50%",
+            None if not n_ok else float(res.get("prob_oos_loss", 1.0)) < 0.50,
+            f"prob_oos_loss={res.get('prob_oos_loss'):.4f} "
+            f"(IS 均值 Sharpe {res.get('is_best_mean_is'):.3f} -> OOS "
+            f"{res.get('is_best_mean_oos'):.3f})",
+            measured=f"{float(res.get('prob_oos_loss', float('nan'))):.4f}",
+            threshold="< 50%",
+            category="PBO",
+        )
+        rank_pct = None
 
-    R.check(
-        "过拟合概率 PBO < 50% (策略未过拟合随机噪声)",
-        None if not n_ok else pbo < 0.50,
-        f"PBO={pbo:.4f}, 真实策略排名 {rank*100:.1f}% 百分位, "
-        f"n={n}{'' if n_ok else ' <12 功效不足, 不作 FAIL'}",
-        measured=f"PBO={pbo:.4f} ({pbo*100:.2f}%)",
-        threshold="< 50%",
-        category="PBO",
-    )
-
-    # 辅助: 最大 Sharpe 与中位数 Sharpe 的差异
-    median_sharpe = np.median(sharpes)
+    # ------------------------------------------------------------------
+    # [辅助] 窗口间离散度: 最优窗口 vs 中位数窗口 Sharpe
+    # 说明: 这是"跨窗口收益离散度"的描述性指标, 不是过拟合证据(阈值 1.0 为经验值)。
+    # ------------------------------------------------------------------
+    median_sharpe = float(np.median(sharpes))
     sharpe_gap = best_sharpe - median_sharpe
     R.check(
-        "最优与中位数 Sharpe 差异合理 (gap < 1.0)",
+        "窗口间 Sharpe 离散度合理 (最优-中位数 gap < 1.0)",
         sharpe_gap < 1.0,
-        f"最优 {best_sharpe:.3f} vs 中位数 {median_sharpe:.3f}, gap={sharpe_gap:.3f}",
+        f"最优 {best_sharpe:.3f} vs 中位数 {median_sharpe:.3f}, gap={sharpe_gap:.3f} "
+        f"(描述性: 反映窗口间行情异质性, 非过拟合证据)",
         measured=f"gap={sharpe_gap:.3f}",
         threshold="< 1.0",
         category="PBO",
     )
 
-    return {"pbo": pbo, "rank_pct": rank, "best_sharpe": best_sharpe,
-            "median_sharpe": median_sharpe, "n_sim": n_sim}
+    return {"pbo": pbo, "best_sharpe": best_sharpe,
+            "median_sharpe": median_sharpe, "sharpe_gap": sharpe_gap,
+            "pbo_source": "cscv" if res else "not_run"}
 
 
 # ====================================================================
