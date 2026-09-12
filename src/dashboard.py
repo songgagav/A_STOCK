@@ -1468,6 +1468,9 @@ def read_bt_scan(force: bool = False) -> dict:
                 g = r.get("gated") or {}
                 b = r.get("baseline") or {}
                 gs = r.get("gate_stats") or {}
+                # 注意单位: backtest_with_gate -> strategy_validation.curve_metrics 的
+                # max_drawdown 为"比例"(0..1), 故此处 x100 转百分点; 与 perf/BacktestRunner
+                # 的百分数字段不同源, 不可套用统一换算。
                 rows.append({
                     "name": c["name"], "desc": c["desc"], "ok": r.get("ok"),
                     "gated": {"sharpe": g.get("sharpe"), "cagr": g.get("cagr"),
@@ -5761,16 +5764,14 @@ function renderBacktestHistory(d){
     const stats = r.stats || {};
     const m = r.metrics || {};
     const period = r.period || {};
-    // 总收益: 自动判断是百分比还是小数 (|x|>1 -> 已%)
+    // 单位约定(2026-09-12 统一): performance_report.metrics / vnpy stats / BacktestRunner
+    // 的收益与回撤字段均为"百分数"(*_pct 亦然), 展示层不再做 x100 启发式换算。
     let totalRet = r.total_return;
     if(totalRet==null) totalRet = stats.annual_return != null ? stats.annual_return : m.total_return;
-    function _toPct(v){ if(v==null) return null; return Math.abs(v)>1 ? v : v*100; }
-    totalRet = _toPct(totalRet);
     // Sharpe: vnpy sharpe_ratio; 其它 sharpe_annual
     const sharpe = stats.sharpe_ratio != null ? stats.sharpe_ratio : m.sharpe_annual;
-    // 最大回撤: vnpy max_ddpercent (已%); 其它需 *100 (自动适配)
-    let maxDd = stats.max_ddpercent != null ? stats.max_ddpercent : (r.max_drawdown_pct != null ? r.max_drawdown_pct : (m.max_drawdown != null ? m.max_drawdown*100 : null));
-    maxDd = _toPct(maxDd);
+    // 最大回撤: vnpy max_ddpercent / BacktestRunner max_drawdown_pct / perf max_drawdown 均为百分数
+    let maxDd = stats.max_ddpercent != null ? stats.max_ddpercent : (r.max_drawdown_pct != null ? r.max_drawdown_pct : (m.max_drawdown != null ? m.max_drawdown : null));
     // 交易日 / 笔数
     const tradeDays = stats.total_days != null ? stats.total_days : r.trade_days;
     const totalTrades = r.total_trades != null ? r.total_trades : (stats.total_trade_count != null ? stats.total_trade_count : m.trade_count);

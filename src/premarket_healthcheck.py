@@ -1354,8 +1354,8 @@ def check_reflection_diagnostics() -> dict:
                 underlying.append(f"驱动: {d}")
             for r in (review.get("risks") or [])[:2]:
                 underlying.append(f"风险: {r}")
-        if max_dd is not None and max_dd <= -0.08:
-            underlying.append(f"回撤-{abs(max_dd)*100:.0f}%, 可能结构性问题而非噪音")
+        if max_dd is not None and max_dd <= -8.0:
+            underlying.append(f"回撤-{abs(max_dd):.2f}%, 可能结构性问题而非噪音")
 
         # attribution: canon + unrealized_pct(百分号), 负值即浮亏持仓
         top_bad = [a for a in attr if (a.get("unrealized_pct") or 0) < 0][:3]
@@ -1363,7 +1363,7 @@ def check_reflection_diagnostics() -> dict:
         ret_done = total_ret is not None
         status = "OK"
         action = None
-        if max_dd is not None and max_dd <= -0.10 and top_bad:
+        if max_dd is not None and max_dd <= -10.0 and top_bad:
             status = "WARN"
             action = "回撤过大且存在浮亏持仓, 建议复核止盈/止损逻辑是否结构性失效"
         ref["insight"] = underlying or (["暂无异动, 表现正常"] if ret_done else ["样本过少"])
@@ -1373,7 +1373,7 @@ def check_reflection_diagnostics() -> dict:
              "unrealized_pct": round(a.get("unrealized_pct") or 0, 2)}
             for a in top_bad] or None
         ref["max_drawdown_pct"] = (None if max_dd is None
-                                   else round(max_dd * 100, 2))
+                                   else round(max_dd, 2))
         return _record(name, status, {**ref, "action": action}, t0)
     except Exception as e:
         import traceback
@@ -1402,8 +1402,8 @@ def check_backtest_paper_parity() -> dict:
         with open(pr.PERF_FILE, encoding="utf-8") as f:
             perf = json.load(f)
         m = perf.get("metrics") or {}
-        paper_total = m.get("total_return")        # 小数
-        paper_maxdd = m.get("max_drawdown")        # 小数(负)
+        paper_total = m.get("total_return")        # 百分数(performance_report 已 x100)
+        paper_maxdd = m.get("max_drawdown")        # 百分数(负, performance_report 已 x100)
         period = perf.get("period") or {}
         paper_days = int(period.get("n_days") or 0)
 
@@ -1413,12 +1413,12 @@ def check_backtest_paper_parity() -> dict:
         # 收益差(百分点): 回测 vs 模拟
         diff_ret = None
         if bt_total_pct is not None and paper_total is not None:
-            diff_ret = round(paper_total * 100 - float(bt_total_pct), 2)  # 模拟-回测
+            diff_ret = round(paper_total - float(bt_total_pct), 2)  # 模拟-回测(均为百分点)
         # 回撤差
         diff_dd = None
         if bt_maxdd_pct is not None and paper_maxdd is not None:
-            # paper_maxdd 为负, bt_maxdd_pct 回撤幅度为正 => 转负
-            diff_dd = round(-(abs(paper_maxdd)*100 - float(bt_maxdd_pct)), 2)
+            # paper_maxdd 为负(百分数), bt_maxdd_pct 回撤幅度为正 => 转负
+            diff_dd = round(-(abs(paper_maxdd) - float(bt_maxdd_pct)), 2)
         # 换手/交易数差 (样本日不同, 仅展示不硬判)
         bt_trades = bt.get("total_trades")
 
@@ -1430,10 +1430,10 @@ def check_backtest_paper_parity() -> dict:
             flags.append(f"模拟年化收益比回测低 {abs(diff_ret):.1f}pp (>5pp)")
         out["parity"] = {
             "paper_days": paper_days, "bt_days": bt.get("trade_days"),
-            "paper_total_return_pct": round(paper_total * 100, 2) if paper_total is not None else None,
+            "paper_total_return_pct": round(paper_total, 2) if paper_total is not None else None,
             "bt_total_return_pct": bt_total_pct,
             "ret_diff_pp": diff_ret,
-            "paper_maxdd_pct": round(paper_maxdd * 100, 2) if paper_maxdd is not None else None,
+            "paper_maxdd_pct": round(paper_maxdd, 2) if paper_maxdd is not None else None,
             "bt_maxdd_pct": bt_maxdd_pct,
             "dd_diff_pp": diff_dd,
             "bt_trades": bt_trades,
