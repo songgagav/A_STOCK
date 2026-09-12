@@ -141,6 +141,18 @@ def _universe_h5i(date=None) -> pd.DataFrame:
 _PE_PATCH_CACHE: dict = {}
 
 
+_PATCH_COMPAT_WARNED: set = set()
+
+
+def _log_patch_compat(f: str) -> None:
+    """旧格式补丁(缺 free_cap 列)兼容读取: 每次会话只提示一次."""
+    if f in _PATCH_COMPAT_WARNED:
+        return
+    _PATCH_COMPAT_WARNED.add(f)
+    print("[pit] 补丁为旧格式(无 free_cap 列), 已按兼容方式读取: %s"
+          % os.path.basename(f), flush=True)
+
+
 def _pe_patch_asof(as_of) -> pd.DataFrame:
     """读取 data/pit/pe_patch/*.parquet 的 pe_ttm 补丁, 返回每 symbol 的 as-of 取值.
 
@@ -161,7 +173,14 @@ def _pe_patch_asof(as_of) -> pd.DataFrame:
         try:
             t = pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm", "free_cap"])
         except Exception:
-            continue
+            # 旧格式兼容: 早期补丁可能没有 free_cap 列。若整块 except 跳过,
+            # 该文件的 pe_ttm 也会一起失效(2026-09-13 修正)。降级读取并记日志。
+            try:
+                t = pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm"])
+                t["free_cap"] = float("nan")
+                _log_patch_compat(f)
+            except Exception:
+                continue
         t = t[t["ts"] <= asd]
         if len(t):
             frames.append(t)

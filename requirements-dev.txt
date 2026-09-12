@@ -5,6 +5,7 @@
 # ============================================================
 # --- 测试 ---
 pytest>=8.0
+duckdb>=1.0            # db.py 顶层依赖; 测试环境必备
 # --- DRL 训练/环境 (torch 建议用 CPU wheel: --index-url https://download.pytorch.org/whl/cpu) ---
 torch>=2.6
 stable-baselines3>=2.3
