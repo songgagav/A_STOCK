@@ -185,7 +185,7 @@ def _start_engine(day: date):
         except Exception:
             pass
     try:
-        with open(ENGINE_PIDFILE, "w") as f:
+        with open(ENGINE_PIDFILE, "w", encoding="utf-8") as f:
             f.write(str(p.pid))
     except Exception:
         pass
@@ -198,7 +198,7 @@ def _ensure_dashboard():
     try:
         pid = None
         if os.path.exists(DASH_PIDFILE):
-            pid = int(open(DASH_PIDFILE).read().strip())
+            pid = int(open(DASH_PIDFILE, encoding="utf-8").read().strip())
         if pid and _proc_alive(pid):
             return True
         out = open(DASH_LOG, "a", encoding="utf-8")
@@ -212,7 +212,7 @@ def _ensure_dashboard():
             except Exception:
                 pass
         try:
-            with open(DASH_PIDFILE, "w") as f:
+            with open(DASH_PIDFILE, "w", encoding="utf-8") as f:
                 f.write(str(p.pid))
         except Exception:
             pass
@@ -526,13 +526,13 @@ def _status():
         print("  状态文件读取失败:", e)
     if os.path.exists(DAEMON_PID):
         try:
-            dp = int(open(DAEMON_PID).read().strip())
+            dp = int(open(DAEMON_PID, encoding="utf-8").read().strip())
             print(f"  守护pid    : {dp} ({'运行中' if _proc_alive(dp) else '已停止'})")
         except Exception:
             pass
     # Web 可视化状态
     try:
-        dp = int(open(DASH_PIDFILE).read().strip())
+        dp = int(open(DASH_PIDFILE, encoding="utf-8").read().strip())
         print(f"  Web可视化  : pid={dp} ({'运行中' if _proc_alive(dp) else '已停止'}) -> http://localhost:{DASH_PORT}/")
     except Exception:
         print(f"  Web可视化  : 未运行 -> http://localhost:{DASH_PORT}/")
@@ -551,7 +551,7 @@ def _stop():
         print("守护进程未在运行(无 pid 文件)")
         return
     try:
-        dp = int(open(DAEMON_PID).read().strip())
+        dp = int(open(DAEMON_PID, encoding="utf-8").read().strip())
         if _proc_alive(dp):
             subprocess.run(["taskkill", "/F", "/PID", str(dp)], capture_output=True)
             print(f"守护进程已停止 pid={dp} (引擎子进程自动并存)")
@@ -585,7 +585,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     os.makedirs(LOG_DIR, exist_ok=True)
-    with open(DAEMON_PID, "w") as f:
+    with open(DAEMON_PID, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
     try:
         run_loop()
