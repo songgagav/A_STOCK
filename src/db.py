@@ -138,6 +138,41 @@ def _universe_h5i(date=None) -> pd.DataFrame:
     return _build(v)
 
 
+def _valuation_asof_h5i(as_of) -> pd.DataFrame:
+    """PIT(point-in-time) 估值: 取 valuation 表中 <= as_of 的每 symbol 最新一行.
+
+    2026-09-12: 历史选股/回放此前只能读 valuation_snapshot(仅当日快照, 且
+    MAX(ts) 属前视), 故 _universe_asof_h5i 干脆不提供估值列, 导致回测中
+    governance_score 的 PB/PE 过滤与 filter_universe 的流通市值过滤**双双失效**,
+    与实盘(读快照)特征不一致。valuation 表本身有 1993 起逐日 PIT 数据
+    (近 3 年 730 个交易日, 日均覆盖 5399 只), 因此这里用窗口函数做严格 as-of 取值,
+    在"只用 <= as_of 数据"的前提下把估值特征还给历史路径.
+
+    单位: market_cap/free_cap 为"元", 统一转"亿"(total_mv/float_mv)对齐快照口径。
+    """
+    s = _h5i_store()
+    asd = str(as_of)[:10]
+    q = ("SELECT symbol, pe_ttm, pb, ps_ttm, float_shares, is_st, market_cap, free_cap "
+         "FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) rn "
+         "FROM valuation "
+         f"WHERE CAST(ts AS DATE) <= DATE '{asd}' "
+         f"AND CAST(ts AS DATE) >= DATE '{asd}' - INTERVAL 400 DAY) "
+         "WHERE rn = 1")
+    try:
+        df = s._db.sql(q).to_pandas()
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "pe_ttm", "pb", "ps_ttm",
+                                     "float_shares", "is_st", "total_mv", "float_mv"])
+    if df.empty:
+        return df
+    mc = pd.to_numeric(df.pop("market_cap"), errors="coerce")
+    fc = pd.to_numeric(df.pop("free_cap"), errors="coerce")
+    df["float_mv"] = fc / 1e8                      # 流通市值(亿), 近一年覆盖 92~99%
+    # market_cap 历史覆盖≈0%(仅 2026-08 起少量), 缺失时以流通市值兜底(近似总市值)
+    df["total_mv"] = (mc / 1e8).fillna(df["float_mv"])
+    return df
+
+
 def _universe_asof_h5i(as_of) -> pd.DataFrame:
     s = _h5i_store()
     asd = str(as_of)[:10]
@@ -154,8 +189,15 @@ def _universe_asof_h5i(as_of) -> pd.DataFrame:
     m = m[(m["list_date"].isna()) | (m["list_date"] <= as_of)]
     if m.empty:
         return m
+    # PIT 估值合并 (无前视): pe_ttm/pb/ps_ttm/total_mv/float_mv/float_shares/is_st
+    v = _valuation_asof_h5i(as_of)
+    if not v.empty:
+        m = m.merge(v, on="symbol", how="left")
     m["canon"] = m.apply(lambda r: _db_to_canon(r["symbol"], r["market"]), axis=1)
-    return m[["symbol", "market", "list_date", "price", "amount", "canon"]]
+    keep = ["symbol", "market", "list_date", "price", "amount", "canon",
+            "pe_ttm", "pb", "ps_ttm", "total_mv", "float_mv", "float_shares", "is_st"]
+    keep = [c for c in keep if c in m.columns]
+    return m[keep]
 
 
 class StockDB:

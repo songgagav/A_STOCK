@@ -298,8 +298,11 @@ class RotationSelector:
         消除前视偏差: 候选池/因子K线/财务全部截断到 hist_day, 绝不使用其后数据。
 
         governance 分: 用 as_of 财务(report_date<=hist_day)打分; 无财务时回退到
-        bars 可得的占位(不读未来估值快照)。float_mv/pe_ttm/pb 估值快照列在历史
-        日无法严格对齐, 回测中不给该字段(governance 用财务侧, 不受影响)。
+        bars 可得的占位。估值特征(pe_ttm/pb/ps_ttm/total_mv/float_mv)自
+        2026-09-12 起由 valuation 表做严格 as-of 取值(<= hist_day, 窗口 400 天),
+        因此 governance 的 PB/PE 负向过滤与 filter_universe 的流通市值过滤
+        在历史路径同样生效, 与实盘读快照(valuation_snapshot)的行为对齐,
+        不再存在"回测缺估值特征"的前视规避型分叉。
         """
         uni = self.db.get_universe_asof(hist_day)
         if uni.empty:
