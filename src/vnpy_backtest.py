@@ -339,6 +339,22 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120) -> di
     day_dir = day.replace("-", "")
 
     targets = _load_selection(day_dir)
+    pool_source = "selection"
+    if not targets:
+        # 2026-09-12: 虚拟盘运行前的历史窗口没有 selection/target_plan 产物, 此前直接
+        # 判 FAIL, 导致非重叠滚动样本外验证无法覆盖历史区间(过拟合检测要求 >=4 窗口).
+        # 现回退到 PIT 现场选股(selector._select_hist: 行情/财务/估值全部 <= day,
+        # 无前视), 使任意历史交易日都能重建当日目标池.
+        try:
+            from db import StockDB
+            from selector import RotationSelector
+            sel = RotationSelector(StockDB()).select(hist_day=day)
+            if sel and not sel.get("error"):
+                targets = sel.get("top_n") or []
+                pool_source = "onsite_pit"
+                _log(f"无当日 selection 产物, 已回退 PIT 现场选股: {len(targets)} 只")
+        except Exception as e:  # noqa: BLE001
+            _log(f"PIT 现场选股回退失败: {type(e).__name__}: {str(e)[:150]}")
     if not targets:
         return {"ok": False, "error": "selection.json 无目标池", "rows": 0}
     targets = targets[:top_n]

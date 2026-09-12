@@ -25,6 +25,7 @@ import time
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BASE)
+sys.path.insert(0, os.path.join(_BASE, "src"))  # src/ 布局(2026-09 迁移), 模块位于 src/
 os.chdir(_BASE)
 
 from vnpy_backtest import run_vnpy_backtest  # noqa: E402
