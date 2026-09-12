@@ -60,12 +60,15 @@ quant-llm-drl-system/
 │
 ├── scripts/                          # 运维与一次性工具
 │   ├── nonoverlap_rerun.py           # 非重叠窗口样本重建
+│   ├── pbo_sweep.py                  # PBO 参数扫描 + CSCV 估计
 │   ├── backtest_with_gate.py         # 门控历史重放 (含变点/漂移上下文)
 │   └── rerun_vnpy_all.py             # 滚动窗口样本重建
 │
 ├── docs/                             # 文档
 │   ├── architecture.md               # 系统架构设计
 │   ├── deployment.md                 # 部署指南
+│   ├── pit-valuation.md              # PIT 估值与样本外验证台账
+│   ├── pbo-cscv.md                   # PBO(CSCV) 口径、实现与解读
 │   └── api_reference.md              # 核心接口说明
 │
 ├── .env.example                      # 环境变量模板

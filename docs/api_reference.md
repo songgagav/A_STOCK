@@ -41,7 +41,8 @@
 - `vnpy_backtest.run_vnpy_backtest(day, top_n, lookback_days)` → stats+curve。
 - `backtest_with_gate.simulate(ds, ...)` → baseline/gated 指标与 per_day;`use_change_detection`/`use_factor_drift` 默认开启。
 - `overfitting_test.py` CLI:`--list/--only/--html`;样本源可用 `OVERFIT_RESULTS_FILE` 覆盖。
-- `scripts/nonoverlap_rerun.py`: 非重叠窗口回测样本。
+- `scripts/nonoverlap_rerun.py`: 非重叠窗口回测样本(默认 12 个非重叠 120 交易日窗口, 按 day 增量合并;`--only-missing`/`--fresh`)。
+- `scripts/pbo_sweep.py`: PBO 参数扫描 + CSCV;产出 `data/pbo/pbo_result.json` 供 `overfitting_test` 的 `[PBO]` 检查读取(`--report-only` 只重算 CSCV)。见 `docs/pbo-cscv.md`。
 
 ## 运行
 

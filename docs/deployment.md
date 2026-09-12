@@ -45,6 +45,7 @@ python src/rerun_vnpy_all.py                 # 滚动窗口回测样本
 python src/backtest_with_gate.py             # 门控连续重放(当前配置)
 python src/overfitting_test.py --html        # 过拟合与稳健性检测
 python scripts/nonoverlap_rerun.py       # 非重叠窗口样本(盘后/空闲时)
+python scripts/pbo_sweep.py              # PBO 参数扫描 + CSCV(约 50 分钟, 可断点续跑)
 ```
 
 ## 5. 运维注意事项
