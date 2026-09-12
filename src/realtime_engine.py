@@ -386,11 +386,22 @@ class RealtimeEngine:
         self.pb.day = self.pb.trade_date
         self.targets, self.sel, self.sel_day = load_targets(self.pb.trade_date)
         # 策略层优化: 目标权重与配置对齐(DRL 等权 plan -> 现算 fml 激活预测加权)
+        # 2026-09-13: 失败不再静默 pass —— 记录 degraded_mode/原因/降级策略, 写入
+        # live_state 并在日志与页面显式提示, 避免"看似正常但策略行为已改变"。
+        self.degraded = None
         try:
             from target_weighting import ensure_target_weights
             ensure_target_weights(self.targets, as_of=self.pb.trade_date)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            self.degraded = {
+                "mode": "target_weights",
+                "ok": False,
+                "reason": f"{type(e).__name__}: {str(e)[:150]}",
+                "fallback": "沿用目标池原始权重(未经 fml 预测加权)",
+                "as_of": self.pb.trade_date,
+            }
+            log(f"[策略降级] 目标权重计算失败 → 已记录 degraded_mode=target_weights; "
+                f"原因: {self.degraded['reason']}; 降级策略: {self.degraded['fallback']}")
         self.cur_day = self.pb.trade_date          # 真实运行日 (写入目录用)
         self.feed = PriceFeed(cache_ttl=15)
         # ---- 午间重选状态 ----
@@ -421,13 +432,17 @@ class RealtimeEngine:
     def in_session(now: datetime = None) -> bool:
         now = now or datetime.now()
         # 非交易日(周末+节假日)防御式跳过: 走权威交易日历, 防节假日误撮合/误估值
+        # 2026-09-13: 日历不可用(缓存/DB/网络同时故障)时不再回退 weekday()——
+        # 那会把节假日误判为交易日。改为"保守拒绝交易 + 报警", 只刷新估值不动仓;
+        # 工作日回退仅保留给数据维护任务(scripts/ 与 daemon 数据窗口)。
         try:
             from trading_calendar import is_trading_day as _tc_day
             if not _tc_day(now):
                 return False
-        except Exception:
-            if now.weekday() >= 5:                # 回退: 周末非交易日
-                return False
+        except Exception as e:  # noqa: BLE001
+            log(f"[日历降级] 交易日历不可用({type(e).__name__}: {str(e)[:80]}), "
+                f"保守拒绝交易(仅刷新估值/报警)")
+            return False
         hm = now.hour * 60 + now.minute
         am_open, am_close = 9 * 60 + 30, 11 * 60 + 30
         pm_open, pm_close = 13 * 60, 15 * 60
@@ -1028,6 +1043,10 @@ class RealtimeEngine:
                                        "last": round(float(_a[-1]), 1)}}
         else:
             live["ops"] = {"tick_ms": None}
+        # 策略降级状态显式落盘(2026-09-13): 供 dashboard/告警中心展示,
+        # 避免"页面与日志看起来正常, 实际策略行为已降级"。
+        if getattr(self, "degraded", None):
+            live["degraded"] = self.degraded
         _atomic_write_json(LIVE_STATE, live)
 
         # 回写累计状态
@@ -1055,6 +1074,7 @@ class RealtimeEngine:
 
     def loop(self):
         log(f"盘中引擎启动 | 目标池 {len(self.targets)}只 | interval={self.interval}s | 收盘15:05自动停止")
+        _cal_warned = False
         try:
             while True:
                 now = datetime.now()
@@ -1064,7 +1084,14 @@ class RealtimeEngine:
                     from trading_calendar import is_trading_day as _tc_day
                     _is_td = _tc_day(now)
                 except Exception:
+                    # 2026-09-13: 日历不可用时的 weekday 回退**仅**用于决定"是否继续
+                    # 循环"(避免周末空转), 不作为交易依据——in_session() 会保守拒绝
+                    # 交易并报警, 故节假日不会被误撮合。
                     _is_td = now.weekday() < 5
+                    if not _cal_warned:
+                        log("[日历降级] 无法确认交易日(交易日历不可用): 引擎继续运行, "
+                            "但拒绝交易、仅刷新估值并持续报警, 请检查日历缓存/DB/网络")
+                        _cal_warned = True
                 if (not _is_td) or (now.hour > 15 or (now.hour == 15 and now.minute >= 3)):
                     log("已收盘或非交易日, 引擎自动停止(次日由守护进程调度重启)")
                     break

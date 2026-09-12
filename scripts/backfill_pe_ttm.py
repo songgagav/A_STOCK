@@ -76,25 +76,29 @@ def _fetch_baidu(symbol: str, wanted: set[str]):
     try:
         df = ak.stock_zh_valuation_baidu(symbol=symbol, indicator="市盈率(TTM)",
                                          period="近十年")
-    except Exception as e:  # noqa: BLE001
-        return None, f"{type(e).__name__}:{str(e)[:70]}"
-    if df is None or df.empty:
-        return None, "empty"
-    df = df.rename(columns={"date": "ts", "value": "pe_ttm"})
-    df["ts"] = pd.to_datetime(df["ts"]).astype("datetime64[us]")
-    df = df[df["ts"].dt.strftime("%Y-%m-%d").isin(wanted)]
-    if df.empty:
-        return None, "no_overlap"
-    df = df.copy()
-    df["symbol"] = str(symbol).zfill(6)
-    df["source"] = "baidu_hist"
-    for c in ("pb", "ps_ttm", "pcf_ncf_ttm", "market_cap", "free_cap", "float_shares"):
-        df[c] = np.nan
-    df["is_st"] = False
-    for c in ("pe_ttm", "pb", "ps_ttm", "pcf_ncf_ttm", "market_cap",
-              "free_cap", "float_shares"):
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
-    return df[KEEP].sort_values(["ts", "symbol"]), None
+        if df is None or df.empty:
+            return None, "empty"
+        df = df.rename(columns={"date": "ts", "value": "pe_ttm"})
+        if "ts" not in df.columns or "pe_ttm" not in df.columns:
+            return None, "no_date_col"
+        df["ts"] = pd.to_datetime(df["ts"]).astype("datetime64[us]")
+        df = df[df["ts"].dt.strftime("%Y-%m-%d").isin(wanted)]
+        if df.empty:
+            return None, "no_overlap"
+        df = df.copy()
+        df["symbol"] = str(symbol).zfill(6)
+        df["source"] = "baidu_hist"
+        # is_st: 数据源未提供 ST 状态 -> 写 NaN(未知), 不可写成 False(会被读端
+        # 误当作"明确非 ST")。只有数据源明确给布尔值时才写布尔。
+        df["is_st"] = np.nan
+        for c in ("pe_ttm", "pb", "ps_ttm", "pcf_ncf_ttm", "market_cap",
+                  "free_cap", "float_shares"):
+            if c not in df.columns:
+                df[c] = np.nan
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+        return df[KEEP].sort_values(["ts", "symbol"]), None
+    except Exception as e:  # noqa: BLE001  解析异常保护
+        return None, f"parse:{type(e).__name__}:{str(e)[:70]}"
 
 
 def fetch_one(symbol: str, wanted: set[str], retry: int = 3, sleep: float = 0.25):
@@ -120,7 +124,11 @@ def fetch_one(symbol: str, wanted: set[str], retry: int = 3, sleep: float = 0.25
         return None, f"em:{last_err} | baidu:{berr}"
     df = df.rename(columns=COLMAP)
     if "ts" not in df.columns:
-        return None, "no_date_col"
+        # 2026-09-13: 主源缺日期列同样走备用源回退(此前直接返回 no_date_col)
+        bdf, berr = _fetch_baidu(symbol, wanted)
+        if bdf is not None:
+            return bdf, None
+        return None, f"no_date_col | baidu:{berr}"
     df["ts"] = df["ts"].astype(str).str[:10]
     if not df["ts"].isin(wanted).any():
         bdf, berr = _fetch_baidu(symbol, wanted)
@@ -135,13 +143,15 @@ def fetch_one(symbol: str, wanted: set[str], retry: int = 3, sleep: float = 0.25
     df["source"] = "em_hist"
     for c in ("pcf_ncf_ttm",):
         df[c] = np.nan
-    df["is_st"] = False
+    # is_st: 东财个股估值接口不提供 ST 状态 -> 写 NaN(未知);
+    # 写成 False 会把"未知"误当"明确非 ST"(2026-09-13 修正)。
+    df["is_st"] = np.nan
     for c in ("pe_ttm", "pb", "ps_ttm", "market_cap", "free_cap", "float_shares"):
         if c not in df.columns:
             df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df["pcf_ncf_ttm"] = pd.to_numeric(df["pcf_ncf_ttm"], errors="coerce").astype("float64")
-    df["is_st"] = df["is_st"].astype(bool)
+    df["is_st"] = pd.to_numeric(df["is_st"], errors="coerce")   # NaN 保留为 NaN
     df["ts"] = pd.to_datetime(df["ts"]).astype("datetime64[us]")
     return df[KEEP].sort_values(["ts", "symbol"]), None
 
