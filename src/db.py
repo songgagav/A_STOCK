@@ -138,6 +138,47 @@ def _universe_h5i(date=None) -> pd.DataFrame:
     return _build(v)
 
 
+_PE_PATCH_CACHE: dict = {}
+
+
+def _pe_patch_asof(as_of) -> pd.DataFrame:
+    """读取 data/pit/pe_patch/*.parquet 的 pe_ttm 补丁, 返回每 symbol 的 as-of 取值.
+
+    h5i valuation 主表无法回填历史(append 单调 + 无建表 API), 故补丁落 parquet,
+    此处按 <= as_of 过滤后取"pe_ttm 非空优先 + ts 最新"的一行, 保证 PIT 无前视.
+    """
+    import glob
+    from config import DATA_DIR as _DD
+    files = sorted(glob.glob(os.path.join(_DD, "pit", "pe_patch", "*.parquet")))
+    if not files:
+        return pd.DataFrame(columns=["symbol", "pe_ttm"])
+    key = (tuple(files), str(as_of)[:10])
+    if key in _PE_PATCH_CACHE:
+        return _PE_PATCH_CACHE[key]
+    asd = pd.Timestamp(str(as_of)[:10])
+    frames = []
+    for f in files:
+        try:
+            t = pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm"])
+        except Exception:
+            continue
+        t = t[t["ts"] <= asd]
+        if len(t):
+            frames.append(t)
+    if frames:
+        allp = pd.concat(frames, ignore_index=True)
+        allp["_ok"] = allp["pe_ttm"].notna().astype(int)
+        allp = (allp.sort_values(["symbol", "_ok", "ts"])
+                .drop_duplicates("symbol", keep="last"))
+        out = allp[["symbol", "pe_ttm"]]
+    else:
+        out = pd.DataFrame(columns=["symbol", "pe_ttm"])
+    if len(_PE_PATCH_CACHE) > 32:
+        _PE_PATCH_CACHE.clear()
+    _PE_PATCH_CACHE[key] = out
+    return out
+
+
 def _valuation_asof_h5i(as_of) -> pd.DataFrame:
     """PIT(point-in-time) 估值: 取 valuation 表中 <= as_of 的每 symbol 最新一行.
 
@@ -153,7 +194,8 @@ def _valuation_asof_h5i(as_of) -> pd.DataFrame:
     s = _h5i_store()
     asd = str(as_of)[:10]
     q = ("SELECT symbol, pe_ttm, pb, ps_ttm, float_shares, is_st, market_cap, free_cap "
-         "FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) rn "
+         "FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol "
+         "ORDER BY ts DESC, (pe_ttm IS NOT NULL) DESC) rn "
          "FROM valuation "
          f"WHERE CAST(ts AS DATE) <= DATE '{asd}' "
          f"AND CAST(ts AS DATE) >= DATE '{asd}' - INTERVAL 400 DAY) "
@@ -170,6 +212,17 @@ def _valuation_asof_h5i(as_of) -> pd.DataFrame:
     df["float_mv"] = fc / 1e8                      # 流通市值(亿), 近一年覆盖 92~99%
     # market_cap 历史覆盖≈0%(仅 2026-08 起少量), 缺失时以流通市值兜底(近似总市值)
     df["total_mv"] = (mc / 1e8).fillna(df["float_mv"])
+    # pe_ttm 补丁合并(parquet as-of): 主表近一年 pe_ttm 覆盖仅 4~5%,
+    # 由东财历史估值补丁(data/pit/pe_patch)按 <= as_of 补齐, 仍无前视.
+    try:
+        p = _pe_patch_asof(as_of)
+        if not p.empty:
+            df = df.merge(p.rename(columns={"pe_ttm": "_patch_pe"}),
+                          on="symbol", how="left")
+            df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce").fillna(
+                pd.to_numeric(df.pop("_patch_pe"), errors="coerce"))
+    except Exception:
+        pass
     return df
 
 
