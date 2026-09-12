@@ -1,0 +1,18 @@
+# ============================================================
+# 开发 / 测试 / 观测栈依赖 (在 requirements_314.txt 之上)
+# 本地参考环境: .venv314 (Python 3.14)
+# 安装: .venv314\Scripts\python.exe -m pip install -r requirements-dev.txt
+# ============================================================
+# --- 测试 ---
+pytest>=8.0
+# --- DRL 训练/环境 (torch 建议用 CPU wheel: --index-url https://download.pytorch.org/whl/cpu) ---
+torch>=2.6
+stable-baselines3>=2.3
+gymnasium>=1.0
+# --- 观测栈 (Celery/Redis/Prometheus/Grafana/Flower) ---
+celery>=5.4
+redis>=4.6,<5          # Windows 原生 redis 5.0 仅支持 RESP2, 需 redis-py 4.x
+prometheus_client>=0.20
+flower>=2.0
+psutil>=6.0
+requests>=2.32
