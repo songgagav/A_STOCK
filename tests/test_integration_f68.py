@@ -434,8 +434,8 @@ class TestFactorValueDRLIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(meta_path),
                         f"train_meta.json 应存在: {meta_path}")
 
-        # 验证 meta JSON 可读
-        with open(meta_path, "r") as f:
+        # 验证 meta JSON 可读 (drl_train 以 UTF-8 写入, Windows 默认 cp936 会解码失败)
+        with open(meta_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         self.assertEqual(loaded["day"], day,
                          "meta JSON 中的 day 应匹配")
