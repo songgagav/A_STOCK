@@ -159,7 +159,7 @@ def _pe_patch_asof(as_of) -> pd.DataFrame:
     frames = []
     for f in files:
         try:
-            t = pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm"])
+            t = pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm", "free_cap"])
         except Exception:
             continue
         t = t[t["ts"] <= asd]
@@ -170,9 +170,9 @@ def _pe_patch_asof(as_of) -> pd.DataFrame:
         allp["_ok"] = allp["pe_ttm"].notna().astype(int)
         allp = (allp.sort_values(["symbol", "_ok", "ts"])
                 .drop_duplicates("symbol", keep="last"))
-        out = allp[["symbol", "pe_ttm"]]
+        out = allp[["symbol", "pe_ttm", "free_cap"]]
     else:
-        out = pd.DataFrame(columns=["symbol", "pe_ttm"])
+        out = pd.DataFrame(columns=["symbol", "pe_ttm", "free_cap"])
     if len(_PE_PATCH_CACHE) > 32:
         _PE_PATCH_CACHE.clear()
     _PE_PATCH_CACHE[key] = out
@@ -207,22 +207,24 @@ def _valuation_asof_h5i(as_of) -> pd.DataFrame:
                                      "float_shares", "is_st", "total_mv", "float_mv"])
     if df.empty:
         return df
-    mc = pd.to_numeric(df.pop("market_cap"), errors="coerce")
-    fc = pd.to_numeric(df.pop("free_cap"), errors="coerce")
-    df["float_mv"] = fc / 1e8                      # 流通市值(亿), 近一年覆盖 92~99%
-    # market_cap 历史覆盖≈0%(仅 2026-08 起少量), 缺失时以流通市值兜底(近似总市值)
-    df["total_mv"] = (mc / 1e8).fillna(df["float_mv"])
-    # pe_ttm 补丁合并(parquet as-of): 主表近一年 pe_ttm 覆盖仅 4~5%,
-    # 由东财历史估值补丁(data/pit/pe_patch)按 <= as_of 补齐, 仍无前视.
+    # 补丁合并(parquet as-of): 同时补齐 pe_ttm 与 free_cap(流通市值, 原为"元"),
+    # 数据来源东财历史估值; 仍严格 <= as_of, 无前视.
     try:
         p = _pe_patch_asof(as_of)
         if not p.empty:
-            df = df.merge(p.rename(columns={"pe_ttm": "_patch_pe"}),
+            df = df.merge(p.rename(columns={"pe_ttm": "_p_pe", "free_cap": "_p_fc"}),
                           on="symbol", how="left")
             df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce").fillna(
-                pd.to_numeric(df.pop("_patch_pe"), errors="coerce"))
+                pd.to_numeric(df.pop("_p_pe"), errors="coerce"))
+            df["free_cap"] = pd.to_numeric(df["free_cap"], errors="coerce").fillna(
+                pd.to_numeric(df.pop("_p_fc"), errors="coerce"))
     except Exception:
         pass
+    mc = pd.to_numeric(df.pop("market_cap"), errors="coerce")
+    fc = pd.to_numeric(df.pop("free_cap"), errors="coerce")
+    df["float_mv"] = fc / 1e8                      # 流通市值(亿)
+    # market_cap 历史覆盖≈0%(仅 2026-08 起少量), 缺失时以流通市值兜底(近似总市值)
+    df["total_mv"] = (mc / 1e8).fillna(df["float_mv"])
     return df
 
 
@@ -904,6 +906,14 @@ def filter_universe(df: pd.DataFrame, as_of=None) -> pd.DataFrame:
     if p["exclude_st"] and "name6" in out.columns:
         # 排除 ST/*ST/退 (名称含 'ST'/'*ST'/'退')
         out = out[~out["name6"].astype(str).str.contains(r"ST|退", case=False)]
+
+    # ST 过滤(历史路径补充, 2026-09-12): 历史宇宙无名称列(valuation 表无 name,
+    # symbols parquet 亦无 name), 故用 PIT 的 is_st 标记剔除——该字段为当日状态,
+    # 有值即当日 ST, 无偏且不引入后视; 当前覆盖率约 6%(有值即剔, 缺失不剔)。
+    if p["exclude_st"] and "is_st" in out.columns:
+        st = out["is_st"]
+        if st.notna().any():
+            out = out[st.ne(True)]      # NaN(未覆盖)保留, True(ST)剔除
 
     # 流通市值过滤 (float_mv 单位=亿)
     if "float_mv" in out.columns:

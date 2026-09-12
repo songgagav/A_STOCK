@@ -43,9 +43,14 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
    读取端 `db._pe_patch_asof()` 按 `<= as_of` 合并（无前视）。
    原因：h5i `valuation` 主表 append 受"时间单调且 min(ts) ≥ 表 max(ts)"约束，且无公开
    建表 API，历史行无法回填，故采用"独立补丁 + 读取合并"。缺口规模：5320 只 / 135.7 万行。
-2. **`free_cap` 2025-06/07 与 2019 段缺口**：影响该区间的市值过滤。
-3. **ST/名称过滤**：`filter_universe` 依赖 `name6`（来自 `valuation_snapshot.name`），
-   `valuation` 表无名称列，历史路径该过滤仍受限；`is_st` 已随 PIT 列提供，
-   后续可在 `filter_universe` 增加 `is_st` 分支。
+2. ~~**`free_cap` 2025-06/07 与 2019 段缺口**~~ **已缓解（2026-09-12）**：①读取端
+   已用 `float_shares × price` 复原流通市值（覆盖 0% → 99.8%，见 `_universe_asof_h5i`）；
+   ②PE 补丁 parquet 同时携带 `free_cap`（东财历史估值，非空率 100%），
+   `db._valuation_asof_h5i` 已合并补齐其覆盖区间。更早年份仍靠 ① 的兜底估算。
+3. ~~**ST/名称过滤**~~ **已部分补齐（2026-09-12）**：历史宇宙无名称列（`valuation`
+   无 `name`，symbols parquet 亦无 `name`），而 `valuation.is_st` 覆盖率仅 **6.2%**
+   （近一年实测），故在 `filter_universe` 增加 `is_st` 分支——**有值且为 True 即剔除**
+   （当日 PIT 状态，无偏、不引入后视），NaN 保留。完整历史 ST 名单需逐日名称历史，
+   当前数据源不可得，属已知局限。
 4. 补齐后再执行滚动样本外验证（`scripts/nonoverlap_rerun.py` + `src/overfitting_test.py`），
    产出 OOS 序列作为资金可用性判断依据。
