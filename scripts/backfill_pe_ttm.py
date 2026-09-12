@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import date, datetime, timedelta
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,8 +113,8 @@ def write_rows(df: pd.DataFrame) -> int:
     df = df.copy()
     df["ts"] = pd.to_datetime(df["ts"]).astype("datetime64[us]")
     df = df.sort_values(["ts", "symbol"])
-    fn = os.path.join(PATCH_DIR, "pe_patch_%s.parquet"
-                      % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    fn = os.path.join(PATCH_DIR, "pe_patch_%s_%s.parquet" % (
+        datetime.now().strftime("%Y%m%d_%H%M%S"), uuid.uuid4().hex[:6]))
     df.to_parquet(fn, index=False)
     return len(df)
 
@@ -126,7 +127,7 @@ def main() -> None:
     ap.add_argument("--resume", action="store_true", help="断点续跑(跳过已完成 symbol)")
     ap.add_argument("--sleep", type=float, default=0.25, help="请求重试间隔基数秒")
     ap.add_argument("--workers", type=int, default=6, help="并发拉取线程数")
-    ap.add_argument("--flush", type=int, default=200000, help="每批写库行数")
+    ap.add_argument("--flush", type=int, default=2000000, help="每批写库行数(默认单批)")
     args = ap.parse_args()
 
     need = missing_targets(args.days)
