@@ -429,10 +429,75 @@ def test_pbo():
 # ====================================================================
 # 3) 置换检验 (Permutation Test)
 # ====================================================================
+def sign_flip_test(x, max_exact: int = 16, n_mc: int = 200000,
+                   seed: int = 42) -> dict:
+    """精确符号翻转置换检验 (one-sample sign-flip randomization test).
+
+    背景 (2026-09-13 修正): 原实现对"窗口汇总值"先做 permutation 再取 mean,
+    而均值是置换不变量 —— 置换分布退化为常数(实测标准差仅 ~1e-16 的浮点误差),
+    p 值恒等于 1.0, 该检查在 n>=12 时**永不可能通过**。故改为此检验。
+
+    H0: 各窗口的收益序列关于 0 对称(策略无方向性技能)。
+    统计量: T = mean(x)。把某个窗口的收益序列整体取负号, 该窗口的 Sharpe 精确
+    变为 -Sharpe(标准差不变), 因此"独立翻转各窗口符号"恰好给出 T 在 H0 下的
+    精确随机化分布 —— 不依赖正态性/独立同分布假设, 也无需打乱标签。
+
+    窗口数 <= max_exact 时穷举全部 2^n 种符号(精确); 更多窗口改为固定种子
+    蒙特卡洛。返回单侧(策略方向为正)、双侧 p 值及分布摘要。
+
+    参数 x: 窗口级指标序列(此处为各窗口 Sharpe)。
+    """
+    arr = np.asarray(x, dtype=np.float64).ravel()
+    n = int(arr.size)
+    if n < 2:
+        raise ValueError(f"符号翻转检验至少需要 2 个窗口, 实际 {n}")
+    observed = float(np.mean(arr))
+
+    if n <= max_exact:
+        bits = ((np.arange(1 << n, dtype=np.uint32)[:, None]
+                 >> np.arange(n, dtype=np.uint32)) & 1).astype(np.float64)
+        signs = bits * 2.0 - 1.0               # 0/1 -> -1/+1
+        scheme = f"精确枚举 2^{n}={1 << n} 种符号"
+        exact = True
+    else:
+        rng = np.random.RandomState(seed)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(n_mc, n))
+        scheme = f"蒙特卡洛 {n_mc} 次符号翻转(seed={seed})"
+        exact = False
+
+    dist = signs @ arr / n                     # H0 下统计量的随机化分布
+    b_ge = int(np.sum(dist >= observed - 1e-12))
+    b_abs = int(np.sum(np.abs(dist) >= abs(observed) - 1e-12))
+    if exact:
+        # 恒等符号向量(全 +1)必然包含在枚举中, 故单侧 p >= 1/2^n
+        p_value = float(b_ge / dist.size)
+        p_two = float(b_abs / dist.size)
+        p_min = 1.0 / dist.size
+    else:
+        # 蒙特卡洛: 采用 (1+b)/(1+m) 估计量, 避免有限次模拟给出 p=0
+        p_value = float((1 + b_ge) / (1 + dist.size))
+        p_two = float((1 + b_abs) / (1 + dist.size))
+        p_min = 1.0 / (1 + dist.size)
+    return {
+        "p_value": p_value,
+        "p_two_sided": p_two,
+        "actual_mean": observed,
+        "perm_mean": float(np.mean(dist)),
+        "perm_std": float(np.std(dist)),
+        "ci_low": float(np.percentile(dist, 2.5)),
+        "ci_high": float(np.percentile(dist, 97.5)),
+        "rank_pct": float(np.mean(dist <= observed) * 100),
+        "p_min": float(p_min),
+        "n": n,
+        "scheme": scheme,
+        "exact": exact,
+    }
+
+
 def test_permutation():
     print("\n" + "=" * 60)
     print("  [3] 置换检验 (Permutation Test)")
-    print("      目标: 随机打乱数据, 验证策略表现是否仍能保持")
+    print("      目标: 翻转窗口收益方向, 验证策略表现是否显著优于随机")
     print("=" * 60)
 
     vnpy = _load_vnpy_results()
@@ -444,60 +509,49 @@ def test_permutation():
 
     n = len(vnpy)
     sharpes = np.array([float(v["stats"]["sharpe_ratio"]) for v in vnpy])
-    actual_mean = np.mean(sharpes)
-    # (2026-09-07) 统计功效: 窗口数 <12 时置换分布过稀, 不作 FAIL 判定.
-    # 注意: 对"窗口汇总值"做置换在设计上退化为恒等分布(均值不变), p 无区分度;
-    # 严格置换需逐日收益序列或 ≥12 个非重叠窗口.
+    # (2026-09-13) 统计功效: 窗口数 <12 时该检验功效有限, 不作 FAIL 判定(WARN).
     n_ok = n >= 12
 
-    # 置换检验: 随机打乱 Sharpe 标签, 计算打乱后的均值分布
-    rng = np.random.RandomState(42)
-    n_perm = 10000
-    perm_means = []
+    t = sign_flip_test(sharpes)
+    p_value = t["p_value"]
+    actual_mean = t["actual_mean"]
+    rank_pct = t["rank_pct"]
 
-    for _ in range(n_perm):
-        perm = rng.permutation(sharpes)
-        perm_means.append(np.mean(perm))
-
-    perm_means = np.array(perm_means)
-    p_value = np.mean(perm_means >= actual_mean)
-
-    # 95% 置信区间
-    ci_low = np.percentile(perm_means, 2.5)
-    ci_high = np.percentile(perm_means, 97.5)
-
+    print(f"  检验方式: {t['scheme']}")
     print(f"  实际 Sharpe 均值: {actual_mean:.4f}")
-    print(f"  置换分布均值: {np.mean(perm_means):.4f} ± {np.std(perm_means):.4f}")
-    print(f"  置换 95% CI: [{ci_low:.4f}, {ci_high:.4f}]")
-    print(f"  p-value: {p_value:.4f}")
-    print(f"  样本量: n={n} ({'充足, ≥12' if n_ok else '不足, <12 → WARN; 且窗口级置换无区分度'})")
+    print(f"  置换分布均值: {t['perm_mean']:.4f} ± {t['perm_std']:.4f}  (H0 下期望为 0)")
+    print(f"  置换 95% CI: [{t['ci_low']:.4f}, {t['ci_high']:.4f}]")
+    print(f"  单侧 p-value: {p_value:.6f}  (双侧 {t['p_two_sided']:.6f})")
+    print(f"  最小可达 p (全 + 符号): {t['p_min']:.6f}")
+    print(f"  样本量: n={n} ({'充足, ≥12' if n_ok else '不足, <12 → WARN'})")
 
-    # 如果实际均值显著高于置换分布, 则策略不是拟合噪声
+    # 如果实际均值显著高于随机化分布, 则策略不是拟合噪声
     R.check(
         "置换检验: 实际 Sharpe 均值显著高于随机 (p < 0.10)",
         None if not n_ok else p_value < 0.10,
-        f"p-value={p_value:.4f}, 实际均值={actual_mean:.4f}, 置换分布={np.mean(perm_means):.4f}±{np.std(perm_means):.4f}, "
+        f"单侧 p={p_value:.6f} (双侧 {t['p_two_sided']:.6f}), 实际均值={actual_mean:.4f}, "
+        f"置换分布={t['perm_mean']:.4f}±{t['perm_std']:.4f}, {t['scheme']}, "
         f"n={n}{'' if n_ok else ' 功效不足, 不作 FAIL'}",
-        measured=f"p-value={p_value:.4f}",
+        measured=f"p-value={p_value:.6f}",
         threshold="< 0.10",
         category="置换检验",
     )
 
     # 实际均值在置换分布中的百分位
-    rank_pct = np.mean(perm_means <= actual_mean) * 100
     R.check(
         f"实际均值位于置换分布前 {rank_pct:.0f}% (越高越好)",
         None if not n_ok else rank_pct > 50,
-        f"实际均值位于 {rank_pct:.1f}% 百分位",
+        f"实际均值位于 {rank_pct:.1f}% 百分位 ({t['scheme']})",
         measured=f"{rank_pct:.1f}% 百分位",
         threshold="> 50%",
         category="置换检验",
     )
 
-    return {"p_value": p_value, "actual_mean": actual_mean,
-            "perm_mean": float(np.mean(perm_means)),
-            "perm_std": float(np.std(perm_means)),
-            "rank_pct": rank_pct}
+    return {"p_value": p_value, "p_two_sided": t["p_two_sided"],
+            "actual_mean": actual_mean, "perm_mean": t["perm_mean"],
+            "perm_std": t["perm_std"], "rank_pct": rank_pct,
+            "p_min": t["p_min"], "n": n, "exact": t["exact"],
+            "scheme": t["scheme"]}
 
 
 # ====================================================================
