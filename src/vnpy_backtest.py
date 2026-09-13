@@ -266,6 +266,84 @@ def _build_adj_close_inplace(df: pd.DataFrame) -> None:
     df["adj_close"] = build_adj_close(df)
 
 
+# ---------------------------------------------------------------------------
+# 前向窗口 (2026-09-13): 修正原"回测窗口在决策日之前"的前视问题
+#
+# 原实现用 _load_bars(s6, day, 120) 取 [day-120, day] 的日线, 而目标池是
+# select(hist_day=day)(特征截至 day) —— 评估期整体落在决策日之前, 选股因此
+# "知道"了整个评估期的走势。实测对照(见 check_lookahead):
+#   2022-12-30 窗口回测 +98.08% vs 所选 10 只在该区间自身的等权涨幅 +93.47%
+#   2021-07-02 窗口回测 +73.25% vs +78.48%
+#   2024-07-03 窗口回测 +23.74% vs +27.67%
+# 即回测收益 ≈ "用已知结果挑出的动量篮子"在该区间的涨幅, 属机械前视。
+#
+# 修正: 窗口改为 [决策日, 决策日 + N 个交易日], 选股仍为 PIT(数据 <= 决策日),
+# 持有期全部在决策日之后 -> 无前视。
+# ---------------------------------------------------------------------------
+_CAL_CACHE: dict = {}
+
+
+def _full_calendar() -> list:
+    """全部交易日(升序, 'YYYY-MM-DD'), 进程内缓存."""
+    cal = _CAL_CACHE.get("cal")
+    if cal is not None:
+        return cal
+    ds: list = []
+    try:
+        from h5i_bar_store import H5iBarStore
+        ds = sorted(H5iBarStore().trading_days())
+    except Exception:  # noqa: BLE001
+        ds = []
+    if not ds:
+        try:
+            con = duckdb.connect(DUCKDB_PATH, read_only=True)
+            try:
+                rows = con.execute(
+                    "SELECT DISTINCT date FROM daily_bars ORDER BY date").fetchall()
+            finally:
+                con.close()
+            ds = [str(r[0])[:10] for r in rows]
+        except Exception:  # noqa: BLE001
+            ds = []
+    _CAL_CACHE["cal"] = ds
+    return ds
+
+
+def forward_window_days(start_day: dt.date, days: int) -> list:
+    """返回 [start_day, 之后 days 个交易日] 的交易日列表; 未来数据不足则返回 [].
+
+    交易日以"首个 >= start_day 的交易日"为起点, 保证窗口不包含决策日之前的数据。
+    """
+    cal = _full_calendar()
+    if not cal:
+        return []
+    import bisect
+    i = bisect.bisect_left(cal, start_day.strftime("%Y-%m-%d"))
+    seg = cal[i:i + days]
+    return seg if len(seg) >= days else []
+
+
+def _load_bars_forward(symbol6: str, start_day: dt.date, days: int) -> pd.DataFrame:
+    """加载 [start_day 起 days 个交易日] 的日线(决策日之后, 不含决策日之前).
+
+    与 _load_bars 的区别: 后者取"截至 end_day 的最后 days 根", 用于回溯评估;
+    本函数取"自 start_day 起的前 days 根", 用于无前视的前向评估。
+    复权口径与 _load_bars 一致(同走 build_adj_close)。
+    """
+    seg = forward_window_days(start_day, days)
+    if not seg:
+        return pd.DataFrame()
+    end_day = dt.date.fromisoformat(seg[-1])
+    # 多取一些以覆盖个股停牌造成的缺口, 再截到 [start_day, end_day]
+    df = _load_bars(symbol6, end_day, days * 3 + 40)
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    df = df[df["date"] >= pd.Timestamp(start_day)].reset_index(drop=True)
+    if df.empty:
+        return df
+    return df.head(days).reset_index(drop=True)
+
+
 def _build_strategy_class(vt_symbols: List[str], weights: List[float], day: str = ""):
     """vt_symbols + weights: 目标持仓; day: 回测日, 用于写 trade_records 标识."""
     from vnpy.alpha import AlphaStrategy
@@ -420,10 +498,27 @@ def _inject_risk_ratios(stats_dict: dict, balances: list) -> None:
 def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
                       sel_n: int = 0, out_tag: str = "",
                       persist_arctic: bool = True,
-                      weight_mode: str = "equal") -> dict:
-    from vnpy.trader.constant import Exchange
+                      weight_mode: str = "equal",
+                      forward: bool = False) -> dict:
+    """vnpy 回测. day 语义随 forward 变化:
+
+    forward=False (默认, 历史行为): day = 窗口**终点**; 窗口为 [day-lookback_days, day];
+        目标池为 as-of day 的选股。注意: 评估期落在决策日之前, 存在前视
+        (见 _load_bars_forward 上方注释), 仅用于回溯归因, 不可用于样本外评估。
+    forward=True: day = **决策日**; 目标池为 PIT(数据 <= day) 选股; 持有期
+        [day, day+lookback_days 个交易日], 全部在决策日之后 -> 无前视, 用于 OOS。
+    """
     day_dt = dt.datetime.strptime(day, "%Y-%m-%d").date()
     day_dir = day.replace("-", "")
+
+    # 前向模式先在昂贵的选股之前校验未来数据是否充足(fail fast, 且不依赖 vnpy)
+    if forward and not forward_window_days(day_dt, lookback_days):
+        return {"ok": False,
+                "error": f"前向窗口未来数据不足: 决策日 {day} 起需 "
+                         f"{lookback_days} 个交易日, 已达数据末端",
+                "rows": 0}
+
+    from vnpy.trader.constant import Exchange
 
     targets = _load_selection(day_dir)
     pool_source = "selection"
@@ -465,7 +560,8 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
 
     bar_map: dict[str, pd.DataFrame] = {}
     for s6 in symbol6_list:
-        df = _load_bars(s6, day_dt, lookback_days)
+        df = (_load_bars_forward(s6, day_dt, lookback_days) if forward
+              else _load_bars(s6, day_dt, lookback_days))
         if not df.empty:
             bar_map[s6] = df
     if not bar_map:
