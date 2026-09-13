@@ -312,7 +312,9 @@ class RotationSelector:
         # 才上市的标的, 与实盘"以当日为次新口径"保持一致。
         pool = filter_universe(uni, as_of=hist_day)
         filtered = len(pool)
-        W = selector_weights()
+        # 2026-09-13: 历史路径传 as_of -> 只用该日及之前的 IC 曲线判因子隔离,
+        # 消除"用今天的 IC 给历史日期定权重"的因子权重层前视
+        W = selector_weights(as_of=hist_day)
 
         # [m4 性能] h5i 批量预热: 一次性加载 hist_day 前整窗日线, 避免对数千标的
         # 逐条触发 h5i 全表扫描 (~1s/标的). 预热失败自动回退逐条 SQL (语义不变).

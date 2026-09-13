@@ -81,15 +81,19 @@ def build_adj_close(df: pd.DataFrame) -> pd.Series:
 #   selector_weights() / score_factor(name, bars) / _pb_rev_score / _roe_score /
 #   _mf_net_score. 语义与旧版一致 (线性裁切映射到 0..1), 使 realtime_engine 可导入.
 # ---------------------------------------------------------------------------
-def selector_weights() -> dict:
-    """旧打分权重: 返回 config.SCORE_WEIGHTS 副本, 并经因子健康处置 (失效因子隔离)."""
+def selector_weights(as_of: str | None = None) -> dict:
+    """旧打分权重: 返回 config.SCORE_WEIGHTS 副本, 并经因子健康处置 (失效因子隔离).
+
+    as_of (2026-09-13 新增): 历史日期 -> 用**该日及之前**的 IC 曲线判隔离, 消除
+    "用今天的 IC 给历史定权重"的前视; None = 实盘(取曲线末尾)。
+    """
     try:
         from config import SCORE_WEIGHTS
         W = dict(SCORE_WEIGHTS)
     except Exception:
         W = {"signal": 0.34, "trend": 0.14, "govern": 0.16, "liquidity": 0.08,
              "vol": 0.10, "mom_rev": 0.0, "pb_rev": 0.06, "roe": 0.06, "mf_net": 0.06}
-    _apply_factor_health(W)
+    _apply_factor_health(W, as_of=as_of)
     return W
 
 
@@ -97,17 +101,18 @@ def selector_weights() -> dict:
 _health_logged: dict = {}
 
 
-def _apply_factor_health(W: dict) -> None:
+def _apply_factor_health(W: dict, as_of: str | None = None) -> None:
     """(2026-09-07) 因子健康处置: 短期方向翻转/强度收敛(反转义失效)的因子, 打分权重置 0.
 
     由 factor_gate.factor_health_flags 依据 data/ic 曲线判定; 环境变量
     FACTOR_HEALTH_ENABLED=0 可关闭. 任何异常静默降级(不影响选股主链路).
+    as_of 透传给 factor_health_flags: 历史日期只用到该日为止的 IC 曲线(消前视)。
     """
     if os.environ.get("FACTOR_HEALTH_ENABLED", "1") == "0":
         return
     try:
         from factor_gate import factor_health_flags
-        flags = factor_health_flags()
+        flags = factor_health_flags(as_of=as_of)
     except Exception:
         return
     for key, info in (flags.get("isolated") or {}).items():
