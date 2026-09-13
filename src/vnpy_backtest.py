@@ -224,6 +224,20 @@ def _load_pit_selection_cached(day: str, n: int = 10) -> list[dict]:
     return targets
 
 
+_BARS_WARNED: dict = {}
+
+
+def _warn_bars_once(key: str, msg: str) -> None:
+    """日线读取失败只告警一次 (2026-09-13).
+
+    原实现两路取数失败都静默返回空表, 上层若不校验只数就会用 1~2 只标的算均值
+    (历史上出现过"篮子收益严重失真"), 或把数据源故障误读成"区间无数据"。
+    """
+    if not _BARS_WARNED.get(key):
+        _BARS_WARNED[key] = True
+        print(msg, file=sys.stderr)
+
+
 def _load_bars(symbol6: str, end_day: dt.date, days: int = 120) -> pd.DataFrame:
     """加载日线数据, 包含 change_pct 用于复权重建.
     返回 DataFrame 含列: date, open, high, low, close, volume, amount, change_pct, adj_close.
@@ -244,8 +258,8 @@ def _load_bars(symbol6: str, end_day: dt.date, days: int = 120) -> pd.DataFrame:
             df = df.sort_values("date").tail(days).reset_index(drop=True)
             _build_adj_close_inplace(df)
             return df
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        _warn_bars_once("duck", f"[bars] duckdb 源不可用({type(e).__name__}: {e}); 转 h5i 源")
 
     # 2) h5i 主数据源 (daily_bars 在 data/h5i/market.db)
     try:
@@ -261,7 +275,9 @@ def _load_bars(symbol6: str, end_day: dt.date, days: int = 120) -> pd.DataFrame:
         df = df.sort_values("date").tail(days).reset_index(drop=True)
         _build_adj_close_inplace(df)
         return df
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        _warn_bars_once("h5i", f"[bars] h5i 源不可用({type(e).__name__}: {e}) -> 返回空表; "
+                                f"调用方必须校验只数, 否则篮子均值会失真")
         return pd.DataFrame()
 
 
@@ -288,17 +304,60 @@ def _build_adj_close_inplace(df: pd.DataFrame) -> None:
 _CAL_CACHE: dict = {}
 
 
+def _cache_calendar(ds: list) -> list:
+    """仅在**非空**时写入进程缓存并返回.
+
+    2026-09-13 修正: 原实现无条件 `_CAL_CACHE["cal"] = ds`, 于是首次调用一旦失败
+    (h5i 客户端缺失 / 被瞬时占用), 该进程之后**全部** forward_window_days 都返回
+    [], 上层把它显示成"前向窗口未来数据不足" —— 真实故障被伪装成数据不全。
+    空结果一律视为失败, 不缓存 (下次调用会重新尝试)。
+    """
+    if ds:
+        _CAL_CACHE["cal"] = ds
+    return ds
+
+
+def _calendar_from_static_file() -> list:
+    """data/trade_calendar.json -> 升序交易日列表 'YYYY-MM-DD' (项目自带官方日历).
+
+    注意: 该文件的 days 是 **'YYYYMMDD'** 无分隔格式, 必须归一化后再返回, 否则
+    与 'YYYY-MM-DD' 混用会破坏 bisect 的字符串比较(窗口会全空)。
+    """
+    try:
+        with open(os.path.join(DATA_DIR, "trade_calendar.json"), encoding="utf-8") as f:
+            days = (json.load(f) or {}).get("days") or []
+    except Exception:  # noqa: BLE001
+        return []
+
+    def _norm(d) -> str:
+        s = str(d).strip()
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+        return s[:10]
+
+    return sorted({_norm(d) for d in days if str(d).strip()})
+
+
 def _full_calendar() -> list:
-    """全部交易日(升序, 'YYYY-MM-DD'), 进程内缓存."""
+    """全部交易日(升序, 'YYYY-MM-DD'), 进程内缓存(仅缓存非空结果).
+
+    数据源优先级:
+      1) h5i daily_bars 的 distinct ts (实盘主源, 范围与真实日线一致)
+      2) DuckDB daily_bars (已退役, 仅当文件仍在时可用)
+      3) data/trade_calendar.json (项目自带官方日历, 覆盖 1990~2026)
+    三源全空时打印明确告警, 便于区分"数据源故障"与"未来数据不足"。
+    """
     cal = _CAL_CACHE.get("cal")
-    if cal is not None:
+    if cal:
         return cal
+
     ds: list = []
     try:
         from h5i_bar_store import H5iBarStore
         ds = sorted(H5iBarStore().trading_days())
-    except Exception:  # noqa: BLE001
-        ds = []
+    except Exception as e:  # noqa: BLE001
+        print(f"[calendar] h5i 交易日历不可用: {type(e).__name__}: {e}", file=sys.stderr)
+
     if not ds:
         try:
             con = duckdb.connect(DUCKDB_PATH, read_only=True)
@@ -310,8 +369,19 @@ def _full_calendar() -> list:
             ds = [str(r[0])[:10] for r in rows]
         except Exception:  # noqa: BLE001
             ds = []
-    _CAL_CACHE["cal"] = ds
-    return ds
+
+    if not ds:
+        ds = _calendar_from_static_file()
+        if ds:
+            print(f"[calendar] 已回退 data/trade_calendar.json ({len(ds)} 个交易日, "
+                  f"{ds[0]} ~ {ds[-1]}); 该源非实盘主源, 若区间内个股日线缺失会另行报错",
+                  file=sys.stderr)
+
+    if not ds:
+        print("[calendar] 警告: h5i / duckdb / trade_calendar.json 三个日历源全部不可用, "
+              "前向窗口将全部被判为'未来数据不足'; 请检查 h5i_db 客户端是否已安装",
+              file=sys.stderr)
+    return _cache_calendar(ds)
 
 
 def forward_window_days(start_day: dt.date, days: int) -> list:
