@@ -39,6 +39,22 @@ def _db_to_canon(symbol6: str, market: str = None) -> str:
     return f"{symbol6}.SZ"
 
 
+def to_sym6(symbol: str) -> str:
+    """任意形式 -> db 纯 6 位 (显式命名, 供跨模块调用).
+
+    命名约定 (2026-09-13 统一, 详见 docs/symbols.md):
+      - `canon` 在 universe/selector 口径下带后缀, 如 '600519.SH'
+      - `canon` 在 h5i views 口径下是纯 6 位 (v_factor_scores_daily 实测 0% 带后缀)
+      - db 各表的 `symbol` 一律纯 6 位
+    两种 `canon` 同名不同形是历史遗留, 混用会让 merge/join **静默返回空**,
+    因此跨表 join 时一律用本函数(或 _canon_to_db)显式转换, 不要依赖列名相同。
+    """
+    s = str(symbol or "")
+    if "." in s:
+        s = s.split(".")[0]
+    return s.zfill(6) if s.isdigit() else s
+
+
 # A 股代码段白名单 (与 realtime_engine._A_SHARE_PREFIXES 一致).
 # 剔除: 可转债(110/111/113 沪, 123/127/128 深), B股(200 深, 900 沪),
 #       北交所(920/8xx/4xx), 及一切非 A 段.

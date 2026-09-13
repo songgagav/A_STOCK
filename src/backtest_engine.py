@@ -550,13 +550,18 @@ class BacktestRunner:
             del canon_target, name_map, cands, closes, prev_closes, tradable
 
         # 汇总
+        # 单位约定(2026-09-13 统一, 详见 docs/units.md): 凡"百分数"字段一律带 _pct 后缀.
+        # total_return 为**百分点**(如 -1.13 表示 -1.13%), 历史上少后缀易与"比例"
+        # (0..1) 混用 -> 新增 total_return_pct 作为规范键, 旧键保留兼容。
+        _total_return_pct = round((pb.snapshot()["equity"] / INIT_CAPITAL - 1) * 100, 2)
         result = {
             "tag": tag,
             "start": self.days_list[0].strftime("%Y-%m-%d"),
             "end": self.days_list[-1].strftime("%Y-%m-%d"),
             "init_capital": INIT_CAPITAL,
             "final_equity": round(pb.snapshot()["equity"], 2),
-            "total_return": round((pb.snapshot()["equity"] / INIT_CAPITAL - 1) * 100, 2),
+            "total_return_pct": _total_return_pct,
+            "total_return": _total_return_pct,   # 兼容旧读取方(同值, 单位=百分点)
             "trade_days": len(self.days_list),
             "total_trades": len(trade_log),
             "max_drawdown_pct": self._max_dd(curve),

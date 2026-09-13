@@ -255,6 +255,33 @@ def _max_10d_swing(sr: np.ndarray) -> float:
 # ====================================================================
 # 1) 组合净化交叉验证 (CPCV) + 滚动窗口样本外验证
 # ====================================================================
+def sharpe_dispersion_stat(sharpes, floor: float = 0.25):
+    """滚动窗口 Sharpe 的稳健离散度 (2026-09-13).
+
+    原实现 CV = std/|mean| 在均值近 0 时会爆掉(前向口径 mean≈-0.25 时 CV 极大),
+    使该项退化为"恒 FAIL"; 且 CV 对单个离群窗口敏感。
+    改为 1.4826*MAD/|median| (与 #8 同一套稳健思路); 当 |median| < floor 时 CV
+    在数学上无意义(分母趋 0), 退化为**符号一致性**(正比例)判定并明确标注。
+
+    返回 (kind, stat, ok, detail, threshold)。
+    """
+    arr = np.array(list(sharpes), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return ("empty", float("nan"), False, "无有效窗口数据", "n/a")
+    med = float(np.median(arr))
+    scale = 1.4826 * float(np.median(np.abs(arr - med)))
+    if abs(med) >= floor:
+        stat = scale / abs(med)
+        return ("robust_cv", stat, stat < 2.0,
+                f"稳健CV={stat:.3f} (median={med:.3f}, 1.4826*MAD={scale:.3f}, "
+                f"std={float(np.std(arr)):.3f})", "< 2.0")
+    pos = float((arr > 0).mean())
+    return ("sign_consistency", pos, pos >= 0.60,
+            f"正比例={pos:.0%} ({int((arr > 0).sum())}/{arr.size}); median={med:.3f} "
+            f"近 0 故稳健CV 无意义 (1.4826*MAD={scale:.3f})", "≥ 60%")
+
+
 def test_cpcv_and_rolling():
     print("\n" + "=" * 60)
     print("  [1] 组合净化交叉验证 (CPCV)")
@@ -309,16 +336,23 @@ def test_cpcv_and_rolling():
     print(f"  Sharpe 范围: {min(sharpes):.3f} ~ {max(sharpes):.3f}")
     print(f"  Sharpe 均值: {np.mean(sharpes):.3f} ± {np.std(sharpes):.3f}")
 
-    # Sharpe 稳定性
-    sharpe_vol = np.std(sharpes) / max(abs(np.mean(sharpes)), 0.01)
-    R.check(
-        "滚动窗口 Sharpe 稳定性 (CV < 2.0)",
-        sharpe_vol < 2.0,
-        f"Sharpe CV={sharpe_vol:.3f} (mean={np.mean(sharpes):.3f}, std={np.std(sharpes):.3f})",
-        measured=f"Sharpe CV={sharpe_vol:.3f}",
-        threshold="< 2.0",
-        category="滚动窗口",
-    )
+    # Sharpe 稳定性 (2026-09-13 改用 MAD-based 稳健离散度, 见 sharpe_dispersion_stat)
+    _kind, _stat, _ok, _detail, _thr = sharpe_dispersion_stat(sharpes)
+    if _kind == "robust_cv":
+        R.check(
+            "滚动窗口 Sharpe 稳健离散度 (1.4826*MAD/|median| < 2.0)",
+            _ok, _detail, measured=f"稳健CV={_stat:.3f}", threshold=_thr,
+            category="滚动窗口",
+        )
+    elif _kind == "sign_consistency":
+        R.check(
+            "滚动窗口 Sharpe 符号一致性 (|median|<0.25 时替代稳健CV)",
+            _ok, _detail, measured=f"正比例={_stat:.0%}", threshold=_thr,
+            category="滚动窗口",
+        )
+    else:
+        R.check("滚动窗口 Sharpe 稳定性", False, _detail, measured="无数据",
+                threshold=_thr, category="滚动窗口")
 
     # 正 Sharpe 比例
     pos_sharpe = sum(1 for s in sharpes if s > 0)
