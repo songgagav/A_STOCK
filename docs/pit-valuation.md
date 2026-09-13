@@ -365,3 +365,53 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
     | 2026-03-05 | 59 | 36 | 19 | 6 | 15.8% |
 
     11 窗口 RISK 占比均值 3.3%。**item 4 撤销**。
+
+12. **工程质量三项 item 7 / 9 / 10（2026-09-13，执行结果）**：
+    本批**不改策略逻辑**（不影响并行运行的影子回测）。
+
+    **① item 7 — Sharpe CV 口径（MAD 替代）**：`overfitting_test.py` 新增模块级纯函数
+    `sharpe_dispersion_stat(sharpes, floor=0.25)`，用 **1.4826×MAD / |median|**（稳健 CV，
+    阈值 <2.0）替代原 `std/|mean|`；当 `|median| < 0.25` 时分母趋 0、CV 数学上无意义，
+    退化为**符号一致性**（正比例 ≥60%）并在 detail 中明确标注。原实现在前向口径
+    （均值≈-0.25）下会给出无上界的爆炸值，使该项退化为"恒 FAIL"。
+    实测 11 窗口前向基线 `sharpe = [-1.37, -0.081, 0.247, 0.297, 0.87, -1.18, -1.812,
+    0.497, 1.558, 0.587, -2.376]`（均值 -0.251，中位 0.247，std 1.185）：
+
+    | 口径 | 统计量 | 结论 |
+    |---|---|---|
+    | 旧 `std/\|mean\|` | 4.714 | FAIL（>2.0，且对离群窗口敏感） |
+    | 新 稳健 CV | —（中位 0.247 < 0.25，退化） | — |
+    | 新 符号一致性 | 正比例 55%（6/11） | FAIL（<60%） |
+
+    结论相同但统计量不再爆炸，且 detail 如实说明"median 近 0 故稳健 CV 无意义"。
+
+    **② item 9 — canon 后缀全链路**：`db.py` 新增显式入口 `to_sym6()`（与既有
+    `_canon_to_db` / `_db_to_canon` 并存），新增 `docs/symbols.md` 固定两种同名不同形的
+    canon（universe/selector 带后缀如 `600519.SH`；h5i views 纯 6 位）与 db `symbol` 纯 6 位，
+    并固化规则：**跨表 join 一律显式转换，禁止依赖列名相同**（否则静默返回空表）。
+    审计结论：`build_factor_views.py:620/779/810` 安全（两侧均为纯 6 位，views 实测
+    441,527 行 0% 带后缀）；`scripts/` 下仅 `factor_ic_forward.py` 曾违规，已修。
+
+    **③ item 10 — 收益单位统一**：`backtest_engine.py` 汇总新增规范键 `total_return_pct`，
+    旧键 `total_return` 保留但**复用同一变量**（同值，单位=百分点），消除"两处各自换算"
+    的风险。`docs/units.md` 新增「**符号约定（回撤）**」小节，逐源固定回撤正负：
+
+    | 来源 | 符号 | 消费端 |
+    |---|---|---|
+    | `backtest_engine._max_dd()` / `max_drawdown_pct` | **正**（幅度） | 直接展示，不得取反 |
+    | `strategy_validation.curve_metrics.max_drawdown` | **正**（比例 0..1，阈值 0.30） | ×100 |
+    | `vnpy_backtest` stats `max_ddpercent` | **负** | 展示前 `abs()` |
+    | `performance_report.py` metrics `max_drawdown` | **负** | 展示前 `abs()` |
+
+    （后两条已核对源码：`dd = equities/peak - 1.0` → `min()` → `*100`。）
+
+    **④ 新增守卫测试 18 例**：`tests/test_sharpe_dispersion.py`（6）、
+    `tests/test_symbols_contract.py`（6）、`tests/test_units_contract.py`（6）。
+
+    **⑤ 全量回归**：**420 passed / 15 skipped**（基线 402 passed / 15 skipped，
+    增量恰好为新增的 18 例）。commit `d845967`。
+
+    **⑥ 留档的教训**：本批首次跑测时 3 例 FAIL，其中 2 例是**我自己写的断言错了**
+    （误设 `_max_dd()` 返回负值、误查带引号的变量名），而非被测代码有问题 ——
+    说明写守卫测试时必须**先读源码再下断言**，不能凭"应该是"的直觉。
+
