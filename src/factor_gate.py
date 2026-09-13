@@ -128,6 +128,16 @@ class _Cfg:
     # ---- 个体因子 IC 漂移监控 (2026-09-07 新增) ----
     factor_ic_drift = _num("factor_ic_drift", "FG_FACTOR_IC_DRIFT", 0.15)
     unstable_factor_limit = _inum("unstable_factor_limit", "FG_UNSTABLE_FACTOR_LIMIT", 2)
+    # flipped 判据收紧 (2026-09-13, item 5): 反转义因子"短期 IC 转正"还须**有足够幅度**
+    # 才算方向翻转, 否则只当噪声(不判翻转)。原判据是 |short| >= 0.01, 幅度过小:
+    # 长期 -0.20 的因子被 +0.011 的单期噪声判成"信号变反向"并清零权重。
+    flip_min_abs = _num("flip_min_abs", "FG_FLIP_MIN_ABS", 0.02)        # 绝对下限
+    flip_min_ratio = _num("flip_min_ratio", "FG_FLIP_MIN_RATIO", 0.25)  # 相对长期强度比例
+    # "强度收敛"判据的两个门槛也做成可调(默认值 = 原行为, 不改语义):
+    # 实测 11 窗口里 vol 被隔离多数走的是本分支而非 flipped 分支, 若要减少过早隔离,
+    # 调这里才是真正的杠杆(把 ratio 调小 = 要求更深的收敛才算失效)。
+    weaken_ratio = _num("weaken_ratio", "FG_WEAKEN_RATIO", 0.7)
+    weaken_min_abs = _num("weaken_min_abs", "FG_WEAKEN_MIN_ABS", 0.02)
     # ---- Sharpe 变点检测 (2026-09-07 新增) ----
     sharpe_change_threshold = _num("sharpe_change_threshold", "FG_SHARPE_CHANGE_THRESHOLD", 0.3)
     sharpe_change_window = _inum("sharpe_change_window", "FG_SHARPE_CHANGE_WINDOW", 5)
@@ -181,22 +191,32 @@ def check_factor_ic_drift(
         is_rev = name in _REVERSAL_ALPHA_FACTORS and abs(long_m) >= 0.02
         if is_rev:
             # 反转义 alpha: 有效方向是负 IC.
-            flipped = bool(short_m > 0 and abs(short_m) >= 0.01)
+            # 2026-09-13 (item 5) 收紧: 转正还须达到 max(绝对下限, 长期强度的比例),
+            # 否则视为噪声 -> 不判 flipped (仍可能因强度收敛走 weakened 分支)。
+            flip_thr = max(c.flip_min_abs, abs(long_m) * c.flip_min_ratio)
+            flipped = bool(short_m > 0 and abs(short_m) >= flip_thr)
+            weaken_thr = max(abs(long_m) * c.weaken_ratio, c.weaken_min_abs)
             weakened = bool(not flipped and abs(long_m) >= 0.02
-                            and abs(short_m) < max(abs(long_m) * 0.7, 0.02))
+                            and abs(short_m) < weaken_thr)
             unstable_flag = flipped or weakened
             d = {"long_mean": long_m, "short_mean": short_m,
                  "drift": drift, "mode": "reversal",
-                 "flipped": flipped, "weakened": weakened}
+                 "flipped": flipped, "weakened": weakened,
+                 "flip_threshold": round(flip_thr, 4),
+                 "weaken_threshold": round(weaken_thr, 4)}
             if flipped:
-                d["reason"] = "短期IC转正 → 反转义失效(信号变反向)"
+                d["reason"] = (f"短期IC转正且幅度 {abs(short_m):.4f} >= 阈值 {flip_thr:.4f} "
+                               f"→ 反转义失效(信号变反向)")
                 unstable.append(name)
             elif weakened:
-                d["reason"] = "反转义强度收敛到 <70%长期(或 <0.02) → 信号失灵"
+                d["reason"] = (f"反转义强度收敛: |短期| {abs(short_m):.4f} < 门槛 "
+                               f"{weaken_thr:.4f} → 信号失灵")
                 unstable.append(name)
+            elif short_m > 0:
+                d["reason"] = (f"短期正 IC 幅度 {short_m:.4f} < 翻转阈值 {flip_thr:.4f}, "
+                               f"视为噪声, 不判方向翻转")
             else:
-                d["reason"] = ("反转义方向保持(负IC加深或持平=更有效/有效)"
-                               if short_m < 0 else "反转义方向保持")
+                d["reason"] = "反转义方向保持(负IC加深或持平=更有效/有效)"
             detail[name] = d
         else:
             # 常规方向因子 (或长期方向不明确): 原始漂移判据
