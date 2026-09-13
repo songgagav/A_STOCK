@@ -49,17 +49,22 @@ def _names(day: str, top: int = 10) -> list[str]:
     return [t["canon"] for t in _load_pit_selection_cached(day, 20)][:top]
 
 
-def _ret(day: str, end: str, top: int = 10):
+def _ret(day: str, end: str, top: int = 10, n_fwd: int = 200):
     """[day, end] 区间等权篮子收益(**百分数**). 返回 (ret%, 有效只数).
 
     注意: _load_bars_forward 在 DB 读取瞬时失败时会静默返回空表, 若不加约束会
     用极少数标的算均值(实测并发读取时出现过 1~2 只 -> 收益严重失真)。故此处返回
     有效只数, 由调用方校验。
+
+    n_fwd (2026-09-13 修): `_load_bars_forward(s6, day, N)` 要求 day 之后**至少**
+    还有 N 个交易日, 否则直接返回空表。原来固定传 200, 对靠近数据末端的窗口/分段
+    (如 2026-03-05 的静态篮子、2025-06-30 的最后一个分段) 必然取空 -> 整窗口被判
+    "数据不足"跳过。现由调用方按"该点到窗口终点的实际交易日数"传入。
     """
     rs = []
     for canon in _names(day, top):
         s6 = canon.split(".")[0]
-        df = _load_bars_forward(s6, pd.Timestamp(day).date(), 200)
+        df = _load_bars_forward(s6, pd.Timestamp(day).date(), max(int(n_fwd), 5))
         if df is None or df.empty:
             continue
         c = pd.to_numeric(df["adj_close"], errors="coerce")
@@ -96,8 +101,8 @@ def main() -> None:
         if not cal:
             print(f"  {day}: 未来数据不足, 跳过")
             continue
-        # 静态持有
-        static_ret, n_static = _ret(day, cal[-1])
+        # 静态持有 (只需到窗口终点为止的交易日数, 不可多要 -> 见 _ret 的 n_fwd 说明)
+        static_ret, n_static = _ret(day, cal[-1], n_fwd=len(cal))
         if n_static < 8:
             print(f"  {day}: 静态篮子仅取到 {n_static} 只(<8), 数据读取异常, 跳过本窗口")
             continue
@@ -118,7 +123,7 @@ def main() -> None:
                 eq *= (1.0 - c)
                 n_swaps += 1
             prev = nm
-            r, nseg = _ret(reb, seg_end)
+            r, nseg = _ret(reb, seg_end, n_fwd=len(cal) - p)
             if r is None:
                 seg_bad += 1
                 continue
