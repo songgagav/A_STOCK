@@ -75,27 +75,94 @@ A 股规则纸面撮合
 | `scripts/check_data_completeness.py` | 数据完整性巡检 |
 | `scripts/nonoverlap_rerun.py` | 非重叠窗口样本外重跑 |
 
-## 目录结构
+## 项目结构
 
 ```text
 A_stock_rotation/
-├── src/                         # 核心源码，当前为扁平模块布局
-│   └── factor_mine/             # GP 因子挖掘子模块
-├── tests/                       # 单元、集成和 DRL 回归测试
-├── scripts/                     # 数据补录、诊断、回测和验证脚本
-├── ops/                         # Prometheus、Grafana、告警与启动配置
-├── docs/                        # 架构、部署、PIT、单位与 API 文档
-├── data/                        # 本地运行数据，默认不提交 Git
-├── logs/                        # 日志和运行报告，默认不提交 Git
-├── .env.example                 # 环境变量模板
-├── requirements_314.txt         # 核心运行依赖
-├── requirements-dev.txt         # 测试、DRL 和观测栈依赖
-├── requirements-lock.txt        # 锁定依赖清单
-├── conftest.py                  # 测试路径初始化
-└── README.md
+├── .github/                          # GitHub 工作流配置
+│   └── workflows/
+│       └── ci.yml                    # 核心回归 + DRL 回归
+│
+├── src/                              # 核心源代码（当前为扁平模块布局）
+│   ├── db.py                          # 统一数据访问入口
+│   ├── h5i_bar_store.py               # h5i 行情/财务/估值查询
+│   ├── arctic_store.py                # ArcticDB 读写与审计存储
+│   ├── build_factor_views.py          # 因子宽表与视图构建
+│   ├── free_stockdb_sync.py           # 本地行情镜像同步
+│   │
+│   ├── factor_fusion.py               # ICIR 因子融合与截面 IC
+│   ├── factor_library.py              # 实证 alpha 与选股权重
+│   ├── factor_dynamic_weights.py      # DRL 动态因子权重
+│   ├── factor_gate.py                 # IC 门控、漂移与变点状态机
+│   ├── factor_mine/                   # 遗传规划因子挖掘/筛选/OOS
+│   │
+│   ├── selector.py                    # 候选池过滤、打分与 Top-N
+│   ├── target_weighting.py            # 目标权重归一化与加权
+│   ├── drl_train.py                   # CVaR-PPO 与 FactorValueEnv
+│   ├── explainable_rl.py              # DRL 可解释性分析
+│   ├── logic_q.py                     # 神经符号化趋势/量价逻辑
+│   ├── risk_first.py                  # Risk-First 决策层
+│   ├── risk_factor_optimizer.py       # CVaR/回撤/波动率风险因子
+│   ├── degradation.py                 # 策略退化防御
+│   │
+│   ├── paper_book.py                  # A 股规则纸面账户与撮合
+│   ├── realtime_engine.py             # 盘中模拟撮合引擎
+│   ├── backtest_engine.py             # 连续交易日回放
+│   ├── vnpy_backtest.py               # vn.py 回测适配
+│   ├── run_daily.py                   # 日频主流程
+│   ├── daemon.py                      # 交易日守护与自动拉起
+│   ├── run_services.py                # 盘中服务启动/停止/状态
+│   ├── dashboard.py                   # Web 看板
+│   ├── premarket_healthcheck.py       # 盘前健康检查
+│   ├── trading_calendar.py            # A 股交易日历与节假日判断
+│   └── metrics_server.py              # Prometheus 指标服务
+│
+├── tests/                             # 单元、集成和 DRL 回归测试
+│   ├── test_factor_gate.py            # IC 门控
+│   ├── test_factor_health.py          # 因子健康隔离
+│   ├── test_pit_valuation.py          # PIT 估值与数据源回退
+│   ├── test_risk_first.py             # Risk-First 风控
+│   ├── test_execution_decomposition.py# 执行成本与撮合
+│   └── …                              # 其余策略、因子、回测测试
+│
+├── scripts/                           # 数据补录、诊断、回测和验证
+│   ├── backfill_pe_ttm.py             # PE(TTM) PIT 补丁与双源回退
+│   ├── backfill_valuation.py          # 估值快照补录
+│   ├── check_data_completeness.py     # 数据完整性巡检
+│   ├── nonoverlap_rerun.py            # 非重叠窗口样本外重跑
+│   ├── diag_data.py                   # 数据诊断
+│   └── validate_h5i_migration.py      # h5i 迁移校验
+│
+├── ops/                               # 观测、告警与服务配置
+│   ├── prometheus.yml                 # Prometheus 抓取配置
+│   ├── alertmanager.yml               # 告警路由
+│   ├── alert_rules.yml                # 策略/数据告警规则
+│   ├── astock_db_dashboard.json       # Grafana 数据库看板
+│   └── start_obs_stack.ps1            # 观测栈启动脚本
+│
+├── docs/                              # 项目文档
+│   ├── architecture.md                # 系统架构与数据流
+│   ├── deployment.md                  # 环境和部署指南
+│   ├── pit-valuation.md               # PIT 估值与样本外验证台账
+│   ├── units.md                       # 收益/回撤单位约定
+│   ├── symbols.md                     # 标的代码形态约定
+│   ├── perf-plan.md                   # 回测性能改进计划
+│   ├── pbo-cscv.md                    # PBO/CSCV 口径与解读
+│   └── api_reference.md               # 核心接口说明
+│
+├── data/                              # 本地行情、状态和运行产物（不提交 Git）
+├── logs/                              # 日志、净值和绩效报告（不提交 Git）
+├── .env.example                       # 环境变量模板
+├── .gitignore                         # 数据、密钥、模型与缓存忽略规则
+├── conftest.py                        # 测试路径初始化
+├── requirements_314.txt               # 核心依赖
+├── requirements-dev.txt               # 测试、DRL 与观测栈依赖
+├── requirements-lock.txt              # 锁定依赖清单
+├── LICENSE                            # MIT 许可证
+└── README.md                          # 项目说明
 ```
 
-实际源码没有物理拆分成 `src/data`、`src/factor` 等子目录；README 中的分层是逻辑架构，便于理解和维护。
+源码文件实际位于扁平的 `src/` 下；上面的数据层、因子层、决策层、风控层、评估层和运行层是逻辑分层，不代表物理目录。统一运行入口为 `python src/<脚本>.py`，测试通过根目录 `conftest.py` 注入 `src/`。
 
 ## 环境要求
 
