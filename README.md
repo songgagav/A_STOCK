@@ -1,140 +1,284 @@
-# A_STOCK — A股量化轮动系统 (Quant-LLM-DRL)
+# A_STOCK — A 股量化轮动研究系统
 
-A 股量化研究/模拟盘系统:全市场日频因子选股、盘中模拟撮合、因子 IC 门控、CVaR-PPO 动态权重、遗传规划因子挖掘与过拟合检测套件。
+[![CI](https://github.com/songgagav/A_STOCK/actions/workflows/ci.yml/badge.svg)](https://github.com/songgagav/A_STOCK/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 研究/回测用途,非投资建议。仓库仅含核心代码、配置模板与文档;不含行情数据、数据库文件、交易记录或 API 密钥。
-
-## 项目结构
+A_STOCK 是一个面向 A 股的量化研究、回测与模拟盘系统，围绕以下闭环构建：
 
 ```text
-quant-llm-drl-system/
-├── .github/                          # GitHub 工作流配置
-│   └── workflows/
-│       └── ci.yml                    # 持续集成 (核心逻辑回归)
-│
-├── src/                              # 核心源代码 (逻辑分层)
-│   ├── data/                         # 数据层
-│   │   ├── arctic_store.py           # ArcticDB 读写客户端 (bars/回执/IC/reward)
-│   │   ├── h5i_bar_store.py          # h5i-db 行情/财务/估值查询引擎
-│   │   ├── db.py                     # 统一数据访问 (h5i 优先, 退役 duckdb 兼容)
-│   │   ├── build_factor_views.py     # 因子宽表构建 (mom20/vol/mom_rev/治理/流动性)
-│   │   └── free_stockdb_sync.py      # 本地行情镜像同步与增量更新
-│   │
-│   ├── factor/                       # 因子研究层
-│   │   ├── factor_fusion.py          # 融合因子 (ICIR 加权, 含 IC 门控联动)
-│   │   ├── factor_dynamic_weights.py # DRL 动态因子权重分配
-│   │   ├── factor_library.py         # 实证 alpha 打分与旧版权重 API
-│   │   └── factor_mine/              # 遗传规划(GP)因子挖掘/筛选/评估
-│   │
-│   ├── strategy/                     # 智能决策层
-│   │   ├── drl_train.py              # CVaR-PPO 核心算法 + FactorValueEnv
-│   │   ├── explainable_rl.py         # DRL 可解释性
-│   │   ├── logic_q.py                # 神经符号化趋势/量价逻辑 (NeSy-TA)
-│   │   ├── risk_first.py             # Risk-First 风控优先决策
-│   │   └── selector.py               # 候选池选股打分 (等权/加权)
-│   │
-│   ├── risk/                         # 风险控制层
-│   │   ├── factor_gate.py            # IC 门控 (联合判据 + 滞后状态机 + 变点检测
-│   │   │                             #   + 因子健康处置 factor_health_flags)
-│   │   ├── risk_factor_optimizer.py  # CVaR/回撤/波动率风险因子
-│   │   └── degradation.py            # 策略退化防御
-│   │
-│   ├── validation/                   # 评估与归因
-│   │   ├── overfitting_test.py       # 过拟合与稳健性检测套件 (7 维度)
-│   │   ├── strategy_validation.py    # 策略指标达标检测
-│   │   ├── performance_report.py     # 绩效归因与 IC 监控
-│   │   └── attribution_analysis.py   # 收益/因子归因
-│   │
-│   └── engine/                       # 运行引擎
-│       ├── run_daily.py              # 日频任务调度
-│       ├── realtime_engine.py        # 盘中模拟撮合引擎
-│       ├── daemon.py                 # 交易日守护 (调度/崩溃拉起)
-│       ├── dashboard.py              # Web 可视化面板
-│       └── premarket_healthcheck.py  # 盘前健康检查
-│
-├── tests/                            # 测试套件
-│   ├── test_factor_gate.py           # 门控单元测试
-│   ├── test_factor_health.py         # 因子健康处置测试
-│   ├── test_cvar_config.py           # CVaR 配置测试
-│   └── …                             # (共 20+ 测试文件)
-│
-├── scripts/                          # 运维与一次性工具
-│   ├── nonoverlap_rerun.py           # 非重叠窗口样本重建
-│   ├── pbo_sweep.py                  # PBO 参数扫描 + CSCV 估计
-│   ├── backtest_with_gate.py         # 门控历史重放 (含变点/漂移上下文)
-│   └── rerun_vnpy_all.py             # 滚动窗口样本重建
-│
-├── docs/                             # 文档
-│   ├── architecture.md               # 系统架构设计
-│   ├── deployment.md                 # 部署指南
-│   ├── pit-valuation.md              # PIT 估值与样本外验证台账
-│   ├── units.md                      # 收益/回撤的单位约定(百分点 vs 比例)
-│   ├── symbols.md                    # 标的代码形态约定(canon 带后缀 vs 纯 6 位)
-│   ├── perf-plan.md                  # 下一次重跑的性能改造计划(池快照/并行/中性化/预筛)
-│   ├── pbo-cscv.md                   # PBO(CSCV) 口径、实现与解读
-│   └── api_reference.md              # 核心接口说明
-│
-├── .env.example                      # 环境变量模板
-├── .gitignore                        # Git 忽略规则
-├── LICENSE                           # MIT 许可证
-├── README.md                         # 项目说明
-└── requirements_314.txt              # Python 3.14 核心依赖清单
+行情/财务/估值数据
+        ↓
+因子计算与因子挖掘
+        ↓
+候选池过滤与组合构建
+        ↓
+IC 门控 / 风险因子 / DRL 动态权重
+        ↓
+A 股规则纸面撮合
+        ↓
+绩效归因、过拟合检测与运行监控
 ```
 
-> 说明:本仓库源码已**物理迁移到 `src/`**(单层平铺,扁平 import 保持,便于守护与工具直接引用);上表将 `src/` 内文件按逻辑层归入 `data/factor/strategy/risk/validation/engine` 便于理解,文件一一对应真实路径。运行入口统一为 `python src/<脚本>.py`;`tests/` 通过根 `conftest.py` 注入 `src/`。如需进一步把 `src/` 拆成子层(包路径 import),需同步改全量相对引用,见 `docs/architecture.md`。
+项目重点不是单一选股公式，而是建立一套可审计、可回放、可降级、可持续运行的研究基础设施。
 
-## 关键模块说明
+> 本项目仅用于研究、教学和模拟交易，不构成任何投资建议。默认执行通道为 PaperBook 纸面撮合，不连接真实券商，也不保证任何历史结果能够在未来复现。
 
-| 模块 | 职责 |
-|---|---|
-| `config.py` | 全系统配置:资金规则/候选池过滤/因子开关/风控与 DRL 参数(均可用环境变量覆盖) |
-| `factor_gate.py` | 组合风控核心:融合 IC 联合判据进入/退出 risk,3 日滞后;单日亏损防御;个体因子 IC 漂移监控(方向有效性语义:反转义因子"负 IC 加深=更有效");Sharpe 变点检测 + 变点后保持 |
-| `factor_health_flags` → `selector_weights` | 因子健康处置:方向翻转/强度收敛(反转义失效)的因子自动从打分权重隔离(置 0);`FACTOR_HEALTH_ENABLED=0` 关闭 |
-| `factor_fusion.py` | 四因子 ICIR 加权融合打分(pb_inv/ep/ocf_ps/roe_yy_chg 反转),行业+市值中性 |
-| `drl_train.py` | CVaR-PPO 训练六维因子权重(signal 权重硬边界 `[0.10,0.39]`),奖励含尾部风险 |
-| `selector.py` | 全 A 候选过滤 → 因子打分 → Top-N;signal/趋势/治理/流动性 + 实证 alpha(低波/超跌反转) |
-| `overfitting_test.py` | 7 维度过拟合检测:CPCV / PBO / 置换 / 市场状态依赖 / 参数稳定性 / 健康度(IC 稳定性 121 日口径)/ 回撤换手诊断;`OVERFIT_RESULTS_FILE` 可切换样本源 |
+## 功能概览
 
-## 重要说明
+| 模块 | 能力 |
+| --- | --- |
+| 数据层 | A 股日线、财务、估值、资金流、融资融券与本地数据湖接入 |
+| PIT 数据 | 按 `as_of` 严格取历史可见数据，避免估值和股票池前视偏差 |
+| 因子层 | 基本面、趋势、流动性、波动率、反转、治理因子及 ICIR 融合 |
+| 因子挖掘 | 遗传规划因子生成、筛选、OOS 检验与因子注册 |
+| 决策层 | 截面打分、候选池 Top-N、CVaR-PPO 动态因子权重、可解释分析 |
+| 风控层 | IC 门控、因子健康隔离、回撤/波动/CVaR 约束、策略退化防御 |
+| 执行层 | A 股 T+1、整手、涨跌停、停牌、滑点、佣金、印花税与止损模拟 |
+| 评估层 | 回测、滚动样本外验证、CPCV/PBO、压力测试、收益归因 |
+| 运行层 | 日频调度、盘中模拟引擎、健康检查、Web 看板、Prometheus 指标 |
 
-- **数据与敏感信息**:本仓库仅包含核心代码、配置模板和文档,不包含任何原始行情数据、数据库文件、交易记录或 API 密钥。请自行准备数据源(推荐 free-stockdb 或 CNEquity)。本地数据根通过环境变量注入,不硬编码个人路径。
-- **依赖项**:核心依赖包括 numpy、pandas、scipy、scikit-learn、h5py、pyarrow、matplotlib 等;DRL 链路另需 torch / stable-baselines3 / gymnasium(重型,按需安装)。详见 [`requirements_314.txt`](requirements_314.txt)。测试与 CI 的轻量子集仅需 numpy/pandas/scipy/scikit-learn/pytest。
-- **环境变量**:`STOCKDB_ROOT`(本地行情镜像根)、`ARCTIC_URI`(ArcticDB 地址)、`PYBAO_DIR`(本地行情 SDK,可选)、`TRAE_PYTHON`(守护进程外部解释器,可选)、`OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`(LLM 增强,可选)。见 [`.env.example`](.env.example)。
+## 核心设计原则
 
-### 解释器选择与数据可用性(2026-09-13 排查结论)
+1. **研究信号与执行隔离**：LLM 或 DRL 只生成结构化信号/目标权重，不能绕过确定性风控直接下单。
+2. **Point-in-Time 优先**：历史选股只使用当日及以前可获得的数据；估值补丁通过 as-of 合并读取。
+3. **风险优先**：因子失效、IC 漂移、Sharpe 变点、组合回撤等情况可以降低暴露或冻结新买入。
+4. **安全默认值**：实时引擎默认使用 PaperBook；未知数据、日历异常和策略降级会记录状态。
+5. **可审计运行**：选股结果、目标权重、成交、净值、门控状态和训练元数据均支持落盘。
 
-本机存在**两个解释器**,用途不同,用错会出现"取不到数据"的假象:
+## 架构
 
-| 解释器 | 版本 | 含 `h5i_db` | 用途 |
-|---|---|---|---|
-| `%APPDATA%\TRAE SOLO CN\...\vm\tools\python\python.exe` | 3.10.11 | **是**(h5i-db 0.1.6) | **一切需要日线/因子/回测的数据脚本** |
-| `.venv314\Scripts\python.exe` | 3.14.7 | 否 | 轻量回归测试(`pytest tests/`) |
+源码采用扁平 `src/` 布局，逻辑上分为以下层次：
 
-`h5i_db` 的 `_native.pyd` 是 **cp310 编译扩展**,因此无法装进 3.14 的 venv。用 `.venv314`
-跑数据脚本时,`_load_bars()` 会返回空表、`_full_calendar()` 会退回
-`data/trade_calendar.json`(并在 stderr 提示),表现为"没有数据/未来数据不足",而
-**不是**数据真的缺失。判断方法:看 stderr 是否出现 `[calendar] 已回退 data/trade_calendar.json`。
-
-## 快速开始
-
-```bash
-pip install -r requirements_314.txt
-python -m pytest tests/ -q                       # 单元测试
-python src/refresh_gate_ic.py                    # 刷新融合 IC 缓存
-python src/rerun_vnpy_all.py                     # 滚动窗口回测
-python src/backtest_with_gate.py                 # 门控重放对照
-python src/overfitting_test.py --html            # 过拟合检测
-python src/run_daily.py                          # 日频主流程
+```text
+数据层       db.py / h5i_bar_store.py / arctic_store.py
+因子层       factor_fusion.py / factor_library.py / factor_mine/
+决策层       selector.py / drl_train.py / target_weighting.py
+风控层       factor_gate.py / risk_first.py / risk_factor_optimizer.py
+执行层       paper_book.py / realtime_engine.py / backtest_engine.py
+评估层       performance_report.py / attribution_analysis.py
+             overfitting_test.py / strategy_validation.py
+运维层       daemon.py / run_services.py / dashboard.py
+             health_check.py / metrics_server.py
 ```
 
-## 贡献指南
+主要入口：
 
-1. Fork 本仓库
-2. 创建您的特性分支:`git checkout -b feature/AmazingFeature`
-3. 提交您的更改:`git commit -m 'Add some AmazingFeature'`
-4. 推送到分支:`git push origin feature/AmazingFeature`
-5. 开启一个 Pull Request
+| 路径 | 用途 |
+| --- | --- |
+| `src/run_daily.py` | 收盘选股、因子/权重更新及日频任务 |
+| `src/realtime_engine.py` | 盘中价格刷新与 PaperBook 模拟撮合 |
+| `src/backtest_engine.py` | 连续交易日撮合回放 |
+| `src/factor_gate.py` | IC 门控、因子漂移和状态机 |
+| `src/drl_train.py` | CVaR-PPO 因子权重训练 |
+| `src/overfitting_test.py` | 稳健性与过拟合检测 |
+| `src/dashboard.py` | 本地 Web 看板 |
+| `scripts/check_data_completeness.py` | 数据完整性巡检 |
+| `scripts/nonoverlap_rerun.py` | 非重叠窗口样本外重跑 |
 
-## License
+## 目录结构
 
-[MIT](LICENSE)
+```text
+A_stock_rotation/
+├── src/                         # 核心源码，当前为扁平模块布局
+│   └── factor_mine/             # GP 因子挖掘子模块
+├── tests/                       # 单元、集成和 DRL 回归测试
+├── scripts/                     # 数据补录、诊断、回测和验证脚本
+├── ops/                         # Prometheus、Grafana、告警与启动配置
+├── docs/                        # 架构、部署、PIT、单位与 API 文档
+├── data/                        # 本地运行数据，默认不提交 Git
+├── logs/                        # 日志和运行报告，默认不提交 Git
+├── .env.example                 # 环境变量模板
+├── requirements_314.txt         # 核心运行依赖
+├── requirements-dev.txt         # 测试、DRL 和观测栈依赖
+├── requirements-lock.txt        # 锁定依赖清单
+├── conftest.py                  # 测试路径初始化
+└── README.md
+```
+
+实际源码没有物理拆分成 `src/data`、`src/factor` 等子目录；README 中的分层是逻辑架构，便于理解和维护。
+
+## 环境要求
+
+- Windows/Linux 均可用于轻量研究和测试。
+- 推荐 Python 3.14 虚拟环境用于核心回归、DRL 和纯 Python 工具。
+- 部分本地 `h5i_db` 数据库组件使用 CPython 3.10 原生扩展；运行依赖该组件的数据脚本时，必须使用与 `_native.pyd` 匹配的 Python 3.10 环境。
+- 数据库、行情镜像、API token 和运行产物不随仓库提供。
+
+### 创建测试/DRL 环境
+
+```powershell
+cd A_stock_rotation
+py -3.14 -m venv .venv314
+.venv314\Scripts\python.exe -m pip install --upgrade pip
+.venv314\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+如果只需要不含 DRL 的基础逻辑，可安装核心依赖并额外安装 pytest：
+
+```powershell
+.venv314\Scripts\python.exe -m pip install -r requirements_314.txt pytest
+```
+
+CPU 环境安装 PyTorch 时，可按本机平台参考 PyTorch 官方 wheel 源，再安装 `stable-baselines3` 和 `gymnasium`。
+
+## 配置
+
+复制环境变量模板并按实际数据位置填写：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+常用配置项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `STOCKDB_ROOT` | 本地行情镜像或 free-stockdb 根目录 |
+| `ARCTIC_URI` | ArcticDB 地址；未配置时使用可用的本地后端 |
+| `PYBAO_DIR` | 可选的本地行情 SDK 路径 |
+| `TRAE_PYTHON` | 守护任务调用的外部 Python 解释器 |
+| `OPENAI_BASE_URL` | 可选的 LLM 服务地址 |
+| `OPENAI_API_KEY` | LLM API 密钥，只通过环境变量提供 |
+| `OPENAI_MODEL` | LLM 模型名 |
+| `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关，默认开启 |
+| `OVERFIT_RESULTS_FILE` | 覆盖过拟合检测使用的结果文件 |
+
+不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
+
+## 常用命令
+
+以下命令默认在仓库根目录执行。
+
+### 测试
+
+```powershell
+# 完整回归
+.venv314\Scripts\python.exe -m pytest tests -q
+
+# PIT 估值与数据回退专项
+.venv314\Scripts\python.exe -m pytest tests/test_pit_valuation.py -q
+
+# 风控与因子门控专项
+.venv314\Scripts\python.exe -m pytest tests/test_factor_gate.py tests/test_factor_health.py -q
+```
+
+CI 分为两部分：
+
+- `regression-core`：不依赖 GPU 的核心逻辑全量回归，运行于 Python 3.11/3.12；
+- `regression-drl`：包含 PyTorch、Stable-Baselines3 和 Gymnasium 的 DRL 回归。
+
+### 日频、回测和过拟合检测
+
+```powershell
+# 刷新 IC 与门控缓存
+.venv314\Scripts\python.exe src/refresh_gate_ic.py
+
+# 日频主流程
+.venv314\Scripts\python.exe src/run_daily.py
+
+# 连续交易日 PaperBook 回放
+.venv314\Scripts\python.exe src/backtest_engine.py --days 10
+
+# 指定起始日期回放
+.venv314\Scripts\python.exe src/backtest_engine.py --start 2026-06-01
+
+# 门控历史重放
+.venv314\Scripts\python.exe src/backtest_with_gate.py
+
+# 非重叠样本外重跑
+.venv314\Scripts\python.exe scripts/nonoverlap_rerun.py
+
+# 过拟合/稳健性检测
+.venv314\Scripts\python.exe src/overfitting_test.py --html
+
+# 数据完整性巡检
+.venv314\Scripts\python.exe scripts/check_data_completeness.py
+```
+
+### 盘中模拟与看板
+
+```powershell
+# 单次模拟 tick，不启动常驻循环
+.venv314\Scripts\python.exe src/realtime_engine.py --once
+
+# 启动盘中 PaperBook 引擎和 Web 看板
+.venv314\Scripts\python.exe src/run_services.py start
+
+# 查看服务状态
+.venv314\Scripts\python.exe src/run_services.py status
+
+# 停止服务
+.venv314\Scripts\python.exe src/run_services.py stop
+
+# 直接启动看板
+.venv314\Scripts\python.exe src/dashboard.py --port 8000
+```
+
+浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
+
+## 数据与 Point-in-Time 口径
+
+历史选股和回测必须区分“当日可见数据”和“当前最新数据”。本项目的 PIT 路径包括：
+
+- `db._universe_asof_h5i(as_of)`：按历史日期合并日线与估值；
+- `db._pe_patch_asof(as_of)`：读取 PE/free_cap 补丁，并严格过滤 `ts <= as_of`；
+- `filter_universe(...)`：执行 A 股代码段、ST、次新、流通市值和流动性过滤；
+- `scripts/nonoverlap_rerun.py`：使用非重叠窗口检查样本外稳定性。
+
+详细口径见 [`docs/pit-valuation.md`](docs/pit-valuation.md)、[`docs/units.md`](docs/units.md) 和 [`docs/symbols.md`](docs/symbols.md)。
+
+当前仍需注意：
+
+1. 历史 ST 名称数据并不完整；PIT `is_st` 覆盖不足时，未知值会保留而不是强行剔除。
+2. 某些早期区间的总市值缺失，会使用流通股本 × 价格进行近似补齐。
+3. 如果回测使用固定的当前股票池，只能验证撮合链路，不能代表完整历史选股能力。
+4. 任何回测结果都必须同时报告数据窗口、股票池、交易成本、滑点、换手率和最大回撤。
+
+## 风控和执行边界
+
+PaperBook/盘中模拟默认实现以下 A 股规则：
+
+- 只做多、不使用杠杆；
+- T+1，当日买入股份不可当日卖出；
+- 买入和卖出按 100 股整手处理；
+- 涨停不买、跌停不卖；停牌或无有效价格时跳过；
+- 支持佣金最低收费、卖出印花税、过户费和滑点；
+- 支持单股止损、组合回撤控制、换手预算和 IC 门控；
+- 目标权重计算失败时记录 `degraded` 状态，明确使用的降级策略；
+- 交易日历不可用时，盘中路径保守拒绝交易。
+
+当前 `realtime_engine.py` 的交易通道固定为 PaperBook。任何非 `paper` 的交易通道配置都会拒绝下单，不会静默切换到真实交易。
+
+## 结果解读
+
+本仓库包含历史实验报告和模拟运行产物，但它们主要用于诊断和回归，不能直接作为策略收益承诺。评估时建议重点关注：
+
+- 样本外年化收益、Sharpe、Calmar 与最大回撤；
+- 交易成本和换手率对结果的影响；
+- 不同市场状态下的表现，而不是只看单一窗口；
+- 基线、门控、DRL 和风险增强版本之间的增量；
+- 回测中是否存在未来数据、幸存者偏差、固定股票池或不现实成交假设。
+
+推荐先完成 PIT 数据补齐和非重叠样本外验证，再评估任何资金可用性结论。
+
+## 文档索引
+
+- [`docs/architecture.md`](docs/architecture.md)：系统分层和关键数据流；
+- [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
+- [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
+- [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
+- [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
+- [`ops/`](ops/)：Prometheus、Grafana 和告警配置。
+
+## 开发约定
+
+1. 新增数据源时必须注明是否联网、数据时间口径和失败降级行为。
+2. 涉及历史数据的逻辑必须明确 `as_of`，并增加无前视测试。
+3. 涉及风控、执行或数据补丁的修复必须添加回归用例。
+4. 修改运行入口后同步更新 README、部署文档和 CI。
+5. 提交前执行 `git diff --check` 和相关测试，并确认没有敏感文件进入暂存区。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
