@@ -68,6 +68,9 @@ quant-llm-drl-system/
 │   ├── architecture.md               # 系统架构设计
 │   ├── deployment.md                 # 部署指南
 │   ├── pit-valuation.md              # PIT 估值与样本外验证台账
+│   ├── units.md                      # 收益/回撤的单位约定(百分点 vs 比例)
+│   ├── symbols.md                    # 标的代码形态约定(canon 带后缀 vs 纯 6 位)
+│   ├── perf-plan.md                  # 下一次重跑的性能改造计划(池快照/并行/中性化/预筛)
 │   ├── pbo-cscv.md                   # PBO(CSCV) 口径、实现与解读
 │   └── api_reference.md              # 核心接口说明
 │
