@@ -98,6 +98,20 @@ quant-llm-drl-system/
 - **依赖项**:核心依赖包括 numpy、pandas、scipy、scikit-learn、h5py、pyarrow、matplotlib 等;DRL 链路另需 torch / stable-baselines3 / gymnasium(重型,按需安装)。详见 [`requirements_314.txt`](requirements_314.txt)。测试与 CI 的轻量子集仅需 numpy/pandas/scipy/scikit-learn/pytest。
 - **环境变量**:`STOCKDB_ROOT`(本地行情镜像根)、`ARCTIC_URI`(ArcticDB 地址)、`PYBAO_DIR`(本地行情 SDK,可选)、`TRAE_PYTHON`(守护进程外部解释器,可选)、`OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`(LLM 增强,可选)。见 [`.env.example`](.env.example)。
 
+### 解释器选择与数据可用性(2026-09-13 排查结论)
+
+本机存在**两个解释器**,用途不同,用错会出现"取不到数据"的假象:
+
+| 解释器 | 版本 | 含 `h5i_db` | 用途 |
+|---|---|---|---|
+| `%APPDATA%\TRAE SOLO CN\...\vm\tools\python\python.exe` | 3.10.11 | **是**(h5i-db 0.1.6) | **一切需要日线/因子/回测的数据脚本** |
+| `.venv314\Scripts\python.exe` | 3.14.7 | 否 | 轻量回归测试(`pytest tests/`) |
+
+`h5i_db` 的 `_native.pyd` 是 **cp310 编译扩展**,因此无法装进 3.14 的 venv。用 `.venv314`
+跑数据脚本时,`_load_bars()` 会返回空表、`_full_calendar()` 会退回
+`data/trade_calendar.json`(并在 stderr 提示),表现为"没有数据/未来数据不足",而
+**不是**数据真的缺失。判断方法:看 stderr 是否出现 `[calendar] 已回退 data/trade_calendar.json`。
+
 ## 快速开始
 
 ```bash
