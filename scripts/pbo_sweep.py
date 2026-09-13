@@ -52,9 +52,17 @@ PBO_DIR = os.path.join(_BASE, "data", "pbo")
 CURVE_DIR = os.path.join(PBO_DIR, "curves")
 RESULT = os.path.join(PBO_DIR, "pbo_result.json")
 
+# 窗口口径 (2026-09-13): 默认前向(无前视); --backward 回到历史(前视)口径。
+# 两种口径的曲线缓存与产物目录都带 mode 前缀, 不会互相污染。
+MODE = "forward"
+
 DEFAULT_TOPN = [5, 8, 10, 12, 15, 20]
 DEFAULT_WEIGHTS = ["equal", "signal", "rank"]
 LOOKBACK = 120
+
+
+def _is_forward() -> bool:
+    return MODE == "forward"
 
 
 def _default_windows() -> list[str]:
@@ -68,7 +76,7 @@ def _default_windows() -> list[str]:
 
 
 def _tag(top_n: int, weight_mode: str) -> str:
-    return f"pbo_tn{top_n}_{weight_mode}"
+    return f"pbo_{MODE}_tn{top_n}_{weight_mode}"
 
 
 def _returns_from_curve(curve: list) -> pd.Series:
@@ -102,7 +110,7 @@ def run_one(day: str, top_n: int, weight_mode: str,
 
     res = run_vnpy_backtest(day, top_n=top_n, lookback_days=LOOKBACK,
                             sel_n=sel_n, out_tag=tag, persist_arctic=False,
-                            weight_mode=weight_mode)
+                            weight_mode=weight_mode, forward=_is_forward())
     if not res.get("ok"):
         return None, f"FAIL: {res.get('error')}"
     cpath = os.path.join(_out_dir(day.replace("-", ""), tag), "curve.json")
@@ -142,41 +150,70 @@ def build_blocks(windows: list[str], topn: list[int], wms: list[str]) -> tuple[l
         print(f"  窗口完成, 用时 {time.time() - t0:.1f}s", flush=True)
     print(f"\n扫描总用时 {(time.time() - t_all) / 60:.1f} 分钟", flush=True)
 
-    # 只保留"所有窗口都成功"的配置, 保证矩阵是矩形
+    # 可用窗口: 该窗口下**全部**配置都成功(前向模式下末端窗口会因未来数据不足整体失败)
+    usable = [d for d in windows
+              if all(series.get((tn, wm), {}).get(d) is not None
+                     and len(series[(tn, wm)][d]) >= 3 for tn, wm in grid)]
+    unusable = [d for d in windows if d not in usable]
+    if unusable:
+        print(f"  [warn] {len(unusable)} 个窗口全部配置均失败, 已排除: {unusable}")
+        diag["excluded_windows"] = unusable
+
+    # 只保留"所有可用窗口都成功"的配置, 保证矩阵是矩形
     ok_cfgs = []
     for cfg, per_win in series.items():
         if not cfg:
             continue
-        if all(per_win.get(d) is not None and len(per_win[d]) >= 3 for d in windows):
+        if all(per_win.get(d) is not None and len(per_win[d]) >= 3 for d in usable):
             ok_cfgs.append(cfg)
     ok_cfgs.sort()
-    dropped = [f"top{tn}_{wm}" for (tn, wm) in grid if (tn, wm) not in ok_cfgs]
-    diag["skipped_config"] = dropped
+    diag["skipped_config"] = [f"top{tn}_{wm}" for (tn, wm) in grid if (tn, wm) not in ok_cfgs]
+
+    if not ok_cfgs:
+        raise SystemExit("ERROR: 没有任何配置在全部可用窗口上成功, 无法构建 CSCV 矩阵")
+    if len(usable) < 4:
+        raise SystemExit(f"ERROR: 可用窗口仅 {len(usable)} 个(<4), 无法做 CSCV")
 
     blocks = []
-    for day in windows:
+    for day in usable:
         per_cfg = {cfg: series[cfg][day] for cfg in ok_cfgs}
         common = None
         for s in per_cfg.values():
             common = s.index if common is None else common.intersection(s.index)
+        if common is None:
+            continue
         common = list(common)
         if len(common) < 10:
             print(f"  [warn] 窗口 {day} 公共交易日仅 {len(common)} 天, 跳过")
             continue
         m = np.column_stack([per_cfg[cfg].reindex(common).to_numpy() for cfg in ok_cfgs])
-        blocks.append(m)
+        blocks.append((day, m))
         diag["per_window_days"][day] = len(common)
-    return blocks, [f"top{tn}_{wm}" for tn, wm in ok_cfgs], diag
+
+    # CSCV 要求 IS/OOS 等块 -> 块数必须为偶数; 奇数时按时间顺序去掉最早一个
+    if len(blocks) % 2 == 1:
+        dropped_day, _ = blocks.pop(0)
+        print(f"  [warn] 块数为奇数, 为保证 IS/OOS 等块去掉最早窗口: {dropped_day}")
+        diag["odd_drop_window"] = dropped_day
+    return ([m for _, m in blocks],
+            [f"top{tn}_{wm}" for tn, wm in ok_cfgs], diag)
 
 
 def main() -> None:
+    global MODE
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows", nargs="*", default=None)
     ap.add_argument("--topn", type=str, default=",".join(map(str, DEFAULT_TOPN)))
     ap.add_argument("--weights", type=str, default=",".join(DEFAULT_WEIGHTS))
     ap.add_argument("--limit-windows", type=int, default=0)
     ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--backward", action="store_true",
+                    help="回到历史(前视)口径; 默认前向(无前视)")
     args = ap.parse_args()
+
+    MODE = "backward" if args.backward else "forward"
+    if args.backward:
+        print("[warn] --backward: 窗口落在决策日之前, 存在前视, 结果不可用于 OOS 判断.")
 
     windows = args.windows or _default_windows()
     if not windows:
@@ -186,7 +223,7 @@ def main() -> None:
         windows = windows[:args.limit_windows]
     topn = [int(x) for x in args.topn.split(",") if x.strip()]
     wms = [x.strip() for x in args.weights.split(",") if x.strip()]
-    print(f"窗口 {len(windows)} 个: {windows}")
+    print(f"窗口口径: {MODE}  窗口 {len(windows)} 个: {windows}")
     print(f"配置 {len(topn) * len(wms)} 组: top_n={topn} × weight={wms}, lookback={LOOKBACK}")
 
     os.makedirs(PBO_DIR, exist_ok=True)
@@ -228,6 +265,7 @@ def main() -> None:
     res = cscv_pbo(blocks[:n_blocks])
     out = {
         "run_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "window_mode": MODE,
         "windows": windows,
         "blocks_used": n_blocks,
         "configs": cfgs,
@@ -237,8 +275,12 @@ def main() -> None:
     }
     with open(RESULT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+    arch = os.path.join(PBO_DIR, f"pbo_result_{MODE}.json")
+    with open(arch, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
 
-    print(f"\n{'=' * 62}\n  CSCV-PBO 结果\n{'=' * 62}")
+    print(f"\n{'=' * 62}\n  CSCV-PBO 结果  (窗口口径={MODE}"
+          f"{'  无前视' if MODE == 'forward' else '  ⚠ 存在前视'})\n{'=' * 62}")
     print(f"  时间块 S={res['n_blocks']}  配置 N={res['n_configs']}  组合数={res['n_combos']}")
     print(f"  PBO = {res['pbo']:.4f}  ({res['pbo']*100:.2f}%)   [越低越好, >50% 视为过拟合]")
     print(f"  λ 分布: mean={res['lambda_mean']:.3f} std={res['lambda_std']:.3f} "

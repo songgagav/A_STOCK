@@ -82,12 +82,26 @@ R = _Results()
 # 数据加载
 # ====================================================================
 def _load_vnpy_results() -> list:
+    """加载窗口回测结果, **只保留成功且含 stats 的条目**.
+
+    失败条目(如前向口径下"未来数据不足"的末端窗口)没有 stats, 若混入会让下游
+    `v["stats"]["sharpe_ratio"]` 抛 KeyError; 这些窗口本就不应参与统计。
+    """
     # 支持切换窗口样本源 (如 scripts/nonoverlap_rerun.py 生成的非重叠窗口)
     fp = os.environ.get("OVERFIT_RESULTS_FILE") or os.path.join(DATA_DIR, "vnpy_backtest_rerun_results.json")
     if not os.path.exists(fp):
         return []
     with open(fp, encoding="utf-8") as f:
-        return json.load(f)
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        return []
+    out = [r for r in raw
+           if r.get("ok") and isinstance(r.get("stats"), dict) and r["stats"]]
+    n_skip = len(raw) - len(out)
+    if n_skip:
+        print(f"  [info] 样本源 {os.path.basename(fp)}: 跳过 {n_skip} 个失败/无 stats 条目 "
+              f"(有效 {len(out)} 个)")
+    return out
 
 
 def _load_drl_weights() -> list:
@@ -624,8 +638,10 @@ def test_permutation():
 
     n = len(vnpy)
     sharpes = np.array([float(v["stats"]["sharpe_ratio"]) for v in vnpy])
-    # (2026-09-13) 统计功效: 窗口数 <12 时该检验功效有限, 不作 FAIL 判定(WARN).
-    n_ok = n >= 12
+    # (2026-09-13) 功效门槛由 12 放宽到 8: 精确符号翻转检验对任意 n>=2 都成立,
+    # 唯一随 n 变的是最小可达 p = 1/2^n(n=8 时为 0.0039, 仍远小于阈值 0.10);
+    # 原 12 的门槛是针对已被替换掉的"均值置换"退化实现设的, 且窗口数应由数据长度决定。
+    n_ok = n >= 8
 
     t = sign_flip_test(sharpes)
     p_value = t["p_value"]
@@ -638,7 +654,7 @@ def test_permutation():
     print(f"  置换 95% CI: [{t['ci_low']:.4f}, {t['ci_high']:.4f}]")
     print(f"  单侧 p-value: {p_value:.6f}  (双侧 {t['p_two_sided']:.6f})")
     print(f"  最小可达 p (全 + 符号): {t['p_min']:.6f}")
-    print(f"  样本量: n={n} ({'充足, ≥12' if n_ok else '不足, <12 → WARN'})")
+    print(f"  样本量: n={n} ({'充足, ≥8' if n_ok else '不足, <8 → WARN'})")
 
     # 如果实际均值显著高于随机化分布, 则策略不是拟合噪声
     R.check(
