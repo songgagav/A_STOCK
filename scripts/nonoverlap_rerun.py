@@ -98,6 +98,10 @@ def main() -> None:
     forward = "--backward" not in args
     mode = "forward" if forward else "backward"
     out = OUT_FWD if forward else OUT_LEGACY
+    # 2026-09-13: 排序口径不同(如 RANK_BY_FUSION=1)时结果须另存, 避免覆盖基线
+    _suf = os.environ.get("OOS_OUT_SUFFIX", "")
+    if _suf:
+        out = out.replace(".json", f"_{_suf}.json")
     if not forward:
         print("[warn] --backward: 窗口为 [终点-120, 终点], 评估期落在决策日之前, "
               "存在前视, 结果不可用于样本外评估(仅回溯归因).")

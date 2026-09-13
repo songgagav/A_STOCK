@@ -58,6 +58,17 @@ def _rank_normalize(scored: list, W: dict) -> None:
         )
 
 
+def _rank_key(x: dict):
+    """排序键: 开启融合排名(RANK_BY_FUSION!=0)时用 fusion_rank_key, 否则用 score.
+
+    _apply_fusion_rank 要么给**所有**条目写入 fusion_rank_key, 要么一条都不写,
+    因此排序时量纲始终一致(不会混用 0~1 分位与原始 score)。
+    """
+    if "fusion_rank_key" in x:
+        return x["fusion_rank_key"]
+    return x["score"]
+
+
 class RotationSelector:
     def __init__(self, db: StockDB, n: int = MAX_STOCKS):
         self.db = db
@@ -66,6 +77,53 @@ class RotationSelector:
     # ---------- f_ml 融合因子接入(容错: 失败即退化为原打分) ----------
     def _latest_bar_date(self) -> str:
         return pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    def _apply_fusion_rank(self, scored: list, as_of: str) -> None:
+        """(2026-09-13) 可选: 让四因子融合分参与排序, 而非只用旧 SCORE_WEIGHTS 复合.
+
+        背景(证据见 scripts/ic_neutral_check.py / docs/pit-valuation.md 第 10 条):
+          旧复合 `signal` 的 IC 全视界为负(均值 -0.0674);
+          而 pb_inv+ep+ocf_ps+roe_yy_chg 融合分 IC 全视界为正(修正 roe 方向后 +0.1167)。
+        融合分目前只用于权重分配, 未参与选股排名。本函数提供开关:
+
+          RANK_BY_FUSION=0 关闭(默认, 原行为不变)
+          RANK_BY_FUSION=1 打开; 混合比例 FUSION_RANK_ALPHA (0=纯旧排序, 1=纯融合)
+
+        实现要点: 只写 `fusion_rank_key`(两路排名各转 0~1 分位后线性混合), **不改
+        `score`**, 以免影响下游 allocate_target_weights 等对 score 量纲的依赖;
+        排序处优先用 fusion_rank_key。失败静默回退原排序。
+        """
+        if os.environ.get("RANK_BY_FUSION", "0") in ("", "0") or not scored:
+            return
+        try:
+            alpha = float(os.environ.get("FUSION_RANK_ALPHA", "1.0"))
+        except Exception:
+            alpha = 1.0
+        alpha = min(max(alpha, 0.0), 1.0)
+        try:
+            from factor_fusion import cross_section_scores
+            syms = [str(x.get("canon") or "").split(".")[0].zfill(6) for x in scored]
+            res = cross_section_scores(as_of, symbols=syms)
+            zmap = (res or {}).get("scores") or {}
+            if not zmap:
+                return
+            zs = np.array([zmap.get(s, np.nan) for s in syms], dtype=float)
+            if int(np.isfinite(zs).sum()) < 30:
+                return
+            med = float(np.nanmedian(zs))
+            zs = np.where(np.isfinite(zs), zs, med)
+            old = np.array([float(x.get("score") or 0.0) for x in scored], dtype=float)
+
+            def _pct_rank(a: np.ndarray) -> np.ndarray:
+                o = np.argsort(np.argsort(a))
+                return o / max(len(a) - 1, 1)
+
+            blended = (1.0 - alpha) * _pct_rank(old) + alpha * _pct_rank(zs)
+            for x, b, z in zip(scored, blended, zs):
+                x["fusion_rank_key"] = float(b)
+                x["fusion_z"] = float(z)
+        except Exception:
+            return
 
     def _blend_fml(self, scored: list, as_of: str) -> None:
         """对 scored(含 canon/score) 现算 f_ml/fused score, 以截面百分位排名(0..1)
@@ -268,7 +326,8 @@ class RotationSelector:
             _rank_normalize(scored, W)
 
         self._blend_fml(scored, as_of or self._latest_bar_date())
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        self._apply_fusion_rank(scored, as_of or self._latest_bar_date())
+        scored.sort(key=_rank_key, reverse=True)
         top_n = scored[: self.n]
         # 策略层优化 (2026-09-05): 目标权重分配 — f_ml 预测加权(收缩+集中度上限)
         # 写入每项 target_weight(相对总资产, 和=1); 引擎下单将消费该字段,
@@ -396,7 +455,8 @@ class RotationSelector:
                 "score": round(float(score), 4),
                 "thesis": thesis,
             })
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        self._apply_fusion_rank(scored, hist_day)
+        scored.sort(key=_rank_key, reverse=True)
         top_n = scored[: self.n]
         basket_signal = float(np.mean([t["signal"] for t in top_n])) if top_n else 0.0
         return {

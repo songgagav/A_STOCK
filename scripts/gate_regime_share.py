@@ -30,8 +30,8 @@ PY = sys.executable
 def main() -> None:
     fw = [x for x in json.load(open(FW, encoding="utf-8")) if x.get("ok")]
     print(f"门控 regime 分布: {len(fw)} 个前向窗口\n")
-    print(f"{'决策日':<12}{'天数':>6}{'unknown':>9}{'risk':>7}{'neutral':>9}"
-          f"{'bull':>7}{'risk占比%':>10}  结论")
+    print(f"{'决策日':<12}{'天数':>6}{'normal':>8}{'caution':>9}{'risk':>7}"
+          f"{'unknown':>9}{'risk占比%':>10}  结论")
     rows = []
     for x in fw:
         day = x["day"]
@@ -57,8 +57,8 @@ def main() -> None:
                          else "RISK 占比正常"))
         rows.append({"day": day, "end": end, "n_days": n, "counts": cnt,
                      "risk_share": risk_share, "unknown_share": 100.0 * cnt.get("unknown", 0) / n})
-        print(f"{day:<12}{n:>6}{cnt.get('unknown', 0):>9}{cnt.get('risk', 0):>7}"
-              f"{cnt.get('neutral', 0):>9}{cnt.get('bull', 0):>7}{risk_share:>10.1f}  "
+        print(f"{day:<12}{n:>6}{cnt.get('normal', 0):>8}{cnt.get('caution', 0):>9}"
+              f"{cnt.get('risk', 0):>7}{cnt.get('unknown', 0):>9}{risk_share:>10.1f}  "
               f"{verdict}  ({time.time() - t0:.0f}s)", flush=True)
 
     with open(OUT, "w", encoding="utf-8") as f:
