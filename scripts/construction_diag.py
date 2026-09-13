@@ -41,7 +41,8 @@ TOPK = 10
 TRIM_Q = 0.95
 FML_W = 0.10          # 生产 FML_WEIGHT 默认值 (ml_fusion_bridge)
 
-KEYS = ["old_base", "prod_score", "pure_fusion", "fusion_trim5", "fusion_rank11_20"]
+KEYS = ["old_base", "prod_score", "pure_fusion", "fusion_trim5", "fusion_rank11_20",
+        "prod_trim"]
 
 
 def _pct_rank(a: pd.Series) -> pd.Series:
@@ -87,6 +88,9 @@ def main() -> None:
         cut = m["fz"].quantile(TRIM_Q)
         m_trim = m[m["fz"] <= cut]
         m_top20 = m.nlargest(2 * TOPK, "fz")
+        # 组合方案: 生产式 10% 掺入 + 融合分截尾 (极端头部降为最低分位, 不参与头部)
+        m["fz_trim_pct"] = m["fz"].where(m["fz"] <= cut).rank(pct=True).fillna(0.0)
+        m["prod_trim"] = (1.0 - FML_W) * m["old_base"] + FML_W * m["fz_trim_pct"]
 
         picks = {
             "old_base": m.nlargest(TOPK, "old_base"),
@@ -94,6 +98,7 @@ def main() -> None:
             "pure_fusion": m.nlargest(TOPK, "pure_fusion"),
             "fusion_trim5": m_trim.nlargest(TOPK, "fz"),
             "fusion_rank11_20": m_top20.tail(TOPK),
+            "prod_trim": m.nlargest(TOPK, "prod_trim"),
         }
 
         rec = {"day": day, "n": int(len(m))}
