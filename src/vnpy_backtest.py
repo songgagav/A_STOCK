@@ -140,11 +140,19 @@ PIT_SEL_CACHE_DIR = os.path.join(DATA_DIR, "pit", "selection_cache")
 
 
 def _pit_cache_path(day: str, n: int) -> str:
-    # 2026-09-13: 排序口径不同 -> 选股结果不同, 缓存必须隔离, 否则开关切换会命中旧产物
+    # 2026-09-13: 排序/掺入口径不同 -> 选股结果不同, 缓存必须隔离, 否则开关切换会命中旧产物
     mode = os.environ.get("RANK_BY_FUSION", "0")
     tag = ""
     if mode not in ("", "0"):
         tag = f"_rf{mode}a{os.environ.get('FUSION_RANK_ALPHA', '1.0')}"
+    # 融合分截尾(FUSION_TRIM_Q)改变的是 score(掺入口径), 与 RANK_BY_FUSION 无关,
+    # 因此即使不切排序也要带标签隔离缓存。
+    try:
+        _q = float(os.environ.get("FUSION_TRIM_Q", "0") or 0.0)
+    except (TypeError, ValueError):
+        _q = 0.0
+    if _q > 0:
+        tag += f"_t{_q}"
     return os.path.join(PIT_SEL_CACHE_DIR, f"{day}_n{int(n)}{tag}.json")
 
 
