@@ -24,6 +24,43 @@ from ml_fusion_bridge import FML_WEIGHT  # 兼容旧 import; f_ml 计算统一�
 _RANK_FIELDS = ["vol", "mom_rev", "pb_rev", "roe", "mf_net"]
 
 
+def fusion_trim_q() -> float:
+    """融合分截尾比例 (环境变量 FUSION_TRIM_Q, 默认 0 = 关闭).
+
+    背景与证据(2026-09-13, 见 docs/pit-valuation.md 第 15/16 条): 融合分的池内 RankIC
+    为正(+0.1105) 且全截面 IC 为正, 但**池内最尖的 top10**(约前 0.5%)前向收益为负
+    (-5.89% vs 池内其余 +3.73%, 最高 1% 分位 -1.71%) —— 秩相关为正、极端头部反转。
+    对参与排序/掺入的融合分**剔除最高的 q 比例**后, 头部收益转正且稳健:
+      纯融合口径  3/5/8/10/15% 均改善, 5% 最强(+16.65pp, 11/11 窗口改善, t=4.10)
+      掺入口径    3%/5% 有效(+7.22/+6.27pp, t=3.34/3.10), 8% 起失效
+    故默认关闭(=0), 推荐值 0.05。
+    """
+    try:
+        q = float(os.environ.get("FUSION_TRIM_Q", "0") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(q, 0.0), 0.5)
+
+
+def trim_top(values: np.ndarray, q: float):
+    """把最高 q 比例的值置为 NaN. 返回 (trimmed, mask).
+
+    q<=0 或样本过少时原样返回。用于"极端头部反转"的处理: 被截掉的标的在排序里
+    被降到最低档(rank=0)而不是"跳过", 以保持 score 量纲一致。
+    """
+    v = np.asarray(values, dtype=float)
+    if q <= 0 or v.size < 20:
+        return v, np.zeros(v.shape, dtype=bool)
+    finite = v[np.isfinite(v)]
+    if finite.size < 20:
+        return v, np.zeros(v.shape, dtype=bool)
+    cut = float(np.quantile(finite, 1.0 - q))
+    mask = v > cut
+    out = v.copy()
+    out[mask] = np.nan
+    return out, mask
+
+
 def _rank_normalize(scored: list, W: dict) -> None:
     """将 scored 中各因子的线性裁切值替换为横截面 rank percentile (0..1).
 
@@ -112,13 +149,18 @@ class RotationSelector:
                 return
             med = float(np.nanmedian(zs))
             zs = np.where(np.isfinite(zs), zs, med)
+            # 极端头部截尾 (FUSION_TRIM_Q, 默认 0=关闭): 与 _blend_fml 同一口径,
+            # 被截掉的标的降到最低分位, 不再参与头部竞争。
+            zs_t, trimmed = trim_top(zs, fusion_trim_q())
+            if trimmed.any():
+                zs_t = np.where(trimmed, float(np.nanmin(zs)), zs_t)
             old = np.array([float(x.get("score") or 0.0) for x in scored], dtype=float)
 
             def _pct_rank(a: np.ndarray) -> np.ndarray:
                 o = np.argsort(np.argsort(a))
                 return o / max(len(a) - 1, 1)
 
-            blended = (1.0 - alpha) * _pct_rank(old) + alpha * _pct_rank(zs)
+            blended = (1.0 - alpha) * _pct_rank(old) + alpha * _pct_rank(zs_t)
             for x, b, z in zip(scored, blended, zs):
                 x["fusion_rank_key"] = float(b)
                 x["fusion_z"] = float(z)
@@ -140,11 +182,17 @@ class RotationSelector:
             return
         vals = np.array([fml.get(s["canon"], np.nan) for s in scored],
                         dtype=float)
-        good = ~np.isnan(vals)
+        # 极端头部截尾 (FUSION_TRIM_Q, 默认 0=关闭): 被截掉的标的 rank 记 0(最低档),
+        # 即不再获得融合加成; 而不是整条跳过, 以保持 score 量纲与其余标的一致。
+        q = fusion_trim_q()
+        vals_t, trimmed = trim_top(vals, q)
+        good = ~np.isnan(vals_t)
         ranks = np.full(len(scored), np.nan)
         if int(good.sum()) > 1:
-            order = np.argsort(np.argsort(vals[good]))
+            order = np.argsort(np.argsort(vals_t[good]))
             ranks[good] = order / (good.sum() - 1.0)
+        if trimmed.any():
+            ranks[trimmed] = 0.0
         w = min(max(float(FML_WEIGHT), 0.0), 0.5)
         for i, s in enumerate(scored):
             raw = fml.get(s["canon"])
@@ -153,6 +201,8 @@ class RotationSelector:
             base = s["score"]
             s["fml"] = round(float(raw), 5)
             s["fml_rank"] = round(float(ranks[i]), 4)
+            if trimmed[i]:
+                s["fml_trimmed"] = True      # 审计标记: 因极端头部被截尾而降档
             s["score"] = round((1.0 - w) * base + w * float(ranks[i]), 4)
             if ranks[i] >= 0.7:
                 s["thesis"] = ("融合预测信号强" + ("；" + s["thesis"]

@@ -16,6 +16,55 @@ def test_rank_key_prefers_fusion_when_present():
     assert _rank_key({"score": 0.1, "fusion_rank_key": 0.8}) == 0.8
 
 
+class TestFusionTrim:
+    """FUSION_TRIM_Q: 极端头部截尾 (2026-09-13, 见 docs/pit-valuation.md 第 16 条)."""
+
+    def test_trim_top_masks_highest_fraction(self):
+        import numpy as np
+        from selector import trim_top
+        v = np.arange(100, dtype=float)          # 0..99
+        out, mask = trim_top(v, 0.05)
+        assert mask.sum() == 5, "应恰好截掉最高的 5%"
+        assert np.isnan(out[mask]).all()
+        assert np.isfinite(out[~mask]).all()
+
+    def test_trim_top_disabled_when_q_zero(self):
+        import numpy as np
+        from selector import trim_top
+        v = np.arange(100, dtype=float)
+        out, mask = trim_top(v, 0.0)
+        assert not mask.any() and np.isfinite(out).all()
+
+    def test_trim_top_safe_on_small_sample(self):
+        import numpy as np
+        from selector import trim_top
+        v = np.arange(10, dtype=float)
+        out, mask = trim_top(v, 0.05)
+        assert not mask.any(), "样本过少不应截尾(否则会把整个池子打空)"
+
+    def test_fusion_trim_q_env_and_clamp(self, monkeypatch):
+        from selector import fusion_trim_q
+        monkeypatch.delenv("FUSION_TRIM_Q", raising=False)
+        assert fusion_trim_q() == 0.0            # 默认关闭
+        monkeypatch.setenv("FUSION_TRIM_Q", "0.05")
+        assert fusion_trim_q() == 0.05
+        monkeypatch.setenv("FUSION_TRIM_Q", "abc")
+        assert fusion_trim_q() == 0.0            # 非法值回落关闭
+        monkeypatch.setenv("FUSION_TRIM_Q", "0.9")
+        assert fusion_trim_q() == 0.5            # 上限保护
+
+    def test_pit_cache_path_tagged_by_trim(self, monkeypatch):
+        """截尾改变 score -> PIT 缓存必须与不截尾隔离, 否则会命中旧产物."""
+        import vnpy_backtest as V
+        monkeypatch.delenv("RANK_BY_FUSION", raising=False)
+        monkeypatch.delenv("FUSION_TRIM_Q", raising=False)
+        base = V._pit_cache_path("2024-07-03", 10)
+        monkeypatch.setenv("FUSION_TRIM_Q", "0.05")
+        tagged = V._pit_cache_path("2024-07-03", 10)
+        assert base != tagged
+        assert tagged.endswith("_t0.05.json")
+
+
 def test_rank_key_scale_is_uniform_when_set():
     """开启时必须所有条目都有 fusion_rank_key, 否则会混用量纲."""
     from selector import _rank_key
