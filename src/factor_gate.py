@@ -223,15 +223,30 @@ def check_factor_ic_drift(
 _DRIFT_CURVE_TO_SCORE_KEY = {"vol": "vol", "mom_20": "mom_rev"}
 
 
-def load_factor_ic_from_curves(cfg: _Cfg | None = None) -> dict:
+_IC_CURVE_CACHE: dict = {}
+
+
+def load_factor_ic_from_curves(cfg: _Cfg | None = None,
+                               as_of: str | None = None) -> dict:
     """从 data/ic/ic_curve_*_k20.csv 读近 121/近 20 交易日 ic_h20 均值.
 
     口径与 overfitting 6c 一致: long = 近 ic_drift_long_window(默认121) 日,
     short = 近 20 日. 无曲线/样本不足的因子不返回.
+
+    as_of (2026-09-13 新增): 指定历史日时**只取 day <= as_of 的样本**(再取尾部
+    long/short 窗), 避免"用今天的 IC 曲线给历史日期定权重"的前视。
+    as_of=None 保持原行为(取曲线末尾, 用于实盘)。
     """
-    import csv as _csv
     c = cfg or _Cfg()
     long_w = c.ic_drift_long_window
+    key = (c.ic_drift_long_window, c.ic_window, (as_of or "")[:10])
+    if key in _IC_CURVE_CACHE:
+        return _IC_CURVE_CACHE[key]
+    import csv as _csv
+
+    def _tail_mean(vals: list, w: int) -> float:
+        return float(np.mean(vals[-w:])) if len(vals) >= w else float(np.mean(vals))
+
     out = {}
     ic_dir = os.path.join(_BASE, "data", "ic")
     for name in _DRIFT_CURVE_TO_SCORE_KEY:
@@ -242,6 +257,10 @@ def load_factor_ic_from_curves(cfg: _Cfg | None = None) -> dict:
             vals = []
             with open(p, encoding="utf-8") as f:
                 for row in _csv.DictReader(f):
+                    if as_of:
+                        d = str(row.get("day") or "")[:10]
+                        if not d or d > str(as_of)[:10]:
+                            continue
                     v = row.get("ic_h20")
                     if v in (None, ""):
                         continue
@@ -251,16 +270,18 @@ def load_factor_ic_from_curves(cfg: _Cfg | None = None) -> dict:
                         continue
             if len(vals) < 30:
                 continue
-            long_m = float(np.mean(vals[-long_w:])) if len(vals) >= long_w else float(np.mean(vals))
-            short_m = float(np.mean(vals[-20:]))
-            out[name] = {"long_mean": long_m, "short_mean": short_m}
+            out[name] = {"long_mean": _tail_mean(vals, long_w),
+                         "short_mean": _tail_mean(vals, c.ic_window)}
         except Exception:
             continue
+    if len(_IC_CURVE_CACHE) < 256:
+        _IC_CURVE_CACHE[key] = out
     return out
 
 
 def factor_health_flags(factor_ics: dict[str, dict] | None = None,
-                        cfg: _Cfg | None = None) -> dict:
+                        cfg: _Cfg | None = None,
+                        as_of: str | None = None) -> dict:
     """按方向有效性给出打分键处置建议 (供 selector_weights 消费).
 
     - isolate: 因子短期方向翻转或强度收敛归零 (反转义失效), 打分权重应置 0;
@@ -274,7 +295,9 @@ def factor_health_flags(factor_ics: dict[str, dict] | None = None,
     """
     c = cfg or _Cfg()
     # None = 自动读 IC 曲线; 传入 dict(可为空)则按给定数据判定
-    fics = factor_ics if factor_ics is not None else load_factor_ic_from_curves(c)
+    # as_of: 历史日期 -> 只用该日及之前的 IC 曲线, 避免权重层前视
+    fics = (factor_ics if factor_ics is not None
+            else load_factor_ic_from_curves(c, as_of=as_of))
     if not fics:
         return {"enabled": True, "isolated": {},
                 "unstable": [], "drift_detail": {},
