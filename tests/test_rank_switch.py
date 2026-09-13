@@ -109,7 +109,10 @@ def test_pit_cache_path_isolated_by_rank_mode(monkeypatch):
     monkeypatch.setenv("RANK_BY_FUSION", "1")
     p1 = _pit_cache_path("2024-07-03", 20)
     assert p0 != p1
-    assert p0.endswith("2024-07-03_n20.json")
+    # 基线缓存名 = {day}_n{n} + 数据版本标签(2026-09-14 起), 口径标签只在非默认时出现
+    b0 = os.path.basename(p0)
+    assert b0.startswith("2024-07-03_n20")
+    assert "_d" in b0 and "_rf" not in b0
     assert "_rf1" in os.path.basename(p1)
 
 
