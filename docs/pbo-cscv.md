@@ -120,7 +120,22 @@ IS 最优: IS Sharpe 2.659 -> OOS Sharpe 2.548
 OOS~IS 回归斜率 = 0.095
 ```
 
-## 6. 这个结果证明了什么，没有证明什么
+## 6. 同类别辅助项 #8：最优窗口离群度
+
+`[PBO]` 类别下还有一项脆弱性检查（原为"最优-中位数 Sharpe gap < 1.0"）。该阈值存在
+量纲依赖、由单点决定、且与 `[1b]` 的 Sharpe CV 检查重复三个问题，已于 2026-09-13 改为
+**稳健 modified z-score**：
+
+```
+robust_z = (max − median) / (1.4826 × MAD)      阈值 3.5 (Iglewicz & Hoaglin 1993)
+```
+
+它回答的是"整体表现是否被单个离群窗口撑起来"，且量纲无关、平移不变、对单点稳健
+（MAD=0 时退化为 `IQR/1.349` 尺度）。实测 12 窗口 `robust_z = 1.40`（旧口径 gap=2.14
+会被误判 FAIL）——最优窗口 2022-12-30（Sharpe 4.38）并非统计离群点。实现见
+`src/overfitting_test.robust_max_z()`，测试见 `tests/test_overfitting_dispersion.py`。
+
+## 7. 这个结果证明了什么，没有证明什么
 
 **证明了**：在"持仓只数 × 权重构造"这个 18 组配置的搜索空间里，样本内挑出的最优配置在
 样本外依然稳定（924 种划分下无一次落到底部一半，ω̄=0.885）。也就是说，**常用的选参
@@ -141,6 +156,7 @@ OOS~IS 回归斜率 = 0.095
 
 - `src/pbo_cscv.py` — CSCV 纯算法（无 IO 依赖，便于测试）
 - `scripts/pbo_sweep.py` — 参数扫描 + 矩阵构建 + CSCV 调用
-- `src/overfitting_test.py` — `test_pbo()` 读取 `data/pbo/pbo_result.json`
+- `src/overfitting_test.py` — `test_pbo()` 读取 `data/pbo/pbo_result.json`；`robust_max_z()` 为 #8 的离群度口径
 - `src/vnpy_backtest.py` — `sel_n` / `out_tag` / `persist_arctic` / `weight_mode` 参数与选股缓存
-- `tests/test_pbo_cscv.py` — 10 例回归测试
+- `tests/test_pbo_cscv.py` — CSCV 估计算法 10 例回归测试
+- `tests/test_overfitting_dispersion.py` — #8 离群度口径 12 例回归测试

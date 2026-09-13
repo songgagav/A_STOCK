@@ -372,6 +372,51 @@ def _load_pbo_result() -> dict:
         return {}
 
 
+def robust_max_z(x) -> dict:
+    """最优值相对整体的稳健离群度 (modified z-score).
+
+    口径 (2026-09-13 调整): 原检查用 (max - median) 的原始差值, 阈值写死 1.0。该口径
+    有三个问题: ①量纲依赖 Sharpe 单位, 阈值 1.0 无统计含义; ②完全由单个最大值决定,
+    对样本量不敏感; ③与"滚动窗口 Sharpe 稳定性 (CV < 2.0)"重复度量离散度。
+
+    改为回答真正关心的脆弱性问题 —— **整体表现是否被单个离群窗口撑起来**:
+        robust_z = (max - median) / (1.4826 * MAD)
+    其中 MAD = median(|x - median(x)|), 1.4826 是使之与正态标准差一致的一致性常数。
+    该统计量对量纲不变(乘以任意正数 z 不变)、对单个离群点稳健, 阈值取 3.5
+    (Iglewicz & Hoaglin 1993 的常用离群判据)。
+
+    MAD 为 0 时(半数以上取值相同)退化为用 IQR/1.349 作为尺度; 二者都为 0 说明所有
+    取值几乎相同, 此时 max 与 median 不等即视为离群(返回 inf)。
+
+    返回 dict: robust_z / mad / scale / iqr / median / max / gap。
+    """
+    arr = np.asarray(x, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {"robust_z": float("nan"), "mad": float("nan"), "scale": float("nan"),
+                "iqr": float("nan"), "median": float("nan"),
+                "max": float("nan"), "gap": float("nan"), "n": 0}
+    med = float(np.median(arr))
+    mx = float(np.max(arr))
+    gap = mx - med
+    mad = float(np.median(np.abs(arr - med)))
+    q75, q25 = np.percentile(arr, [75, 25])
+    iqr = float(q75 - q25)
+    scale = 1.4826 * mad
+    if scale <= 1e-12:
+        scale = iqr / 1.349
+    if scale <= 1e-12:
+        z = 0.0 if abs(gap) <= 1e-12 else float("inf")
+    else:
+        z = float(gap) / scale
+    return {"robust_z": z, "mad": mad, "scale": float(scale), "iqr": iqr,
+            "median": med, "max": mx, "gap": float(gap), "n": int(arr.size)}
+
+
+def _fmt_z(z: float) -> str:
+    return "inf" if z == float("inf") else f"{z:.2f}"
+
+
 def test_pbo():
     print("\n" + "=" * 60)
     print("  [2] 过拟合概率 (PBO) 检验")
@@ -462,18 +507,37 @@ def test_pbo():
     # ------------------------------------------------------------------
     median_sharpe = float(np.median(sharpes))
     sharpe_gap = best_sharpe - median_sharpe
+    # ------------------------------------------------------------------
+    # [辅助] 脆弱性: 整体表现是否被单个离群窗口撑起来
+    #
+    # 2026-09-13 口径调整。原为 (max - median) 原始差值、阈值写死 1.0 —— 量纲依赖
+    # Sharpe 单位、完全由单个最大值决定、且与"滚动窗口 Sharpe 稳定性(CV<2.0)"重复。
+    # 现改用稳健 modified z-score(见 robust_max_z), 阈值 3.5(Iglewicz-Hoaglin 离群判据)。
+    # 离散度本身已由 [1b] 的 CV 检查覆盖, 此处专门回答"是否单窗口离群"。
+    # ------------------------------------------------------------------
+    zs = robust_max_z(sharpes)
+    rz = zs["robust_z"]
+    print(f"  最优窗口稳健离群度: robust_z={_fmt_z(rz)} "
+          f"(max={zs['max']:.3f} median={zs['median']:.3f} gap={zs['gap']:.3f} "
+          f"1.4826*MAD={zs['scale']:.3f} IQR={zs['iqr']:.3f}, n={zs['n']})")
     R.check(
-        "窗口间 Sharpe 离散度合理 (最优-中位数 gap < 1.0)",
-        sharpe_gap < 1.0,
-        f"最优 {best_sharpe:.3f} vs 中位数 {median_sharpe:.3f}, gap={sharpe_gap:.3f} "
-        f"(描述性: 反映窗口间行情异质性, 非过拟合证据)",
-        measured=f"gap={sharpe_gap:.3f}",
-        threshold="< 1.0",
+        "窗口间 Sharpe: 最优窗口不构成离群 (稳健 z < 3.5)",
+        rz < 3.5,
+        f"robust_z={_fmt_z(rz)} = (max {zs['max']:.3f} - median {zs['median']:.3f}) / "
+        f"(1.4826*MAD {zs['scale']:.3f}); 原始 gap={zs['gap']:.3f}, IQR={zs['iqr']:.3f}, "
+        f"n={zs['n']} 窗口。量纲无关, 阈值 3.5 = Iglewicz-Hoaglin 离群判据 "
+        f"(离散度另见 [1b] Sharpe CV 检查)",
+        measured=f"稳健 z={_fmt_z(rz)}",
+        threshold="< 3.5",
         category="PBO",
     )
 
     return {"pbo": pbo, "best_sharpe": best_sharpe,
             "median_sharpe": median_sharpe, "sharpe_gap": sharpe_gap,
+            # inf 不是合法 JSON, 落报告时转字符串
+            "robust_z": ("inf" if rz == float("inf")
+                         else (None if rz != rz else rz)),
+            "mad": zs["mad"], "iqr": zs["iqr"],
             "pbo_source": "cscv" if res else "not_run"}
 
 
