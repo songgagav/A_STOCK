@@ -140,7 +140,12 @@ PIT_SEL_CACHE_DIR = os.path.join(DATA_DIR, "pit", "selection_cache")
 
 
 def _pit_cache_path(day: str, n: int) -> str:
-    return os.path.join(PIT_SEL_CACHE_DIR, f"{day}_n{int(n)}.json")
+    # 2026-09-13: 排序口径不同 -> 选股结果不同, 缓存必须隔离, 否则开关切换会命中旧产物
+    mode = os.environ.get("RANK_BY_FUSION", "0")
+    tag = ""
+    if mode not in ("", "0"):
+        tag = f"_rf{mode}a{os.environ.get('FUSION_RANK_ALPHA', '1.0')}"
+    return os.path.join(PIT_SEL_CACHE_DIR, f"{day}_n{int(n)}{tag}.json")
 
 
 def _out_dir(day_dir: str, out_tag: str = "") -> str:
