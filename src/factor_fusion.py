@@ -10,6 +10,7 @@
 #   data/h5i/market.db  (daily_bars / financials / valuation)
 #   data/h5i/static/symbols.parquet
 #   data/industry_map.json
+#   data/pit/pe_patch/*.parquet (pe_ttm 补丁: 主表在部分交易日整体缺 pe_ttm, 见 _PATCH)
 # 不触碰 h5i 库文件、不引用 DuckDB、不启动常驻进程。
 #
 # 因子与融合参数 (由月度中性化面板 m6_neutralize post-ICIR 核定):
@@ -212,6 +213,91 @@ def _fin_frame() -> pd.DataFrame:
 # valuation 范围缓存 (按需从 lo 加载)
 _VAL = None
 _VAL_LO = None
+
+
+# pe_ttm 补丁 (data/pit/pe_patch/*.parquet, 由东财历史估值回补).
+# 为什么必须合并: 主表 valuation 的 pe_ttm 在部分交易日**整体缺失**(上游写入缺口),
+# 实测覆盖率 2018-2024 年 77%~90%(≈亏损公司), 但 2025 年均值 28.5%、2026 年均值 5.0%,
+# 66 个决策/调仓日里 10 个 <50%, 2026-03-05 仅 0.4% ⇒ ep 因子在这些日期**整体失效**
+# (而 pb 始终 100%, 所以不是"没数据", 是没写进来)。补丁覆盖同期末尾, 合并后
+# 2026-03-05 的 pe_ttm 非空率由 0.4% 升到 100%(可算 ep 的 72%)。
+# PIT 安全性: 补丁每行自带日期 d, 只做**同日**左连接填空, 不引入新行、不覆盖主表已有值,
+# 且这些行随后仍受 _Snap 的 "d <= upto" 约束, 因此无前视。
+_PATCH = None
+
+
+def _pe_patch_all() -> pd.DataFrame:
+    """载入并缓存全部 pe_ttm 补丁行 (symbol 以 int32 存储省内存)."""
+    global _PATCH
+    if _PATCH is not None:
+        return _PATCH
+    import glob
+    from config import DATA_DIR as _DD
+    files = sorted(glob.glob(os.path.join(_DD, "pit", "pe_patch", "*.parquet")))
+    parts = []
+    for f in files:
+        try:
+            parts.append(pd.read_parquet(f, columns=["ts", "symbol", "pe_ttm"]))
+        except Exception as e:  # noqa: BLE001
+            _LOG.warning("pe_patch 读取失败 %s: %s", os.path.basename(f), str(e)[:120])
+    if not parts:
+        _PATCH = pd.DataFrame({"sym_i": np.array([], dtype="int32"),
+                               "d": pd.to_datetime([]), "pe_ttm": np.array([])})
+        _LOG.warning("pe_patch 为空: ep 因子在 pe_ttm 缺口日期仍会失效")
+        return _PATCH
+    df = pd.concat(parts, ignore_index=True)
+    df["sym_i"] = pd.to_numeric(df["symbol"].astype(str).str.zfill(6),
+                                errors="coerce").astype("Int32")
+    df["d"] = pd.to_datetime(df["ts"]).dt.normalize()
+    df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
+    df = df.dropna(subset=["pe_ttm", "sym_i"])
+    # 多个补丁文件的时间范围有重叠, 同 (symbol, d) 只留最后一份
+    df = df.sort_values("d").drop_duplicates(["sym_i", "d"], keep="last")
+    _PATCH = df[["sym_i", "d", "pe_ttm"]].reset_index(drop=True)
+    _LOG.info("pe_patch 载入 %d 行 (%s ~ %s), 文件 %d 个", len(_PATCH),
+              _PATCH["d"].min().date(), _PATCH["d"].max().date(), len(parts))
+    return _PATCH
+
+
+def _pe_patch_rows(lo) -> pd.DataFrame:
+    """补丁行 (symbol 转回 6 位字符串), 只取 d >= lo, 与 _val_frame 的范围对齐."""
+    allp = _pe_patch_all()
+    if allp.empty:
+        return allp
+    sub = allp if lo is None else allp[allp["d"] >= pd.Timestamp(lo).normalize()]
+    if sub.empty:
+        return sub
+    out = sub.copy()
+    out["symbol"] = out["sym_i"].astype(str).str.zfill(6)
+    return out[["symbol", "d", "pe_ttm"]]
+
+
+def _merge_pe_patch(df: pd.DataFrame, patch: pd.DataFrame) -> pd.DataFrame:
+    """按 (symbol, d) 左连接补丁, **仅填空不覆盖**, 且不改变行数.
+
+    单独抽成纯函数以便测试: 行数与语义(主表优先、补丁只补缺口)都是硬约束。
+    """
+    if df is None or df.empty or patch is None or patch.empty:
+        return df
+    p = patch[["symbol", "d", "pe_ttm"]].rename(columns={"pe_ttm": "_p_pe"})
+    out = df.merge(p, on=["symbol", "d"], how="left")
+    if len(out) != len(df):     # 补丁未按 (symbol,d) 去重会放大行数 -> 宁可不补
+        _LOG.warning("pe_patch 合并后行数 %d -> %d, 放弃合并以免污染样本",
+                     len(df), len(out))
+        return df
+    cur = pd.to_numeric(out["pe_ttm"], errors="coerce")
+    new = pd.to_numeric(out["_p_pe"], errors="coerce")
+    fill = cur.isna() & new.notna()
+    out["pe_ttm"] = cur.where(~fill, new)
+    out = out.drop(columns=["_p_pe"])
+    n0, n1 = int(cur.notna().sum()), int(out["pe_ttm"].notna().sum())
+    if n1 > n0:
+        tot = max(len(out), 1)
+        _LOG.info("pe_patch 填补 pe_ttm %d 行 (非空 %d -> %d, %.1f%% -> %.1f%%)",
+                  n1 - n0, n0, n1, n0 / tot * 100, n1 / tot * 100)
+    return out
+
+
 def _val_frame(lo: pd.Timestamp) -> pd.DataFrame:
     global _VAL, _VAL_LO
     if _VAL is not None and (lo is None or (_VAL_LO is not None and lo >= _VAL_LO)):
@@ -224,6 +310,8 @@ def _val_frame(lo: pd.Timestamp) -> pd.DataFrame:
     df["d"] = pd.to_datetime(df["d"])
     df = df.drop_duplicates(["symbol", "d"], keep="last")
     df = df.sort_values("d").reset_index(drop=True)
+    # pe_ttm 补丁: 主表在部分日期整体缺 pe_ttm(见 _PATCH 注释), 不补则 ep 因子失效
+    df = _merge_pe_patch(df, _pe_patch_rows(lo))
     _VAL, _VAL_LO = df, lo
     _LOG.debug("val_frame loaded since=%s rows=%d %.0fs", lo_s, len(df),
                time.time() - t0)

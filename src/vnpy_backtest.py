@@ -139,6 +139,38 @@ def _load_selection(day_dir: str) -> list[dict]:
 PIT_SEL_CACHE_DIR = os.path.join(DATA_DIR, "pit", "selection_cache")
 
 
+_DATA_VER = None
+
+
+def _data_version() -> str:
+    """pe_ttm 补丁的数据版本标签(8 位十六进制).
+
+    为什么需要: 补丁一旦新增/更新, 历史日期的 pe_ttm 就会变 -> 融合分变 -> 选股结果变,
+    但缓存键里原本没有数据版本, 会**静默命中旧产物**(2026-09-14 修 pe_ttm 链路时,
+    10 个日期的主表覆盖率为 0~5%, 那些缓存全部作废却无从察觉)。
+    主表 valuation 是 append-only 且无法回填历史, 所以只需对补丁做版本。
+    """
+    global _DATA_VER
+    if _DATA_VER is not None:
+        return _DATA_VER
+    import glob
+    import hashlib
+    from config import DATA_DIR as _DD
+    files = sorted(glob.glob(os.path.join(_DD, "pit", "pe_patch", "*.parquet")))
+    if not files:
+        _DATA_VER = "np"
+        return _DATA_VER
+    h = hashlib.md5()
+    for f in files:
+        try:
+            stt = os.stat(f)
+            h.update(f"{os.path.basename(f)}:{stt.st_size}:{int(stt.st_mtime)};".encode())
+        except OSError:
+            h.update(f"{os.path.basename(f)}:missing;".encode())
+    _DATA_VER = h.hexdigest()[:8]
+    return _DATA_VER
+
+
 def _pit_cache_path(day: str, n: int) -> str:
     # 2026-09-13: 排序/掺入口径不同 -> 选股结果不同, 缓存必须隔离, 否则开关切换会命中旧产物
     mode = os.environ.get("RANK_BY_FUSION", "0")
@@ -153,6 +185,8 @@ def _pit_cache_path(day: str, n: int) -> str:
         _q = 0.0
     if _q > 0:
         tag += f"_t{_q}"
+    # 数据版本: 补丁更新后历史 pe_ttm 会变 -> 融合分变 -> 旧缓存必须失效
+    tag += f"_d{_data_version()}"
     return os.path.join(PIT_SEL_CACHE_DIR, f"{day}_n{int(n)}{tag}.json")
 
 

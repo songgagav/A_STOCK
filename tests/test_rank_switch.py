@@ -62,7 +62,17 @@ class TestFusionTrim:
         monkeypatch.setenv("FUSION_TRIM_Q", "0.05")
         tagged = V._pit_cache_path("2024-07-03", 10)
         assert base != tagged
-        assert tagged.endswith("_t0.05.json")
+        assert "_t0.05" in tagged
+
+    def test_pit_cache_path_carries_data_version(self):
+        """补丁更新会改变历史 pe_ttm -> 缓存必须带数据版本, 否则静默命中旧产物."""
+        import vnpy_backtest as V
+        p = V._pit_cache_path("2024-07-03", 10)
+        ver = V._data_version()
+        assert ver and len(ver) >= 2
+        assert p.endswith(f"_d{ver}.json")
+        # 版本标签稳定(同一进程内多次调用一致)
+        assert V._pit_cache_path("2024-07-03", 10) == p
 
 
 def test_rank_key_scale_is_uniform_when_set():
