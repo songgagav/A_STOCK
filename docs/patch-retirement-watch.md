@@ -85,11 +85,43 @@ float_shares < 90%              -> WARN      影响 ln_size 市值中性化
 
 ## 5. 观察期清单
 
-- [ ] 哨兵每日运行（已接入 `scheduler_entry` 盘后管道，交易日与维护日都跑）
+- [x] 哨兵每日运行（**已接入后台常驻脚本**，见 §5.1）
 - [ ] 每日记录 `data/valuation_coverage.json`（追加式，保留最近 120 次）
 - [ ] 观察期内**出现任何 CRITICAL → 观察期重置**（从当日重新计 10 个交易日）
 - [ ] 观察期内**不做高频配置对比**（不跑截尾变体、不跑六格矩阵）
 - [ ] 满 10 个交易日后汇总一次，判定补丁是否退役
+
+### 5.1 哨兵怎么"每日运行"
+
+本机**没有 Windows 计划任务**，`run_daily` 一直靠手工启动，所以哨兵此前不会自动跑。
+不加定时任务、也不改造 `run_daily` 的调用方式，改为把这一步挂进**已有的后台常驻脚本**：
+
+```
+ops/start_obs_stack.ps1          # 后台启动脚本, 新增第 6 步
+  └── Ensure-ProcLog 'sentinel_daemon' 'src/sentinel_daemon.py' ...
+        └── src/sentinel_daemon.py           # 常驻守护 (触发时间默认 18:30)
+              └── scheduler_entry._pe_patch_and_sentinel()   # 复用已测编排
+                    ├── scripts/valuation_coverage_sentinel.py   # 体检
+                    └── scripts/backfill_pe_ttm.py --resume      # 仅报出缺口时才补
+```
+
+`start_obs_stack.ps1` 用的是既有的**幂等**模式（`Ensure-Proc` 按命令行匹配，已在运行
+就跳过），因此重复执行不会起第二个守护。新增的 `Ensure-ProcLog` 只多做了 stdout/stderr
+落盘，用于常驻进程留证据/排错。
+
+| 项 | 值 |
+|---|---|
+| 触发时间 | 每日 18:30（`--at HH:MM` 可改） |
+| 检查间隔 | 5 分钟（`--interval-min`） |
+| 日期去重 | `data/sentinel_last.json`（同日只跑一次；重启脚本会补跑当天漏掉的） |
+| 交易日过滤 | 默认**每天**都跑（作心跳证据）；`--trading-days-only` 可只跑交易日 |
+| 失败处理 | 连续失败 3 次后放弃当天并记标记，避免 5 分钟一次刷屏 |
+| 日志 | `logs/sentinel_daemon.log`（stderr 另存 `.err.log`） |
+| 手动触发 | `python src/sentinel_daemon.py --once` |
+
+守护**不自己实现**体检逻辑，只做"什么时候跑"——体检与补丁判定仍由 `scheduler_entry`
+负责，避免两套阈值/两套口径。哨兵报出 CRITICAL（rc=1）算**体检成功**（是有效结论），
+只有子进程起不来/抛异常才计失败。
 
 ### 退役判定表
 

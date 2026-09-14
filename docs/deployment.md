@@ -33,10 +33,18 @@ python -m pytest tests/ -q        # 自检
 # 一次性/日频
 python src/run_daily.py                    # 收盘选股主流程
 python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
+python src/sentinel_daemon.py              # 估值覆盖率哨兵守护 (每日 18:30; 报缺口才补 pe_ttm)
 python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘 15:05 / 崩溃自动拉起
 python src/realtime_engine.py --once       # 盘中撮合单次
 python src/dashboard.py --port 8000        # Web 面板
+
+# 后台常驻(观测栈 + 上述守护) 一键拉起, 幂等, 重复执行不会起第二个
+powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 ```
+
+`src/sentinel_daemon.py` 由 `ops/start_obs_stack.ps1` 第 6 步拉起，日志
+`logs/sentinel_daemon.log`，状态 `data/sentinel_last.json`；手动补跑用 `--once`。
+背景见 `docs/patch-retirement-watch.md`（补丁退役观察期）。
 
 ## 4. 回测与检测
 

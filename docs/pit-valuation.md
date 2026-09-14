@@ -1110,8 +1110,21 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
     期间**不做高频配置对比**。退役判据：满期 0 CRITICAL 且"补丁独有"持续 ≤1% →
     正式退役（关闭 `PE_PATCH_AUTO`，保留哨兵）。
 
-    **⑥ 回归**：`488 passed, 15 skipped`（新增 `tests/test_derive_float_shares.py` 6 项、
-    `tests/test_valuation_sentinel.py` 重写 8 项）。
+    **⑥ 哨兵"每日运行"的落地方式**：本机没有 Windows 计划任务、`run_daily` 靠手工启动，
+    故不新建定时任务，改为挂进**已有的后台常驻脚本** `ops/start_obs_stack.ps1`（新增第 6 步，
+    用既有的幂等 `Ensure-Proc` 模式 + 新增 `Ensure-ProcLog` 落盘日志）：
+
+        ops/start_obs_stack.ps1 → src/sentinel_daemon.py (常驻, 触发 18:30)
+          → scheduler_entry._pe_patch_and_sentinel()  ← 复用已测编排
+              → scripts/valuation_coverage_sentinel.py (体检)
+              → scripts/backfill_pe_ttm.py --resume    (仅报缺口时才补)
+
+    守护只负责"什么时候跑"，体检与补丁判定仍由 `scheduler_entry` 单点负责（避免两套阈值）；
+    日期去重靠 `data/sentinel_last.json`，重启脚本会补跑当天漏掉的；连续失败 3 次放弃当天。
+    哨兵 rc=1（CRITICAL）算**体检成功**，只有子进程起不来/异常才计失败。
+
+    **⑦ 回归**：`497 passed, 15 skipped`（新增 `tests/test_derive_float_shares.py` 6 项、
+    `tests/test_sentinel_daemon.py` 9 项、`tests/test_valuation_sentinel.py` 重写 8 项）。
 
 
 
