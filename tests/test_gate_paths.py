@@ -89,7 +89,7 @@ class TestNewScriptsCompile(unittest.TestCase):
                      "gate_refresh_daemon.py", "scheduler_entry.py",
                      "gate_sensitivity.py", "backfill_vnpy_risk.py",
                       "vnpy_backtest.py", "performance_report.py", "dashboard.py",
-                      "backtest_audit.py"):
+                     "backtest_audit.py", "sentinel_daemon.py"):
             p = os.path.join(_BASE, "src", name)
             with open(p, encoding="utf-8") as f:
                 compile(f.read(), name, "exec")

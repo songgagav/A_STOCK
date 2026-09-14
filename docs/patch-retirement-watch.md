@@ -94,10 +94,10 @@ float_shares < 90%              -> WARN      影响 ln_size 市值中性化
 ### 5.1 哨兵怎么"每日运行"
 
 本机**没有 Windows 计划任务**，`run_daily` 一直靠手工启动，所以哨兵此前不会自动跑。
-不加定时任务、也不改造 `run_daily` 的调用方式，改为把这一步挂进**已有的后台常驻脚本**：
+不加定时任务、也不改造 `run_daily` 的调用方式，改为把这一步挂进**已有的后台启动脚本**：
 
 ```
-ops/start_obs_stack.ps1          # 后台启动脚本, 新增第 6 步
+ops/start_obs_stack.ps1          # 后台一键启动脚本(共 9 项服务), 哨兵是其中一步
   └── Ensure-ProcLog 'sentinel_daemon' 'src/sentinel_daemon.py' ...
         └── src/sentinel_daemon.py           # 常驻守护 (触发时间默认 18:30)
               └── scheduler_entry._pe_patch_and_sentinel()   # 复用已测编排
@@ -107,7 +107,9 @@ ops/start_obs_stack.ps1          # 后台启动脚本, 新增第 6 步
 
 `start_obs_stack.ps1` 用的是既有的**幂等**模式（`Ensure-Proc` 按命令行匹配，已在运行
 就跳过），因此重复执行不会起第二个守护。新增的 `Ensure-ProcLog` 只多做了 stdout/stderr
-落盘，用于常驻进程留证据/排错。
+落盘，用于常驻进程留证据/排错。脚本结束前对 7 个端口做 TCP 自检（含哨兵所在栈的
+Redis 6379 / Prometheus 9090 / 看板 8000），端口与就绪判据见
+`docs/deployment.md` §3.1。
 
 | 项 | 值 |
 |---|---|

@@ -283,6 +283,28 @@ CI 分为两部分：
 
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
+### 一键启动后台栈
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
+```
+
+幂等（已在跑的只报 `OK`，重复执行不会起第二个），一次拉起全部常驻服务并做端口自检：
+
+| 端口 | 服务 | 说明 |
+|---|---|---|
+| 8000 | Web 看板 | 选股结果 / 模拟盘 / 数据更新入口 |
+| 3000 | Grafana | 数据库看板（admin/admin） |
+| 9090 | Prometheus | 指标库，抓取 `astock-db`(9101) |
+| 9093 | Alertmanager | 告警路由 → 本地 webhook |
+| 9111 | alert_hook | 告警落盘 `logs/alerts.log`（设 `DING_WEBHOOK_URL` 则转发钉钉） |
+| 9101 | metrics_server | `/metrics` 暴露端 |
+| 6379 | Redis | Celery broker/backend（看板“全量数据库更新”依赖） |
+| — | Celery worker | 全量数据更新任务（solo pool） |
+| — | sentinel daemon | 估值覆盖率哨兵，每日 18:30（见 `docs/patch-retirement-watch.md`） |
+
+各常驻服务日志在 `logs/`：`dashboard.log`、`sentinel_daemon.log`、`alert_hook.log`、`alerts.log`。
+
 ## 数据与 Point-in-Time 口径
 
 历史选股和回测必须区分“当日可见数据”和“当前最新数据”。本项目的 PIT 路径包括：
