@@ -57,7 +57,11 @@ SYMBOLS_PQ = os.path.join(_BASE, "data", "h5i", "static", "symbols.parquet")
 REPORT_JSON = os.path.join(_BASE, "data", "factor_mine", "valuation_backfill_report.json")
 
 WINDOW_LO = "2025-08-04"
-WINDOW_HI = "2026-08-19"
+WINDOW_HI = os.environ.get("VB_WINDOW_HI") or pd.Timestamp.today().strftime("%Y-%m-%d")
+# 2026-09-14: 原为硬编码 "2026-08-19"。硬编码的后果是**重建会把窗口外的近似行丢掉**
+# (`rebuild_valuation` 会剔除全部 `source=approx_pb_rebuild` 行, 只重灌 parquet 里的),
+# 实测因此丢失了 08-20 之后 54,978 行(含 PB 覆盖)。改为默认"今天", 可用
+# `VB_WINDOW_HI` 覆盖; 这样每日/每周重跑都能覆盖最新交易日, 且重建幂等。
 SNAP_DATES_LEGACY = ["2026-08-31", "2026-09-04"]   # 现存两次快照并入日
 APPEND_CHUNK = 300_000
 SOURCE_APPROX = "approx_pb_rebuild"
