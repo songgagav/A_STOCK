@@ -372,6 +372,21 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
 # ---------------------------------------------------------------------------
 # [2] 快照并入
 # ---------------------------------------------------------------------------
+def derive_float_shares(fs, fmv, px):
+    """float_shares 缺失时用 float_mv(元) / price(元/股) 复原.
+
+    返回 (新 float_shares 序列, 补了多少行)。纯函数, 便于测试。
+    仅在 `fs` 为空 且 `fmv` / `px` 均为正时换算; 其余保持原值(NaN 仍是 NaN)。
+    """
+    fs = pd.to_numeric(pd.Series(fs).reset_index(drop=True), errors="coerce")
+    fmv = pd.to_numeric(pd.Series(fmv).reset_index(drop=True), errors="coerce")
+    px = pd.to_numeric(pd.Series(px).reset_index(drop=True), errors="coerce")
+    need = fs.isna() & fmv.notna() & px.notna() & (fmv > 0) & (px > 0)
+    if bool(need.any()):
+        fs = fs.where(~need, fmv / px)
+    return fs, int(need.sum())
+
+
 def _snap_rows_to_valuation_frame(db, day: pd.Timestamp) -> pd.DataFrame:
     """把某日 valuation_snapshot 全部 symbol 规整成 valuation schema 行 (ts=day 零点).
 
@@ -397,6 +412,25 @@ def _snap_rows_to_valuation_frame(db, day: pd.Timestamp) -> pd.DataFrame:
         df[c] = x
     is_st = df["is_st"].astype(str).str.strip().str.lower().map(
         {"true": True, "false": False, "1": True, "0": False})
+    # float_shares 兜底 (2026-09-14, 观察期首日哨兵发现):
+    #   上游 2026-09-08 段的 valuation_snapshot **float_shares / total_shares 整列 NULL**
+    #   (5551/5551 全空), 但 float_mv 与 price 完整。此处若 `float_shares` 缺失而
+    #   float_mv/price 可用, 直接换算 float_shares = float_mv(元) / price(元/股)。
+    #   为什么必须补: `valuation.float_shares` 缺失会让 `factor_fusion._assemble_snapshot`
+    #   的 `ln_size = ln(close * float_shares)` 变成 NaN ⇒ 规模中性化**静默退化为仅行业中性**,
+    #   选股结果看起来正常却已语义不同(与 item 8 同类问题)。
+    #   精度: 在有两者可对照的 2026-09-04 段 (n=5181) 上, 换算值与原值相对误差
+    #   中位 0.0032% / p95 0.019% / 最大 0.13% —— 作为兜底足够。
+    #   (与 db.py 里既有的反向兜底 float_mv = float_shares x price 对称。)
+    fs, n_fix = derive_float_shares(df["float_shares"], df["float_mv"], df["price"])
+    if n_fix:
+        try:
+            from dataguard import warn_once
+            warn_once("vb_float_shares_derived",
+                      f"[valuation_backfill] {dstr}: {n_fix} 行 float_shares 缺失, "
+                      f"已由 float_mv/price 换算兜底(上游快照整列 NULL)")
+        except Exception:  # noqa: BLE001
+            pass
     out = pd.DataFrame({
         "ts": day.as_unit("us"),
         "symbol": df["symbol"].to_numpy(),
@@ -407,7 +441,7 @@ def _snap_rows_to_valuation_frame(db, day: pd.Timestamp) -> pd.DataFrame:
         "is_st": pd.array(is_st.to_numpy(), dtype="boolean"),
         "market_cap": df["total_mv"].to_numpy(),
         "free_cap": df["float_mv"].to_numpy(),
-        "float_shares": pd.to_numeric(df["float_shares"], errors="coerce").to_numpy(),
+        "float_shares": fs.to_numpy(),
         "source": SOURCE_SNAPSHOT,
     })
     return out
