@@ -157,7 +157,10 @@ def _data_version() -> str:
     import hashlib
     from config import DATA_DIR as _DD
     files = sorted(glob.glob(os.path.join(_DD, "pit", "pe_patch", "*.parquet")))
-    if not files:
+    # 主表 valuation 重建后由 valuation_backfill._write_build_stamp 落版本戳;
+    # 一并纳入哈希, 使"重建主表"同样能自动失效 PIT 选股缓存。
+    files.append(os.path.join(_DD, "pit", "valuation_build.json"))
+    if not any(os.path.exists(f) for f in files):
         _DATA_VER = "np"
         return _DATA_VER
     h = hashlib.md5()

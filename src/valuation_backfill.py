@@ -134,6 +134,57 @@ def _fin_frame_bvps(db) -> pd.DataFrame:
     return df[["symbol", "avail", "bvps"]].reset_index(drop=True)
 
 
+def ttm_eps(fin: pd.DataFrame) -> pd.DataFrame:
+    """(symbol, ts, eps) -> (symbol, ts, eps_ttm). 纯函数, 便于测试.
+
+    口径 (2026-09-14 Step1 确认):
+      `financials.eps` 是**累计**口径(实测 600519: 2026-03-31=21.76, 06-30=35.57),
+      因此 TTM 必须聚合为 "最近年报累计 + 本期累计 - 去年同期累计":
+        - ts 为 12-31: eps_ttm = eps
+        - 其它报告期:  eps_ttm = eps(上年年报) + eps(本期) - eps(去年同期)
+      任一构成项缺失 -> NaN(不猜、不外推)。
+    """
+    d = fin[["symbol", "ts", "eps"]].copy()
+    d["ts"] = pd.to_datetime(d["ts"])
+    d["eps"] = pd.to_numeric(d["eps"], errors="coerce")
+    d = d.dropna(subset=["eps"]).sort_values(["symbol", "ts"])
+    d = d.drop_duplicates(["symbol", "ts"], keep="last")
+    d["year"] = d["ts"].dt.year
+    prev = d[["symbol", "ts", "eps"]].copy()
+    prev["ts"] = prev["ts"] + pd.DateOffset(years=1)
+    prev = prev.rename(columns={"eps": "eps_prev_same"})
+    ann = d[d["ts"].dt.month == 12][["symbol", "year", "eps"]].copy()
+    ann["year"] = ann["year"] + 1          # 上一年年报, 对"次年"的报告期可见
+    ann = ann.rename(columns={"eps": "eps_annual"})
+    out = d.merge(prev, on=["symbol", "ts"], how="left")
+    out = out.merge(ann, on=["symbol", "year"], how="left")
+    is_ann = out["ts"].dt.month == 12
+    ttm = out["eps_annual"] + out["eps"] - out["eps_prev_same"]
+    out["eps_ttm"] = np.where(is_ann, out["eps"], ttm)
+    return out[["symbol", "ts", "eps_ttm"]]
+
+
+def _fin_frame_bvps_eps(db) -> pd.DataFrame:
+    """financials -> {symbol, avail, bvps, eps_ttm}; 同(symbol,avail)只留最新报告期.
+
+    与 `_fin_frame_bvps` 的区别: 额外带上 TTM 每股收益(供近似行算 PE),
+    且不完全丢弃 bvps 缺失行(只要 eps_ttm 可用就保留), 可见性沿用同一套
+    `avail_date` 披露截止日规则 ⇒ PB 与 PE 共享完全相同的 PIT 约束。
+    """
+    df = _sql(db, "SELECT CAST(ts AS DATE) ts, symbol, bvps, eps FROM financials")
+    df["ts"] = pd.to_datetime(df["ts"])
+    df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+    df = df[df["ts"].dt.month.isin([3, 6, 9, 12])].copy()
+    df["bvps"] = pd.to_numeric(df["bvps"], errors="coerce")
+    te = ttm_eps(df[["symbol", "ts", "eps"]])
+    df = df.merge(te, on=["symbol", "ts"], how="left")
+    df = df[((df["bvps"].notna()) & (df["bvps"] > 0)) | (df["eps_ttm"].notna())].copy()
+    df["avail"] = df["ts"].map(avail_date)
+    df = (df.sort_values(["symbol", "avail", "ts"])
+            .drop_duplicates(["symbol", "avail"], keep="last"))
+    return df[["symbol", "avail", "bvps", "eps_ttm"]].reset_index(drop=True)
+
+
 def _val_float_frame(db) -> pd.DataFrame:
     """valuation 从 2024-06 起按日浮盈 float_shares, 用于 PIT 前进式 vmap 预热."""
     df = _sql(db, "SELECT CAST(ts AS DATE) d, symbol, float_shares, pb "
@@ -167,10 +218,14 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
         bars = bars[bars["symbol"].isin(whitelist)].copy()
         bars = bars.drop_duplicates(["d", "symbol"], keep="last")
 
-        # 当日既有行(窗口内 valuation 原行): symbol 集合 + pb 非空统计
+        # 当日既有**真实**行(窗口内 valuation 原行): symbol 集合 + pb 非空统计。
+        # 2026-09-14 修: 必须排除 source='approx_pb_rebuild' 的旧近似行 —— 否则重算时
+        # 这些天已经被自己上一轮的近似行填到 >=4000 行, fill_days 会变成空集,
+        # 重算(以及 Step4 的全量重建)将**一行都不生成**, 缺口静默保留。
         exist = _sql(db, "SELECT CAST(ts AS DATE) d, symbol, pb FROM valuation "
                          f"WHERE CAST(ts AS DATE) >= DATE '{WINDOW_LO}' "
-                         f"AND CAST(ts AS DATE) <= DATE '{WINDOW_HI}'")
+                         f"AND CAST(ts AS DATE) <= DATE '{WINDOW_HI}' "
+                         f"AND (source IS NULL OR source <> '{SOURCE_APPROX}')")
         exist["d"] = pd.to_datetime(exist["d"])
         exist["symbol"] = exist["symbol"].astype(str).str.zfill(6)
         ex_set = {d: set(g["symbol"]) for d, g in exist.groupby("d")}
@@ -180,9 +235,10 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
         # 原行数<4000 才回补 (>=4000 视为该日已有全市场真值)
         fill_days = {d for d in days if ex_n.get(pd.Timestamp(d), 0) < 4000}
 
-        fin = _fin_frame_bvps(db).sort_values("avail").reset_index(drop=True)
+        fin = _fin_frame_bvps_eps(db).sort_values("avail").reset_index(drop=True)
         f_key = fin["avail"].to_numpy(dtype="datetime64[us]")
         f_fp, f_map = 0, {}
+        e_map: dict = {}          # symbol -> 最新可见 eps_ttm (与 bvps 同一套 PIT) 
 
         valf = _val_float_frame(db)
         v_key = valf["d"].to_numpy(dtype="datetime64[us]")
@@ -204,6 +260,7 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
                     tail = blk.drop_duplicates("symbol", keep="last")
                     for r in tail.itertuples(index=False):
                         f_map[r.symbol] = r.bvps
+                        e_map[r.symbol] = r.eps_ttm
             # 估值 float_shares 可见性推进
             pos = int(np.searchsorted(v_key, u, side="right"))
             if pos > v_fp:
@@ -228,13 +285,20 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
                 continue
             b = day_bars[day_bars["symbol"].isin(missing)].copy()
             b["bvps"] = b["symbol"].map(f_map)
+            b["eps_ttm"] = b["symbol"].map(e_map)
             b["fs"] = b["symbol"].map(v_map)
             close = b["close"].to_numpy(dtype=float)
             bvps = b["bvps"].to_numpy(dtype=float)
+            epst = pd.to_numeric(b["eps_ttm"], errors="coerce").to_numpy(dtype=float)
             fs = b["fs"].to_numpy(dtype=float)
             pb = np.full(len(b), np.nan, dtype=float)
             ok = np.isfinite(bvps) & (bvps > 0)
             pb[ok] = close[ok] / bvps[ok]
+            # PE(TTM) = close / eps_ttm; 亏损(eps_ttm<=0)或缺失一律置空,
+            # 与主表 calculated_from_financials 的既有口径一致(其非空 pe 几乎全为正)。
+            pe = np.full(len(b), np.nan, dtype=float)
+            okp = np.isfinite(epst) & (epst > 0)
+            pe[okp] = close[okp] / epst[okp]
             fc = np.full(len(b), np.nan, dtype=float)
             okf = np.isfinite(fs) & (fs > 0)
             fc[okf] = close[okf] * fs[okf]
@@ -242,7 +306,7 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
             out = pd.DataFrame({
                 "ts": pd.Timestamp(Dts.date()).as_unit("us"),
                 "symbol": b["symbol"].to_numpy(),
-                "pe_ttm": np.full(len(b), np.nan),
+                "pe_ttm": pe,
                 "pb": pb,
                 "ps_ttm": np.full(len(b), np.nan),
                 "pcf_ncf_ttm": np.full(len(b), np.nan),
@@ -258,11 +322,14 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
             epb = ex_pb_ok.get(Dts, 0)
             tot = en + len(out)
             pbo = int(epb + int(np.isfinite(pb).sum()))
+            peo = int(np.isfinite(pe).sum())
             per_day.append({
                 "date": D, "exist_n": en, "approx_n": len(out),
                 "approx_pb_ok": int(np.isfinite(pb).sum()),
+                "approx_pe_ok": peo,
                 "total_n": tot, "pb_nonnull": pbo,
                 "pb_nonnull_rate": round(pbo / tot, 4) if tot else None,
+                "pe_nonnull_rate": round(peo / tot, 4) if tot else None,
             })
             if (i + 1) % 25 == 0:
                 print(f"  ...{D} approx_rows={total} elapse={time.time() - t0:.0f}s",
@@ -417,6 +484,29 @@ def export_valuation_backup(out_parquet: str) -> dict:
         db.close()
 
 
+def _write_build_stamp(res: dict) -> None:
+    """重建成功后落一个版本戳 data/pit/valuation_build.json.
+
+    作用: `vnpy_backtest._data_version()` 会把它算进 PIT 选股缓存的标签里,
+    这样"重建了 valuation"能让历史选股缓存**自动失效**, 不必手工清缓存
+    (补丁变化已由 pe_patch 文件哈希覆盖, 这里是主表重建的对应机制)。
+    """
+    import json
+    from datetime import datetime
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "data", "pit", "valuation_build.json")
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"built_at": datetime.now().isoformat(timespec="seconds"),
+                       "window": [WINDOW_LO, WINDOW_HI], **res},
+                      f, ensure_ascii=False, indent=2)
+        print(f"[rebuild] 版本戳已写入 {p}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[rebuild] 版本戳写入失败(不影响重建): {type(e).__name__}: {e}",
+              flush=True)
+
+
 def rebuild_valuation(approx_parquet: str | None = None) -> dict:
     """重建 valuation: 保留行 + 近似行(可选) -> 按 (ts,symbol) 升序重建.
 
@@ -489,10 +579,13 @@ def rebuild_valuation(approx_parquet: str | None = None) -> dict:
         # 验证
         chk = _sql(db, "SELECT COUNT(*) n FROM valuation")
         new_n = int(chk.iloc[0, 0])
-        return {"old_rows": int(old_n),
-                "approx_rows": int(sum(len(x) for x in extras)),
-                "dup_removed": int(dup_removed), "new_rows": int(new_n),
-                "ok": new_n == total, "elapsed_s": round(time.time() - t0, 1)}
+        res = {"old_rows": int(old_n),
+               "approx_rows": int(sum(len(x) for x in extras)),
+               "dup_removed": int(dup_removed), "new_rows": int(new_n),
+               "ok": new_n == total, "elapsed_s": round(time.time() - t0, 1)}
+        if res["ok"]:
+            _write_build_stamp(res)
+        return res
     finally:
         db.close()
 
