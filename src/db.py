@@ -236,8 +236,25 @@ def _valuation_asof_h5i(as_of) -> pd.DataFrame:
          f"AND CAST(ts AS DATE) >= DATE '{asd}' - INTERVAL 400 DAY) "
          "WHERE rn = 1")
     try:
-        df = s._db.sql(q).to_pandas()
-    except Exception:
+        from dataguard import env_tries, with_retry
+        # 2026-09-14 (item 8): 这里原本"异常即静默返回空表" —— 一旦瞬时故障, PIT 路径
+        # 会**静默失去全部估值特征**(governance 的 PB/PE 过滤与 filter_universe 的
+        # 流通市值过滤同时失效), 选股结果看起来正常却已语义不同。
+        # 现在: 指数退避重试 + "空结果视为失败"(该表在 1993 起任意 as_of 都应有数据,
+        # 为空必属故障) + 重试耗尽时响亮告警。
+        df, _ok = with_retry(lambda: s._db.sql(q).to_pandas(),
+                             tries=env_tries(), label=f"valuation_asof:{asd}",
+                             empty_is_failure=True, warn_key="valuation_asof_h5i")
+        if df is None:
+            raise RuntimeError("valuation_asof 返回 None")
+        if not _ok:
+            print(f"[db] 警告: PIT 估值读取失败({asd}), 本次选股将缺失估值特征 "
+                  f"(PB/PE 过滤与流通市值过滤失效)", flush=True)
+    except Exception as e:  # noqa: BLE001
+        from dataguard import warn_once
+        warn_once("valuation_asof_fail",
+                  f"[db] PIT 估值读取失败({type(e).__name__}: {e}); "
+                  f"返回空表 => 估值特征缺失")
         return pd.DataFrame(columns=["symbol", "pe_ttm", "pb", "ps_ttm",
                                      "float_shares", "is_st", "total_mv", "float_mv"])
     if df.empty:

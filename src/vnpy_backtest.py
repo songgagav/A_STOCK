@@ -308,14 +308,19 @@ def _load_bars(symbol6: str, end_day: dt.date, days: int = 120) -> pd.DataFrame:
 
     # 2) h5i 主数据源 (daily_bars 在 data/h5i/market.db)
     try:
+        from dataguard import env_tries, with_retry
         from factor_fusion import _sql
         iso = end_day.strftime("%Y-%m-%d")
-        df = _sql(
-            f"SELECT CAST(ts AS DATE) AS date, open, high, low, close, volume, "
-            f"amount, change_pct FROM daily_bars WHERE symbol = '{symbol6}' "
-            f"AND CAST(ts AS DATE) <= DATE '{iso}' ORDER BY CAST(ts AS DATE) DESC")
-        if df is None or df.empty:
-            return df if df is not None else pd.DataFrame()
+        # 2026-09-14 (item 8): 瞬时故障用指数退避重试; 重试耗尽仍失败则返回空表,
+        # 但**必定告警**(不再静默), 且批次层的 guard_basket 会拦截残篮子。
+        df, _ok = with_retry(
+            lambda: _sql(
+                f"SELECT CAST(ts AS DATE) AS date, open, high, low, close, volume, "
+                f"amount, change_pct FROM daily_bars WHERE symbol = '{symbol6}' "
+                f"AND CAST(ts AS DATE) <= DATE '{iso}' ORDER BY CAST(ts AS DATE) DESC"),
+            tries=env_tries(), label=f"bars.h5i:{symbol6}", warn_key="bars_h5i_sql")
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return pd.DataFrame() if df is None else df
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date").tail(days).reset_index(drop=True)
         _build_adj_close_inplace(df)
@@ -679,11 +684,22 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
     weights = _make_weights(targets, weight_mode)
 
     bar_map: dict[str, pd.DataFrame] = {}
+    _missing: list = []
     for s6 in symbol6_list:
         df = (_load_bars_forward(s6, day_dt, lookback_days) if forward
               else _load_bars(s6, day_dt, lookback_days))
         if not df.empty:
             bar_map[s6] = df
+        else:
+            _missing.append(s6)
+    # 2026-09-14 (item 8): 批次级覆盖度闸门。原实现只校验"全空", 于是 10 只篮子
+    # 只加载到 2 只时仍继续回测并把结果标成 OK —— 残篮子的收益会被误当成正常窗口。
+    from dataguard import guard_basket
+    _okb, _msg = guard_basket(len(bar_map), len(symbol6_list), f"窗口 {day}")
+    if not _okb:
+        return {"ok": False, "error": _msg, "rows": 0,
+                "missing": _missing[:20], "n_loaded": len(bar_map),
+                "n_basket": len(symbol6_list)}
     if not bar_map:
         return {"ok": False, "error": "无标的日线数据", "rows": 0}
 
