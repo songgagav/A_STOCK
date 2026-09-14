@@ -289,6 +289,10 @@ SCHEDULE = {
     "intraday_bar": "02:00",   # 盘中定期价刷新间隔(测试用; 实盘可调到 9:35开始)
     "close_time": "15:00",     # 收盘
 }
+# 注: 估值覆盖率哨兵 + pe_ttm 兜底补丁 不单独定时, 而是挂在收盘管道**之后**
+# (`scheduler_entry._pe_patch_and_sentinel`, 避免拖累选股); 也可独立执行
+#   python src\scheduler_entry.py --pe-patch-only
+# 背景与根本修复计划见 docs/pit-valuation.md 第 20 条 / docs/perf-plan.md。
 
 # ---- 数据库每日补录 ----
 # 收盘后统一补录的全表头清单, 与 DuckDB 表名一一对应. None 代表不存在或不需要同步.

@@ -815,6 +815,17 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
     受影响日期重新选股，其余窗口可复用）；②告警需接到调度（每日盘后一次）；
     ③长期方向：融合信号的**条件有效性**研究（状态感知的权重分配）。
 
+    **⑥ 已接入每日调度（2026-09-14）**：`scheduler_entry._pe_patch_and_sentinel()`
+    在收盘管道**之后**执行（不拖累 15:05 选股）：先跑哨兵体检 → 仅当报出缺口时
+    才跑 `backfill_pe_ttm.py --days 30 --resume` 增量补，带 timeout、异常不抛。
+    `PE_PATCH_AUTO=0` 可退化为"只体检不补"；也可独立运行
+    `python src\scheduler_entry.py --pe-patch-only`。补丁变化会让
+    `_data_version()` 变 ⇒ PIT 缓存自动失效。测试 5 例（覆盖率正常不补 /
+    缺口触发且带 --resume / AUTO=0 只体检 / 子进程异常不抛出 / import 不改 CWD）。
+    **根本修复**（让 `valuation_backfill` 的近似行也计算 PE）按计划放本周，
+    完成后即可验证"是否还需要补丁兜底"。
+
+
 
 
 
