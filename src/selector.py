@@ -115,7 +115,8 @@ class RotationSelector:
     def _latest_bar_date(self) -> str:
         return pd.Timestamp.today().strftime("%Y-%m-%d")
 
-    def _apply_fusion_rank(self, scored: list, as_of: str) -> None:
+    def _apply_fusion_rank(self, scored: list, as_of: str,
+                           zs: np.ndarray | None = None) -> None:
         """(2026-09-13) 可选: 让四因子融合分参与排序, 而非只用旧 SCORE_WEIGHTS 复合.
 
         背景(证据见 scripts/ic_neutral_check.py / docs/pit-valuation.md 第 10 条):
@@ -138,13 +139,21 @@ class RotationSelector:
             alpha = 1.0
         alpha = min(max(alpha, 0.0), 1.0)
         try:
-            from factor_fusion import cross_section_scores
             syms = [str(x.get("canon") or "").split(".")[0].zfill(6) for x in scored]
-            res = cross_section_scores(as_of, symbols=syms)
-            zmap = (res or {}).get("scores") or {}
-            if not zmap:
-                return
-            zs = np.array([zmap.get(s, np.nan) for s in syms], dtype=float)
+            if zs is None:
+                from factor_fusion import cross_section_scores
+                res = cross_section_scores(as_of, symbols=syms)
+                zmap = (res or {}).get("scores") or {}
+                if not zmap:
+                    return
+                zs = np.array([zmap.get(s, np.nan) for s in syms], dtype=float)
+            elif isinstance(zs, dict):
+                # 2026-09-14 修: 允许调用方传入 `cross_section_scores` 的 **dict**
+                # (池快照 Step1 复用同一份融合值, 避免重复计算)。原先直接对 dict 调
+                # np.isfinite 会抛 TypeError, 被外层 except 静默吞掉 ⇒ 融合排序**实际失效**
+                # 却看不出错误。现在显式转 array, 并把异常暴露出来。
+                zd = zs
+                zs = np.array([zd.get(s, np.nan) for s in syms], dtype=float)
             if int(np.isfinite(zs).sum()) < 30:
                 return
             med = float(np.nanmedian(zs))
@@ -164,7 +173,11 @@ class RotationSelector:
             for x, b, z in zip(scored, blended, zs):
                 x["fusion_rank_key"] = float(b)
                 x["fusion_z"] = float(z)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # 不再静默: 开关打开时任何异常都说明"融合排序没生效", 必须看得见
+            # (2026-09-14: 曾因 dict/array 类型错误在此静默失效)。
+            print(f"[selector] 融合排序失败, 回退 score 排序: {type(e).__name__}: {e}",
+                  flush=True)
             return
 
     def _blend_fml(self, scored: list, as_of: str) -> None:
@@ -505,7 +518,26 @@ class RotationSelector:
                 "score": round(float(score), 4),
                 "thesis": thesis,
             })
-        self._apply_fusion_rank(scored, hist_day)
+        # [perf Step1, 2026-09-14] 池快照: 融合值(两路)**只算一次**并落盘, 之后任意
+        # 排序口径(截尾比例/融合权重/开关)都能离线复算 -> 敏感性测试从"每次数小时"降到秒级。
+        # 见 src/pool_snapshot.py 与 docs/perf-plan.md 第 1 步。POOL_SNAPSHOT=0 可关闭。
+        _fml_raw, _fml_z = None, None
+        if os.environ.get("POOL_SNAPSHOT", "1") not in ("0", "false", "False"):
+            try:
+                from factor_fusion import cross_section_scores, fusion_or_fml
+                _syms6 = [str(x.get("canon") or "").split(".")[0].zfill(6)
+                          for x in scored]
+                _fml_raw, _used = fusion_or_fml(scored, hist_day)
+                _res = cross_section_scores(hist_day, symbols=_syms6)
+                _fml_z = (_res or {}).get("scores") or {}
+            except Exception:  # noqa: BLE001
+                _fml_raw, _fml_z = None, None
+            try:
+                import pool_snapshot as _psnap
+                _psnap.save(hist_day, self.n, scored, fml_raw=_fml_raw, fml_z=_fml_z)
+            except Exception:  # noqa: BLE001
+                pass
+        self._apply_fusion_rank(scored, hist_day, zs=_fml_z)
         scored.sort(key=_rank_key, reverse=True)
         top_n = scored[: self.n]
         basket_signal = float(np.mean([t["signal"] for t in top_n])) if top_n else 0.0

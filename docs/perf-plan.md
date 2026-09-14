@@ -13,24 +13,36 @@
 | 口径隔离代价 | `_pit_cache_path` 把 `_t{q}` / `_rf{mode}a{alpha}` 写进缓存名 ⇒ **任何口径变体都要重算整套选股** |
 | 内存 | 单进程 PrivateMemory ≈ 1.1GB（`_val_frame` / `_fin_frame` 常驻） |
 
-## 第 1 步（最重要）：把"截尾"移出缓存
+## 第 1 步（最重要）：把"截尾"移出缓存 —— ✅ 已完成（2026-09-14）
 
 **问题**：截尾只改变**融合项**，池子与旧复合 `base` 完全不变，但当前实现把它编进了缓存键，
 导致每个截尾比例都要重算 66 次选股。
 
-**改造**：
-- `RotationSelector._select_hist` 已经返回完整的 `scored` 列表（含
-  `signal/trend/govern/vol/mom_rev/liquidity` 与 `score`）。落盘为
-  `data/pit/pool_snapshot/{day}_n{n}.parquet`，**同时保存**：
-  掺入前的 `base`（即未经过 `_blend_fml` 的 `score`）、融合原始值 `fml`（来自
-  `fusion_or_fml`，即 `cross_section_scores` 的 z）。
-- 排序键（`prod_score` / `rf1` / 截尾 3·5·8·10·15% / 未来任何新方案）在**读取快照后**
-  计算，`_blend_fml`、`_apply_fusion_rank` 改为"纯函数式"地作用在快照上。
-- 缓存键只保留与池子真正相关的维度（`day`、`n`），不再含口径标签。
+**实施结果**：新增 `src/pool_snapshot.py`，在 `_select_hist` 里把**完整打分池**落盘为
+`data/pit/pool_snapshot/{day}_n{n}_{数据版本}.parquet`（约 77KB/天），列含
+`canon/name/price + 六因子 + score(掺入前的旧复合分) + fml_raw + fml_z`。
+排序键改为"读快照后复算"：`top_from_snapshot(df, rank_by='score'|'fusion', alpha, trim_q, blend_w)`。
+融合值**两路只算一次**（`_apply_fusion_rank` 增加 `zs=` 入参，避免重复计算）。
+`POOL_SNAPSHOT=0` 可关闭；文件名带数据版本，数据一变旧快照自动失效。
 
-**收益**：敏感性测试从"每次 4 小时"降到**秒级**；本次这类 66 次全量只需算一次。
-**风险/注意**：必须落盘 `fml` 原始值而非 rank，否则截尾无法在读取后复算；
-`_blend_fml` 当前会**改写 `score`**，所以要额外存 base 供复算。
+**验证（必须逐位一致，否则"秒级敏感性"是错的）**：
+- 端到端 `scripts/verify_pool_snapshot.py --day 2018-06-29`：3 个口径
+  （`RB=0`、`RB=1 α=1.0`、`RB=1 α=1.0 TRIM=0.05`）**全部 live==snapshot**；
+- 单元测试 `tests/test_pool_snapshot.py`（9 例）覆盖 pct_rank/截尾/掺入公式/往返/平局顺序。
+
+**实测加速比**：9 个口径全部复算合计 **0.024s（平均 3ms/口径）**，对比实时选股
+80s（2018 年池）~260s（2026 年池）⇒ 每个口径省 **约 3~10 万倍**。
+敏感性/多口径对比从"每次数小时"变为"毫秒级"。
+
+**过程中发现并修掉 2 个真 bug**（都属于"静默出错、结果看不出"的类型）：
+1. **平局排序不稳定**：实时路径用 Python 稳定排序（同分保持 universe 顺序），而快照若用
+   pandas 默认快排则同分先后不同 ⇒ 实测出现"Top-N 仅两两对调"的差异。已改 `kind="stable"`。
+2. **`_apply_fusion_rank(zs=<dict>)` 会静默失效**：对 dict 调 `np.isfinite` 抛 `TypeError`，
+   被外层 `except Exception: return` 吞掉 ⇒ **融合排序看似打开、实际按 score 排序**，
+   从结果完全看不出来。已支持 dict 入参，并把该分支的异常改为**打印告警**（不再静默）。
+   注：此 bug 是本轮**新引入**的（原实现自行计算 zs，不传参），已在上线前修掉，
+   **此前 `rf1`/`rf1fix`/`rb_rf1` 等融合排序结果不受影响**。
+
 
 ## 第 2 步：并行度（8 核）
 
