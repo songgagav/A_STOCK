@@ -23,12 +23,11 @@
     {
       "id": "E-1",
       "level": "P0",
-      "title": "非整手成交 ⇒ 对账结论不可外推（P0-1 并列阻塞项）",
-      "status": "open",
-      "detail": "veighna_adapter.py:220 用 volume = max(round(notional/limit_price, 0), 100)，按股取整而非 100 股整手。所有成交（含接入前既有 184 笔 + 本轮 70 笔）均非整手；A 股买入必须整手 ⇒ 台账高估可执行性；对高价股影响显著（688826 一手 ≈ 100×800 ≈ 8 万元）。",
-      "evidence": "docs/acceptance-scope.md §五；reconcile_astock.py --require-lot 可升级为硬失败",
-      "next": "独立批次修复（改共享执行层会影响既有全部策略），修完重跑全部基线；排在 P0-2/P0-3 之后",
-      "acceptance_wording": "E-1 修复前，\"对账通过\"仅代表代码逻辑一致，不代表实盘可执行。"
+      "title": "非整手成交（P0-1 并列阻塞项）—— 已修",
+      "status": "fixed",
+      "detail": "veighna_adapter 原用 volume = max(round(notional/limit_price, 0), 100)，含两个缺陷：a) 按股取整、不按 100 股整手（实测既有 184 笔 + astock 70 笔成交全部非整手，如 40840 股 = 408.4 手）；b) max(...,100) 下限会把不足 1 手的委托放大（600519 测试价 100 元上，1 万元委托会被凑成 100 股 = 10,005 元；800 元股价上 1,000 元委托会变成 80,040 元，约 80 倍）。现抽为纯函数 order_volume() 向下取整到整手，不足 1 手则拒单并给出所需最小金额。实测：astock 4 日成交非整手数 69 → 0，reconcile_astock.py --require-lot 通过。",
+      "evidence": "src/veighna_sim/veighna_adapter.py（order_volume + _lot_size）；tests/test_order_volume_lot.py（12 例，构造两个缺陷的触发条件）；tests/test_veighna_adapter.py::test_paper_broker_rejects_sub_lot_order（端到端拒单）",
+      "next": "副作用须知：整手约束会留下闲置现金（实测 09-07 现金 20,702 → 101,201，因 688826≈800 元、688836≈536 元一手即 8 万/5.4 万，0.1 权重无法整手逼近）。这是 A 股真实约束，但意味着组合跟踪误差对高价股敏感，建议后续在选股/配权侧显式建模。"
     },
     {
       "id": "P0-2",
@@ -186,29 +185,47 @@
     {
       "id": "SEC-4",
       "level": "安全",
-      "title": "watchdog/面板 health 载荷与 UI 渲染器形状不匹配",
-      "status": "open",
-      "detail": "renderHealth 期望 {level, summary, generated_at, checks[]}，而 /api/health 返回 {ok, service, pid, ts, deps:{duckdb, arcticdb}} ⇒ 健康卡片渲染为\"OK + 空表\"；退役 DuckDB 的打开失败（deps.duckdb_error）在 UI 上完全不显示。",
+      "title": "面板 health 载荷与 UI 渲染器形状不匹配 —— 已修",
+      "status": "fixed",
+      "detail": "renderHealth 期望 {level, summary, generated_at, checks[]}，而 /api/health 返回 {ok, service, pid, ts, deps:{duckdb, arcticdb}} ⇒ 健康卡片渲染为\"OK + 空表\"；退役 DuckDB 的打开失败（deps.duckdb_error）在 UI 上完全不显示。 已修：/api/health 统一走 read_health_merged()（运行期 + 盘前 + 阻塞项），保留 keepalive 需要的 ok/pid；新增 /api/acceptance。",
       "evidence": "src/dashboard.py /api/health 与 renderHealth",
-      "next": "本批次修：统一载荷并补 bar_store/h5i 状态与阻塞项汇总"
+      "next": "无"
     },
     {
       "id": "DOC-1",
       "level": "P2",
       "title": "README/deployment 的看板启动命令与 h5i 主源不匹配",
-      "status": "open",
-      "detail": "README.md:281 与 docs/deployment.md:39 让用 .venv314\\Scripts\\python.exe 启动 dashboard，但实测 .venv314(3.14) 无 h5i_db（h5i_db=False），会失去 h5i 主源数据；持有 h5i_db 的是 TRAE python 3.10.11。",
+      "status": "fixed",
+      "detail": "README.md:281 与 docs/deployment.md:39 让用 .venv314\\Scripts\\python.exe 启动 dashboard，但实测 .venv314(3.14) 无 h5i_db（h5i_db=False），会失去 h5i 主源数据；持有 h5i_db 的是 TRAE python 3.10.11。 已修：README 在看板启动命令处补充解释器要求与验证方式，deployment.md 同步加注。",
       "evidence": "两个解释器的 importlib.find_spec 实测对比",
-      "next": "修正文档，或给 .venv314 装上 h5i_db"
+      "next": "根治方案二选一：给 .venv314 装 h5i_db，或把 .venv314 从看板路径彻底移除"
     },
     {
       "id": "P1-PREMARKET-DUCK",
       "level": "P1",
-      "title": "premarket 健康检查未适配 h5i 主源（退役 DuckDB 造成连锁误报）",
+      "title": "premarket 健康检查未适配 h5i 主源（退役 DuckDB 连锁误报）—— 已修",
+      "status": "fixed",
+      "detail": "7 个 DuckDB 依赖检查改为「h5i 主源优先、DuckDB 仅作回退/对照」：check_duckdb / check_arcticdb 陈旧度基准 / check_daily_bars_freshness / check_ic_history / check_ic_curve / check_duckdb_pool 均已改指 h5i；check_orderbook 因 h5i 无 orderbook_snapshot 表降为 WARN 并注明待适配。实测 FAIL 8 → 6，且 legacy DuckDB 已不再对任何 FAIL 负因果责任：duckdb FAIL→WARN（真实陈旧）、duckdb_pool FAIL→OK；daily_bars_freshness / ic_history / ic_curve 的 FAIL 换了真实原因（h5i 数据真实滞后/缺失）。反向验证：注入 h5i 故障后 6 项全部 FAIL（真故障不粉饰）。",
+      "evidence": "src/premarket_healthcheck.py（_bar_store_latest 等共用工具 + 7 个检查）；实测 OK=9 WARN=2 FAIL=8 → OK=9 WARN=4 FAIL=6，无 Traceback",
+      "next": "剩余 6 个 FAIL 见 P1-ARCTICDB 与 P1-DATA-STALE"
+    },
+    {
+      "id": "P1-ARCTICDB",
+      "level": "P1",
+      "title": "arcticdb 包未安装 ⇒ 3 项盘前检查真实 FAIL",
       "status": "open",
-      "detail": "data/health/premarket.json 由 premarket_healthcheck.py 产出，其判定仍以 DuckDB 为主源。DuckDB 退役后，面板 /api/health 实测 22 项检查中 8 项 FAIL，其中至少 6 项（duckdb / orderbook / daily_bars_freshness / ic_history / ic_curve / duckdb_pool）是\"legacy_stockdb.duckdb 不存在\"导致的连锁误报，非实际故障。另有 arcticdb / arcticdb_rw / strategy_diag 三项 InternalException（arcticdb 未安装），归属待确认。",
-      "evidence": "面板 /api/health 实测输出（2026-09-19）；src/dashboard.py read_health_merged() 已追加来源说明但不改状态",
-      "next": "更新 premarket_healthcheck.py 改用 h5i 主源；确认 arcticdb 是否已退役"
+      "detail": "premarket 的 arcticdb / arcticdb_rw / strategy_diag 三项 FAIL，真因是 ModuleNotFoundError: No module named 'arcticdb'（持 h5i_db 的解释器缺该包）。这与 DuckDB 退役无关，属**真实故障**而非误报 —— 改造时刻意未粉饰。",
+      "evidence": "premarket_healthcheck.py 实测：arcticdb / arcticdb_rw / strategy_diag 三项 FAIL",
+      "next": "二选一：安装 arcticdb；或确认 ArcticDB 已退役并让 arctic_store 优雅降级（含告警）"
+    },
+    {
+      "id": "P1-DATA-STALE",
+      "level": "P1",
+      "title": "h5i 行情与 IC 数据真实滞后（面板 level=CRITICAL 的主因）",
+      "status": "open",
+      "detail": "主源 h5i 最新 bar 日 = 2026-09-08（面板检查时距今日 11 天）；daily_bars_freshness 报落后 10 天；ic_history 报 20260831/20260907 无 IC 行；ic_curve 报 pb_rev/roe/mf_net 文件 MISSING、vol/mom_rev 滞后 5 天。这些是**真实数据问题**，不是代码误报；面板要变绿必须先补数据。",
+      "evidence": "premarket_healthcheck.py 实测输出（source: h5i / latest_bar=20260908）",
+      "next": "补 h5i 日线与 IC 曲线数据；时间点与 f_ml 断链（9/07-9/08）一致，需一并排查"
     },
     {
       "id": "P2-BARFALLBACK",

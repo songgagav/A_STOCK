@@ -4,12 +4,19 @@
 # 设计目标: 盘前 (08:00~09:00) 在交易引擎启动前确认以下通道就绪, 任一项不通过
 # 则引擎不应启动 (或带降级模式运行). 校验项:
 #   1) disk         : DATA_DIR 可写, 剩余空间 >= 1 GB
-#   2) duckdb       : daily_bars 存在 + 最新日期 <= 今日 (否则行情缺)
+#   2) duckdb       : [名沿用] 行情主源 h5i 的 daily_bars 可用 + 最新日期 <= 5 天
 #   3) arcticdb     : 6 个库可读写 (health_check)
 #   4) orderbook    : orderbook_snapshot 当日已落盘 (或允许缺, 但要标记 WARN)
-#   5) daily_bars   : 最新日期距今天数 <= 1 (否则数据老化)
+#   5) daily_bars   : 最新日期距期望交易日 <= 1 (否则数据老化)
 #   6) akshare      : 实时源可达 (拉一只样本股行情, 3s 内有价)
 #   7) state_io     : state.json / live_state.json 可写
+#
+# [m4] 数据源架构变更: DuckDB 已退役(DUCKDB_PATH 指向的 legacy 文件在本机不复存在,
+# 属预期状态), 全A日频行情主源为 h5i (data/h5i/market.db). 因此所有涉及 daily_bars
+# 最新日的检查统一走 _bar_store_latest(): 先 h5i, 仅当 h5i 不可用且 DuckDB 文件仍在
+# 时回退 DuckDB; 只有两者都不可用才判 FAIL. 检查项的 detail 均带 source 字段标明来源.
+# 无 h5i 对应物的检查(如 orderbook_snapshot)在 DuckDB 退役后无法验证 -> WARN 并注明
+# "legacy DuckDB 已退役、该项待适配 h5i", 既不假报 OK 也不误报 FAIL.
 #
 # 调用方:
 #   - run_daily.py 步骤 0.5 (盘前也兼容: --premarket)
@@ -88,6 +95,134 @@ def _record_duckdb(e: Exception, name: str, t0: float) -> dict:
     return _record(name, "FAIL", e, t0)
 
 
+# ---- 主数据源抽象 (h5i 主源 / DuckDB 已退役, 仅在文件存在时作回退与对照) ----
+# 背景: DuckDB 已于 m4 退役, DUCKDB_PATH 指向的 legacy 文件在本机不复存在(预期状态).
+# 此前 7 个检查仍直连 DuckDB, 一旦该文件缺失就集体 FAIL, 形成与真实故障无关的连锁
+# 误报(运维面板因此恒为 CRITICAL). 下列工具统一"先 h5i, 再 DuckDB", 让检查项按真实
+# 主源的新鲜度判定; 只有 h5i 与 DuckDB 都不可用才视为数据源故障.
+
+_H5I_POOL: dict = {"store": None}
+_H5I_DB_HINT = os.path.join(DATA_DIR, "h5i", "market.db")   # h5i 主源(目录形态)
+
+
+def _h5i_ready() -> bool:
+    """h5i 主源是否启用(未显式 BAR_STORE=duck). 与 db.py 的 _h5i_enabled 同语义."""
+    return os.environ.get("BAR_STORE", "h5i").strip().lower() != "duck"
+
+
+def _bar_store():
+    """进程内复用的 h5i 句柄(无参构造). 失败抛异常, 由调用方决定降级."""
+    s = _H5I_POOL.get("store")
+    if s is None:
+        from h5i_bar_store import H5iBarStore
+        s = H5iBarStore()
+        _H5I_POOL["store"] = s
+    return s
+
+
+def _bar_store_trade_days() -> tuple[str, list[str] | None, str | None]:
+    """主源交易日历, 升序 YYYY-MM-DD. 返回 (来源, 交易日列表, 失败原因).
+
+    h5i 优先; 仅当 h5i 未启用/不可读 且 legacy DuckDB 文件仍在时回退 DuckDB.
+    来源可为 h5i / duckdb / None(两者皆不可用).
+    """
+    if _h5i_ready():
+        try:
+            days = _bar_store().trading_days()
+            if days:
+                return "h5i", [str(d)[:10] for d in days], None
+            h5i_err = "h5i daily_bars 为空"
+        except Exception as e:
+            h5i_err = f"{type(e).__name__}: {e}"
+    else:
+        h5i_err = "BAR_STORE=duck (显式指定 DuckDB 对照)"
+    try:
+        from db import duck_available
+        if duck_available():
+            import duckdb
+            con = duckdb.connect(DUCKDB_PATH, read_only=True)
+            try:
+                rows = con.execute(
+                    "SELECT DISTINCT date FROM daily_bars ORDER BY date").fetchall()
+            finally:
+                con.close()
+            days = [str(r[0])[:10] for r in rows if r and r[0]]
+            if days:
+                return "duckdb", days, None
+            return None, None, f"h5i 不可用({h5i_err}); legacy DuckDB daily_bars 为空"
+    except Exception as e:
+        return None, None, (f"h5i 不可用({h5i_err}); "
+                            f"legacy DuckDB 亦不可读({type(e).__name__}: {e})")
+    if not os.path.exists(DUCKDB_PATH):
+        return None, None, (f"h5i 不可用({h5i_err}); legacy DuckDB 已退役, "
+                            f"库文件不存在: {DUCKDB_PATH}")
+    return None, None, f"h5i 不可用({h5i_err}); legacy DuckDB 无可用数据"
+
+
+def _bar_store_latest() -> tuple[str | None, str | None, int | None, str | None]:
+    """主源最新 bar 日 + 该日标的数. 返回 (来源, 最新日 YYYYMMDD, 标的数, 失败原因).
+
+    h5i 主源优先(标的数为该日 daily_bars 的 symbol 数); legacy DuckDB 仅在文件
+    仍存在时作回退/对照. 两者都不可用 -> 来源 None 且给出原因, 调用方判 FAIL.
+    """
+    src, days, why = _bar_store_trade_days()
+    if not days:
+        return None, None, None, why
+    latest = _norm_date(days[-1])
+    if src == "h5i":
+        try:
+            n = len(_bar_store().symbols_on(days[-1]))
+        except Exception:
+            n = None
+        return "h5i", latest, n, None
+    try:
+        import duckdb
+        con = duckdb.connect(DUCKDB_PATH, read_only=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM daily_bars WHERE date = ?",
+                [days[-1]]).fetchone()
+        finally:
+            con.close()
+        return "duckdb", latest, (int(row[0]) if row and row[0] is not None else None), None
+    except Exception:
+        return "duckdb", latest, None, None
+
+
+def _latest_bar_day() -> tuple[str | None, str | None]:
+    """最新 bar 日(YYYYMMDD)及其来源, 读不到返回 (None, None)."""
+    src, latest, _n, _why = _bar_store_latest()
+    return latest, src
+
+
+def _bar_store_available() -> bool:
+    """主数据源(h5i 或 legacy DuckDB)当前是否可读."""
+    return bool(_bar_store_trade_days()[1])
+
+
+def _parse_day(v) -> date | None:
+    """把 'YYYYMMDD' / 'YYYY-MM-DD' / date / datetime 解析成 date; 失败返回 None."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _days_since(latest) -> int | None:
+    """最新 bar 日距今天数; 无法解析返回 None(与既有 days_lag 语义一致)."""
+    d = _parse_day(latest)
+    return (date.today() - d).days if d else None
+
+
 # ---- 单项检查 ----
 def check_disk() -> dict:
     t0 = time.time()
@@ -112,27 +247,36 @@ def check_disk() -> dict:
 
 
 def check_duckdb() -> dict:
+    """主源日线可达性 + 新鲜度 (检查名沿用 duckdb, 语义已升级为"行情主源").
+
+    m4 起全A日频行情主源为 h5i(data/h5i/market.db), legacy DuckDB 已退役且库文件
+    不复存在. 本项据此改为:h5i 可读即按真实最新 bar 日判定新鲜度(与今日差 <=5 天
+    -> OK, 否则 WARN); 只有 h5i 与 legacy DuckDB 都不可用才 FAIL(真实主源故障).
+    """
     t0 = time.time()
     name = "duckdb"
     try:
-        import duckdb
-        if not os.path.exists(DUCKDB_PATH):
-            return _record(name, "FAIL", f"db 不存在: {DUCKDB_PATH}", t0)
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        try:
-            row = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-        finally:
-            con.close()
-        if not row or not row[0]:
-            return _record(name, "FAIL", "daily_bars 表为空", t0)
-        latest = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
+        src, latest, n_uni, why = _bar_store_latest()
+        if not latest:
+            return _record(name, "FAIL",
+                           {"error": why or "数据源不可用",
+                            "h5i": "data/h5i/market.db",
+                            "duckdb": DUCKDB_PATH,
+                            "note": "h5i 与 legacy DuckDB 均不可用, 属真实主源故障"},
+                           t0)
+        days_lag = _days_since(latest)
         today = date.today().isoformat()
-        days_lag = (date.today() - row[0]).days if hasattr(row[0], "isoformat") else None
         status = "OK" if (days_lag is not None and days_lag <= 5) else "WARN"
-        return _record(name, status,
-                       {"latest_date": latest, "today": today,
-                        "days_lag": days_lag, "path": DUCKDB_PATH},
-                       t0)
+        detail = {"source": src, "latest_date": latest, "today": today,
+                  "days_lag": days_lag, "universe_size": n_uni,
+                  "path": DUCKDB_PATH,
+                  "legacy_duckdb_retired": not os.path.exists(DUCKDB_PATH),
+                  "note": ("legacy DuckDB 已退役, 本项以 h5i 主源判定; DuckDB 仅在 "
+                           "文件存在时作回退/对照")}
+        if status == "WARN" and days_lag is not None:
+            detail["action"] = (f"主源({src})最新 bar 日 {latest} 距今 {days_lag} 天, "
+                                f"超出 5 天阈值; 请检查 h5i 入库管道")
+        return _record(name, status, detail, t0)
     except Exception as e:
         return _record_duckdb(e, name, t0)
 
@@ -155,21 +299,18 @@ def check_arcticdb() -> dict:
             if v and v.get("symbols", 0) > 0 and v.get("read_fail")
         ]
         # r3 增强: "能读"还要"读到的是最新的". 对比 ArcticDB 抽样读到的 latest_date
-        # 与 DuckDB daily_bars 最新日, 滞后过多 => 数据老化(库活着但内容冻结).
+        # 与行情主源(h5i, DuckDB 已退役仅作回退)最新 bar 日, 滞后过多 => 数据老化
+        # (库活着但内容冻结).
         # 仅对"应每日更新"的核心行情/因子库判陈旧(bars/daily_summary/factor_ic);
         # trade_records/perf_report/reward_curve 为低频写库, 不做 lag 判定, 避免误报.
         DAILY_LIBS = ("bars", "daily_summary", "factor_ic")
         stale_libs = []
         db_latest = None
+        ref_src = None
+        ref_why = None
         try:
-            import duckdb
-            con = duckdb.connect(DUCKDB_PATH, read_only=True)
-            try:
-                row = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-            finally:
-                con.close()
-            if row and row[0]:
-                db_latest = _norm_date(row[0])
+            ref_src, db_latest, _n, ref_why = _bar_store_latest()
+            if db_latest:
                 for k in DAILY_LIBS:
                     v = probe.get(k)
                     if not v or v.get("symbols", 0) == 0:
@@ -199,6 +340,8 @@ def check_arcticdb() -> dict:
                         "missing": miss,
                         "read_probe": {k: v for k, v in probe.items()},
                         "read_fail": read_fail or None,
+                        "stale_ref_source": ref_src,
+                        "stale_ref_error": ref_why,
                         "db_latest_date": db_latest,
                         "stale_libs": stale_libs or None},
                        t0)
@@ -207,12 +350,36 @@ def check_arcticdb() -> dict:
 
 
 def check_orderbook() -> dict:
+    """盘口快照落盘检查. 注意: orderbook_snapshot 是 legacy DuckDB 独有表, h5i 主源
+    (daily_bars/financials/valuation/valuation_snapshot/northbound_money/
+    money_flow_estimate/margin_daily) 目前没有对应物. 因此 DuckDB 退役后本项**无法
+    验证** —— 按"不粉饰"原则判 WARN 并在 detail 明确写出待适配 h5i, 既不假报 OK 也
+    不判 FAIL 制造误报; 只有 h5i 与 legacy DuckDB 都不可用才算真实主源故障(FAIL).
+    """
     t0 = time.time()
     name = "orderbook"
     try:
-        import duckdb
+        if not _bar_store_available():
+            return _record(name, "FAIL",
+                           {"error": "数据源不可用: h5i 读不到且 legacy DuckDB 已退役",
+                            "h5i": "data/h5i/market.db",
+                            "duckdb": DUCKDB_PATH},
+                           t0)
         if not os.path.exists(DUCKDB_PATH):
-            return _record(name, "WARN", "DuckDB 缺失, 跳过 orderbook 校验", t0)
+            # 主源健康, 仅"该项缺少 h5i 对应表" -> WARN, 并提示待适配.
+            return _record(name, "WARN",
+                           {"source": "h5i", "source_ok": True,
+                            "legacy_duckdb_retired": True,
+                            "table": "orderbook_snapshot",
+                            "reason": "legacy DuckDB 已退役、该项待适配 h5i: h5i 主源无 "
+                                      "orderbook_snapshot 表, 盘口快照落盘状态无法验证",
+                            "h5i_tables": ["daily_bars", "financials", "valuation",
+                                           "valuation_snapshot", "northbound_money",
+                                           "money_flow_estimate", "margin_daily"],
+                            "action": "将盘口快照采集/落盘迁至 h5i(或在 h5i 建对应表)后, "
+                                      "本项方可恢复严格判定"},
+                           t0)
+        import duckdb
         con = duckdb.connect(DUCKDB_PATH, read_only=True)
         try:
             row = con.execute(
@@ -221,40 +388,39 @@ def check_orderbook() -> dict:
         finally:
             con.close()
         if not row or not row[0]:
-            return _record(name, "WARN", "orderbook_snapshot 表为空", t0)
+            return _record(name, "WARN",
+                           {"source": "duckdb", "table": "orderbook_snapshot",
+                            "error": "orderbook_snapshot 表为空"}, t0)
         latest = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
         today = date.today().isoformat()
         days_lag = (date.today() - row[0]).days if hasattr(row[0], "isoformat") else None
         # 当日盘前 (08:00) 还未必落盘, 所以"今日缺"视为 WARN 而非 FAIL
         status = "OK" if (days_lag is not None and days_lag <= 1) else "WARN"
         return _record(name, status,
-                       {"latest_date": latest, "today": today, "days_lag": days_lag},
+                       {"source": "duckdb", "latest_date": latest, "today": today,
+                        "days_lag": days_lag},
                        t0)
     except Exception as e:
         return _record_duckdb(e, name, t0)
 
 
 def check_daily_bars_freshness() -> dict:
+    """主源日线新鲜度: 最新 bar 日 vs 期望交易日. 数据取自 h5i 主源(DuckDB 已退役,
+    仅在文件存在时作回退), 因此不再因 legacy 库缺失而误报 FAIL."""
     t0 = time.time()
     name = "daily_bars_freshness"
     try:
-        import duckdb
-        if not os.path.exists(DUCKDB_PATH):
-            return _record(name, "FAIL", "DuckDB 缺失", t0)
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        try:
-            row = con.execute(
-                "SELECT MAX(date), COUNT(DISTINCT symbol) FROM daily_bars "
-                "WHERE date = (SELECT MAX(date) FROM daily_bars)"
-            ).fetchone()
-        finally:
-            con.close()
-        if not row or not row[0]:
-            return _record(name, "FAIL", "无数据", t0)
-        latest = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
-        n_uni = int(row[1] or 0)
+        src, latest, n_uni, why = _bar_store_latest()
+        if not latest:
+            return _record(name, "FAIL",
+                           {"error": why or "数据源不可用",
+                            "h5i": "data/h5i/market.db",
+                            "duckdb": DUCKDB_PATH,
+                            "note": "h5i 与 legacy DuckDB 均不可用, 属真实主源故障"},
+                           t0)
         today = date.today().isoformat()
-        days_lag = (date.today() - row[0]).days if hasattr(row[0], "isoformat") else None
+        latest_d = _parse_day(latest)
+        days_lag = (date.today() - latest_d).days if latest_d else None
         # 交易日期望校正: 周六/周日闭市, 最近"应有"交易日自然回退到周五(周一/周三亦前移),
         # 避免首发 check 见 days_lag=2 就误报 FAIL 的周末误报. 仅查看自然日星期, 不依赖节假日表.
         weekend = {"sat": 5, "sun": 6}
@@ -265,18 +431,22 @@ def check_daily_bars_freshness() -> dict:
             expected = nowd - timedelta(days=2)      # 周日 → 期望周五
         else:
             expected = nowd                           # 周一~周五 → 期望当天
-        expected_lag = (expected - row[0]).days if hasattr(row[0], "isoformat") else None
+        expected_lag = (expected - latest_d).days if latest_d else None
         if expected_lag is None or expected_lag > 1:
             status = "FAIL"
         elif expected_lag == 1:
             status = "WARN"
         else:
             status = "OK"
-        return _record(name, status,
-                       {"latest_date": latest, "today": today,
-                        "days_lag": days_lag, "expected_lag": expected_lag,
-                        "expected": expected.isoformat(), "universe_size": n_uni},
-                       t0)
+        detail = {"source": src, "latest_date": latest, "today": today,
+                  "days_lag": days_lag, "expected_lag": expected_lag,
+                  "expected": expected.isoformat(), "universe_size": n_uni,
+                  "legacy_duckdb_retired": not os.path.exists(DUCKDB_PATH)}
+        if status != "OK":
+            detail["action"] = (f"主源({src})最新 bar 日 {latest}, 落后期望交易日 "
+                                f"{expected.isoformat()} {expected_lag} 天; "
+                                f"请检查 h5i 入库管道")
+        return _record(name, status, detail, t0)
     except Exception as e:
         return _record_duckdb(e, name, t0)
 
@@ -359,18 +529,15 @@ def check_state_io() -> dict:
 
 
 def _distinct_trade_days(n):
-    """daily_bars 最近 n 个(去重)交易日, 升序 YYYYMMDD 列表. 供滞后判定. """
-    import duckdb
-    con = duckdb.connect(DUCKDB_PATH, read_only=True)
-    try:
-        rows = con.execute("""
-            SELECT DISTINCT date FROM daily_bars
-            ORDER BY date DESC LIMIT ?
-        """, [n]).fetchall()
-    finally:
-        con.close()
-    days = [_norm_date(r[0]) for r in rows if r and r[0]]
-    return list(reversed(days))   # 升序: [最老..最新], 倒数第 k 个 = 最新往前第 k-1 个交易日
+    """最近 n 个(去重)交易日, 升序 YYYYMMDD 列表. 供滞后判定.
+
+    取自行情主源 h5i(DuckDB 已退役, 仅在文件存在时作回退), 避免 legacy 库缺失时
+    下游 ic_history / ic_curve 连锁误报.
+    """
+    _src, days, _why = _bar_store_trade_days()
+    if not days:
+        return []
+    return [_norm_date(d) for d in days[-n:]]
 
 
 def _norm_date(v):
@@ -385,11 +552,11 @@ def check_ic_history() -> dict:
     max_hold 个交易日的 selection 天(此后 max_hold 收益已全部发生), 此类天必须在
     ic_history.csv 有对应行, 否则说明滞后结算闭环断裂(本修复前 ic_history 从未
     由管道自动生成, 正是此类盲区). 阈值: 文件缺失/覆盖不足/最新结算日陈旧 -> FAIL.
+    最新 bar 日取自行情主源 h5i(DuckDB 已退役, 仅文件存在时作回退).
     """
     t0 = time.time()
     name = "ic_history"
     import ic_track as icm
-    from db import StockDB
 
     IC_HISTORY = icm.IC_HISTORY
     MAX_HOLD = 10
@@ -398,19 +565,19 @@ def check_ic_history() -> dict:
             return _record(name, "FAIL",
                            {"error": "ic_history.csv 缺失 (滞后结算闭环从未落盘)"}, t0)
 
-        # 已到期判定: 最新 bar 往前数 MAX_HOLD 个交易日
-        db = StockDB()
-        try:
-            latest_bar = _norm_date(db.latest_daily_bar_date())
-        finally:
-            db.close()
+        # 已到期判定: 最新 bar 往前数 MAX_HOLD 个交易日 (主源 h5i; DuckDB 已退役)
+        latest_bar, bar_src = _latest_bar_day()
         if not latest_bar:
-            return _record(name, "FAIL", {"error": "daily_bars 无数据, 无法判定到期"}, t0)
+            _s, _l, _n, why = _bar_store_latest()
+            return _record(name, "FAIL",
+                           {"error": "主源无 daily_bars 数据, 无法判定到期",
+                            "source": bar_src, "detail": why,
+                            "h5i": "data/h5i/market.db", "duckdb": DUCKDB_PATH}, t0)
         trade_days = _distinct_trade_days(MAX_HOLD + 1)
         if len(trade_days) <= 1:
             return _record(name, "WARN",
                            {"error": "交易日不足, 暂无法判定陈旧",
-                            "latest_bar": latest_bar}, t0)
+                            "source": bar_src, "latest_bar": latest_bar}, t0)
 
         # 前一日交易日: 此后 >=1 根未来K线已发生, 该信号日的 h1 必已可结算.
         prev_trade_day = trade_days[-2] if len(trade_days) >= 2 else None
@@ -420,7 +587,7 @@ def check_ic_history() -> dict:
                     if prev_trade_day is not None and d <= prev_trade_day]
         if not due_days:
             return _record(name, "OK",
-                           {"note": "无已过交易日的 selection 天(数据不足)",
+                           {"source": bar_src, "note": "无已过交易日的 selection 天(数据不足)",
                             "latest_bar": latest_bar, "prev_trade_day": prev_trade_day},
                            t0)
 
@@ -450,7 +617,9 @@ def check_ic_history() -> dict:
         hard_fail = bool(problems) and (missing or latest_hist_day is None)
         status = "FAIL" if hard_fail else ("WARN" if problems else "OK")
         return _record(name, status,
-                       {"due_days": len(due_days), "hist_rows": len(hist_rows),
+                       {"source": bar_src,
+                        "latest_bar": latest_bar,
+                        "due_days": len(due_days), "hist_rows": len(hist_rows),
                         "latest_hist_day": latest_hist_day,
                         "prev_trade_day": prev_trade_day,
                         "complete_due": len(complete_due),
@@ -524,21 +693,19 @@ def check_ic_curve() -> dict:
     交易日收益, 故"可结算最新日" = DB 最新 bar 往前 20 个交易日. 判定以"非空 ic_h20
     的最后一行"为准(ic_backtest 对区间末尾未发生收益的行写 NaN, MAX(day) 会误读成
     已结算). 若可结算行落后于应结算日 -> 权重依据冻结; 任一因子文件此类落后 ->
-    FAIL 建议增量刷新/全量重建.
+    FAIL 建议增量刷新/全量重建. 最新 bar 日取自行情主源 h5i(DuckDB 已退役, 仅在
+    文件存在时作回退).
     """
     t0 = time.time()
     name = "ic_curve"
     try:
-        from config import DUCKDB_PATH
-        import duckdb
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        try:
-            latest = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-        finally:
-            con.close()
-        if not latest or not latest[0]:
-            return _record(name, "FAIL", {"error": "daily_bars 无数据"}, t0)
-        latest_bar = _norm_date(latest[0])
+        bar_src, bar_latest, _n, bar_why = _bar_store_latest()
+        if not bar_latest:
+            return _record(name, "FAIL",
+                           {"error": "主源无 daily_bars 数据",
+                            "detail": bar_why,
+                            "h5i": "data/h5i/market.db", "duckdb": DUCKDB_PATH}, t0)
+        latest_bar = bar_latest
 
         import weight_optimizer as wo
         factors = {}
@@ -612,7 +779,8 @@ def check_ic_curve() -> dict:
             status = "OK"
             note = "ic_curve 的有效 ic_h20 覆盖到最近可结算日"
         return _record(name, status,
-                       {"latest_bar": latest_bar, "due_settled_day": due,
+                       {"source": bar_src,
+                        "latest_bar": latest_bar, "due_settled_day": due,
                         "factors": {k: v for k, v in factors.items()
                                     if not k.startswith("_")},
                         "stale_files": stale_files,
@@ -984,40 +1152,79 @@ def _duck_select1(con) -> tuple[float, bool]:
         return (time.time() - t) * 1000, False
 
 
+def _h5i_probe_ms() -> tuple[float, bool]:
+    """对 h5i 主源执行一次轻量心跳探针(等价 SELECT 1: 读一行聚合), 返回(ms, ok)."""
+    t = time.time()
+    try:
+        _bar_store().trading_days()
+        return (time.time() - t) * 1000, True
+    except Exception:
+        return (time.time() - t) * 1000, False
+
+
 def check_duckdb_pool() -> dict:
     """查询引擎层(R2) 连接池健康 + 主动轻量探针.
 
     借鉴连接池 health_check_interval 定期对(空闲)连接执行 HealthCheck() 的思路:
-    盘前对 DuckDB 只读句柄执行 SELECT 1 心跳(等价健康校验), 统计响应耗时;
-    同时做一次真实轻量 IO(SELECT MAX(date)) 验证引擎正常响应.
-    连接可开/可关、SELECT 1 快速返回 => 连接池健康.
+    盘前对**行情主源只读句柄**执行心跳探针(等价 SELECT 1), 统计响应耗时; 同时做一次
+    真实轻量 IO(取最新 bar 日)验证引擎正常响应. 连接可开/可关、心跳快速返回 =>
+    连接池健康.
+
+    m4 起主源为 h5i, legacy DuckDB 已退役(库文件不存在属预期), 故探针先打 h5i;
+    仅当 h5i 不可用且 DuckDB 文件仍在时才回落 DuckDB 心跳. 两者都不可用才 FAIL.
     """
     t0 = time.time()
     name = "duckdb_pool"
     try:
-        import duckdb
-        if not os.path.exists(DUCKDB_PATH):
-            return _record(name, "FAIL", f"db 不存在: {DUCKDB_PATH}", t0)
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        try:
-            s1_ms, s1_ok = _duck_select1(con)
+        src, latest, _n, why = _bar_store_latest()
+        if src == "h5i":
+            h1_ms, h1_ok = _h5i_probe_ms()
             t_io = time.time()
-            row = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+            _s, _l, _c, io_err = _bar_store_latest()
             io_ms = (time.time() - t_io) * 1000
-            latest = row[0].isoformat() if row and row[0] and hasattr(row[0], "isoformat") else (
-                str(row[0])[:10] if row and row[0] else None)
-            # 再验一句连接仍活(池内复用能力)
-            s2_ms, s2_ok = _duck_select1(con)
-            alive = s1_ok and s2_ok and row is not None
-        finally:
-            con.close()
-        status = "OK" if alive else "FAIL"
-        return _record(name, status,
-                       {"liveness": {"select1_ms": round(s1_ms, 2),
-                                     "reuse_select1_ms": round(s2_ms, 2),
-                                     "alive": alive},
-                        "probe": {"io_ms": round(io_ms, 2), "latest_date": latest},
-                        "path": DUCKDB_PATH},
+            # 再验一次句柄仍活(池内复用能力)
+            h2_ms, h2_ok = _h5i_probe_ms()
+            alive = bool(h1_ok and h2_ok and latest)
+            status = "OK" if alive else "FAIL"
+            return _record(name, status,
+                           {"source": "h5i",
+                            "liveness": {"heartbeat_ms": round(h1_ms, 2),
+                                         "reuse_heartbeat_ms": round(h2_ms, 2),
+                                         "alive": alive},
+                            "probe": {"io_ms": round(io_ms, 2), "latest_date": latest,
+                                      "error": io_err},
+                            "path": _H5I_DB_HINT,
+                            "legacy_duckdb_retired": not os.path.exists(DUCKDB_PATH),
+                            "note": "legacy DuckDB 已退役, 探针打在 h5i 主源句柄上"},
+                           t0)
+        if src == "duckdb":
+            import duckdb
+            con = duckdb.connect(DUCKDB_PATH, read_only=True)
+            try:
+                s1_ms, s1_ok = _duck_select1(con)
+                t_io = time.time()
+                row = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+                io_ms = (time.time() - t_io) * 1000
+                latest2 = row[0].isoformat() if row and row[0] and hasattr(row[0], "isoformat") else (
+                    str(row[0])[:10] if row and row[0] else None)
+                # 再验一句连接仍活(池内复用能力)
+                s2_ms, s2_ok = _duck_select1(con)
+                alive = s1_ok and s2_ok and row is not None
+            finally:
+                con.close()
+            status = "OK" if alive else "FAIL"
+            return _record(name, status,
+                           {"source": "duckdb",
+                            "liveness": {"select1_ms": round(s1_ms, 2),
+                                         "reuse_select1_ms": round(s2_ms, 2),
+                                         "alive": alive},
+                            "probe": {"io_ms": round(io_ms, 2), "latest_date": latest2},
+                            "path": DUCKDB_PATH},
+                           t0)
+        return _record(name, "FAIL",
+                       {"error": why or "数据源不可用",
+                        "h5i": _H5I_DB_HINT, "duckdb": DUCKDB_PATH,
+                        "note": "h5i 与 legacy DuckDB 均不可用, 属真实主源故障"},
                        t0)
     except Exception as e:
         return _record_duckdb(e, name, t0)
@@ -1470,7 +1677,8 @@ CHECKS = [
     check_decider_freshness,
     check_position_gap,
     check_target_contract,
-    # 第五轮分层健康探测: 数据存储(ArcticDB 读写+存活) / 查询引擎(DuckDB 连接池)
+    # 第五轮分层健康探测: 数据存储(ArcticDB 读写+存活) / 查询引擎(主源连接池:
+    #                     h5i 优先, legacy DuckDB 已退役)
     #                    / AI Agent(LLM 输出循环 + DRL 覆盖停滞)
     check_arcticdb_rw,
     check_duckdb_pool,

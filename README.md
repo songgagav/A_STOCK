@@ -281,6 +281,18 @@ CI 分为两部分：
 .venv314\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
+> ⚠️ **解释器要求（2026-09-19 修正）**：`.venv314`（Python 3.14）**没有 `h5i_db`**
+> （实测 `importlib.util.find_spec("h5i_db") is None`）。DuckDB 退役后 h5i 是**主数据源**，
+> 用 `.venv314` 启动看板会失去主源数据。请改用持有 `h5i_db` 的解释器，例如：
+>
+> ```powershell
+> $env:BAR_STORE = 'h5i'
+> & "<持有 h5i_db 的解释器>\python.exe" src\dashboard.py --port 8000
+> ```
+>
+> 验证方式：`& <解释器> -c "import h5i_db; print('ok')"`，以及看板
+> `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
+
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
 ### 一键启动后台栈
