@@ -13,6 +13,7 @@ from functools import lru_cache
 import duckdb
 import pandas as pd
 from config import DUCKDB_PATH, POOL_FILTER
+from dataguard import warn_once, with_retry
 
 # [2026-09-05 迁移 m4] 读取侧数据源切换: h5i(新分析层, 默认) | duck(对照/临时回退).
 # DuckDB 已退役删除; 仅当显式设 BAR_STORE=duck 且文件仍在时走 DuckDB 对照.
@@ -102,13 +103,44 @@ _H5I_BULK_SLOT: dict = {"key": None, "frame": None, "window_days": 0}
 _H5I_BULK_BACK_DAYS = 400  # 覆盖 >=200 交易日的自然日缓冲
 
 
-@lru_cache(maxsize=1)
-def _h5i_symbols_df():
-    import pyarrow.parquet as pq
-    try:
+# ---------------------------------------------------------------------------
+# symbols parquet 进程内缓存槽
+#
+# [2026-09-19 修] 原实现为:
+#     @lru_cache(maxsize=1)
+#     def _h5i_symbols_df():
+#         try:    return pq.read_table(_SYM_PARQUET).to_pandas()
+#         except Exception: return pd.DataFrame()
+#    两个缺陷叠加成**静默失败**:
+#      a) `except: return pd.DataFrame()` 吞掉异常, 调用方拿到空表却无从知晓;
+#      b) `@lru_cache` 把这次**失败的空表永久缓存** —— 一次瞬时读盘故障之后,
+#         universe merge / list_date 在其后的整个进程生命周期内**静默全空**,
+#         且没有任何重试机会(见 docs/pit-valuation.md §⑭ 静默失败审计)。
+#    现改为: 成功才写 `_SYM_DF_SLOT`, 失败**不缓存** + 指数退避重试 + warn_once 告警。
+#    对应的回归用例: tests/test_silent_failure_guards.py
+#      ::test_symbols_df_failure_is_not_cached
+# ---------------------------------------------------------------------------
+_SYM_DF_SLOT: dict = {"df": None}
+
+
+def _h5i_symbols_df() -> pd.DataFrame:
+    """读取 symbols parquet 为 DataFrame (进程内缓存, **失败不缓存**)。"""
+    cached = _SYM_DF_SLOT.get("df")
+    if cached is not None:
+        return cached
+
+    def _read() -> pd.DataFrame:
+        import pyarrow.parquet as pq
         return pq.read_table(_SYM_PARQUET).to_pandas()
-    except Exception:
-        return pd.DataFrame()
+
+    # 空结果同样视为失败: symbols 表为空 ⇒ universe 必然为空, 属硬伤而非合法情形。
+    df, ok = with_retry(_read, tries=3, base_delay=0.2,
+                        label="h5i symbols parquet",
+                        empty_is_failure=True, warn_key="h5i_symbols_read")
+    if not ok or df is None or len(df) == 0:
+        return pd.DataFrame()          # 失败 -> 返回空表但**不写缓存**, 下次仍会重试
+    _SYM_DF_SLOT["df"] = df
+    return df
 
 
 def _universe_h5i(date=None) -> pd.DataFrame:
@@ -329,10 +361,22 @@ class StockDB:
                 turnover, pe_ttm, pb, amount, float_shares, list_date
         """
         if _h5i_enabled():
+            # [2026-09-19 修] 原先此处是 `except Exception: return pd.DataFrame()`
+            # —— h5i 取数失败时**静默返回空池**, 调用方无法区分"当日确实无标的"与
+            # "取数故障", 空池会被当成正常结果继续往下走(选股/回测据此得出空结果)。
+            # 现改为: 失败与空结果都**亮出告警**(dataguard.warn_once 去重),
+            # 返回值语义不变(仍是空表), 以免改变既有调用方的降级路径。
             try:
-                return _universe_h5i(date)
-            except Exception:
+                out = _universe_h5i(date)
+            except Exception as e:  # noqa: BLE001
+                warn_once("universe_h5i_empty",
+                          f"h5i universe 取数失败, 已返回空表: {type(e).__name__}: {e}")
                 return pd.DataFrame()
+            if out is None or len(out) == 0:
+                warn_once("universe_h5i_empty",
+                          "h5i universe 返回空池(非异常路径), 候选池为空")
+                return pd.DataFrame() if out is None else out
+            return out
         con = self._conn()
 
         # —— 脏快照段防护 (重要): 某 fetch_time 段若 float_mv/float_shares 集体

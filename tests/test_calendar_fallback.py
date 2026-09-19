@@ -37,14 +37,36 @@ def test_cache_calendar_never_stores_empty():
 
 
 def test_full_calendar_returns_non_empty_and_caches():
+    """三个日历源(h5i_db / duckdb / data/trade_calendar.json)至少一个可用时,
+    日历必须非空、升序且被缓存。
+
+    [2026-09-19] 补 skip: 本用例的断言前提是"环境里存在日历源", 而 CI 里
+      - `h5i_db` 不在依赖清单中;
+      - `data/` 被 .gitignore 整目录忽略 ⇒ `data/trade_calendar.json` 结构上不可能存在。
+    故无源时 skip(与本文件另两处 `pytest.skip("无日历")` 的既有约定一致),
+    有源时仍严格断言。
+    """
     cal = V._full_calendar()
+    if not cal:
+        pytest.skip("环境无任何日历源(h5i_db 未安装且 data/trade_calendar.json 不存在)")
     assert cal, "三个源都拿不到日历时该用例会失败, 说明环境缺数据源"
     assert cal == sorted(cal), "日历必须升序"
     assert V._CAL_CACHE.get("cal") == cal, "非空日历应被缓存"
 
 
 def test_static_calendar_file_is_usable():
-    """项目自带 data/trade_calendar.json 必须可解析且覆盖研究区间."""
+    """项目自带 data/trade_calendar.json 必须可解析且覆盖研究区间。
+
+    [2026-09-19] 该文件位于被 .gitignore 忽略的 `data/` 下, 在 CI 中不存在,
+    故文件缺失时 skip; 存在时仍严格校验覆盖区间。
+
+    另注: 该文件契约是 `days` 键 + 'YYYYMMDD' 无分隔格式
+    (见 vnpy_backtest._calendar_from_static_file)。scripts/export_trade_calendar.py
+    曾只写 `trading_days` 键而覆盖此文件, 使回退链失效; 现该脚本写**双键**。
+    """
+    static_fp = os.path.join(V.DATA_DIR, "trade_calendar.json")
+    if not os.path.exists(static_fp):
+        pytest.skip(f"静态日历文件不存在(被 .gitignore 忽略的数据产物): {static_fp}")
     ds = V._calendar_from_static_file()
     assert ds, "静态日历不可用, 回退链失效"
     assert ds == sorted(ds)

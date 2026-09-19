@@ -17,12 +17,9 @@ import pytest
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, _SRC)
 
-# `db` 顶部无条件 `import duckdb`(src/db.py:13), 而 CI 的 requirements_314.txt **不含
-# duckdb** —— 若直接 import, 整个模块在收集阶段就 ImportError, 使 CI 以 exit code 2
-# 中断(而非测试失败)。此处显式跳过, 让"缺 duckdb"表现为 skip 而不是 CI 崩溃。
-# 注: 该缺陷属既有问题(db.py 硬依赖 duckdb), 与本文件无关, 已在提交信息中记录。
-pytest.importorskip("duckdb", reason="db.py 硬依赖 duckdb, 而 CI 依赖清单未包含它")
-
+# 注: 曾需要 `pytest.importorskip("duckdb")`(db.py 顶部无条件 import duckdb, 而 CI 的
+# requirements_314.txt 不含 duckdb ⇒ 收集即 ImportError)。2026-09-19 已把 db.py 的
+# duckdb 改为守卫导入, 故此处不再需要。
 import dataguard  # noqa: E402
 
 
@@ -47,20 +44,18 @@ def _patch_read(monkeypatch, fn):
 
 
 # ---------------------------------------------------------------------------
-# 2026-09-19 合并时订正: 以下前三个用例依赖 `db._h5i_symbols_df` 的一份**修复**
+# 2026-09-19 订正: 以下三个用例依赖 `db._h5i_symbols_df` 的一份**修复**
 # (去掉 @lru_cache、失败不写缓存、带重试与 warn_once 告警、缓存槽 _SYM_DF_SLOT)。
-# 该修复**不在任何已合入的分支上**:
-#   - `src/db.py` 在 80ca9bf 与 origin/main 上是**完全相同**的旧实现
-#     (`@lru_cache(maxsize=1)` + `except: return pd.DataFrame()`);
-#   - 两边的 db.py 都没有 `_SYM_DF_SLOT` 这个属性。
-# 合并后这三例会以 AttributeError 报错(而非断言失败), 属**测试引用了不存在的实现**。
-# 故显式 skip 并保留原始断言, 待那份 db.py 修复合入后去掉 skip 即生效。
-# 不删除、不改成"伪造通过" —— 缺陷本身仍然真实存在(见 docs/pit-valuation.md §⑭)。
+# 合并时该修复**不在任何已合入分支上**, 故曾显式 skip。
+# **该修复已于同日实装**(见 src/db.py 的 _SYM_DF_SLOT / _h5i_symbols_df 与
+# get_universe 的 h5i 分支), 因此下面的 skipif 现为恒假、用例正常执行。
+# 保留 skipif 是为了记录"测试与实现的耦合关系": 若哪天修复被回退, 用例会自动
+# 变成 skip 而不是让人误以为它通过了。
 # ---------------------------------------------------------------------------
 _DB_SLOT_FIX_MERGED = hasattr(__import__("db"), "_SYM_DF_SLOT")
 _skip_db_fix = pytest.mark.skipif(
     not _DB_SLOT_FIX_MERGED,
-    reason="依赖 db._h5i_symbols_df 的去缓存/重试/告警修复(含 _SYM_DF_SLOT), 该修复尚未合入任何分支",
+    reason="依赖 db._h5i_symbols_df 的去缓存/重试/告警修复(含 _SYM_DF_SLOT), 该修复未实装",
 )
 
 

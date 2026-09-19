@@ -84,13 +84,24 @@ def main() -> int:
         "n": len(days),
         "first": days[0],
         "last": days[-1],
+        # [2026-09-19 修] **双键**, 因为本文件有**两个既有消费方**, 契约不同:
+        #   1) `days`: 'YYYYMMDD' 无分隔 —— 项目原有契约。
+        #      `src/vnpy_backtest._calendar_from_static_file()` 读 `days` 并自行归一化;
+        #      `tests/test_calendar_fallback.py::test_static_calendar_file_is_usable`
+        #      断言其存在且覆盖研究区间。
+        #   2) `trading_days`: 'YYYY-MM-DD' —— 本会话新增的 veighna_sim 消费方
+        #      (`veighna_sim/loop/astock_source.py::trading_days()`)。
+        # 历史教训: 本脚本最初**只写 trading_days**, 而目标路径正是 (1) 所读的文件 ——
+        # 等于用不兼容的 schema 覆盖了项目契约文件, 使日历回退链失效(该用例由通过变
+        # 为空列表)。故此处**必须**同时写两个键; 请勿删掉其中任何一个。
+        "days": [d.replace("-", "") for d in days],
         "trading_days": days,
     }
     os.makedirs(os.path.dirname(OUT_FP), exist_ok=True)
     with open(OUT_FP, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
     print(f"[export_trade_calendar] {OUT_FP} n={len(days)} "
-          f"{days[0]}~{days[-1]} src={src}")
+          f"{days[0]}~{days[-1]} src={src} keys=days+trading_days")
     return 0
 
 

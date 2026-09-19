@@ -28,7 +28,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_314.txt pytest
+          # [2026-09-19 修] 原为 `pip install -r requirements_314.txt pytest`。
+          # requirements_314.txt 只是**核心**依赖(10 项), 而测试链还会 import:
+          #   duckdb  -> src/db.py 顶层依赖(requirements-dev.txt 已注明"测试环境必备")
+          #   polars  -> src/vnpy_backtest.py 顶层依赖(tests/test_calendar_fallback.py 会 import 它)
+          # 缺这两个 ⇒ 凡 import db / vnpy_backtest 的测试模块在**收集阶段**即
+          # ImportError, pytest 以 exit code 2 中断(表现为"1 秒内失败", 而非测试失败)。
+          # 实测 origin/main 基线 48ccf7f(不含任何本会话改动) 同样 exit 2 ⇒ 既有缺陷。
+          # 此处补齐 author 已在 requirements-dev.txt 中标注的测试环境依赖。
+          pip install -r requirements_314.txt pytest duckdb polars
       - name: Run full regression (excluding torch/DRL suites)
         run: |
           python -m pytest tests -q \
@@ -38,7 +46,9 @@ jobs:
             --ignore=tests/test_regime_aware.py \
             --ignore=tests/test_risk_factor_integration.py \
             --ignore=tests/test_risk_factor_optimizer.py \
-            --ignore=tests/test_run_factor_value_drl_risk.py
+            --ignore=tests/test_run_factor_value_drl_risk.py \
+            --ignore=tests/test_cvar_config.py \
+            --ignore=tests/test_execution_decomposition.py
 
   regression-drl:
     runs-on: ubuntu-latest
@@ -50,12 +60,18 @@ jobs:
       - name: Install deps (CPU torch)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_314.txt pytest
+          # 与 regression-core 同样补齐 requirements-dev.txt 已注明的顶层依赖
+          pip install -r requirements_314.txt pytest duckdb polars
           pip install gymnasium
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install stable-baselines3
       - name: Run DRL regression
         run: |
+          # [2026-09-19] 并入两处 torch 依赖用例(原先遗漏在 core job 里, 而 core 按设计
+          # 不装 torch ⇒ 必然 ModuleNotFoundError: gymnasium/torch):
+          #   tests/test_cvar_config.py            -> 经 drl_train 间接依赖 torch
+          #   tests/test_execution_decomposition.py-> risk_factor_optimizer -> drl_train -> torch
+          # core job 已对应 --ignore, 故两处仍被完整覆盖, 只是移到有 torch 的 job 执行。
           python -m pytest tests/test_factor_dynamic_weights.py \
             tests/test_factor_value_env.py \
             tests/test_llm_drl_integration.py \
@@ -63,4 +79,6 @@ jobs:
             tests/test_risk_factor_integration.py \
             tests/test_risk_factor_optimizer.py \
             tests/test_run_factor_value_drl_risk.py \
+            tests/test_cvar_config.py \
+            tests/test_execution_decomposition.py \
             -q
