@@ -128,11 +128,30 @@ def _proc_alive(pid):
         import ctypes
         # PROCESS_QUERY_INFORMATION | SYNCHRONIZE 权限位, 进程结束后 OpenProcess 返回 NULL.
         # 旧代码用 1 (PROCESS_TERMINATE) 会对已结束进程误判为"存活", 使看护不重建崩溃的 dashboard.
-        h = ctypes.windll.kernel32.OpenProcess(0x0400, False, int(pid))
+        #
+        # [2026-09-19 再修] 仅靠 OpenProcess 成功**仍不足以**判定存活: Windows 上只要还有
+        # **任何句柄**指向已终止的进程对象, OpenProcess 就会成功 —— 而 subprocess.Popen 在
+        # wait() 之后**仍持有句柄**(直到该对象被回收)。故看护若曾 wait 过该子进程、或持有其
+        # Popen 对象, 就会把一个**已崩溃**的进程判为存活, 从而**不重建** —— 与上面那条旧缺陷
+        # 是同一故障模式; 换权限位解决不了句柄残留。
+        # 实测(2026-09-19, 经故障注入演练发现): 子进程已 exit(7)、未释放其 Popen 句柄时
+        #     daemon._proc_alive(pid) = True    (错)
+        #     GetExitCodeProcess       = False  (对)
+        # 故必须**同时**校验退出码: 仍在运行 => STILL_ACTIVE(259)。
+        STILL_ACTIVE = 259
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x0400, False, int(pid))
         if not h:
             return False
-        ctypes.windll.kernel32.CloseHandle(h)
-        return True
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+                # 拿不到退出码: 保守沿用旧语义(能打开即算存活), 以免在受限句柄/非 Windows
+                # 场景把**活进程**误判为死亡而反复重建。
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
     except Exception:
         return False
 

@@ -202,6 +202,27 @@ def _ad_fault_inject():
     return p, t - p, items, str(j.get("scope_note", ""))[:120]
 
 
+def _ad_daemon_heal():
+    """进程崩溃 + 守护重启演练。
+
+    **本次演练抓到一个真缺陷**：`daemon._proc_alive()` 仅凭 OpenProcess 成功判定存活,
+    而 Windows 上只要还有句柄指向已终止的进程对象, OpenProcess 就会成功 —— 于是看护会把
+    **已崩溃**的进程判为存活而**不重建**(与 daemon.py 注释里那条旧缺陷同一故障模式)。
+    实测: 子进程 exit(7) 且未释放其 Popen 句柄时 `_proc_alive=True`(错)、
+    `GetExitCodeProcess=False`(对)。已修 `_proc_alive` 增加退出码判定, 修后 6/6 PASS。
+    """
+    j = _load("preflight_daemon_heal.json", _RUN_START)
+    if not j:
+        return 0, 1, [("preflight_daemon_heal", "FAIL", "无 JSON 输出")], ""
+    items = []
+    for c in j.get("checks", []):
+        items.append((f"守护:{c.get('name')}", "OK" if c.get("pass") else "FAIL",
+                      str(c.get("detail", ""))[:80]))
+    s = j.get("_summary", {})
+    p, t = s.get("pass", 0), s.get("total", 0)
+    return p, t - p, items, str(j.get("note", ""))[:120]
+
+
 def _ad_neutral_removed():
     """已移除的适配器（保留以记录教训）。
 
@@ -226,6 +247,9 @@ INJECT = [
     # 第二批: 模拟条件(ENOSPC/URLError/TimeoutError)打在真实代码路径上;
     # 每例均已断言"告警触发+系统恢复+数据一致"三件事。
     ("preflight_fault_inject.py", _ad_fault_inject, "盘中", "数据链"),
+    # 第三批: 进程崩溃 + 守护自愈(真实拉起子进程, 用临时端口不碰用户 8000)。
+    # 归入执行链: 守护看护的是引擎/可视化等执行侧进程。
+    ("preflight_daemon_heal.py", _ad_daemon_heal, "盘中", "执行链"),
 ]
 
 #: 已知未闭环 P0 (摘自 ops/acceptance_status.json 的权威登记)

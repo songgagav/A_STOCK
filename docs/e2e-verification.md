@@ -8,11 +8,11 @@
 > |---|---|---|---|---|
 > | 数据链 | 14 | 0 | 0 | **Conditional Go** |
 > | 信号链 | 3 | 2 | 0 | **No-Go** |
-> | 执行链 | 4 | 1 | 0 | **No-Go** |
+> | 执行链 | 10 | 1 | 0 | **No-Go** |
 >
 > 判据（用户设计第五节）：未闭环 P0 → No-Go；有 P1 且有缓解 / 有需人工定性项 → Conditional Go；全通过 → Go。
 >
-> *数据链由 10 pass/1 review 更新为 14 pass/0 review：写入原子性已由"需人工定性"定为**块粒度原子 PASS**（见第二节盘后），并新增第二批故障注入 3 例（见第四节）。*
+> 演进：数据链 10/0/1 → **14/0/0**（写入原子性定性与第二批故障注入）；执行链 4/1 → **10/1**（新增守护重启演练 6 项）。
 
 ---
 
@@ -114,9 +114,26 @@
 | **磁盘满** | `preflight_fault_inject.py`（**模拟 ENOSPC**） | 告警 + 可恢复 + 无残留 | ✅ 两轮注入均 FAIL；恢复后 OK；无残留探针文件 |
 | **网络中断** | 同上（**模拟 URLError**） | 降级 + 重试 + 不静默 | ✅ `status=WARN degraded=True attempts=3`（实际调用 3 次）；恢复后可重跑 |
 | **数据延迟（超时）** | 同上（**模拟 TimeoutError** 打 `dataguard.with_retry`） | 重试后告警、失败不缓存 | ✅ 重试 3 次后 `warn_once`；失败返回 `None` 不伪造数据；恢复后返回正常值 |
-| 进程崩溃 + 守护重启 | `src/daemon.py` 自动拉起 | 状态恢复 | ⛔ **本批次未演练** |
+| 进程崩溃 + 守护重启 | `preflight_daemon_heal.py`（**真实 kill + 真实拉起**，临时端口） | 检测到崩溃→重建→留痕→幂等 | ✅ **6/6**（详见下方"演练抓到的真缺陷"） |
 | 真实磁盘满 / 真实断网 | — | — | ⛔ 未演练（需小容量卷 / 可控网络隔离） |
 | 部分成交 / 拒单 | `preflight_paperbook`（资金不足） | 告警，不重试死循环 | ✅ 模拟层；真实通道 ⛔ |
+
+#### ⚠️ 演练抓到的真缺陷（已修）：`daemon._proc_alive` 会把已崩溃进程判为存活
+
+**这是本次故障注入最有价值的产出** —— 它正是设计第四节"进程崩溃 → 守护重启"想抓的东西。
+
+- **现象**：把"已崩溃的 pid"预置进 pidfile 后调用 `daemon._ensure_dashboard()`，看护**提前 return、根本没重建**；
+  而演练脚本当时还把"新 pid 存活"当成通过 —— 那个"新 pid"其实就是**已死进程的 pid**，构成**假 PASS**（脚本 bug 也一并修了：现强制断言 **pid 必须更换**）。
+- **根因**：`_proc_alive` 仅凭 `OpenProcess(PROCESS_QUERY_INFORMATION)` 成功判定存活；而 Windows 上**只要还有任何句柄**指向已终止的进程对象，`OpenProcess` 就会成功 —— 而 `subprocess.Popen` 在 `wait()` 之后**仍持有句柄**。
+- **实测证据**（子进程 `exit(7)`、未释放其 Popen 句柄）：
+  ```
+  daemon._proc_alive(pid) = True     ← 错：把已退出判为存活
+  GetExitCodeProcess      = False   ← 对
+  ```
+- **与既有注释的关系**：`daemon.py` 原注释称该缺陷已通过把权限位从 `PROCESS_TERMINATE(1)` 改为 `PROCESS_QUERY_INFORMATION(0x400)` 修好 —— **权限位解决不了句柄残留**，故修复不完整。
+- **修法**：`_proc_alive` 增加退出码校验（仍在运行 ⇔ `STILL_ACTIVE(259)`）；拿不到退出码时保守沿用旧语义，避免把活进程误判为死亡而反复重建。
+- **修后**：演练 **6/6 PASS**，且 pid 确实更换（旧 76760 → 新 33672）。
+- **影响面**：`_ensure_dashboard` / `_ensure_obs_stack` / `_start_engine` 均以该判据决定是否重建，故此前**任一被看护进程若崩溃，看护可能不重建**。
 
 > **第二批注入的性质声明（不得含糊）**：`preflight_fault_inject.py` 注入的是
 > **模拟条件**（monkeypatch 出 `OSError(ENOSPC)` / `URLError` / `TimeoutError`），
@@ -165,7 +182,7 @@
   [x] 磁盘满（模拟 ENOSPC）                      -> 告警+恢复+一致 三件齐全
   [x] 网络中断（模拟 URLError）                  -> 降级+重试+可恢复 三件齐全
   [x] 数据延迟（模拟 TimeoutError）              -> 重试后告警、失败不缓存 三件齐全
-  [ ] 进程崩溃 + 守护重启                        -> 未演练
+  [x] 进程崩溃 + 守护重启                        -> 6/6（真实 kill + 真实拉起；**并抓到 `_proc_alive` 真缺陷，已修**）
   [ ] 真实磁盘满 / 真实断网                       -> 未演练（需小容量卷 / 网络隔离）
   [x] 部分成交/拒单（资金不足）                   -> 模拟层通过
 
