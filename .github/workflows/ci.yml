@@ -42,6 +42,7 @@ jobs:
           python -m pytest tests -q \
             --ignore=tests/test_factor_dynamic_weights.py \
             --ignore=tests/test_factor_value_env.py \
+            --ignore=tests/test_factor_weight_env_bounds.py \
             --ignore=tests/test_llm_drl_integration.py \
             --ignore=tests/test_regime_aware.py \
             --ignore=tests/test_risk_factor_integration.py \
@@ -72,8 +73,11 @@ jobs:
           #   tests/test_cvar_config.py            -> 经 drl_train 间接依赖 torch
           #   tests/test_execution_decomposition.py-> risk_factor_optimizer -> drl_train -> torch
           # core job 已对应 --ignore, 故两处仍被完整覆盖, 只是移到有 torch 的 job 执行。
+          # [2026-09-20] 新增 tests/test_factor_weight_env_bounds.py -> 需 gymnasium+torch
+          #   （FactorWeightEnv 回合终止边界 + _load_factor_state 失败路径; core 同步 --ignore）
           python -m pytest tests/test_factor_dynamic_weights.py \
             tests/test_factor_value_env.py \
+            tests/test_factor_weight_env_bounds.py \
             tests/test_llm_drl_integration.py \
             tests/test_regime_aware.py \
             tests/test_risk_factor_integration.py \

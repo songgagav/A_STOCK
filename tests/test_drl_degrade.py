@@ -513,17 +513,23 @@ class TestNoSilentFailurePathsInTrain:
     def test_import_present(self):
         assert "import drl_degrade" in self._src()
 
-    def test_helper_defined_and_used_twice(self):
+    def test_helper_defined_and_used_three_times(self):
         src = self._src()
         assert "def _degrade_on_failure(" in src
-        assert src.count("_degrade_on_failure(") == 3, \
-            "1 处定义 + 2 处调用（数据不足 / 外层 except）"
+        assert src.count("_degrade_on_failure(") == 4, \
+            "1 处定义 + 3 处调用（数据源不可用 / 数据不足 / 外层 except）"
 
     def test_every_failure_return_carries_degrade(self):
         src = self._src()
-        assert src.count('"degrade": _degrade_on_failure') == 1       # 数据不足
-        assert src.count('"degrade": _dec}') == 1                     # 外层 except
-        assert src.count('"degrade": ') == 2
+        assert src.count('"degrade": _degrade_on_failure') == 2   # 数据源 + 数据不足
+        assert src.count('"degrade": _dec}') == 1                 # 外层 except
+        assert src.count('"degrade": ') == 3
+
+    def test_data_source_path_goes_through_chain(self):
+        """`_load_factor_state` 抛异常也必须走降级链（原先在外层 try 之外 -> 逃出函数）。"""
+        src = self._src()
+        i = src.index("因子状态数据源不可用")
+        assert "_degrade_on_failure" in src[i:i + 700]
 
     def test_data_insufficient_path_goes_through_chain(self):
         src = self._src()

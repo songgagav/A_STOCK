@@ -92,22 +92,88 @@
 | 经验池充足（≥最小训练量） | ❌ 未见 | 无缓冲区、无最小样本量断言 |
 | 模型版本可追溯 | ✅ 有 | `data/drl/<YYYYMMDD>/{model.zip, train_meta.json, reward_curve.png}`，16 个样本 |
 
-### 学习中 —— **全部未落盘，因而无从验证**
+### 学习中 —— ✅ **已落盘（DRL-2，2026-09-20）**
 
-`train_meta.json` 实测 **23 个键**，逐项检查：
+**原状（实测 23 键）**：
 
-| 设计检查项 | 是否落盘 | 实测 |
+| 设计检查项 | 原是否落盘 | 实测 |
 |---|---|---|
-| 训练步数 | ❌ | 只有 `total_timesteps`（配置值），无实际步数 |
+| 训练步数 | ❌ | 只有 `total_timesteps`（**配置值**），无实际步数 |
 | Policy Loss / Value Loss | ❌ | 键集内**无** `policy_loss` / `value_loss` |
 | 熵值（探索能力） | ❌ | 无 `entropy` / `entropy_loss` |
 | 梯度范数 | ❌ | 无 `grad_norm` |
 | 训练时长（墙钟） | ❌ | 无 duration 类键 |
 
-现有键全集：`algorithm, arcticdb_reward_written, attr_reward, base_weights, day,
+原键全集：`algorithm, arcticdb_reward_written, attr_reward, base_weights, day,
 final_weights, last_dates, llm_brief, mean_reward, model_path, n_dates, n_epochs,
 n_obs_steps, ok, perf_report, plot, prior_weights, reward_weights, sum_reward,
 target_plan, total_timesteps, vnpy_reward, vnpy_stats`
+
+**现实现（`src/drl_metrics.py`，轻量、不依赖 torch ⇒ 不装 torch 的 CI core job 也能跑单测）**：
+
+| 设计检查项 | 现落盘位置 | 采集方式 |
+|---|---|---|
+| 训练步数 | `train_metrics.actual_timesteps` | `model.num_timesteps`（**与** `requested_timesteps` 分开记录） |
+| Policy / Value Loss | `train_metrics.series.policy_loss` / `.value_loss` | `CustomPPO.train()` 末尾快照 `logger.name_to_value` |
+| 熵值 | `train_metrics.series.entropy_loss` | 同上 |
+| 梯度范数 | `train_metrics.series.grad_norm` | `clip_grad_norm_` 返回值（**裁剪前**总范数；不在 SB3 logger 中） |
+| 训练时长 | `train_metrics.duration_s` | `model.learn()` 前后墙钟 |
+
+另有 `approx_kl / clip_fraction / explained_variance / std / ent_coef / n_updates` 一并落盘。
+每个指标输出 `{n, first, last, min, max, mean, delta, rel_delta, slope}` 汇总 + 完整序列（上限 2000 点）。
+
+**两个关键设计选择**：
+
+1. **快照放在 `CustomPPO.train()` 末尾，而非用 SB3 callback** —— 不依赖 callback 的调用顺序，
+   换 SB3 版本也不会静默采到空值（"代码存在 ≠ 路径可用"）。
+2. **不判定"是否收敛"** —— 判定必然要阈值，而阈值须按 METHOD-1 基于**下游表现**来定。
+   故输出里**不产出任何布尔判定**（由单测锁定），并显式 `threshold_applied=false`；
+   待积累 1-2 个月「指标序列 → 下游表现」配对数据后再标定。
+
+**为什么必须跑一次真训练来验证**（`scripts/preflight_drl_metrics_realrun.py`，13/13 PASS）：
+单测只能证明"给定数值能正确汇总"，**不能**证明 `METRIC_LOGGER_KEYS` 映射的 SB3 logger
+键名与真实输出一致 —— 键名写错的表现是"单测全绿而生产一个指标都没有"，即又回到 DRL-2 的老问题。
+真实运行实测：**10 个指标 × 26 次迭代全部非空**，`actual_timesteps=806` vs `requested=800`，
+`train_metrics` 仅 4291 字节。
+
+> **⚠ 但请注意下面 §八：当前生产根本跑不到这一步。**
+
+---
+
+#### ⚠ P0 阻塞项（登记册 `P0-DRLSRC`）：DRL 链路自 2026-09-05 起停摆
+
+**这不是设计问题，是"文档声称已迁移、实测没迁移"。**
+
+`src/config.py` 第 26-32 行明确写着：
+
+> `[2026-09-05 m4] DuckDB 已退役删除: 全A日频行情已迁入 h5i …… 读取方**均已改为优先 h5i 并在缺失时降级**`
+> `DUCKDB_PATH = <repo>/data/legacy_stockdb.duckdb  # [已退役] 原全A日频数据湖, 本机已删除`
+
+**实测：这个"均已改"对 DRL 链路不成立。**
+
+| 事实 | 证据 |
+|---|---|
+| 项目内**不存在任何** `*.duckdb`/`*.ddb` 文件 | 全盘 `Get-ChildItem -Recurse -Include *.duckdb,*.ddb` → 0 命中 |
+| `_load_factor_state()` 仍直接连它，**无 h5i 分支、无降级** | `drl_train.py` `duckdb.connect(DUCKDB_PATH, read_only=True)` |
+| 该连接实测抛异常 | `IOException: Cannot open database ... in read-only mode: database does not exist` |
+| 该调用**原先在外层 try 之外** ⇒ 异常逃出 `run_drl_train` | 现已移入 try 并接 DRL-4 降级链（本轮修复） |
+| `_build_target_plan()` 也以 `os.path.exists(DUCKDB_PATH)` 前置判断 | 返回 `'DuckDB 不存在'` ⇒ 不再产出 `target_plan.json` |
+| 最后一次成功训练 = **2026-09-05 15:46**（恰为 m4 退役当日） | `data/drl/20260905/model.zip` mtime |
+| 此后 `20260907`、`20260908` **既无 model.zip 也无 train_meta.json** | 目录内容实测 |
+
+⇒ **DRL 增量学习自 m4 迁移起已完全停摆。** DRL-1/2/3/4 的所有改进在**上游数据可达**
+之前都不会真正生效 —— 这也说明为什么本轮 DRL-2 的价值主要在"**结构性可验证**"
+（让"学习中"从"无数据"变成"有数据"），而不是"立刻能看到生产的收敛曲线"。
+
+**可能的归因纠正**：登记册 `P1-FML` 把「9/07–9/08 无 `target_plan.json`」归因于
+f_ml 链路断链；但 `_build_target_plan` 的 DuckDB 存在性检查同样会（且更直接地）
+造成该现象，故**该归因未必充分**，需一并核对。
+
+**为何本轮不擅自修**：把 `_load_factor_state` / `_build_target_plan` 迁到 h5i 属于
+**数据源迁移**（改动生产取数路径与 IC 口径，需前后对比验证），
+按项目惯例应由用户确认是否作为独立批次、并明确验收口径。
+
+---
 
 ### 学习后 —— **仅「参数漂移」已实现；其余仍未实现**（DRL-3 仍为 P0 open）
 
@@ -222,12 +288,14 @@ target_plan, total_timesteps, vnpy_reward, vnpy_stats`
 | ID | 级别 | 项 | 状态 | 依据 |
 |---|---|---|---|---|
 | `DRL-1` | P1 | **学习前**检查无独立检查点（净值连续性 ❌ / 经验池充足 ❌ / 数据完整性 ◐） | open | §三学习前 |
-| `DRL-2` | P1 | **学习中**指标未落盘（entropy / policy_loss / value_loss / grad_norm / 实际步数 / 时长）⇒ **结构性不可验证** | open | §三学习中（23 键实测） |
+| `DRL-2` | P1 | **学习中**指标 —— ✅ **已落盘**（10 个指标 + 实际步数 + 时长；只记录数值、不判定收敛） | **fixed** | §三学习中 |
 | `DRL-3` | **P0** | **学习后**检查未实现（新旧对比 / 验证集 / 滚动窗口 / 决策一致性） | open | §三学习后 |
-| `DRL-4` | **P0** | **降级链** —— ✅ **已实现**（四级 + 留痕 + 告警 + 可逆；另修掉"静默回退到 2021 回测遗留模型"与两条失败静默路径） | **fixed** | §五 |
+| `DRL-4` | **P0** | **降级链** —— ✅ **已实现**（四级 + 留痕 + 告警 + 可逆；另修掉"静默回退到 2021 回测遗留模型"与三条失败静默路径） | **fixed** | §五 |
 | `DRL-5` | P1 | **因子权重边界** —— ◐ **只记录不截断**已实现；边界截断待 DRL-4 就位后用下游表现标定 | partial | §〇.1 |
 | `DRL-6` | P2 | 灾难性遗忘 / 奖励黑客 无任何缓解；经验回放缓冲区未落盘 | open | §四 |
 | `DRL-7` | P1 | **参数漂移检查** —— ✅ 已实现（只告警不阻断，阈值 0.3 待标定） | fixed | 本节下 |
+| `DRL-8` | P1 | **`FactorWeightEnv` 回合终止步必然 IndexError** —— ✅ 已修（rollout 跨过 IC 序列末端即崩在"本该返回 done=True"处） | **fixed** | §三学习中下方 |
+| `P0-DRLSRC` | **P0** | **DRL 训练/目标计划仍读已退役 DuckDB** ⇒ 自 2026-09-05 起 DRL 链路**完全停摆**（待用户决策迁移 h5i 或恢复） | **open** | §三 ⚠ P0 阻塞项 |
 | `METHOD-1` | P1 | 方法论固化：边界/阈值必须由**下游表现**决定，而非**分布范围** | fixed | §📌 |
 
 > 编号映射说明：用户给出的 `DRL-1..4` 分别对应「学习前 / 学习中 / 学习后 / 降级链」，

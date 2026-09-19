@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR, DUCKDB_PATH, MAX_STOCKS  # noqa: E402
 import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 torch)
 import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
+import drl_metrics  # noqa: E402  (学习中断指标 DRL-2; 轻量模块, 不拖入 torch)
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -290,9 +291,19 @@ class FactorWeightEnv(gymnasium.Env):
 
     def _state(self) -> np.ndarray:
         ic_part = self.ic_history[self.t - self.lookback:self.t].flatten()
+        # [2026-09-20 修复] 终止步越界: `step()` 是**先 `self.t += 1` 再调用本函数**,
+        # 而 `done = self.t >= len(self.ic_history)` 恰好在 `self.t == len(...)` 时为真
+        # —— 也就是说"回合正常结束的那一步"必然越界 IndexError。
+        # 后果: 只要 rollout 跨过 IC 序列末端, 训练就崩在**本该正常返回 done=True** 的地方;
+        # 实测 `n_days=41, n_steps=31, total_timesteps=800` 与
+        # `n_days=90, n_steps=32, total_timesteps=200` 两次都复现
+        # (见 scripts/preflight_drl_metrics_realrun.py)。
+        # 这里 clamp 到最后一个可用行: 该值只用于返回值, 返回后 SB3 即自动 reset,
+        # 故不改变任何非终止步的行为。
+        _rt = min(self.t, len(self.regime_features) - 1)
         return np.concatenate(
             [ic_part, self.sentiment_vec, self.stance_scalar,
-             self.regime_features[self.t]]
+             self.regime_features[_rt]]
         ).astype(np.float32)
 
     def step(self, action):
@@ -702,6 +713,8 @@ class CVaR_PPO(PPO):
         self.ent_coef_boost = ent_coef_boost
         self.adaptation_count = 0
         self.original_ent_coef = float(self.ent_coef)
+        # [DRL-2] 学习中断指标历史（逐次 `train()` 迭代累积; train_meta["train_metrics"] 的来源）
+        self.metric_history = drl_metrics.MetricsHistory()
         # Risk-First 约束层: risk_first_coef > 0 时启用
         self.risk_first_coef = risk_first_coef
         self._risk_first_layer = None
@@ -778,6 +791,8 @@ class CVaR_PPO(PPO):
 
         entropy_losses, pg_losses, value_losses = [], [], []
         clip_fractions, cvar_losses = [], []
+        # [DRL-2] 本轮迭代的梯度范数（`clip_grad_norm_` 的返回值 = **裁剪前**的总范数）
+        grad_norms = []
         continue_training = True
 
         for epoch in range(self.n_epochs):
@@ -862,7 +877,14 @@ class CVaR_PPO(PPO):
 
                 self.policy.optimizer.zero_grad()
                 loss.backward()
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                # [DRL-2] 采集梯度范数: clip_grad_norm_ 返回**裁剪前**的总范数
+                _gn = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                try:
+                    _gnv = float(_gn.item() if hasattr(_gn, "item") else _gn)
+                    if np.isfinite(_gnv):
+                        grad_norms.append(_gnv)
+                except Exception:  # noqa: BLE001  采集失败绝不影响训练
+                    pass
                 self.policy.optimizer.step()
 
             # ---- 超参数自适应: 本轮 epoch 平均熵值低于阈值时调整 ----
@@ -902,6 +924,18 @@ class CVaR_PPO(PPO):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+        # ---- [DRL-2] 快照本轮指标进历史序列 ----
+        # 放在 `train()` **末尾**: 此时上面的 `logger.record` 已填好 `name_to_value`,
+        # 故不依赖 SB3 callback 的调用顺序（比 `on_rollout_end` 更稳, 不会因 SB3
+        # 版本换了顺序而静默采到空值）。采集失败绝不影响训练主链路。
+        try:
+            _vals = drl_metrics.values_from_logger(self.logger.name_to_value)
+            if grad_norms:
+                _vals["grad_norm"] = float(np.mean(grad_norms))
+            self.metric_history.record(_vals)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ============================================================
@@ -963,7 +997,18 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     hb.start(phase="loading_factor_state")
     _dec = None  # [DRL-4] 降级链决策占位: 外层 except 据此判断"是否已决策过"
 
-    ic, rets, dates = _load_factor_state(day_dt, 60)
+    try:
+        ic, rets, dates = _load_factor_state(day_dt, 60)
+    except Exception as e:
+        # [DRL-4] 数据源不可用同样是"训练失败", 必须走降级链, 而不是让异常逃出本函数。
+        # 原先这个调用在**外层 try 之外** → 异常直接冒泡给 run_daily 的 except,
+        # 当天表现为"无 plan + 无告警 + 无留痕" —— 正是 DRL-4 要消除的静默路径,
+        # 而且**恰恰是当前生产实际命中的那条**（因子状态源 legacy DuckDB 已不存在）。
+        _reason = f"因子状态数据源不可用: {type(e).__name__}: {str(e)[:150]}"
+        _log(_reason)
+        hb.stop(phase="data_source_error", ok=False, error=_reason[:200])
+        return {"ok": False, "error": _reason[:300], "rows": 0,
+                "degrade": _degrade_on_failure(day, _reason)}
     if ic is None or len(rets) < 15:
         _n_rows = 0 if ic is None else len(rets)
         _reason = f"数据不足 (<15 日): {_n_rows} 行"
@@ -1049,7 +1094,10 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                          lr_decay_factor=_ADAPT_CFG["lr_decay_factor"],
                          ent_coef_boost=_ADAPT_CFG["ent_coef_boost"])
         hb.ping(phase=f"learn({total_timesteps})")  # 长阻塞前打点, 守护线程持续刷新
+        # [DRL-2] 训练墙钟时长（设计要求的"学习中"五项之一; 原先完全没有落盘）
+        _t_learn0 = dt.datetime.now()
         model.learn(total_timesteps=total_timesteps)
+        _learn_seconds = (dt.datetime.now() - _t_learn0).total_seconds()
         hb.ping(phase="learned")
 
         # 回放收集 reward_curve
@@ -1085,6 +1133,12 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             "day": day,
             "algorithm": "PPO",
             "total_timesteps": total_timesteps,
+            # [DRL-2] 学习中断指标: 实际步数 / 时长 / 逐迭代序列 + 只含数值的汇总。
+            # 注意 `total_timesteps` 是**配置值**, 实际执行步数在
+            # `train_metrics.actual_timesteps`（二者原先混为一谈, 是"步数无从验证"的根源）。
+            "train_metrics": drl_metrics.summarize_run(
+                model=model, history=getattr(model, "metric_history", None),
+                duration_s=_learn_seconds, requested_timesteps=total_timesteps),
             "n_epochs": n_epochs,
             "n_obs_steps": len(rewards),
             "base_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, base_w)},
@@ -1421,7 +1475,10 @@ def run_factor_value_drl(
     )
 
     try:
+        # [DRL-2] 与 run_drl_train 同口径: 实际步数 / 训练时长 / 逐迭代指标序列
+        _t_learn0 = dt.datetime.now()
         model.learn(total_timesteps=total_timesteps)
+        _learn_seconds = (dt.datetime.now() - _t_learn0).total_seconds()
     except Exception as e:
         _log(f"FactorValue DRL learn 异常: {e}")
         return {"ok": False, "error": str(e)[:200]}
@@ -1448,6 +1505,10 @@ def run_factor_value_drl(
         "day": day,
         "algorithm": "CVaR_PPO_FactorValue",
         "total_timesteps": total_timesteps,
+        # [DRL-2] 与 run_drl_train 同口径的学习中断指标
+        "train_metrics": drl_metrics.summarize_run(
+            model=model, history=getattr(model, "metric_history", None),
+            duration_s=_learn_seconds, requested_timesteps=total_timesteps),
         "n_epochs": n_epochs,
         "n_factors": factor_history.shape[1],
         "lookback": lookback,

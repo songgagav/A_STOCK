@@ -257,11 +257,29 @@
     {
       "id": "DRL-2",
       "level": "P1",
-      "title": "DRL 学习中指标未落盘 ⇒ 『学习中』检查点结构性不可验证",
+      "title": "DRL 学习中指标已落盘（原『结构性不可验证』已解除）",
+      "status": "fixed",
+      "detail": "原先实测 `data/drl/*/train_meta.json`（16 个样本）键集共 23 个，其中**没有** entropy/entropy_loss、policy_loss、value_loss、grad_norm、实际训练步数、训练墙钟时长 —— 仅有的 total_timesteps 是**配置值**而非实际步数 ⇒ 设计的『学习中』五项检查（步数/损失收敛/熵值/梯度范数/时长）**无从验证**（不是『检查没通过』，而是『根本没有数据可查』）。\n\n已实现：\n· 新增轻量模块 `src/drl_metrics.py`（不依赖 torch/gymnasium/SB3 ⇒ 不装 torch 的 CI core job 也能跑单测）：`MetricsHistory` 逐次迭代累积序列 + `summarize()` 压成 `{n, first, last, min, max, mean, delta, rel_delta, slope}`。\n· `CustomPPO.train()` 末尾快照 `logger.name_to_value` —— **放在 train() 内而非用 SB3 callback**：不依赖 callback 调用顺序，换 SB3 版本也不会静默采到空值。\n· `grad_norm` 不在 SB3 logger 中，由 `clip_grad_norm_` 的返回值（**裁剪前**总范数）采集。\n· 训练墙钟时长在 `model.learn()` 前后测量；**实际步数** `actual_timesteps`（取自 `model.num_timesteps`）与**配置值** `requested_timesteps` **分开记录**（二者原先混为一谈，正是\"步数无从验证\"的根源之一）。\n· 两个训练入口（`run_drl_train` / `run_factor_value_drl`）都落盘，口径一致。\n· 采集全程 try 包住，采集失败绝不影响训练主链路。\n\n**按用户要求只记录数值、不判定收敛**：输出里**不产出任何布尔判定**（无 converged 之类字段），并显式 `threshold_applied=false`（METHOD-1）。\n\n证据：`tests/test_drl_metrics.py` 46 用例（含\"输出里不得有布尔判定\"的结构断言、JSON 安全断言）；`scripts/preflight_drl_metrics_realrun.py` 跑**真实 PPO** 13/13 PASS —— 实测 10 个指标 × 26 次迭代全部非空（entropy_loss/policy_loss/value_loss/approx_kl/clip_fraction/explained_variance/std/ent_coef/n_updates/grad_norm），actual_timesteps=806 vs requested=800，duration 实测，train_metrics 仅 4291 字节。**该真实运行是必要的**：单测只能证明\"给定数值能正确汇总\"，**不能**证明 logger 键名与真实 SB3 输出一致 —— 键名写错会表现为\"单测全绿而生产一个指标都没有\"。",
+      "evidence": "src/drl_metrics.py；src/drl_train.py（CustomPPO.__init__/train 快照 + 两个入口的 train_metrics）；tests/test_drl_metrics.py；scripts/preflight_drl_metrics_realrun.py（真实训练 13/13 PASS）",
+      "next": "积累 1-2 个月『指标序列 → 下游表现』配对数据后，再按 METHOD-1 标定『收敛/异常』阈值"
+    },
+    {
+      "id": "DRL-8",
+      "level": "P1",
+      "title": "FactorWeightEnv 回合终止步必然 IndexError —— 已修",
+      "status": "fixed",
+      "detail": "`FactorWeightEnv.step()` 是**先 `self.t += 1` 再调用 `self._state()`**，而 `done = self.t >= len(self.ic_history)` 恰好在 `self.t == len(...)` 时为真 ⇒ **\"回合正常结束的那一步\"必然越界**（`self.regime_features[self.t]`）。后果：只要 rollout 跨过 IC 序列末端，训练就崩在**本该正常返回 done=True** 的地方，表现为\"训练失败\"而非\"回合结束\"。\n\n实测复现（`scripts/preflight_drl_metrics_realrun.py`，修复前）：\n· `n_days=41, n_steps=31, total_timesteps=800` → `IndexError: index 41 is out of bounds for axis 0 with size 41`\n· `n_days=90, n_steps=32, total_timesteps=200` → `IndexError: index 90 is out of bounds for axis 0 with size 90`\n\n生产可达性：生产 `n_obs_steps=33` + `lookback=10` ⇒ `L=43`，而 `n_steps = min(64, L-10) = 33` **正好等于回合长度** ⇒ 第一次 rollout 结束即撞上。\n\n修复：`_rt = min(self.t, len(self.regime_features) - 1)` —— 该值只用于**返回值**，返回后 SB3 即自动 reset，故**不改变任何非终止步的行为**（有逐位一致性用例锁定）。\n\n证据：`tests/test_factor_weight_env_bounds.py` 12 用例（含真实 `model.learn()` 跨回合边界的回归）；回归全绿 579 passed。",
+      "evidence": "src/drl_train.py FactorWeightEnv._state；tests/test_factor_weight_env_bounds.py；scripts/preflight_drl_metrics_realrun.py",
+      "next": "无"
+    },
+    {
+      "id": "P0-DRLSRC",
+      "level": "P0",
+      "title": "DRL 训练与目标计划仍读**已退役**的 DuckDB ⇒ 自 2026-09-05 起 DRL 链路停摆",
       "status": "open",
-      "detail": "实测 `data/drl/*/train_meta.json`（16 个样本）键集共 23 个，其中**没有**：entropy/entropy_loss、policy_loss、value_loss、grad_norm、实际训练步数、训练墙钟时长。仅有的 total_timesteps 是**配置值**而非实际步数。⇒ 设计的『学习中』五项检查（步数/损失收敛/熵值/梯度范数/时长）**无从验证**，属结构性不可验证（需先加埋点）。",
-      "evidence": "docs/drl-learning-verification.md §三『学习中』（23 键实测清单）",
-      "next": "在训练回调里落盘 entropy/losses/grad_norm/actual_steps/duration 到 train_meta"
+      "detail": "`config.py` 第 26-32 行明确标注：『[2026-09-05 m4] DuckDB 已退役删除: 全A日频行情已迁入 h5i …… 读取方**均已改为优先 h5i 并在缺失时降级**』，`DUCKDB_PATH = <repo>/data/legacy_stockdb.duckdb  # [已退役] 原全A日频数据湖, 本机已删除`。\n\n**实测：该\"均已改\"的声明对 DRL 链路不成立。**\n· `drl_train._load_factor_state()` 仍直接 `duckdb.connect(DUCKDB_PATH, read_only=True)` —— **无 h5i 分支、无降级**。全盘搜索确认项目内**不存在任何** `*.duckdb`/`*.ddb` 文件；实测该连接抛 `IOException: Cannot open database ... in read-only mode: database does not exist`。\n· 该调用**在外层 try 之外** ⇒ 异常直接冒泡出 `run_drl_train`，当天表现为\"无 model.zip + 无 train_meta + 无告警 + 无留痕\"。\n· `_build_target_plan()`（同文件）也用 `os.path.exists(DUCKDB_PATH)` 前置判断，返回 `'DuckDB 不存在'` ⇒ **不再产出 target_plan.json**。\n\n**时间线证据（产物 mtime）**：最后一次成功训练是 **2026-09-05 15:46**（恰为 m4 退役当日）；此后 `20260907`、`20260908` 目录**既无 model.zip 也无 train_meta.json**（`20260831` 亦无，属更早的独立一次失败）。⇒ **DRL 增量学习自 m4 迁移起已完全停摆**，DRL-1/2/3/4 在 §上游数据可达 之前都不会真正生效。\n\n**可能的归因纠正**：登记册 P1-FML 把『9/07–9/08 无 target_plan.json』归因于 f_ml 链路断链；但 `_build_target_plan` 的 DuckDB 存在性检查同样会（且更直接地）导致该现象，故**该归因未必充分**，需一并核对。\n\n**未修的理由**：把 `_load_factor_state` / `_build_target_plan` 迁到 h5i 属**数据源迁移**（改动生产取数路径与 IC 口径），需要用户确认是否作为独立批次并明确验收口径，故本轮只登记 + 提供证据，不擅自改。",
+      "evidence": "src/config.py 26-32；src/drl_train.py _load_factor_state(474) / run_drl_train 调用点(939 区域, 现已移入 try) / _build_target_plan(1538 区域)；实测 duckdb.connect 报错；data/drl/2026* 产物 mtime",
+      "next": "二选一由用户决策：(a) 把 `_load_factor_state` 与 `_build_target_plan` 的 daily_bars 读取迁到 h5i（`data/h5i/market.db` daily_bars），并按同一口径复算 IC 后做前后对比；(b) 恢复 legacy DuckDB（与 m4 退役决定冲突，不推荐）"
     },
     {
       "id": "DRL-3",
