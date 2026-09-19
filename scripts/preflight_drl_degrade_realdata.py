@@ -18,7 +18,10 @@
   · `DRL_MODEL_POINTER` / `DRL_DEGRADE_LEDGER` / `DRL_VALIDATION_LEDGER` 全部指向 tmp
   · 结束前断言生产 `data/drl/current_model.json` 与 `data/drl_degrade_events.jsonl` **未被创建/未变**
 
-用法: python scripts/preflight_drl_degrade_realdata.py [--day YYYY-MM-DD]
+用法: python scripts/preflight_drl_degrade_realdata.py [--day YYYY-MM-DD] [--data-dir DIR]
+      生产 `data/` **未纳入 git**（worktree / 干净检出里没有）, 故通常需显式指定:
+        QUANT_DATA_DIR=<repo>/data python scripts/preflight_drl_degrade_realdata.py
+        或: python scripts/preflight_drl_degrade_realdata.py --data-dir <repo>/data
 退出码: 0 = 全部断言通过; 1 = 有断言失败
 """
 from __future__ import annotations
@@ -72,7 +75,12 @@ def _naive_latest(before_day: str, exclude: str = "") -> "str | None":
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--day", default=None, help="评估日 YYYY-MM-DD（默认: 生产最新实盘日+1）")
+    ap.add_argument("--data-dir", default=None,
+                    help="生产 data/ 路径（等价于 QUANT_DATA_DIR；生产 data/ 未纳入 git）")
     args = ap.parse_args()
+
+    if args.data_dir:
+        config.DATA_DIR = os.path.abspath(args.data_dir)
 
     tmp = tempfile.mkdtemp(prefix="drl_degrade_realdata_")
     os.environ["DRL_MODEL_POINTER"] = os.path.join(tmp, "current_model.json")
@@ -95,6 +103,9 @@ def main() -> int:
 
     if not os.path.isdir(root):
         print(f"\n[FAIL] 版本根目录不存在: {root}")
+        print("       生产 data/ 未纳入 git；worktree / 干净检出里没有它。请显式指定:")
+        print("         QUANT_DATA_DIR=<repo>/data python scripts/preflight_drl_degrade_realdata.py")
+        print("         或 --data-dir <repo>/data")
         return 1
 
     days = sorted(n for n in os.listdir(root)
