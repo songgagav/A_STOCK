@@ -281,7 +281,41 @@ CI 分为两部分：
 .venv314\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
+> ⚠️ **解释器要求（2026-09-19 修正）**：`.venv314`（Python 3.14）**没有 `h5i_db`**
+> （实测 `importlib.util.find_spec("h5i_db") is None`）。DuckDB 退役后 h5i 是**主数据源**，
+> 用 `.venv314` 启动看板会失去主源数据。请改用持有 `h5i_db` 的解释器，例如：
+>
+> ```powershell
+> $env:BAR_STORE = 'h5i'
+> & "<持有 h5i_db 的解释器>\python.exe" src\dashboard.py --port 8000
+> ```
+>
+> 验证方式：`& <解释器> -c "import h5i_db; print('ok')"`，以及看板
+> `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
+
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
+
+### 一键启动后台栈
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
+```
+
+幂等（已在跑的只报 `OK`，重复执行不会起第二个），一次拉起全部常驻服务并做端口自检：
+
+| 端口 | 服务 | 说明 |
+|---|---|---|
+| 8000 | Web 看板 | 选股结果 / 模拟盘 / 数据更新入口 |
+| 3000 | Grafana | 数据库看板（admin/admin） |
+| 9090 | Prometheus | 指标库，抓取 `astock-db`(9101) |
+| 9093 | Alertmanager | 告警路由 → 本地 webhook |
+| 9111 | alert_hook | 告警落盘 `logs/alerts.log`（设 `DING_WEBHOOK_URL` 则转发钉钉） |
+| 9101 | metrics_server | `/metrics` 暴露端 |
+| 6379 | Redis | Celery broker/backend（看板“全量数据库更新”依赖） |
+| — | Celery worker | 全量数据更新任务（solo pool） |
+| — | sentinel daemon | 估值覆盖率哨兵，每日 18:30（见 `docs/patch-retirement-watch.md`） |
+
+各常驻服务日志在 `logs/`：`dashboard.log`、`sentinel_daemon.log`、`alert_hook.log`、`alerts.log`。
 
 ## 数据与 Point-in-Time 口径
 
@@ -334,8 +368,13 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
 - [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
 - [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/hist-window-protocol.md`](docs/hist-window-protocol.md)：**历史窗口扩展与"环境外"窗口处理协议**
+  （判据标定 / 必报项 / 技术前置检查；扩展历史窗口前必读）；
+- [`docs/preflight-verification.md`](docs/preflight-verification.md)：**上线前复验报告**
+  （8 域逐项可验性映射 / 证据 / 阻塞项 / Go-No-Go）；
 - [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
+- [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建 Runbook；
 - [`ops/`](ops/)：Prometheus、Grafana 和告警配置。
 
 ## 开发约定

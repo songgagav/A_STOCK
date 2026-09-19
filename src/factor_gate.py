@@ -593,7 +593,17 @@ def load_ic_cache(path: str | None = None) -> dict | None:
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # [2026-09-19] 原来与"文件不存在"同样静默返回 None, 调用方无法区分 ⇒
+        # 坏缓存会让门控静默退化为"无 IC 依据"的弱判据(见 build_plan_from_cache 的
+        # series=[] 分支: ic_ir=None, 只靠 drift/sharpe 兜底)。
+        try:
+            from dataguard import warn_once
+            warn_once("ic_cache_unreadable",
+                      f"[factor_gate] **IC 缓存损坏/不可读**: {p} "
+                      f"({type(e).__name__}: {str(e)[:120]}) -> 门控降级为无 IC 依据的弱判据")
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
 

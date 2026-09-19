@@ -105,15 +105,28 @@ def _apply_factor_health(W: dict, as_of: str | None = None) -> None:
     """(2026-09-07) 因子健康处置: 短期方向翻转/强度收敛(反转义失效)的因子, 打分权重置 0.
 
     由 factor_gate.factor_health_flags 依据 data/ic 曲线判定; 环境变量
-    FACTOR_HEALTH_ENABLED=0 可关闭. 任何异常静默降级(不影响选股主链路).
+    FACTOR_HEALTH_ENABLED=0 可关闭.
     as_of 透传给 factor_health_flags: 历史日期只用到该日为止的 IC 曲线(消前视)。
+
+    [2026-09-19 更正] 原 docstring 写"任何异常静默降级(不影响选股主链路)" —— **事实相反**:
+    本函数的作用正是**把失效因子的权重置 0**, 异常即 return 等于"隔离失效",
+    复合分/融合分会用着本该被隔离的因子, **选股结果随之改变**; 而唯一可见症状是
+    "少了一行 `[factor_health] 失效因子隔离` 日志", 盘中几乎不可能察觉。
+    现改为异常时**一律告警**(仍不抛出, 保持主链路可用)。
     """
     if os.environ.get("FACTOR_HEALTH_ENABLED", "1") == "0":
         return
     try:
         from factor_gate import factor_health_flags
         flags = factor_health_flags(as_of=as_of)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        try:
+            from dataguard import warn_once
+            warn_once("factor_health_unavailable",
+                      f"[factor_health] **隔离失效**: factor_health_flags 异常"
+                      f"({type(e).__name__}: {str(e)[:120]}) -> 本次打分未做失效因子隔离")
+        except Exception:  # noqa: BLE001  告警本身失败也不能影响选股
+            pass
         return
     for key, info in (flags.get("isolated") or {}).items():
         if key in W and float(W.get(key) or 0.0) > 0.0:

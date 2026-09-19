@@ -9,3 +9,47 @@ groups:
         annotations:
           summary: "表 {{ $labels.table }} 最后更新已超过24小时"
           description: "astock_db_lastday_ts={{ $value | humanizeTimestamp }} 距今超过 24h, 请检查数据窗口任务"
+
+  # 融合口径降级告警 (2026-09-19)
+  #   背景: fusion 覆盖跌破 MIN_COVERAGE(0.80) 时会回退 f_ml; 而 f_ml 曾因数据湖
+  #   (E:\A_stockDB\stockdb.duckdb) 退役整条断链, 最终静默退化到 used=equal ——
+  #   排序完全不含融合加成, 且只有一条 WARNING 日志, 实盘无人察觉。
+  #   现由 factor_fusion._record_fusion_state 落盘 fusion_health.json,
+  #   metrics_server 暴露 astock_fusion_degraded / astock_fusion_used, 此处告警。
+  - name: astock_fusion_health
+    rules:
+      - alert: FusionDegraded
+        expr: astock_fusion_degraded > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "融合口径已降级 (排序失去融合加成)"
+          description: >-
+            astock_fusion_degraded={{ $value }}: fusion_or_fml 未能走 fusion,
+            已回退 fml_fallback 或 equal。请查 data/fusion_health.json 的
+            used/coverage/degrade_reason, 以及 data/fusion_degradation.jsonl 的留痕。
+      - alert: FusionStale
+        # 选股链路长时间未刷新融合健康度 = 调度中断或选股未跑
+        expr: (time() - astock_fusion_checked_ts) / 86400 > 3 and astock_fusion_checked_ts > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "融合口径健康度已超过 3 天未刷新"
+          description: "astock_fusion_checked_ts 距今超过 3 天, 请检查选股/调度链路是否在跑"
+      - alert: FusionHealthUnreadable
+        # [2026-09-19 复验发现] 健康度文件读失败时, 其余 gauge 会保留上一次的"健康"值,
+        # 导致 FusionDegraded 永远不会触发 —— 告警源自身失效却无人知晓。
+        # 实测触发条件: 文件被写成带 BOM 的 UTF-8(PowerShell Set-Content -Encoding UTF8)。
+        expr: astock_fusion_health_read_ok == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "融合健康度文件不可读 (告警源已失效)"
+          description: >-
+            astock_fusion_health_read_ok=0: metrics_server 无法解析
+            data/fusion_health.json, astock_fusion_* 各指标可能停留在过期值,
+            FusionDegraded 因此可能漏报。请检查该文件编码(需 UTF-8/UTF-8-BOM)
+            与内容是否为合法 JSON。
