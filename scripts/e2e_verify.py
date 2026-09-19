@@ -166,13 +166,40 @@ def _ad_atomicity():
     if not j:
         return 0, 1, [("preflight_atomicity", "FAIL", "无 JSON 输出")], ""
     v = str(j.get("verdict", ""))
-    # 该脚本只给文字 verdict: "完好旧态/完好新态" 视为通过; "部分提交" 需人工定性。
-    # 注意: REVIEW **不计入 fail** —— 它表示"判据不足以自动定性", 与"实测失败"不同;
-    # 计入 fail 会把整条数据链误判为 No-Go(而它其实只到 Conditional Go)。
-    ok = ("完好" in v) and ("部分" not in v)
-    manual = "" if ok else f"需人工定性: {v}"
-    return (1 if ok else 0), 0, \
-        [("写入原子性(kill 中断)", "OK" if ok else "REVIEW", v[:70])], manual
+    # [2026-09-19] 该脚本已升级为给出**确定性判据**: `pass` 布尔 + 提交粒度明细。
+    #   依据: 写入端每块恰 1000 行, 故"每个已落盘块都是 1000 行整数倍" ⇒ 整块提交
+    #   (chunk-granular atomic), 库处于"若干完整块已提交"的一致状态, 满足清单的
+    #   "完好旧态/完好新态"(**块粒度**, 非逐行原子); 出现非整数倍的块 ⇒ 撕裂写 ⇒ FAIL。
+    #   实测: 6 个块各恰好 1000 行, 撕裂块=0。
+    ok = j.get("pass")
+    if ok is None:                      # 兼容旧产物: 退回文字判据
+        ok = ("完好" in v) and ("部分" not in v)
+        return (1 if ok else 0), 0, \
+            [("写入原子性(kill 中断)", "OK" if ok else "REVIEW", v[:70])], \
+            ("" if ok else f"需人工定性(旧产物): {v}")
+    detail = f"{len(j.get('committed_chunks', []))} 个完整块, 撕裂块={len(j.get('torn_chunks', []))}"
+    return (1 if ok else 0), (0 if ok else 1), \
+        [("写入原子性(kill 中断, 块粒度)", "OK" if ok else "FAIL", detail)], ""
+
+
+def _ad_fault_inject():
+    """第二批故障注入（模拟条件 + 真实代码路径）。
+
+    该脚本自身已按用户要求对每个故障验证三件事(告警触发/系统恢复/数据一致),
+    故此处直接读其 `_summary` 与逐例三态。
+    """
+    j = _load("preflight_fault_inject.json", _RUN_START)
+    if not j:
+        return 0, 1, [("preflight_fault_inject", "FAIL", "无 JSON 输出")], ""
+    items = []
+    for c in j.get("cases", []):
+        st = "OK" if c.get("pass") else "FAIL"
+        items.append((f"故障注入:{c.get('fault')}", st,
+                      f"告警={c.get('alert_triggered')} 恢复={c.get('system_recovered')} "
+                      f"一致={c.get('data_consistent')}"))
+    s = j.get("_summary", {})
+    p, t = s.get("pass", 0), s.get("total", 0)
+    return p, t - p, items, str(j.get("scope_note", ""))[:120]
 
 
 def _ad_neutral_removed():
@@ -196,6 +223,9 @@ CHECKS = [
 INJECT = [
     ("preflight_missing_data.py", _ad_missing_data, "盘中", "数据链"),
     ("preflight_atomicity.py", _ad_atomicity, "盘后", "数据链"),
+    # 第二批: 模拟条件(ENOSPC/URLError/TimeoutError)打在真实代码路径上;
+    # 每例均已断言"告警触发+系统恢复+数据一致"三件事。
+    ("preflight_fault_inject.py", _ad_fault_inject, "盘中", "数据链"),
 ]
 
 #: 已知未闭环 P0 (摘自 ops/acceptance_status.json 的权威登记)

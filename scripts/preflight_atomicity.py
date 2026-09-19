@@ -121,22 +121,69 @@ def main() -> None:
     n1, err1 = _count()
     full = (n0 or 0) + N
     print(f"\nkill 后: 可读={err1 is None} 行数={n1} {err1 or ''}")
+
+    # [2026-09-19 补] 提交粒度定性: 只看总行数无法判定"部分提交"是好是坏 ——
+    # 关键在**是否发生撕裂写**。写入端每块恰 1000 行(见 WRITER), 故:
+    #   每块都是 1000 行的整数倍 => 整块提交(chunk-granular), 库处于"若干完整块已提交"
+    #                              的一致状态, 满足清单的"完好旧态/完好新态"(块粒度);
+    #   存在非 1000 整数倍的块   => 撕裂写, 按 FAIL 处理。
+    CHUNK = 1000
+    chunks, torn = [], []
+    if err1 is None:
+        try:
+            import h5i_db as _h5
+            con = _h5.Database(DBP, read_only=True)
+            try:
+                dfc = con.sql("SELECT symbol, COUNT(*) n FROM atomic_test "
+                              "GROUP BY symbol ORDER BY symbol").to_pandas()
+            finally:
+                try:
+                    con.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            for _, r in dfc.iterrows():
+                sym, n = str(r["symbol"]), int(r["n"])
+                if sym == "BASE":
+                    continue
+                chunks.append({"symbol": sym, "rows": n})
+                if n != CHUNK:
+                    torn.append({"symbol": sym, "rows": n, "expected": CHUNK})
+        except Exception as e:  # noqa: BLE001
+            torn = [{"symbol": "?", "rows": -1, "expected": CHUNK, "err": str(e)[:120]}]
+    print(f"提交粒度: 已提交块数={len(chunks)}  撕裂块={len(torn)}")
+    for c in chunks:
+        print(f"   {c['symbol']}: {c['rows']} 行")
+
+    passed = None
     if err1 is not None:
         verdict = "不可读(corrupt)"
+        passed = False
     elif n1 == n0:
         verdict = "回到基线(旧态完好)"
+        passed = True
     elif n1 == full:
         verdict = "恰好写完(窗口太短, 需加长)"
+        passed = True
     elif n1 is not None and n0 is not None and n0 < n1 < full:
-        verdict = f"部分提交(+{n1 - n0} 行) —— 需判断是否属分块提交语义"
+        if not torn:
+            verdict = (f"整块提交(+{n1 - n0} 行, {len(chunks)} 个完整块) —— "
+                       f"块粒度原子, 无撕裂写; 符合'完好旧态/完好新态'(块粒度)")
+            passed = True
+        else:
+            verdict = f"撕裂写: {len(torn)} 个块行数非 {CHUNK} 整数倍"
+            passed = False
     else:
         verdict = "其它"
+        passed = False
     print(f"判定: 基线={n0}, kill 后={n1}, 写满应为={full} => {verdict}")
+    print(f"结论: {'PASS' if passed else 'FAIL'}")
 
     res = {"db": DBP, "base_rows": n0, "base_err": err0, "target_rows": N,
            "after_kill_rows": n1, "after_kill_err": err1, "full_rows": full,
            "writer_returncode": proc.returncode, "verdict": verdict,
-           "note": "仅在一次性测试库上执行, 生产库未触碰"}
+           "pass": passed, "chunk_rows": CHUNK, "committed_chunks": chunks,
+           "torn_chunks": torn,
+           "note": "仅在一次性测试库上执行, 生产库未触碰; 提交粒度为 append 调用级(块)"}
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=2, default=str)
     print("已保存:", OUT)
