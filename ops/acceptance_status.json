@@ -237,6 +237,60 @@
       "next": "注意：演练初版曾出现**假 PASS**（把'已死 pid 未变'当成重建成功）；现已强制断言 pid 必须更换。同类'判据不足以区分'的检查点应一律做此处理。"
     },
     {
+      "id": "P0-FREEZE-0925",
+      "level": "P0",
+      "title": "09:25 信号冻结闸门缺失（盘前信号可能在盘中变更）",
+      "status": "open",
+      "detail": "设计要求的『09:25 后信号不再变更』硬截止**未实现**。全仓搜索 `09:25|freeze_signal|signal_freeze|冻结|hard_deadline`（src/ 与 scripts/ 的 *.py）**零命中**，非凭印象断言。后果：盘前产物（池/评分/权重）在 09:25 之后仍可被重跑或回退链改写，而次日消费方无从区分『这是 09:25 冻结的那一版』。与已修的 f_ml 断链属同类：**缺少不可变快照 + 无留痕**。",
+      "evidence": "全仓 grep 零命中；docs/e2e-verification.md 第二节『盘前』一栏标为未实现",
+      "next": "实现信号冻结：09:25 落一份不可变快照（含内容 hash），次日消费方只认该快照；变更需显式留痕+告警"
+    },
+    {
+      "id": "DRL-1",
+      "level": "P0",
+      "title": "DRL 无学习后验证（新旧模型对比 / 验证集 / 部署检查全缺）",
+      "status": "open",
+      "detail": "设计的学习后检查点为：新旧模型对比（验证集新≥旧）、滚动窗口表现（近20日夏普不降/回撤不扩）、参数漂移、决策一致性、部署检查。实测 `src/drl_train.py` 内**均未实现**（grep `val_|验证集|old_model|prev_model|回滚|rollback` 无命中）。⇒ 新模型只要训练『跑完』就会被当日 plan 采用，没有质量闸门。注：『参数漂移』所需数据**已具备**（train_meta 已落 base_weights/prior_weights/final_weights）。",
+      "evidence": "docs/drl-learning-verification.md §三『学习后』；drl_train.py grep 结果",
+      "next": "优先做低成本项：用已落盘的 base/prior/final_weights 加『权重漂移 ≤ 阈值』断言 + 告警"
+    },
+    {
+      "id": "DRL-2",
+      "level": "P0",
+      "title": "DRL 无降级链（训练失败不告警、不回退上一版、无暂停闸门）",
+      "status": "open",
+      "detail": "设计的四级降级链（学习失败→保留旧模型+告警 → 旧模型损坏→回退上一有效版 → 无有效版→暂停交易）实测**一级都没有独立实现**：`train_meta.ok=False` 会落盘但**无 warn_once 告警**且不阻断；模型按天分目录故旧文件物理仍在，但**消费方不会自动回退**；未见『扫描 data/drl/* 找最近一个 ok=True』的逻辑；未见『无有效版本→暂停交易』闸门。与已修的 f_ml 降级链形成对比：DRL 侧仍是裸奔。",
+      "evidence": "docs/drl-learning-verification.md §五；可参考 f_ml 降级链实现（pit-valuation.md §⑫）",
+      "next": "按 f_ml 降级链模式实现四级；每级留痕 + dataguard.warn_once 告警"
+    },
+    {
+      "id": "DRL-3",
+      "level": "P1",
+      "title": "DRL 学习中指标未落盘 ⇒ 『学习中』检查点结构性不可验证",
+      "status": "open",
+      "detail": "实测 `data/drl/*/train_meta.json`（16 个样本）键集共 23 个，其中**没有**：entropy/entropy_loss、policy_loss、value_loss、grad_norm、实际训练步数、训练墙钟时长。仅有的 total_timesteps 是**配置值**而非实际步数。⇒ 设计的『学习中』五项检查（步数/损失收敛/熵值/梯度范数/时长）**无从验证**，属结构性不可验证（需先加埋点）。",
+      "evidence": "docs/drl-learning-verification.md §三『学习中』（23 键实测清单）",
+      "next": "在训练回调里落盘 entropy/losses/grad_norm/actual_steps/duration 到 train_meta"
+    },
+    {
+      "id": "DRL-4",
+      "level": "P1",
+      "title": "权重硬边界 [0.10, 0.39] 不存在（设计以为已做）",
+      "status": "open",
+      "detail": "设计称『硬边界约束（你已做 [0.10, 0.39]）』，但全仓 grep `\\b0\\.39\\b|weight_bound|WEIGHT_BOUND|\\[0\\.10` 在 src/ 与 scripts/ **零命中**。实际存在的另一对约束是：`config.TARGET_WEIGHT.min_mult=0.60 / max_mult=1.15`（→ 单票权重 6.0%~11.5%），以及 `drl_train.weight_clip=0.6`（动作裁剪）。⇒ 需确认 [0.10,0.39] 指的是『单票权重区间』还是『因子权重区间』；若指前者，该约束当前不存在，参数漂移缺少硬边界。",
+      "evidence": "docs/drl-learning-verification.md §〇.1（grep 证据）",
+      "next": "确认语义后决定：补该边界，或修正设计描述为 6.0%~11.5%"
+    },
+    {
+      "id": "DRL-5",
+      "level": "P2",
+      "title": "DRL 灾难性遗忘 / 奖励黑客 无任何缓解",
+      "status": "open",
+      "detail": "设计六类风险中的两类**完全没有缓解措施**：灾难性遗忘（无经验回放缓冲区落盘、无策略蒸馏）、奖励黑客（无奖励函数审计、无行为监控）。另有『训练不稳定』一项：未见梯度裁剪/学习率调度的落盘证据，故**无法验证是否配置**。证据：docs/drl-learning-verification.md §四。",
+      "evidence": "docs/drl-learning-verification.md §四",
+      "next": "低优先级；建议先完成 DRL-1/2 的质量闸门与降级链"
+    },
+    {
       "id": "P2-BARFALLBACK",
       "level": "P2",
       "title": "vnpy_backtest.py:807 bar 回退口径",

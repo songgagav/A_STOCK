@@ -7,7 +7,17 @@ import os
 
 # ---- 工作区 / 输出 ----
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE, "data")
+# [2026-09-19] 数据目录可被环境变量 QUANT_DATA_DIR 覆盖, **默认值完全不变**。
+# 为什么需要: 第三阶段"完整交易日 dry-run"要求在不触碰生产状态的前提下跑全流程,
+# 而本目录下承载的是**实盘 paper 的持仓与净值**(state.json)、面板轮询的 live_state.json、
+# 每日回执(daily/)与快照(snapshots/) —— 没有覆盖开关就只能改写生产状态。
+# 用法(状态/回执/快照写临时目录; 行情仍读真实 h5i):
+#   $env:QUANT_DATA_DIR = 'D:\temp\astock_dryrun'
+# 注意: 本项只影响 DATA_DIR 及其派生路径。**h5i 行情库路径不由此派生**
+# (见 h5i_bar_store._H5I_PATH, 仍为 <repo>/data/h5i/market.db), 故行情读取不受影响;
+# 但反过来也意味着"写 h5i 的步骤"(如 run_daily.py 的 store.write_bars)仍会落到生产库,
+# 该脚本在未获额外授权前不得用于 dry-run。
+DATA_DIR = os.environ.get("QUANT_DATA_DIR") or os.path.join(BASE, "data")
 DAILY_DIR = os.path.join(DATA_DIR, "daily")       # 每日回执 data/daily/<date>/
 SNAP_DIR = os.path.join(DATA_DIR, "snapshots")    # 盘中快照
 STATE_FILE = os.path.join(DATA_DIR, "state.json") # 运行状态(持仓/净值/回执索引)
