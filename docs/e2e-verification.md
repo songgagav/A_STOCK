@@ -1,0 +1,181 @@
+# 端到端验证报告（三链路 × 时序 × 交叉 × 故障注入）
+
+> **编排器**：`scripts/e2e_verify.py`　·　**报告产物**：`data/e2e_report.json`
+> **本次执行**：`--phase all`（只读 + 故障注入）
+> **总判定**：**No-Go**
+>
+> | 链路 | pass | fail | review | 判定 |
+> |---|---|---|---|---|
+> | 数据链 | 10 | 0 | 1 | **Conditional Go** |
+> | 信号链 | 3 | 2 | 0 | **No-Go** |
+> | 执行链 | 4 | 1 | 0 | **No-Go** |
+>
+> 判据（用户设计第五节）：未闭环 P0 → No-Go；有 P1 且有缓解 / 有需人工定性项 → Conditional Go；全通过 → Go。
+
+---
+
+## 〇、必须先纠正一处前提（否则后续工作建在错误归因上）
+
+> 设计第三节写：「P0-2 的修复目标就是让第一条对比成立——当前偏差 1.02pp 正是因为两侧池口径不同源」。
+
+**该归因已在本批次被证伪，请勿据此推进 P0-2。**
+
+- 回放侧走的是 `backtest_engine._select_targets_hist()`，它严格执行候选目录 `C < D` 的**盘前视角**（该函数 docstring 记录了 v1/v2/v3 修复史）；
+- 而"盘后档会污染池"指的是 `realtime_engine.load_targets()` 的第②档 `selection_same_day`——**回放并不调用它**。我曾据该假设给 `load_targets` 加 `skip_same_day_selection` 参数，**已回退**（改动前提不成立）。
+- 实测佐证：当日 `selection.json` 确实存在且非空（0903/0904/0907/0908），所以"今日直接调 `load_targets` 会拿到不同池"成立——**但这是回放路径之外的事实**。
+
+**结论**：1.02pp 的根因**仍未定**。候选方向见 `docs/preflight-verification.md` 三-1（成交/价格模型、调仓时点 `rebalance_interval_days=3`/`min_hold_days=2`、持仓状态初始化），需重新诊断。
+
+---
+
+## 一、三条主链路的入口/出口契约
+
+| 主链路 | 入口 | 出口契约 | 编排器对应项 |
+|---|---|---|---|
+| 数据链 | 外部数据源 / h5i | h5i `daily_bars`/`valuation`/`financials` 行数与口径 | `preflight_data_checks`、`preflight_missing_data`、`preflight_atomicity` |
+| 信号链 | 数据就绪 | 目标权重 + 门控状态（`regime`/`exposure_mult`/`freeze_new_buys`/`interval_days`） | `preflight_risk_triggers`、`preflight_circuit_breaker` |
+| 执行链 | 订单计划 | 成交台账（`PaperBook`/`simulated_fills`）+ 对账记录 | `preflight_paperbook`、veighna `reconcile_astock.py` |
+
+"上一环输出是否为下一环合法输入"的验证落点：
+- 数据链→信号链：`preflight_data_checks` 的 **PIT 口径一致性**（5 份实现 / 102 期 → mismatch=0）+ 边界日 pb 覆盖；
+- 信号链→执行链：目标权重契约（`preflight_risk_triggers` 的 target contract：n=10、missing_weight=0、`norm_sum=1.0`）；
+- 执行链→账务：`preflight_paperbook.internal_recon`（自算权益 vs 快照权益差 1e-4；费用恒等差 0）。
+
+---
+
+## 二、盘前 → 盘中 → 盘后 时序验证（实测）
+
+### 盘前
+
+| 验证项 | 方法 | 通过标准 | 实测 |
+|---|---|---|---|
+| 数据就绪 | 哨兵查 pe_ttm/pb/float_shares 覆盖 | 无 CRITICAL | ✅ PIT 边界 4 个 pb 覆盖 0.9905~0.9934 |
+| 口径正确 | 5 份 `_avail_date` 实现对比 102 期 | 无分歧 | ✅ `n_mismatch=0` |
+| 并发读一致 | 单进程基线 vs 并发两进程行数 | 一致、无空表/锁冲突 | ✅ valuation 15416998 / financials 330983 三路一致 |
+| 门控状态 | 构造 IC 序列触发 `risk`/`caution` | 与预期一致 | ❌ **7/10 断言通过**（详见下） |
+| 健康检查 | `premarket_healthcheck.py` | 全绿才允许交易 | ⚠️ `FAIL=6`（3× arcticdb 缺包 + 3× h5i 数据真实滞后，见 `docs/vulnerability-register.md`） |
+| 信号冻结（09:25 硬截止） | — | — | ⛔ **未实现/未验证**：代码中未见 09:25 信号冻结闸门 |
+
+**门控 3 项未过（对应已登记 `P1-8`）**：
+1. `IC 负 第3日(触发 risk)` → 实得 `caution`；`IC 恢复 第1/2日(仍 risk)` → 实得 `normal`
+   —— 迟滞为 **5 日**（代码默认 3，`data/factor_gate_config.json`=5），导致**延迟进入、提前退出**；
+2. **风险梯度不足**：`normal 1.0 / caution 0.95 / risk 0.9` —— 清单期望的"半仓"未出现，`risk` 仅降 10% 暴露；
+3. **单日 −5% 与 −9% 响应完全相同**（均 `exposure_mult=0.9, freeze_new_buys=true, interval_days=6`）。
+   `Sharpe 大跳变` 亦显示"risk 滞后进入：需连续 5 日确认"。
+
+### 盘中
+
+| 验证项 | 方法 | 通过标准 | 实测 |
+|---|---|---|---|
+| 下单带单号 | `preflight_paperbook` | 100% 带 `vt_orderid` | ✅ 模拟层；**真实通道 ⛔** |
+| 风控触发 | `preflight_circuit_breaker` | 回撤 −8% 触发熔断级 | ❌ **FAIL**：`level=1`（仓位上限 0.7），未到 `level>=2` |
+| 熔断升级 | 同上 | 回撤 −12% → `level=3` 清仓 | ✅ `level=3, limit=0.0` |
+| CVaR / 波动拦截 | 同上 | 触发 | ✅ `cvar` / `volatility` 均触发 |
+| 资金不足 | `preflight_paperbook` | 不越界、可复现 | ✅ |
+| T+1 锁定 | 同上 | 买入当日记锁定 | ✅ |
+| 幂等重放 | 同上 | 两次重放成交/现金/权益一致 | ✅ |
+| 行情延迟 <5s | — | — | ⛔ **结构性不可验**（无实时行情源，tick 由 seed 构造） |
+| 实时对账（每小时增量） | — | — | ⛔ **结构性不可验**（无真实回报流） |
+
+### 盘后
+
+| 验证项 | 方法 | 通过标准 | 实测 |
+|---|---|---|---|
+| 内部对账 | `preflight_paperbook.internal_recon` | 差≈0 | ✅ 权益差 1e-4、费用恒等 0 |
+| 快照/恢复一致性（对应断线重连状态） | `snapshot_restore` | 逐位一致 | ❌ **FAIL**：`same_cash=False`（84979.35 vs 84979.35，实为分单位舍入 1.05e-4 元）→ 已登记 `P2-SNAPSHOT` |
+| 逐笔对账（模拟盘） | veighna `reconcile_astock.py` | 5 项硬检查全过 | ✅ 70 笔带 `vt_orderid`，H1–H5 全 PASS（见 `docs/pit-valuation.md` §⑮） |
+| 写入原子性（kill 中断） | `preflight_atomicity` | 完好旧态或完好新态 | ⚠️ **需人工定性**：基线 1000 → kill 后 8000（写满应 21000），即**部分提交 +7000 行**。h5i 为分块 append，需确认这是否属其提交语义 |
+| 数据缺失降级 | `preflight_missing_data` | 告警 + 降级，不静默 | ✅ 3/3（前向数据不足 → 合法 `[]`；篮子覆盖闸门生效；单标的空表 → 归属判定为合法空，兜底在批次层） |
+| 持仓/资金核对 vs 券商 | — | — | ⛔ **结构性不可验**（无券商侧真值） |
+
+---
+
+## 三、交叉验证：回测 vs 模拟盘（三角校验的第一条）
+
+| 对比 | 通过标准 | 现状 |
+|---|---|---|
+| 回测 vs 模拟盘（同一决策日选股） | 逐位一致 | ❌ **未通过**：偏差 1.02pp（阈值 0.5pp）；**根因未定**（见第〇节：上版归因已证伪） |
+| 回测 vs 实盘 | 逐位一致 | ⛔ 不可验（无实盘通道） |
+| 模拟盘 vs 实盘 | 逐位一致 | ⛔ 不可验 |
+
+工具：`src/layer3_parity.py`（回测 vs 回放）、`scripts/fidelity_compare.py`、`scripts/fidelity_rebalance.py`。
+
+---
+
+## 四、主动故障注入（第二阶段）
+
+| 故障类型 | 注入方法 | 预期 | 实测 |
+|---|---|---|---|
+| 数据缺失 | `preflight_missing_data.py` | 告警 + 降级不静默 | ✅ 3/3 |
+| 写入中断（等价"进程崩溃"） | `preflight_atomicity.py`（kill 写入子进程） | 完好旧态/新态 | ⚠️ 部分提交，需人工定性 |
+| 数据库故障（连接不可用） | 同上（kill 后只读校验） | 可读、不损坏 | ✅ kill 后可读 |
+| 数据延迟 | — | 超时告警不静默 | ⛔ 无实时行情源 |
+| 进程崩溃 + 守护重启 | `src/daemon.py` 自动拉起 | 状态恢复 | ⛔ **本批次未演练** |
+| 磁盘满 | — | 写入失败告警 | ⛔ **本批次未演练** |
+| 网络中断 | — | 重连、状态一致 | ⛔ **本批次未演练** |
+| 部分成交 / 拒单 | `preflight_paperbook`（资金不足） | 告警，不重试死循环 | ✅ 模拟层；真实通道 ⛔ |
+
+> 用户要求「每次故障注入后必须验证**告警触发 + 系统恢复 + 数据一致**三件事」。
+> 本批次仅 `数据缺失` 三项齐全（告警 `warn_once` + 降级返回 + 结果一致）；
+> `写入中断` 缺"系统恢复"环节；其余故障类型未注入。
+
+---
+
+## 五、结构性不可验证项（7 项，**不计入通过**）
+
+| 链路/阶段 | 项 | 原因 |
+|---|---|---|
+| 执行链 | 真实下单成功率 | `TRADE_BROKER=paper`，无券商通道 |
+| 执行链 | 真实拒单 / 部分成交 | 同上；paper 撮合的拒单语义不等价 |
+| 执行链 | 券商回报对账（逐笔） | 本地 `vt_orderid` 由 paper 引擎生成，**≠ 券商回报** |
+| 执行链 | 断线重连后状态一致性 | 无长连接可断 |
+| 执行链 | 资金/持仓以券商为准核对 | 无券商侧真值 |
+| 盘中 | 行情接收延迟 <5s | 无实时行情源（tick 由 seed 构造） |
+| 盘中 | 实时对账（每小时增量） | 无真实回报流，只能事后对账 |
+
+**范围声明**：本报告所有成交结论仅适用于**本地 `vnpy_paperaccount` 模拟撮合**；真实通道的下单/拒单/超时/断线/回报对账**未验证，不得外推**。
+
+---
+
+## 六、三阶段执行清单状态
+
+```
+第一阶段：只读验证（1天）
+  [x] 盘前：数据就绪、口径、并发读、池构造      -> 通过
+  [x] 盘前：门控状态                            -> 7/10（P1-8 三项未过）
+  [ ] 盘前：信号冻结 09:25 硬截止                -> 代码中未见该闸门
+  [~] 盘中：行情延迟                            -> 结构性不可验
+  [x] 盘中：下单带单号 / T+1 / 幂等 / 资金不足    -> 模拟层通过
+  [x] 盘中：风控触发                            -> 回撤 -8% 未达熔断级（P0-3）
+  [x] 盘后：内部对账                            -> 通过
+  [ ] 盘后：快照/恢复逐位一致                    -> FAIL（P2-SNAPSHOT）
+  [x] 交叉：回测 vs 模拟盘                      -> 已测，未通过（1.02pp，根因未定）
+
+第二阶段：故障注入（1天）
+  [x] 数据缺失                                  -> 3/3
+  [~] 写入中断/库故障                            -> 部分提交，需人工定性
+  [ ] 数据延迟 / 进程崩溃+守护重启 / 磁盘满 / 网络中断  -> 未演练
+  [x] 部分成交/拒单（资金不足）                   -> 模拟层通过
+
+第三阶段：全链路 dry-run（1天）
+  [ ] 一个完整交易日，盘前 -> 盘中 -> 盘后        -> 未做
+  [ ] 监控告警验证                              -> 告警链已验证（amtool→Alertmanager→alert_hook→logs/alerts.log），但**未与全链路 dry-run 合并演练**
+  [ ] 备份恢复演练                              -> 未做
+  [x] 输出 Go/No-Go 报告                        -> 本文件 + data/e2e_report.json
+```
+
+---
+
+## 七、编排器实现要点（踩过的坑，供后续维护）
+
+1. **这 6 个 preflight 脚本一律 `exit 0`，即使内部有 FAIL** ⇒ **退出码不可作判据**，必须解析各自 JSON。
+2. **各 JSON 的 schema 互不相同**（`pass` 字典 / `assert_pass`+`total` / `_summary` / 纯 `verdict` 字符串）⇒ 一脚本一适配器，不能用通用提取器。
+3. **必须校验 JSON 新鲜度**（`mtime > 本次脚本启动时刻`）：编排器初版曾登记一个**不存在的脚本**（`exit=127`），却因目录里残留同名 JSON 而读出 `pass` —— "脚本没跑成功却读出通过"。现已用 `_load(..., since=_RUN_START)` 堵住。
+4. `REVIEW` **不计入 `fail`**：它表示"判据不足以自动定性"，与"实测失败"不同；误计入会把数据链从 Conditional Go 错判为 No-Go。
+
+用法：
+```powershell
+$env:BAR_STORE = 'h5i'
+& <持有 h5i_db 的解释器>\python.exe scripts\e2e_verify.py --phase readonly   # 第一阶段
+& <持有 h5i_db 的解释器>\python.exe scripts\e2e_verify.py --phase all        # 加故障注入
+```
