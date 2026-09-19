@@ -104,7 +104,14 @@ def main():
     if os.path.exists(BLT):
         with open(BLT, encoding="utf-8") as f:
             snap = f.read()
-    r = BacktestRunner(days=6, start=date(2026, 8, 1)).run(tag=BT_TAG)
+    # [2026-09-19 复验修复] 原为 days=6, 而 trading_days() 的语义是"取 [start, 最新]
+    # 范围内最近 N 个交易日" ⇒ days=6 实际只覆盖 09-01~09-08, **不含预热日 08-28**,
+    # 与 docstring 声称的"08-28 作为建仓预热日"不符。后果有二:
+    #   ① 回测首个对齐日没有前值 -> 收益键缺失 -> 原脚本直接 KeyError 跑不完;
+    #   ② 两侧起点不对齐(回测从 09-01 空仓起步, 模拟盘 08-28 已持仓) ->
+    #      日收益偏差无法归因于策略。
+    # 现改为"从预热日起全部回放"。
+    r = BacktestRunner(days=999, start=date(2026, 8, 28)).run(tag=BT_TAG)
     if snap is not None:
         with open(BLT, "w", encoding="utf-8") as f:
             f.write(snap)
@@ -116,6 +123,19 @@ def main():
     aligned = [d for d in PAPER_DAYS if d in paper_eq and d in bt_eq]
     paper_rets = daily_rets(paper_eq, PRE_DAYS + aligned)
     bt_rets = daily_rets(bt_eq, PRE_DAYS + aligned)
+    # [2026-09-19 复验修复] 原实现下面直接用 bt_rets[d] 取值, 而回测曲线可能不含预热日
+    # (2026-08-28) -> 首个对齐日没有收益键 -> KeyError, 整个一致性校验跑不完(第 122 行
+    # 用 .get(d,0) 防御、第 126/128 行却直接索引, 前后不一致)。
+    # 现改为只在"两侧都有收益"的日子上统计; **窗口变窄必须显式打印**, 不得静默缩小。
+    cmp_days = [d for d in aligned if d in paper_rets and d in bt_rets]
+    if len(cmp_days) < len(aligned):
+        _miss = [d for d in aligned if d not in bt_rets or d not in paper_rets]
+        print(f"[warn] 可比交易日 {len(cmp_days)}/{len(aligned)}; 缺收益的日子 {_miss}"
+              f" —— 回测曲线未覆盖预热日({PRE_DAYS[0] if PRE_DAYS else '?'}), 该日不计入统计")
+    if not cmp_days:
+        print("[fatal] 无可比交易日, 回测-实盘一致性校验不可用")
+        return
+    aligned = cmp_days
     print("模拟盘日收益%:", {d: round(v, 4) for d, v in paper_rets.items()})
     print("回测日收益%: ", {d: round(v, 4) for d, v in bt_rets.items()})
 

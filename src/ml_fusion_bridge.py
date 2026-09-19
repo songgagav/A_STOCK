@@ -49,7 +49,14 @@ FUSION_VENV_PY = os.environ.get("ML_FUSION_VENV_PY",
 FML_MODEL = os.environ.get("ML_FUSION_RANK_MODEL", FML_MODEL)
 FML_FALLBACK_MODEL = os.environ.get("ML_FUSION_FWD5_MODEL", FML_FALLBACK_MODEL)
 
-_TIMEOUT_S = float(os.environ.get("ML_FUSION_TIMEOUT_S", "60") or 60)
+# 超时: 2026-09-19 由 60s 提到 120s。
+#   why: f_ml 取数切回 h5i 后实测全候选池 3023 只耗时 34s(≈11ms/只), 而当前候选池已近
+#   5000 只 ⇒ 60s 余量仅 ~1.1x, 一旦超时 compute_fml 返回 available=False, 会重新落入
+#   "fusion 覆盖不足 -> f_ml 失败 -> used=equal" 的降级链(现在有告警, 但仍应预防)。
+#   注意: 本项目**不加载自身 .env**(唯一 dotenv 加载器在 llm_commentary, 指向
+#   research_trader/.env 且仅 LLM 路径调用), 故"设环境变量"对常驻 daemon 是惰性的 ——
+#   要真正生效必须改这里的默认值; 环境变量仍可在需要时覆盖。
+_TIMEOUT_S = float(os.environ.get("ML_FUSION_TIMEOUT_S", "120") or 120)
 
 # 打分融合权重: 融合因子在 selector 综合分中的占比(当前固定, 后续可由
 # weight_optimizer 收入 weights.json 自适应). 小权重起步, 稳定后再上调.
