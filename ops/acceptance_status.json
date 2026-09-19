@@ -275,11 +275,11 @@
     {
       "id": "DRL-4",
       "level": "P0",
-      "title": "DRL 无降级链（4 级一级都没有）",
-      "status": "open",
-      "detail": "设计的四级降级链（学习失败→保留旧模型+告警 → 旧模型损坏→回退上一有效版 → 无有效版→暂停交易）实测**一级都没有独立实现**：`train_meta.ok=False` 会落盘但**无 warn_once 告警**且不阻断；模型按天分目录故旧文件物理仍在，但**消费方不会自动回退**；未见『扫描 data/drl/* 找最近一个 ok=True』的逻辑；未见『无有效版本→暂停交易』闸门。与已修的 f_ml 降级链形成对比：DRL 侧仍是裸奔。",
-      "evidence": "docs/drl-learning-verification.md §五；可参考 f_ml 降级链实现（pit-valuation.md §⑫）",
-      "next": "按 f_ml 降级链模式实现四级；每级留痕 + dataguard.warn_once 告警"
+      "title": "DRL 降级链已实现（四级 + 留痕 + 告警 + 可逆）",
+      "status": "fixed",
+      "detail": "已实现用户设计的四级降级链, 每级都留痕 + 告警, 且**可逆**:\n· 新增轻量模块 `src/drl_degrade.py`（不依赖 torch/gymnasium/stable_baselines3, 故不装 torch 的 CI core job 也能跑）: `LEVEL_OK=0 / LEVEL_RETAIN=1 / LEVEL_FALLBACK=2 / LEVEL_HALT=3`。\n· 触发条件**全为结构性**（训练失败 / 模型文件结构不可用 / 无有效版本）, **不含任何统计阈值** ⇒ METHOD-1 在此不直接适用。\n· L0 正常部署（并记『从降级恢复』事件）→ L1 保留当前模型 + WARNING → L2 回退最近有效版本 + ERROR → L3 **不生成当日 plan** + CRITICAL。\n· L3 的落点写在 `drl_train`: 决策**早于** `_build_target_plan`, halt 时写入 `target_plan={ok:False, blocked_by_degrade:True}`, 即『阻断当日 plan』。\n· 账本 `data/drl_degrade_events.jsonl`（时间/级别/触发原因/处置动作/生效来源日/是否阻断）; 指针 `data/drl/current_model.json` 记录当前模型日**与当前降级级别**（存 level 而非靠'旧文件在不在'去猜, 否则 L1 那种'文件完好但确处于降级'会漏记恢复, 可逆性轨迹断裂）。\n★ **本轮自查发现并修掉一个静默失败模式（比 L3 更危险）**: `data/drl/` 下**混放**实盘版本与回测/验证遗留目录。实测 32 个 8 位目录 = 12 个有实盘标记 + 20 个无标记, 无标记者中**有 7 个满足朴素『可用』判据**（model.zip + ok=True）, 其中 6 个是 2015–2021 的回测遗留。朴素『按日期倒序扫』在**近端版本全不可用时**会回退到 **20211231** 那个 5 年前的回测模型 —— 静默用错模型。已叠加**两道保险**: ①`is_live_version()` 要求实盘标记文件（`pre_drl_brief.json`, 可 `DRL_LIVE_MARKER` 覆盖）; ②`FALLBACK_LOOKBACK_DAYS=45` 回退窗口。被跳过者**计数留痕**（`skipped_not_live` / `skipped_out_of_window`）, 判据失效时可定位, 而非表现为一句无从排查的『无有效版本』。\n· 另修掉两条**训练失败静默路径**: 『数据不足提前 return』与『未捕获异常外层 except』原先都是『当天无 plan 且无任何告警/留痕』, 现统一走 `_degrade_on_failure()`。\n**已知偏差（如实标注）**: 实盘日 `20260825` 早于实盘标记的引入, 也会被判为『非实盘』而排除在回退候选外。方向是**保守**的（可能误停 L3, 不会静默用错）。\n**未做（按用户要求）**: 『验证不通过』的统计阈值**不定义** —— 只由 `record_validation()` 落盘实际数值且 `threshold_applied=false`, `resolve()` **不**用它触发任何降级; 待积累 1-2 个月下游表现后再定（METHOD-1）。",
+      "evidence": "src/drl_degrade.py；src/drl_train.py（_degrade_on_failure + resolve 早于 _build_target_plan 的 halt 分支）；tests/test_drl_degrade.py（50 用例）；scripts/preflight_drl_degrade_realdata.py（真实生产目录上 10/10 PASS，反事实显示朴素扫描会选 20211231）；docs/drl-learning-verification.md §五",
+      "next": "用积累的数据标定『验证不通过』阈值（DRL-3 就位后）；可选：把实盘判据换成由流水线显式写入的 provenance 文件以消除 20260825 偏差"
     },
     {
       "id": "DRL-5",

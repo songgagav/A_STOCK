@@ -28,6 +28,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR, DUCKDB_PATH, MAX_STOCKS  # noqa: E402
 import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 torch)
+import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -906,6 +907,31 @@ class CVaR_PPO(PPO):
 # ============================================================
 # 主训练函数
 # ============================================================
+def _degrade_on_failure(day: str, reason: str) -> dict:
+    """训练**未成功**时的降级决策（DRL-4）。**核心价值 = 消除静默路径**。
+
+    覆盖 `drl_degrade.resolve()` 主流程**之外**的两条失败路径:
+      ① 数据不足 -> 提前 return（**不写** train_meta.json, 故 1181 行的 resolve 根本不会执行）
+      ② 未捕获异常 -> 外层 except（meta 可能还不存在）
+    这两条原先都是"当天没有 plan, 但没有任何告警、任何留痕" —— 正是 DRL-4 要消除的对象。
+    现在两条走同一入口: 记事件 + 按级别告警 + 返回生效来源日。
+    """
+    try:
+        dec = drl_degrade.resolve(str(day), train_ok=False, final_weights=None,
+                                  fail_reason=reason)
+    except Exception as e:  # noqa: BLE001  绝不影响主链路
+        dec = {"ok": False, "halt": False, "level": 0,
+               "error": f"{type(e).__name__}: {e}"}
+    lv = int(dec.get("level") or 0)
+    if lv > 0:
+        _log(f"DRL 降级 L{lv}({dec.get('level_name')}): {reason} -> {dec.get('action')}; "
+             f"生效来源日={dec.get('source_day')}"
+             + ("; **当日 plan 已阻断**" if dec.get("halt") else ""))
+    else:
+        _log(f"DRL 训练未成功({reason}), 但降级链未触发: {dec.get('error')}")
+    return dec
+
+
 def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                   use_vnpy_reward: bool = True,
                   brief: dict | None = None,
@@ -935,12 +961,16 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     hb = Heartbeat(heartbeat_dir, "drl_train",
                    extra={"day": day_dir, "total_timesteps": total_timesteps})
     hb.start(phase="loading_factor_state")
+    _dec = None  # [DRL-4] 降级链决策占位: 外层 except 据此判断"是否已决策过"
 
     ic, rets, dates = _load_factor_state(day_dt, 60)
     if ic is None or len(rets) < 15:
-        hb.stop(phase="data_insufficient", ok=False,
-                error=f"数据不足 (<15 日): {0 if ic is None else len(rets)} 行")
-        return {"ok": False, "error": "数据不足 (<15 日)", "rows": 0}
+        _n_rows = 0 if ic is None else len(rets)
+        _reason = f"数据不足 (<15 日): {_n_rows} 行"
+        hb.stop(phase="data_insufficient", ok=False, error=_reason)
+        # [DRL-4] 提前 return 也必须走降级链 —— 否则是"当天无 plan 且无告警"的静默路径
+        return {"ok": False, "error": "数据不足 (<15 日)", "rows": 0,
+                "degrade": _degrade_on_failure(day, _reason)}
 
     # 市场状态感知特征: 从全 A 平均收益率序列计算 3 维市场状态
     regime_features = _compute_regime_features(rets)
@@ -1172,24 +1202,53 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         with open(os.path.join(out_dir, "train_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
+        # ===== DRL 降级链决策 (DRL-4, 2026-09-19): 决定当日**生效的因子权重** =====
+        # 必须放在 target_plan 生成**之前** —— L3 要阻断当日 plan, L2 要用回退版本的权重。
+        # 触发条件全是**结构性**的(训练失败 / 模型文件不可用 / 无有效版本), 不含统计阈值,
+        # 故 METHOD-1 在此不直接适用（"验证不通过"的阈值按用户要求只记录、不定）。
+        _trained_weights = {k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)}
+        try:
+            _dec = drl_degrade.resolve(day, train_ok=bool(meta.get("ok", True)),
+                                       final_weights=_trained_weights, out_dir=out_dir)
+        except Exception as e:  # noqa: BLE001
+            _dec = {"ok": False, "halt": False, "level": 0,
+                    "effective_weights": _trained_weights, "source_day": day,
+                    "error": f"{type(e).__name__}: {e}"}
+        meta["degrade"] = _dec
+
         # ===== DRL 目标计划生成: 用 final_weights × v_universe_snapshot 重打分 -> TopN =====
         # 这是"信号就绪"的关键产物: 盘中 realtime_engine 优先消费此文件.
-        try:
-            plan = _build_target_plan(
-                day=day, day_dir=day_dir,
-                final_weights={k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)},
-                top_n=MAX_STOCKS,
-            )
+        # [2026-09-19] L3(暂停交易) 时**不生成 plan** —— 这就是"阻断当日 plan"的落点。
+        if _dec.get("halt"):
             meta["target_plan"] = {
-                "path": plan.get("path"),
-                "ok": plan.get("ok"),
-                "top_n": plan.get("top_n"),
-                "method": plan.get("method"),
-                "universe_size": plan.get("universe_size"),
-                "error": plan.get("error"),
+                "ok": False, "blocked_by_degrade": True,
+                "level": _dec.get("level"),
+                "error": f"降级链 L3 暂停交易: {_dec.get('trigger')}",
             }
-        except Exception as e:
-            meta["target_plan"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            _log("DRL 降级 L3: 无有效模型, **已阻断当日 target_plan 生成**, 需人工介入")
+        else:
+            _use_w = _dec.get("effective_weights") or _trained_weights
+            if _dec.get("level", 0) > 0:
+                _log(f"DRL 降级 L{_dec.get('level')}: 使用 {_dec.get('source_day')} 的权重"
+                     f"({_dec.get('action')})")
+            try:
+                plan = _build_target_plan(
+                    day=day, day_dir=day_dir,
+                    final_weights={k: float(v) for k, v in _use_w.items()},
+                    top_n=MAX_STOCKS,
+                )
+                meta["target_plan"] = {
+                    "path": plan.get("path"),
+                    "ok": plan.get("ok"),
+                    "top_n": plan.get("top_n"),
+                    "method": plan.get("method"),
+                    "universe_size": plan.get("universe_size"),
+                    "error": plan.get("error"),
+                    "weights_source_day": _dec.get("source_day"),
+                    "degrade_level": _dec.get("level", 0),
+                }
+            except Exception as e:
+                meta["target_plan"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
         # ===== 权重漂移检查 (2026-09-19): **只告警, 不阻断当日 plan** =====
         # 依据 docs/drl-learning-verification.md §六『参数漂移检查』。
@@ -1226,7 +1285,12 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         tb = traceback.format_exc(limit=3)
         _log(f"DRL 训练异常: {type(e).__name__}: {e}\n{tb}")
         hb.stop(phase="error", ok=False, error=f"{type(e).__name__}: {str(e)[:200]}")
-        return {"ok": False, "error": str(e)[:300], "rows": 0}
+        # [DRL-4] 异常路径不得静默: 走同一降级入口（保留旧模型 / 回退 / 暂停交易 + 告警）
+        _already = isinstance(_dec, dict) and "level" in _dec
+        _dec = _degrade_on_failure(
+            day, f"未捕获异常{' (降级链已决策后)' if _already else ''}: "
+                 f"{type(e).__name__}: {str(e)[:150]}")
+        return {"ok": False, "error": str(e)[:300], "rows": 0, "degrade": _dec}
 
 
 # ============================================================
