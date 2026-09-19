@@ -164,12 +164,15 @@ class TestDataSourceFailureIsNotSilent:
         seg = src[i:i + 700]
         assert '_degrade_on_failure' in seg and '"degrade"' in seg
 
-    def test_behavioural_source_failure_does_not_raise(self, monkeypatch):
+    def test_behavioural_source_failure_does_not_raise(self, monkeypatch, tmp_path):
         """行为验证: 源抛异常时 `run_drl_train` 必须**正常返回**并带上降级决策。"""
         def _boom(*a, **k):
             raise OSError("legacy duckdb 不存在")
         monkeypatch.setattr(T, "_load_factor_state", _boom)
-        monkeypatch.setattr(T, "DATA_DIR", os.environ.get("PYTEST_TMP", "/tmp"))
+        # drl_train 用的是 `from config import DATA_DIR` 的**模块级绑定**,
+        # 故只 monkeypatch config.DATA_DIR 不够, 必须同时改 drl_train.DATA_DIR
+        # （Heartbeat 会写 <DATA_DIR>/drl/<day>/）—— 指到 tmp_path 避免污染 /tmp。
+        monkeypatch.setattr(T, "DATA_DIR", str(tmp_path))
 
         r = T.run_drl_train("2026-09-07", total_timesteps=1)
         assert r["ok"] is False
