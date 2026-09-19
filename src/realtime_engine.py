@@ -39,6 +39,25 @@ from paper_book import PaperBook, PriceFeed
 
 LIVE_STATE = os.path.join(DATA_DIR, "live_state.json")
 
+# ---------------------------------------------------------------------------
+# 消费日解析器（--date 覆盖）
+#
+# [2026-09-19] 新增 `--date`, 用于**可复现的交易日 dry-run**。此前引擎内部直接调
+# `date.today()`, 无法指定消费日 —— 想复现某个交易日只能改系统时间, 或接受"跑今天"
+# （今天往往没有就绪的池, 会落进第⑤档"现场选股"这条数分钟的多核重算路径,
+# 实测墙钟 5.8min / CPU 1406s 仍未完成）。
+#
+# **默认行为逐位不变**: `_DAY_OVERRIDE is None` 时 `_today()` 就是 `date.today()`,
+# 只是纯透传的间接层; 未传 `--date` 时不改变任何取值。
+# 回归用例: tests/test_engine_date_override.py
+# ---------------------------------------------------------------------------
+_DAY_OVERRIDE: "date|None" = None
+
+
+def _today() -> date:
+    """当前消费日。默认 `date.today()`；CLI 传 `--date` 时以其为准。"""
+    return _DAY_OVERRIDE if _DAY_OVERRIDE is not None else date.today()
+
 
 def _keep_a_share(items: list) -> list:
     """按 A 股代码段过滤 top_n 列表(防御 selection/历史文件含可转债)."""
@@ -420,7 +439,7 @@ class RealtimeEngine:
         self.push_only_in_session = intraday_only
         self.pb = PaperBook()
         self.pb.restore(load_state())           # 延续历史现金/持仓
-        self.pb.trade_date = date.today().strftime("%Y-%m-%d")
+        self.pb.trade_date = _today().strftime("%Y-%m-%d")
         self.pb.day = self.pb.trade_date
         self.targets, self.sel, self.sel_day = load_targets(self.pb.trade_date)
         # 策略层优化: 目标权重与配置对齐(DRL 等权 plan -> 现算 fml 激活预测加权)
@@ -499,7 +518,7 @@ class RealtimeEngine:
             if not self.pb.positions:
                 return
             db = self._ref_db()
-            as_of = date.today()
+            as_of = _today()
             # 只入账"建仓之后到期"的分红/送转, 避免把 1996~2026 全部历史事件
             # 在首日建仓时一次性入账 (qty 被历史送转放大, 假性收益暴涨).
             since_dates = {
@@ -758,7 +777,7 @@ class RealtimeEngine:
         gap_days = 999
         if rebal_iv > 0 and self._last_rebal_day:
             try:
-                gap_days = (date.today() - date.fromisoformat(self._last_rebal_day)).days
+                gap_days = (_today() - date.fromisoformat(self._last_rebal_day)).days
             except Exception:
                 gap_days = 999
             gate_open = gap_days >= rebal_iv
@@ -779,7 +798,7 @@ class RealtimeEngine:
                         buy_date = self.pb.positions[canon].get("buy_date")
                         if buy_date:
                             try:
-                                held = (date.today() - date.fromisoformat(buy_date)).days
+                                held = (_today() - date.fromisoformat(buy_date)).days
                             except Exception:
                                 held = 999
                             if held < min_hold:
@@ -897,7 +916,7 @@ class RealtimeEngine:
 
         # 推进策略调仓日: 本窗口确有策略成交(卖出或买入)才锁定调仓间隔.
         if gate_open and self._to_used > 0:
-            self._last_rebal_day = date.today().isoformat()
+            self._last_rebal_day = _today().isoformat()
             log(f"策略调仓日推进 -> {self._last_rebal_day} (下次窗口≥{rebal_iv}自然日后)")
 
     # ---------- 午间重选 (独立线程, 不阻塞盘中 tick) ----------
@@ -1151,12 +1170,22 @@ def tgt(targets):
 
 
 def main():
+    global _DAY_OVERRIDE
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="单次运行")
     ap.add_argument("--interval", type=float, default=15.0, help="tick间隔(秒)")
     ap.add_argument("--allow-offsheet", action="store_true",
                     help="非交易时段也尝试刷新实时价(默认每tick拉, 失败即静默)")
+    # [2026-09-19] 覆盖消费日, 供**可复现的交易日 dry-run** 使用。
+    # 不传 => 与改动前完全一致(走 date.today()); 传 => 池/状态/回写全按该日期。
+    ap.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                    help="覆盖消费日(默认今天)。用于指定历史交易日复现链路; "
+                         "不传时行为与改动前逐位一致")
     args = ap.parse_args()
+
+    if args.date:
+        _DAY_OVERRIDE = date.fromisoformat(args.date)
+        log(f"[date] 消费日已被 --date 覆盖为 {_DAY_OVERRIDE.isoformat()}")
 
     eng = RealtimeEngine(interval=args.interval, intraday_only=not args.allow_offsheet)
     if args.once:

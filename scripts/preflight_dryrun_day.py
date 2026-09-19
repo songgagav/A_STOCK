@@ -37,6 +37,25 @@ os.makedirs(TMP_DATA, exist_ok=True)
 os.environ["QUANT_DATA_DIR"] = TMP_DATA          # **必须在 import config 之前**
 os.environ.setdefault("BAR_STORE", "h5i")
 
+# [2026-09-19 修] **必须把"输入产物"种进沙箱**。
+# 重定向 DATA_DIR 会连**引擎要读的输入**一起遮蔽: `data/daily/<day>/selection.json`
+# 与 `data/drl/<day>/target_plan.json` 都在 DATA_DIR 下。空沙箱会让 `load_targets()`
+# 的前四档**必然**取不到, 从而落进第⑤档"现场选股"（数分钟多核重算）——
+# 那是**沙箱造成的假象**, 不是生产行为。实测生产下 2026-09-19 会命中第④档(跨日 selection)。
+# daily≈11.2MB / drl≈8.2MB, 复制代价可接受; 复制后写入(如 save_selection)也只落在沙箱。
+_SEED_SUBDIRS = ("daily", "drl")
+_seeded = []
+for _sub in _SEED_SUBDIRS:
+    _src = os.path.join(_BASE, "data", _sub)
+    _dst = os.path.join(TMP_DATA, _sub)
+    if os.path.isdir(_src) and not os.path.exists(_dst):
+        try:
+            import shutil as _sh
+            _sh.copytree(_src, _dst)
+            _seeded.append(_sub)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[dry-run] 警告: 种入 {_sub} 失败: {_e}")
+
 PROD_STATE = os.path.join(_BASE, "data", "state.json")
 PROD_LIVE = os.path.join(_BASE, "data", "live_state.json")
 SUMMARY_OUT = os.path.join(_BASE, "data", "preflight_dryrun.json")
@@ -59,8 +78,16 @@ def _tree(root):
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="交易日 dry-run（写临时目录）")
+    ap.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                    help="覆盖消费日（默认今天）。指定历史交易日可检验**正常路径**"
+                         "（池命中），否则今天往往无就绪池、只能检验第⑤档降级路径")
+    args = ap.parse_args()
+
     before = {"state.json": _md5(PROD_STATE), "live_state.json": _md5(PROD_LIVE)}
     print(f"[dry-run] 临时数据目录: {TMP_DATA}")
+    print(f"[dry-run] 已种入输入产物: {_seeded or '（无需/已存在）'}")
     print(f"[dry-run] 生产 state.json md5(前) = {before['state.json']}")
     print(f"[dry-run] 生产 live_state md5(前) = {before['live_state.json']}\n")
 
@@ -78,8 +105,15 @@ def main() -> int:
     try:
         import realtime_engine as RE
 
+        # ---- 消费日：默认今天；--date 覆盖（与 CLI 同一条路径）----
+        if args.date:
+            from datetime import date as _d
+            RE._DAY_OVERRIDE = _d.fromisoformat(args.date)
+        day = RE._today().isoformat()
+        print(f"[dry-run] 消费日 = {day}"
+              f"{'（--date 覆盖）' if args.date else '（今天, 未覆盖）'}\n")
+
         # ---- 盘前：池构造（耗时 + 落点档位）----
-        day = datetime.now().strftime("%Y-%m-%d")
         t0 = time.time()
         targets, sel_info, sel_day = RE.load_targets(day)
         dt_pool = time.time() - t0
