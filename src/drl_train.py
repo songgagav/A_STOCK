@@ -27,6 +27,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR, DUCKDB_PATH, MAX_STOCKS  # noqa: E402
+import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 torch)
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -1190,7 +1191,18 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         except Exception as e:
             meta["target_plan"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-        # 二次写盘 (含 target_plan)
+        # ===== 权重漂移检查 (2026-09-19): **只告警, 不阻断当日 plan** =====
+        # 依据 docs/drl-learning-verification.md §六『参数漂移检查』。
+        # 用户明确要求: 现在只做"只告警不阻断" —— 阻断需要 DRL-4 降级链先就位,
+        # 否则会引入新的静默行为(权重被改了但没人知道是否合理)。
+        # 阈值 0.3 是**保守初值, 不是标定结果**; 每日本条记录都追加到
+        # data/drl_weight_drift.jsonl 以积累分布, 待 1-2 周数据后再标定。
+        try:
+            meta["weight_drift"] = drl_drift.check_weight_drift(meta, out_dir)
+        except Exception as e:  # noqa: BLE001  绝不影响训练主链路
+            meta["weight_drift"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        # 二次写盘 (含 target_plan + weight_drift)
         with open(os.path.join(out_dir, "train_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 

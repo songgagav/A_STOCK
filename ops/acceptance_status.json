@@ -284,11 +284,11 @@
     {
       "id": "DRL-5",
       "level": "P1",
-      "title": "因子权重边界不存在（已确认 DRL 输出为因子权重 ⇒ 需要该约束）",
+      "title": "因子权重边界不存在（已确认需要；候选 [0.02,0.40] 经实测**也会截断**）",
       "status": "open",
-      "detail": "用户已确认 [0.10, 0.39] 系记忆错误，并要求按 DRL 输出语义判定是否需要因子权重边界。**实测输出语义**：DRL 训练的直接产物是 **6 个因子权重**，键为 signal/trend/govern/liquidity/vol/mom_rev；最新样本 final_weights = {liquidity 0.3254, mom_rev 0.2626, signal 0.1823, trend 0.1073, govern 0.0995, vol 0.0228}，由 target_plan.method = 'drl_final_weights x v_universe_snapshot' 再算出股票 top_n。⇒ 按用户判定表『若 DRL 输出因子权重，则需要独立的因子权重约束』：**该约束当前不存在**，实测因子权重跨度 **0.0228~0.3254（13.6 倍差）**，无任何硬边界。（单票权重边界另有一套且合理：TARGET_WEIGHT.min_mult/max_mult = 0.60/1.15 → 6.0%~11.5%。）补充观察：用户记错的 [0.10, 0.39] 很可能原本就是打算用于因子权重的——实测跨度恰好横跨该区间。",
-      "evidence": "data/drl/*/train_meta.json 的 base_weights/prior_weights/final_weights（16 样本）；target_plan.method；docs/drl-learning-verification.md §〇.1 与 §三『学习后』",
-      "next": "确认因子权重边界取值（建议直接评估 [0.10, 0.39] 是否合适），在 final_weights 落盘处加 clamp + 越界告警"
+      "detail": "用户已确认 [0.10, 0.39] 系记忆错误, 并按 DRL 输出语义判定需要因子权重边界。**实测输出语义 = 因子权重**: train_meta 的 base/prior/final_weights 都是 6 元素 dict(signal/trend/govern/liquidity/vol/mom_rev), 由 target_plan.method='drl_final_weights x v_universe_snapshot' 再算股票 top_n。单票权重边界另有一套且合理(TARGET_WEIGHT.min_mult/max_mult=0.60/1.15 → 6.0%~11.5%)。\n\n**16 天回溯标定（scripts/drl_drift_report.py, 基于已落盘的 16 份 train_meta）**: 因子权重**全局范围 = [0.0098, 0.6033]**; 逐因子 max: signal 0.6033 / govern 0.4189 / liquidity 0.3254 / trend 0.3026 / vol 0.2761 / mom_rev 0.2626; 逐因子 min: govern 0.0098 / mom_rev 0.0098 / vol 0.0101 / signal 0.0260 / liquidity 0.0424 / trend 0.0859。\n\n**对候选边界的量化（判据取自用户自己定的原则: 边界用于防极端, 不得强制均衡）**: [0.10,0.39] → 截断 **20 处**; **[0.02,0.40]（用户新提议）→ 截断 8 处**(govern 上下界各 1、mom_rev 2、vol 2、signal 2: 0.5792/0.6033 超上界); [0.005,0.65] → 0 处。\n\n**结论: 用户新提议的 [0.02,0.40] 与本项目反复出现的『用单点抽样下结论』是同一类问题** ——它由单日(20260905: vol 0.0228~liquidity 0.3254)推出, 而 16 天实测范围远宽于此。若目标是『不改变现有行为』, 边界须严格包含 [0.0098, 0.6033]（如 [0.005, 0.65]）; 若目标是『主动拦截极端日』, 则应接受它会在 2/16 天触发, 并**必须与 DRL-4 降级链同批**(否则边界截断本身引入新的静默行为)。",
+      "evidence": "scripts/drl_drift_report.py + data/drl_weight_drift_report.json（16 样本）; data/drl_weight_drift.jsonl（16 条 source=backfill）; docs/drl-learning-verification.md §六",
+      "next": "待用户定夺两种取向: ① 不改变行为 → 边界取 [0.005, 0.65] 或更宽; ② 拦截极端 → 沿用 [0.02,0.40] 但须与 DRL-4 同批实施。两种都必须: clamp 时留痕 + 告警(不得静默截断)"
     },
     {
       "id": "DRL-6",
@@ -298,6 +298,15 @@
       "detail": "设计六类风险中的两类**完全没有缓解措施**：灾难性遗忘（无经验回放缓冲区落盘、无策略蒸馏）、奖励黑客（无奖励函数审计、无行为监控）。另有『训练不稳定』一项：未见梯度裁剪/学习率调度的落盘证据，故**无法验证是否配置**。证据：docs/drl-learning-verification.md §四。",
       "evidence": "docs/drl-learning-verification.md §四",
       "next": "低优先级；建议先完成 DRL-1/2 的质量闸门与降级链"
+    },
+    {
+      "id": "DRL-7",
+      "level": "P1",
+      "title": "DRL 参数漂移检查缺失 —— 已实现（只告警不阻断，阈值待标定）",
+      "status": "fixed",
+      "detail": "设计要求的『参数漂移』检查此前不存在, 但所需数据(base/prior/final_weights)**已落盘** ⇒ 唯一『数据已就绪、只缺代码』的 DRL 项。已实现:\n· 新增轻量模块 `src/drl_drift.py`(不依赖 torch/gymnasium/stable_baselines3) ——**独立成模块的原因**: 原写在 drl_train.py 里, 而后者导入即拉 torch, 会让『不装 torch 的 CI core job』收集失败; 且报告脚本也必须装全套 DRL 依赖。\n· `drl_train` 在最终写盘前调用 `drl_drift.check_weight_drift(meta, out_dir)`, 结果挂到 `train_meta.weight_drift`。\n· **只告警不阻断**(用户要求): 超阈值仅 `warn_once('drl_weight_drift')`, 不改权重、不拦当日 plan —— 阻断需 DRL-4 降级链先就位, 否则引入新的静默行为。\n· 阈值 `DRL_DRIFT_THRESHOLD` 默认 **0.3, 标注 threshold_is_calibrated=False**(保守初值, 非标定结果)。\n· 两种漂移都算: base→final(单次训练推离基准) 与 **day-over-day**(与上一交易日比,真正要标定的量); 无更早数据时记为 `None` 而非 0(0 会被误读成『无漂移』)。\n· 每条追加 `data/drl_weight_drift.jsonl` 以积累分布。\n\n**实测命中率(16 天回溯, 供标定)**: 阈值 0.20 → 3/16(base→final) 5/15(dod); 0.25 → 3/16 3/15; **0.30 → 2/16 2/15**; 0.40 → 2/16 1/15; 0.50 → 0/16 0/15。\n⇒ 0.3 命中约 12~13%, 属合理保守起点; 分布 min 0.0379 / median 0.0981 / max 0.4367(base→final)。",
+      "evidence": "src/drl_drift.py; src/drl_train.py（接线）; tests/test_drl_weight_drift.py（11 例, 构造超/未超阈值两种触发条件）; scripts/drl_drift_report.py; data/drl_weight_drift.jsonl",
+      "next": "按用户要求: 阈值先设 0.3 运行 1-2 周积累真实逐日账本(source=run)后再标定, **不得用单日数据定死阈值**"
     },
     {
       "id": "P2-BARFALLBACK",
