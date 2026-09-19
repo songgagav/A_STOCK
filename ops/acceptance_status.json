@@ -284,11 +284,11 @@
     {
       "id": "DRL-5",
       "level": "P1",
-      "title": "因子权重边界不存在（已确认需要；候选 [0.02,0.40] 经实测**也会截断**）",
-      "status": "open",
-      "detail": "用户已确认 [0.10, 0.39] 系记忆错误, 并按 DRL 输出语义判定需要因子权重边界。**实测输出语义 = 因子权重**: train_meta 的 base/prior/final_weights 都是 6 元素 dict(signal/trend/govern/liquidity/vol/mom_rev), 由 target_plan.method='drl_final_weights x v_universe_snapshot' 再算股票 top_n。单票权重边界另有一套且合理(TARGET_WEIGHT.min_mult/max_mult=0.60/1.15 → 6.0%~11.5%)。\n\n**16 天回溯标定（scripts/drl_drift_report.py, 基于已落盘的 16 份 train_meta）**: 因子权重**全局范围 = [0.0098, 0.6033]**; 逐因子 max: signal 0.6033 / govern 0.4189 / liquidity 0.3254 / trend 0.3026 / vol 0.2761 / mom_rev 0.2626; 逐因子 min: govern 0.0098 / mom_rev 0.0098 / vol 0.0101 / signal 0.0260 / liquidity 0.0424 / trend 0.0859。\n\n**对候选边界的量化（判据取自用户自己定的原则: 边界用于防极端, 不得强制均衡）**: [0.10,0.39] → 截断 **20 处**; **[0.02,0.40]（用户新提议）→ 截断 8 处**(govern 上下界各 1、mom_rev 2、vol 2、signal 2: 0.5792/0.6033 超上界); [0.005,0.65] → 0 处。\n\n**结论: 用户新提议的 [0.02,0.40] 与本项目反复出现的『用单点抽样下结论』是同一类问题** ——它由单日(20260905: vol 0.0228~liquidity 0.3254)推出, 而 16 天实测范围远宽于此。若目标是『不改变现有行为』, 边界须严格包含 [0.0098, 0.6033]（如 [0.005, 0.65]）; 若目标是『主动拦截极端日』, 则应接受它会在 2/16 天触发, 并**必须与 DRL-4 降级链同批**(否则边界截断本身引入新的静默行为)。",
-      "evidence": "scripts/drl_drift_report.py + data/drl_weight_drift_report.json（16 样本）; data/drl_weight_drift.jsonl（16 条 source=backfill）; docs/drl-learning-verification.md §六",
-      "next": "待用户定夺两种取向: ① 不改变行为 → 边界取 [0.005, 0.65] 或更宽; ② 拦截极端 → 沿用 [0.02,0.40] 但须与 DRL-4 同批实施。两种都必须: clamp 时留痕 + 告警(不得静默截断)"
+      "title": "因子权重边界：**只记录不截断**已实现；边界截断待 DRL-4 后标定",
+      "status": "partial",
+      "detail": "用户 2026-09-19 决策：**选 ① `[0.005, 0.65]`，但本批次不部署**；本批次只做「只记录不截断」最小版本。\n\n**不选 ② 的理由**：`[0.02, 0.40]` 在 16 天内触发 **8 处**（4/16 天）—— 那不是'极端拦截'，而是**常态性改变模型行为**；更关键的是**没有证据表明那 8 处极端值是坏的**：signal 0.6033 可能只是'那几天信号确实最有预测力'、govern 0.0098 可能只是'那几天治理因子确实无效'、vol<0.02 可能只是'那几天低波异象确实消失'。在拿到'极端权重的**下游表现**'证据前，截断是武断的 —— 可能截掉的是**模型的有效表达**而非病态行为。\n\n**① 也不本批次部署**：`[0.005, 0.65]` 在 16 天内触发 **0 次**（实测 0/16 天、0 处）⇒ 当前毫无作用，只是**死代码**（增加代码/测试/维护面而零实际收益；未来真触发时仍需 DRL-4 处置）。\n\n**已实现的最小版本**（`src/drl_drift.check_extreme_weights`）：**只记录、绝不截断**（原样返回权重，记录里 `truncated=false`）；门限 `extreme_bounds()` 默认 `(0.005,0.65)`，可用 `DRL_EXTREME_LO/HI` 覆盖；**每天都落一条记录（即使 n_extreme=0）**以保留频率分母；同条记录带 `mean_reward`/`total_timesteps`/`vnpy_sharpe`/`plan_ok` 供日后关联'极端是否有害'；账本 `data/drl_extreme_weights.jsonl`（`source=run|backfill` 可区分）；回归 `tests/test_drl_extreme_weights.py` **12 例**，含'权重必须原样返回'的硬断言。\n\n**实测（16 天回溯，已回填 16 条）**：门限 `[0.005,0.65]` → **0/16 天、0 处**；对照 `[0.02,0.40]` → **4/16 天、8 处**。",
+      "evidence": "src/drl_drift.py::check_extreme_weights; src/drl_train.py（接线）; tests/test_drl_extreme_weights.py（12 例）; scripts/drl_drift_report.py; data/drl_extreme_weights.jsonl（16 条 backfill）; docs/drl-learning-verification.md §六 + 「方法论固化」",
+      "next": "**待 DRL-4 降级链就位后**，用'极端值 + 下游表现'数据重新标定边界，再决定截断 / 降级 / 保留。当前只积累数据，不改变任何行为。"
     },
     {
       "id": "DRL-6",
@@ -307,6 +307,15 @@
       "detail": "设计要求的『参数漂移』检查此前不存在, 但所需数据(base/prior/final_weights)**已落盘** ⇒ 唯一『数据已就绪、只缺代码』的 DRL 项。已实现:\n· 新增轻量模块 `src/drl_drift.py`(不依赖 torch/gymnasium/stable_baselines3) ——**独立成模块的原因**: 原写在 drl_train.py 里, 而后者导入即拉 torch, 会让『不装 torch 的 CI core job』收集失败; 且报告脚本也必须装全套 DRL 依赖。\n· `drl_train` 在最终写盘前调用 `drl_drift.check_weight_drift(meta, out_dir)`, 结果挂到 `train_meta.weight_drift`。\n· **只告警不阻断**(用户要求): 超阈值仅 `warn_once('drl_weight_drift')`, 不改权重、不拦当日 plan —— 阻断需 DRL-4 降级链先就位, 否则引入新的静默行为。\n· 阈值 `DRL_DRIFT_THRESHOLD` 默认 **0.3, 标注 threshold_is_calibrated=False**(保守初值, 非标定结果)。\n· 两种漂移都算: base→final(单次训练推离基准) 与 **day-over-day**(与上一交易日比,真正要标定的量); 无更早数据时记为 `None` 而非 0(0 会被误读成『无漂移』)。\n· 每条追加 `data/drl_weight_drift.jsonl` 以积累分布。\n\n**实测命中率(16 天回溯, 供标定)**: 阈值 0.20 → 3/16(base→final) 5/15(dod); 0.25 → 3/16 3/15; **0.30 → 2/16 2/15**; 0.40 → 2/16 1/15; 0.50 → 0/16 0/15。\n⇒ 0.3 命中约 12~13%, 属合理保守起点; 分布 min 0.0379 / median 0.0981 / max 0.4367(base→final)。",
       "evidence": "src/drl_drift.py; src/drl_train.py（接线）; tests/test_drl_weight_drift.py（11 例, 构造超/未超阈值两种触发条件）; scripts/drl_drift_report.py; data/drl_weight_drift.jsonl",
       "next": "按用户要求: 阈值先设 0.3 运行 1-2 周积累真实逐日账本(source=run)后再标定, **不得用单日数据定死阈值**"
+    },
+    {
+      "id": "METHOD-1",
+      "level": "P1",
+      "title": "方法论固化：边界/阈值必须由**下游表现**决定，而非**分布范围**",
+      "status": "fixed",
+      "detail": "该坑在本项目已出现**两次**，两次都是从一个点/少量样本的**分布范围**推出边界，而不是从'该值发生时的后果'推出：\n  · `[0.10, 0.39]` —— 用户最初记错（来自更早的假设性讨论，被当成已实现）;\n  · `[0.02, 0.40]` —— 用户新提议，经 16 天实测**仍会截断 8 处**（4/16 天）。\n\n**原则**：\n  1. 边界/阈值必须基于「该值发生时的**下游表现**」证据，**不是**「该值的分布范围」;\n  2. 分布只说明'它有多极端'，**不说明'它是否有害'**; 有害与否只能由下游表现判断;\n  3. 正确顺序: **先记录**（发生频率 + 下游表现）→ **再评估**（有益/有害）→ **才决策**（保留/截断/降级）;\n  4. 证据不足时，增加一个'零触发'的边界等于**增加死代码**; 宁可只记录。\n\n**已按此原则落地的处置**：DRL-5 改为'只记录不截断'（`truncated=false`），边界截断推迟到 DRL-4 就位、且有下游表现证据之后再定。",
+      "evidence": "docs/drl-learning-verification.md 「📌 方法论固化」一节；DRL-5 的处置变更记录",
+      "next": "在**任何**新增告警阈值/风控边界/参数边界时复用该判据: 先问'该值发生时的下游表现是什么、有证据吗'，无证据则先只记录"
     },
     {
       "id": "P2-BARFALLBACK",

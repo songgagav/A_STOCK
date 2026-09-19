@@ -1202,7 +1202,18 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         except Exception as e:  # noqa: BLE001  绝不影响训练主链路
             meta["weight_drift"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-        # 二次写盘 (含 target_plan + weight_drift)
+        # ===== 极端权重**记录** (2026-09-19, DRL-5 最小版本): **只记录, 绝不截断** =====
+        # 用户决策: 本批次**不部署**边界([0.005,0.65] 在 16 天内触发 0 次 = 死代码),
+        # 也**不采用** [0.02,0.40](16 天触发 8 处 = 常态性改变行为, 且无证据表明那 8 处有害)。
+        # 故此处只记录"哪天哪些因子越过门限 + 当时的下游指标", 原样保留权重,
+        # 以积累"极端值发生频率 + 下游表现"数据 —— 供 DRL-4 就位后重新标定边界。
+        try:
+            meta["extreme_weights"] = drl_drift.check_extreme_weights(
+                meta.get("final_weights"), day=meta.get("day"), meta=meta)
+        except Exception as e:  # noqa: BLE001
+            meta["extreme_weights"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        # 二次写盘 (含 target_plan + weight_drift + extreme_weights)
         with open(os.path.join(out_dir, "train_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 

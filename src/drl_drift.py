@@ -150,3 +150,108 @@ def check_weight_drift(meta: dict, out_dir: str | None = None,
 __all__ = ["DRIFT_THRESHOLD_DEFAULT", "DRIFT_FACTORS", "LEDGER_NAME",
            "check_weight_drift", "ledger_path", "max_abs_weight_diff",
            "prev_final_weights"]
+
+
+# ===========================================================================
+# 极端权重**记录**（DRL-5 最小版本：只记录, **不截断**）
+#
+# 用户 2026-09-19 决策（两次踩坑后固化）:
+#   · **不采用 [0.02, 0.40]**: 它在 16 天里触发 8 处 —— 那不是"极端拦截", 而是
+#     **常态性改变模型行为**。更关键的是: **没有证据表明那 8 处极端值是坏的**:
+#         signal 0.6033  可能只是"那几天信号确实最有预测力";
+#         govern 0.0098  可能只是"那几天治理因子确实无效";
+#         vol < 0.02     可能只是"那几天低波异象确实消失"。
+#     在拿到"极端权重的**下游表现**"证据之前, 截断是武断的 ——
+#     可能截掉的是**模型的有效表达**, 而不是病态行为。
+#   · 本批次**也不部署** [0.005, 0.65]: 它在 16 天内触发 **0 次** ⇒ 当前毫无作用,
+#     只是死代码(增加代码/测试/维护面而零实际收益); 且未来真触发时仍需 DRL-4 处置。
+#   · ⇒ **本批次只做最小版本: 记录极端值发生情况, 原样返回权重(绝不截断)**,
+#     以积累"极端值发生频率 + 下游表现"数据, 供 DRL-4 就位后重新标定。
+#
+# **方法论（该坑已出现两次: [0.10,0.39] 与 [0.02,0.40], 故固化为原则）**:
+#   任何边界/阈值的设定, 必须基于"**该值发生时的下游表现**"证据, 而**不是**"该值的分布范围"。
+#   分布只告诉你"它有多极端", 不告诉你"它是否有害"; 有害与否只能由下游表现判断。
+# ===========================================================================
+
+#: 极端权重记录门限。**仅用于记录, 绝不截断**。
+EXTREME_BOUNDS_DEFAULT = (0.005, 0.65)
+EXTREME_LEDGER_NAME = "drl_extreme_weights.jsonl"
+
+
+def extreme_bounds() -> "tuple[float, float]":
+    """记录门限。可用 DRL_EXTREME_LO / DRL_EXTREME_HI 覆盖(标定后调整不必改代码)。"""
+    lo, hi = EXTREME_BOUNDS_DEFAULT
+    try:
+        lo = float(os.environ.get("DRL_EXTREME_LO", lo))
+        hi = float(os.environ.get("DRL_EXTREME_HI", hi))
+    except (TypeError, ValueError):
+        lo, hi = EXTREME_BOUNDS_DEFAULT
+    return lo, hi
+
+
+def extreme_ledger_path() -> str:
+    """极端权重记录账本。**每次调用动态解析** `config.DATA_DIR`(沙箱/测试可覆盖)。"""
+    p = os.environ.get("DRL_EXTREME_LEDGER")
+    return p or os.path.join(config.DATA_DIR, EXTREME_LEDGER_NAME)
+
+
+def check_extreme_weights(final_weights: dict, day: str = "", source: str = "run",
+                          meta: dict | None = None) -> dict:
+    """记录超出 `extreme_bounds()` 的因子权重。**原样返回权重, 绝不截断。**
+
+    与"截断"的关键区别（用户明确要求）:
+      · 本函数**不改变** final_weights 的任何数值, 调用方可原样使用;
+      · 它只把"哪天、哪个因子、什么值、当时的下游指标"写进账本;
+      · 这样 1-2 个月后才有足够样本判断"极端是病态还是有效"。
+
+    设计取舍: **每天都落一条记录（即使 n_extreme=0）** —— 这样才有**分母**,
+    可算"极端值发生频率"; 只记有极端的那几天会丢失频率信息。
+
+    顺带把下游指标(mean_reward / total_timesteps / vnpy 夏普 / plan_ok)一并入账,
+    以便日后与"极端权重的下游表现"做关联 —— 这正是标定边界所需的证据。
+    """
+    try:
+        w = final_weights or {}
+        if not isinstance(w, dict) or not w:
+            return {"ok": False, "error": "缺少 final_weights"}
+        lo, hi = extreme_bounds()
+        ext = {k: float(v) for k, v in w.items() if float(v) < lo or float(v) > hi}
+        m = meta or {}
+        vs = m.get("vnpy_stats") or {}
+        rec = {
+            "at": dt.datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "day": str(day or m.get("day") or "").replace("-", ""),
+            "bounds": [lo, hi],
+            "truncated": False,                 # 明确: 本模块**不截断**
+            "n_factors": len(w),
+            "n_extreme": len(ext),
+            "extreme": {k: round(v, 6) for k, v in ext.items()},
+            "final_weights": {k: round(float(v), 6) for k, v in w.items()},
+            # 下游指标 —— 供日后判断"极端是否有害"
+            "mean_reward": m.get("mean_reward"),
+            "total_timesteps": m.get("total_timesteps"),
+            "vnpy_sharpe": (vs.get("stats") or {}).get("sharpe_ratio")
+            if isinstance(vs, dict) else None,
+            "plan_ok": (m.get("target_plan") or {}).get("ok")
+            if isinstance(m.get("target_plan"), dict) else None,
+        }
+        try:
+            lp = extreme_ledger_path()
+            os.makedirs(os.path.dirname(lp), exist_ok=True)
+            with open(lp, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        if ext:
+            warn_once("drl_extreme_weights",
+                      f"DRL 因子权重越过记录门限 [{lo}, {hi}]: "
+                      + ", ".join(f"{k}={v:.4f}" for k, v in ext.items())
+                      + " —— **仅记录, 未截断**(待下游表现证据后再定夺)")
+        return {"ok": True, **rec}
+    except Exception as e:  # noqa: BLE001  绝不影响训练主链路
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+__all__ += ["EXTREME_BOUNDS_DEFAULT", "EXTREME_LEDGER_NAME",
+            "check_extreme_weights", "extreme_bounds", "extreme_ledger_path"]

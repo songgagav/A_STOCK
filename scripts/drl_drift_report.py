@@ -123,6 +123,38 @@ def main() -> int:
         print(f"    {x['day']:10s} {x['drift_base_to_final']:12.4f} {dod_s:>13s}  "
               f"{top} {x['per_factor_base_to_final'][top]:.4f}")
 
+    # ---- 极端权重**记录**（DRL-5 最小版本）：只记录, 绝不截断 ----
+    # 用户 2026-09-19 决策: 本批次不部署边界, 只积累"极端值发生频率 + 下游表现"数据。
+    # 这里对**记录门限**与**对照门限** [0.02,0.40] 各算一遍, 让"若当初部署会误伤多少"可对比。
+    lo, hi = D.extreme_bounds()
+    print(f"\n=== 极端权重记录（门限 [{lo}, {hi}]，**只记录不截断**）===")
+    ext_days = 0
+    ext_hits = 0
+    ext_detail = []
+    for r in rows:
+        w = r["final"]
+        hits = {k: float(v) for k, v in w.items() if float(v) < lo or float(v) > hi}
+        if hits:
+            ext_days += 1
+            ext_hits += len(hits)
+            ext_detail.append({"day": r["day"], "hits": hits})
+            print(f"    {r['day']}  越界 {len(hits)} 个: "
+                  + ", ".join(f"{k}={v:.4f}" for k, v in hits.items()))
+    if not ext_days:
+        print(f"    0 天越界 / {len(rows)} 天 —— 该门限当前**零触发**")
+        print("    ⇒ 这正是用户判定『本批次不部署该边界(死代码, 零收益)』的实测依据")
+    print(f"    合计: {ext_days}/{len(rows)} 天有越界, 共 {ext_hits} 处")
+
+    # 对照: 若部署 [0.02, 0.40] 会误伤多少
+    print("\n=== 对照: 若部署 [0.02, 0.40] 会触发多少（用户判定为『常态性改变行为』）===")
+    c_days = c_hits = 0
+    for r in rows:
+        hits = {k: float(v) for k, v in r["final"].items() if float(v) < 0.02 or float(v) > 0.40}
+        if hits:
+            c_days += 1
+            c_hits += len(hits)
+    print(f"    {c_days}/{len(rows)} 天触发, 共 {c_hits} 处 —— 且**无证据表明这些极端值有害**")
+
     # 各因子的 final_weights 取值范围（判断"边界"该设在哪）
     print("\n=== 各因子 final_weights 取值范围（因子权重边界的标定依据）===")
     factors = sorted({k for x in rows for k in x["final"]})
@@ -147,6 +179,12 @@ def main() -> int:
                   "median": st.median([float(x["final"][fac]) for x in rows if fac in x["final"]])}
             for fac in factors},
         "records": recs,
+        "extreme_record_bounds": [lo, hi],
+        "extreme_days": ext_days,
+        "extreme_hits": ext_hits,
+        "extreme_detail": ext_detail,
+        "counterfactual_002_040_days": c_days,
+        "counterfactual_002_040_hits": c_hits,
     }
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=2, default=str)
@@ -165,6 +203,13 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"[drift] 账本写入失败: {e}")
         print(f"[drift] 已追加 {n} 条到账本(source=backfill): {D.ledger_path()}")
+        # 极端权重也回填(**只记录, 不截断**) —— 立即积累"发生频率"数据
+        m2 = 0
+        for r in rows:
+            D.check_extreme_weights(r["final"], day=r["day"], source="backfill")
+            m2 += 1
+        print(f"[drift] 已回填 {m2} 条极端权重记录(source=backfill): "
+              f"{D.extreme_ledger_path()}")
     return 0
 
 
