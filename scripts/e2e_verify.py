@@ -223,6 +223,18 @@ def _ad_daemon_heal():
     return p, t - p, items, str(j.get("note", ""))[:120]
 
 
+def _ad_backup_restore():
+    """备份恢复演练（全程临时库/临时文件, 未触碰生产数据）。"""
+    j = _load("preflight_backup_restore.json", _RUN_START)
+    if not j:
+        return 0, 1, [("preflight_backup_restore", "FAIL", "无 JSON 输出")], ""
+    items = [(f"备份恢复:{c.get('name')}", "OK" if c.get("pass") else "FAIL",
+              str(c.get("detail", ""))[:80]) for c in j.get("checks", [])]
+    s = j.get("_summary", {})
+    p, t = s.get("pass", 0), s.get("total", 0)
+    return p, t - p, items, ""
+
+
 def _ad_neutral_removed():
     """已移除的适配器（保留以记录教训）。
 
@@ -250,6 +262,8 @@ INJECT = [
     # 第三批: 进程崩溃 + 守护自愈(真实拉起子进程, 用临时端口不碰用户 8000)。
     # 归入执行链: 守护看护的是引擎/可视化等执行侧进程。
     ("preflight_daemon_heal.py", _ad_daemon_heal, "盘中", "执行链"),
+    # 第四批: 备份恢复演练(临时库/临时文件, 未碰生产)。第三阶段 dry-run 的前置条件。
+    ("preflight_backup_restore.py", _ad_backup_restore, "盘后", "数据链"),
 ]
 
 #: 已知未闭环 P0 (摘自 ops/acceptance_status.json 的权威登记)
