@@ -356,8 +356,13 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
 - [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
 - [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/hist-window-protocol.md`](docs/hist-window-protocol.md)：**历史窗口扩展与"环境外"窗口处理协议**
+  （判据标定 / 必报项 / 技术前置检查；扩展历史窗口前必读）；
+- [`docs/preflight-verification.md`](docs/preflight-verification.md)：**上线前复验报告**
+  （8 域逐项可验性映射 / 证据 / 阻塞项 / Go-No-Go）；
 - [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
+- [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建 Runbook；
 - [`ops/`](ops/)：Prometheus、Grafana 和告警配置。
 
 ## 开发约定

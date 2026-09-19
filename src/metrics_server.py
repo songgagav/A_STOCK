@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -54,6 +55,24 @@ _g_maxdd = Gauge("astock_strategy_max_dd", "max drawdown pct (negative)")
 _g_var95 = Gauge("astock_strategy_var95", "daily var95 pct")
 _g_win = Gauge("astock_strategy_win_rate", "win rate pct")
 _g_totret = Gauge("astock_strategy_total_return", "total return pct since init")
+
+# ---- 融合口径健康度 (来源: data/fusion_health.json, 由 factor_fusion.fusion_or_fml 落盘) ----
+# why: 2026-09-19 前 fusion 覆盖跌破门槛时静默退化到 used=equal(无融合加成), 无任何
+# 可观测信号; 这三个指标 + ops/alert_rules.yml 的 FusionDegraded 规则负责把它变成告警。
+_g_fusion_used = Gauge("astock_fusion_used", "fusion_or_fml 当前口径 (1=生效)",
+                       ["kind"])
+_g_fusion_degraded = Gauge("astock_fusion_degraded", "融合降级标志 (1=已降级)")
+_g_fusion_cov = Gauge("astock_fusion_coverage", "最近一次融合覆盖率 (0~1)")
+_g_fusion_checked = Gauge("astock_fusion_checked_ts",
+                          "最近一次融合口径检查 epoch 秒")
+# [2026-09-19 上线前复验发现] 健康度文件**读失败**必须显式暴露:
+#   原实现读失败只 print 一行, 而 gauge 保留上一次的值 -> 若上次是"健康", 告警永远不会触发
+#   (实测: PowerShell 的 Set-Content -Encoding UTF8 会写 BOM, 触发
+#   "Unexpected UTF-8 BOM" -> 指标永久停在 degraded=0)。1=读成功, 0=读失败。
+_g_fusion_read_ok = Gauge("astock_fusion_health_read_ok",
+                          "融合健康度文件读取成功标志 (0=读失败, 指标可能已过期)")
+FUSION_HEALTH_FP = os.path.join(_BASE, "data", "fusion_health.json")
+FUSION_KINDS = ("fusion", "fml_fallback", "equal")
 
 
 def _to_f(v):
@@ -112,6 +131,33 @@ def _epoch(val) -> float | None:
             return None
 
 
+def _refresh_fusion() -> None:
+    """读 factor_fusion 落盘的融合口径健康度 -> Prometheus 指标.
+
+    文件不存在时**不设值**(指标缺失比报一个假的 0 更安全, 后者会让告警静默)。
+    """
+    if not os.path.exists(FUSION_HEALTH_FP):
+        return
+    try:
+        # utf-8-sig: 兼容带 BOM 的文件(Windows 工具如 PowerShell Set-Content -Encoding UTF8
+        # 会写 BOM)。用纯 utf-8 会抛 "Unexpected UTF-8 BOM" -> 指标永久失效。
+        with open(FUSION_HEALTH_FP, encoding="utf-8-sig") as f:
+            h = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        _g_fusion_read_ok.set(0)      # 显式暴露"读失败", 不留下健康假象
+        print("fusion health read err:", str(e)[:160], flush=True)
+        return
+    _g_fusion_read_ok.set(1)
+    used = str(h.get("used") or "")
+    for k in FUSION_KINDS:
+        _g_fusion_used.labels(k).set(1 if used == k else 0)
+    _g_fusion_degraded.set(1 if h.get("degraded") else 0)
+    cov = h.get("coverage")
+    _g_fusion_cov.set(float(cov) if isinstance(cov, (int, float)) else -1.0)
+    ep = _epoch(h.get("checked_at"))
+    _g_fusion_checked.set(ep if ep is not None else -1.0)
+
+
 def _refresh() -> None:
     try:
         stats = db_stats.collect_once()
@@ -127,6 +173,7 @@ def _refresh() -> None:
         st = tasks_db._read_state()
         _g_run.set(1 if st.get("running") else 0)
         _refresh_strategy()
+        _refresh_fusion()
         db_stats.append_history(stats)  # 60s 一条, 足够趋势分辨率
     except Exception as e:  # noqa: BLE001
         print("refresh err:", str(e)[:200], flush=True)

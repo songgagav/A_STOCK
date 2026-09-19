@@ -1512,6 +1512,147 @@ def read_health():
         return {"ok": False, "error": str(e)}
 
 
+#: 漏洞清单单一事实源 (committed; 由 scripts/render_vulnerability_register.py 渲染成 md)
+ACCEPTANCE_FP = os.path.join(_BASE, "ops", "acceptance_status.json")
+
+
+def read_acceptance():
+    """读取 ops/acceptance_status.json, 汇总阻塞项状态。
+
+    为什么面板要读它: 上线前复验的 P0 阻塞项(P0-1/E-1/P0-2/P0-3)此前只存在于文档里,
+    盘面上看不到。放进 /api/health 的 checks 后, 打开面板即可见当前阻塞与状态。
+    """
+    if not os.path.exists(ACCEPTANCE_FP):
+        return {"ok": False, "error": "acceptance_status.json 不存在"}
+    try:
+        with open(ACCEPTANCE_FP, encoding="utf-8") as f:
+            j = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    items = j.get("items", []) or []
+    by_status: dict = {}
+    for it in items:
+        by_status[it.get("status", "?")] = by_status.get(it.get("status", "?"), 0) + 1
+    p0_open = [it for it in items
+               if it.get("level") == "P0" and it.get("status") in ("open", "partial", "decision")]
+    return {"ok": True, "generated_at": j.get("generated_at", ""), "total": len(items),
+            "by_status": by_status, "p0_open": [{"id": it["id"], "title": it["title"],
+                                                 "status": it["status"]} for it in p0_open]}
+
+
+def read_health_merged():
+    """合并运行期健康 + 盘前健康检查 + 阻塞项, 供 /api/health 单一出口使用。
+
+    背景(2026-09-19 修): /api/health 曾有两份实现 —— 内联分支(为 dashboard_keepalive
+    提供 ok/pid)遮蔽了 read_health()(读 premarket.json)。二者载荷形状不同:
+      - 前端 renderHealth 期望 {level, summary, generated_at, checks[]};
+      - 内联分支返回 {ok, service, pid, ts, deps{duckdb, arcticdb}}。
+    结果健康卡片渲染成"OK + 空表", 退役 DuckDB 的打开失败(deps.duckdb_error)
+    在 UI 上完全不显示。此处合并为同一载荷, 两个消费方都满足。
+    """
+    checks: list = []
+    # --- 运行期检查: bar store ---
+    mode = "h5i" if _h5i_mode() else "duck"
+    if mode == "h5i":
+        try:
+            ok_dir = os.path.isdir(_H5I_PATH)
+            latest = _h5i_max_bar_date() if ok_dir else None
+            if not ok_dir:
+                checks.append({"name": "bar_store(h5i)", "status": "FAIL", "ms": 0,
+                               "detail": f"路径不存在: {_H5I_PATH}"})
+            elif latest:
+                # 与当前日期比较: 超过 5 个自然日视为陈旧(周末+节假日留余量)
+                from datetime import date as _d, datetime as _dt
+                try:
+                    gap = (_d.today() - _dt.strptime(str(latest)[:10], "%Y-%m-%d").date()).days
+                except Exception:  # noqa: BLE001
+                    gap = None
+                st = "OK" if (gap is not None and gap <= 5) else "WARN"
+                checks.append({"name": "bar_store(h5i)", "status": st, "ms": 0,
+                               "detail": f"最新 bar 日={latest}" +
+                                         (f", 距今 {gap} 天" if gap is not None else "")})
+            else:
+                checks.append({"name": "bar_store(h5i)", "status": "WARN", "ms": 0,
+                               "detail": "H5iBarStore 可用但未取到最新 bar 日"})
+        except Exception as e:  # noqa: BLE001
+            checks.append({"name": "bar_store(h5i)", "status": "FAIL", "ms": 0,
+                           "detail": str(e)[:160]})
+    else:
+        try:
+            import duckdb as _d  # noqa: F401
+            con = _d.connect(DUCKDB_PATH, read_only=True)
+            con.execute("SELECT 1").fetchone()
+            con.close()
+            checks.append({"name": "bar_store(duckdb)", "status": "OK", "ms": 0,
+                           "detail": DUCKDB_PATH})
+        except Exception as e:  # noqa: BLE001
+            checks.append({"name": "bar_store(duckdb)", "status": "FAIL", "ms": 0,
+                           "detail": str(e)[:160]})
+    # --- 遗留 DuckDB: 已退役, 不作为失败项(仅提示) ---
+    try:
+        import duckdb as _d2
+        con2 = _d2.connect(DUCKDB_PATH, read_only=True)
+        con2.execute("SELECT 1").fetchone()
+        con2.close()
+        checks.append({"name": "legacy_duckdb(已退役)", "status": "OK", "ms": 0,
+                       "detail": "仍可打开; 主源已切 h5i"})
+    except Exception as e:  # noqa: BLE001
+        checks.append({"name": "legacy_duckdb(已退役)", "status": "WARN", "ms": 0,
+                       "detail": "不可打开(符合预期, 主源=h5i): " + str(e)[:110]})
+    # --- 阻塞项 ---
+    acc = read_acceptance()
+    if acc.get("ok"):
+        p0 = acc.get("p0_open", [])
+        detail = f"共 {acc.get('total')} 项; P0 未闭环 {len(p0)} 项"
+        if p0:
+            detail += ": " + "; ".join(f"{x['id']}[{x['status']}] {x['title']}" for x in p0)
+        checks.append({"name": "acceptance(P0 阻塞项)", "status": "WARN" if p0 else "OK",
+                       "ms": 0, "detail": detail[:400]})
+    else:
+        checks.append({"name": "acceptance(P0 阻塞项)", "status": "WARN", "ms": 0,
+                       "detail": str(acc.get("error", ""))[:160]})
+    # --- 盘前健康检查(premarket.json) ---
+    pm = read_health()
+    pm_checks = pm.get("checks") if isinstance(pm, dict) else None
+    if pm_checks:
+        # 说明(不改状态, 只补信息): premarket.json 由 premarket_healthcheck.py 产出,
+        # 其判定仍以 DuckDB 为主源。DuckDB 退役后, 一批检查因"legacy_stockdb.duckdb
+        # 不存在"连锁 FAIL —— 属**预期结果而非实际故障**, 但状态原样保留(不粉饰),
+        # 仅追加来源说明, 以免被误读为系统损坏。根治需更新 premarket_healthcheck.py。
+        _RETIRED = ("legacy_stockdb.duckdb", "DuckDB 缺失", "db 不存在")
+        for c in pm_checks:
+            if isinstance(c, dict):
+                det = str(c.get("detail", ""))
+                if ("duckdb" in str(c.get("name", "")).lower()
+                        or any(sig in det for sig in _RETIRED)):
+                    det += "（注: legacy DuckDB 已退役、主源=h5i, 此项待 premarket_healthcheck 适配）"
+                checks.append({"name": "premarket:" + str(c.get("name", "?")),
+                               "status": str(c.get("status", "WARN")),
+                               "ms": c.get("ms", 0), "detail": det})
+    else:
+        checks.append({"name": "premarket", "status": "WARN", "ms": 0,
+                       "detail": str(pm.get("error", "无盘前健康检查结果"))[:160]})
+
+    worst = "OK"
+    if any(c["status"] == "FAIL" for c in checks):
+        worst = "FAIL"
+    elif any(c["status"] == "WARN" for c in checks):
+        worst = "DEGRADED"
+    level = pm.get("level") if isinstance(pm, dict) and pm.get("level") else worst
+    return {
+        "ok": True,                      # dashboard_keepalive.py 以 HTTP 200 + ok 判定可用
+        "service": "dashboard",
+        "pid": os.getpid(),
+        "ts": _now(),
+        "level": level,
+        "summary": (f"运行期 {len(checks)} 项; 最差={worst}; "
+                    f"bar_store={mode}; " + str(pm.get("summary", "") if isinstance(pm, dict) else ""))[:300],
+        "generated_at": _now(),
+        "checks": checks,
+        "deps": {"bar_store": mode, "h5i_path": _H5I_PATH, "duckdb_path": DUCKDB_PATH},
+    }
+
+
 def read_views():
     """读取因子物化视图构建元数据 + 各视图摘要: data/views/build_meta.json."""
     p = os.path.join(DATA_DIR, "views", "build_meta.json")
@@ -2944,33 +3085,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:200]})
         if path == "/api/health":
-            # 健康检查端点: dashboard_keepalive.py 用此判定服务可用性
-            # 顺便检查 DuckDB / ArcticDB 是否能连, 提供给运维 dashboard.
-            health = {
-                "ok": True,
-                "service": "dashboard",
-                "pid": os.getpid(),
-                "ts": _now(),
-                "deps": {
-                    "duckdb": False,
-                    "arcticdb": False,
-                },
-            }
-            try:
-                import duckdb as _d
-                con = _d.connect(DUCKDB_PATH, read_only=True)
-                con.execute("SELECT 1").fetchone()
-                con.close()
-                health["deps"]["duckdb"] = True
-            except Exception as e:
-                health["deps"]["duckdb_error"] = str(e)[:120]
-            try:
-                from arctic_store import get_store as _gs
-                _gs().health_check()
-                health["deps"]["arcticdb"] = True
-            except Exception as e:
-                health["deps"]["arcticdb_error"] = str(e)[:120]
-            return self._json(health)
+            # 健康检查端点: dashboard_keepalive.py 用 HTTP 200 判定服务可用性。
+            # 2026-09-19: 此处曾内联返回 {ok,deps} 并**遮蔽**了下方 read_health(),
+            # 而前端 renderHealth 期望 {level,summary,checks[]} ⇒ 卡片渲染成
+            # "OK + 空表"。现统一走 read_health_merged()(运行期 + 盘前 + 阻塞项)。
+            return self._json(read_health_merged())
         if path == "/api/live":
             lv = read_live() or fallback_state()
             return self._json(lv)
@@ -2988,8 +3107,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_degradation())
         if path == "/api/weights":
             return self._json(read_weights())
-        if path == "/api/health":
-            return self._json(read_health())
+        if path == "/api/acceptance":
+            return self._json(read_acceptance())
         if path == "/api/views":
             return self._json(read_views())
         if path == "/api/target_plan":

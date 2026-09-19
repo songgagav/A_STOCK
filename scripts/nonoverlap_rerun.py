@@ -141,6 +141,13 @@ def main() -> None:
         done[day] = {"day": day, "ok": ok, "window_mode": mode,
                      "elapsed": round(time.time() - t0, 1),
                      "dynamic_slippage": res.get("dynamic_slippage"),
+                     # 2026-09-19: 显式落盘引擎口径。此前只保留 stats, 下游要判断
+                     # "本窗是否走了自研简化引擎" 只能靠 `"method" in stats` 反推 ——
+                     # 隐式约定容易漏(§⑬: 简化引擎数值系统性偏高 +5.50pp, 且不可与
+                     # vnpy 窗口同表统计)。fallback=True / engine='fallback_simple'
+                     # 的窗口一律排除出矩阵。
+                     "fallback": bool(res.get("fallback")),
+                     "engine": res.get("engine"),
                      "stats": {k: (round(v, 4) if isinstance(v, float) else v)
                                for k, v in (stats or {}).items()}}
 

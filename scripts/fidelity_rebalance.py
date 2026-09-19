@@ -155,9 +155,13 @@ def main() -> None:
         print(f"定期调仓 均值 {st.mean(n):+.2f}%   中位 {st.median(n):+.2f}%")
         print(f"平均成本 {st.mean(c):.2f}%   保真度偏差(调仓-持有) {st.mean(n) - st.mean(s):+.2f}pp")
         print(f"平均每次换掉新名 {st.mean([r['avg_new'] for r in rows if r['avg_new'] is not None]):.1f}/10 只")
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-    print("已保存:", OUT)
+        with open(OUT, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        print("已保存:", OUT)
+    else:
+        # 2026-09-18: 0 窗口成功时**不落盘**。此前无条件写 rows(空数组), 在解释器缺依赖
+        # (11/11 窗口被跳过) 的场景下静默毁掉上一版产物, 靠人工备份才还原。
+        print(f"[中止] 无任何窗口成功, 不覆盖既有产物: {OUT}", flush=True)
 
 
 if __name__ == "__main__":

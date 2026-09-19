@@ -272,6 +272,32 @@ def _try_load_daily_plan(d: str, day: str, prev_trade_day=None):
     return _plan_to_targets(plan, day, d)
 
 
+#: 目标池来源留痕 (2026-09-19 上线前复验)
+#  load_targets 是 **5 级回退梯子**, 每一级都是 `except Exception: pass`; 实际落到哪一级
+#  只体现在返回值的 sel_day 里, 而**此前无人记录** ⇒ 回测侧与实盘侧可能静默使用不同的池,
+#  一致性偏差无法归因(复验清单三-1 的 0.82pp 偏差即因此"两义")。更危险的是第 3/4 级
+#  "跨日回退": 当日无正式计划时会**沿用几天前的池**。此处把
+#  (消费日 / 实际来源日 / 档位 / 只数) 追加到 data/targets_source.jsonl, 并对跨日回退**打日志**。
+TARGETS_SRC_FP = os.path.join(DATA_DIR, "targets_source.jsonl")
+#: 视为"当日同源"的档位; 其余档位 = 跨日回退或现场选股, 必须留痕
+_RUNG_SAME_DAY = ("drl_same_day", "selection_same_day")
+
+
+def _trace_targets(day: str, sel_day: str, rung: str, n: int) -> None:
+    """记录目标池的实际来源档位。**绝不抛异常**(选股主链路)。"""
+    try:
+        os.makedirs(os.path.dirname(TARGETS_SRC_FP), exist_ok=True)
+        with open(TARGETS_SRC_FP, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": datetime.now().isoformat(timespec="seconds"),
+                                "consume_day": day, "sel_day": sel_day,
+                                "rung": rung, "n": int(n)}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    if rung not in _RUNG_SAME_DAY:
+        log(f"[targets] **非当日同源**: 消费日 {day} 实际使用 {rung} 的池"
+            f"(来源日 {sel_day}, {n} 只) —— 当日无正式计划, 已回退")
+
+
 def load_targets(day: str):
     """从 DRL 目标计划 / 选股结果读取目标持仓 (回测与实盘共用的唯一入口).
 
@@ -286,6 +312,13 @@ def load_targets(day: str):
 
     返回 (target, sel_info, sel_day). sel_day 是目标池实际对应的选股日.
     target 项至少含 canon + price, DRL plan 会多带 drl_score / target_weight.
+
+    注意: 本函数的档位选择**依赖调用时刻的磁盘状态** —— 第 ② 档的当日
+    `selection.json` 是**盘后**产物(实测落盘 15:09~18:52, 交易时段 09:30~15:00),
+    盘中调用时它不存在, 会滑到第 ③/④ 档(隔夜池)。因此**回放/回测不得直接调用
+    本函数**来复现实盘池(事后调用会停在第 ② 档) —— 回放请走
+    `backtest_engine._select_targets_hist()`, 它严格执行候选目录 `C < D` 的
+    盘前视角(见该函数 docstring 的 v1/v2/v3 修复史)。
     """
     d = day.replace("-", "")
 
@@ -295,6 +328,7 @@ def load_targets(day: str):
     # 1) 优先: 当日目录 DRL plan (带 A股过滤 + 时间戳校验)
     top_n, info = _try_load_daily_plan(d, day, prev_trade_day=prev_trade_day)
     if top_n:
+        _trace_targets(day, d, "drl_same_day", len(top_n))
         return top_n, info, d
 
     # 2) 当日 selection.json
@@ -310,6 +344,7 @@ def load_targets(day: str):
                 else:
                     for it in cand_sel["top_n"]:
                         it.setdefault("source", "selection")
+                    _trace_targets(day, d, "selection_same_day", len(cand_sel["top_n"]))
                     return cand_sel["top_n"], cand_sel, d
         except Exception:
             pass
@@ -325,6 +360,7 @@ def load_targets(day: str):
             top_n, info = _try_load_daily_plan(cand, day,
                                                prev_trade_day=prev_trade_day)
             if top_n:
+                _trace_targets(day, cand, "drl_cross_day", len(top_n))
                 return top_n, info, cand
     except Exception:
         pass
@@ -356,6 +392,7 @@ def load_targets(day: str):
     if sel and "top_n" in sel:
         for it in sel.get("top_n", []):
             it.setdefault("source", "selection")
+        _trace_targets(day, sel_day, "selection_cross_day", len(sel.get("top_n", [])))
         return sel.get("top_n", []), sel, sel_day
 
     # 5) 现场选股
@@ -369,6 +406,7 @@ def load_targets(day: str):
         db.close()
     for it in sel.get("top_n", []):
         it.setdefault("source", "live_select")
+    _trace_targets(day, d, "onsite_select", len(sel.get("top_n", [])))
     return sel.get("top_n", []), sel, d
 
 

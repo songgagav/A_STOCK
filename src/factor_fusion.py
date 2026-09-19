@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
@@ -76,6 +77,30 @@ DIRECTIONS: dict[str, int] = {  # 合成符号: +1 直接用 z, -1 取反
 MIN_CS_N = 30          # 单因子截面最小样本(不足则该日该因子置空)
 MIN_POOL_N = 30        # 每日可出分的最小池
 MIN_COVERAGE = 0.80    # fusion_or_fml 覆盖门槛 (请求标的中有分比例)
+
+# ---------------------------------------------------------------------------
+# 融合口径健康度落盘 (2026-09-19)
+#   背景: fusion 覆盖跌破 MIN_COVERAGE 时会回退 f_ml; 而 f_ml 因数据湖退役一度
+#   整条断链, 最终静默退化到 used=equal(排序完全不含融合加成), 只有一条 WARNING
+#   日志, 实盘无人察觉。现改为: 每次调用刷新 fusion_health.json(看板/Prometheus 读),
+#   且 used != 'fusion' 时以 ERROR 落日志 + 追加 fusion_degradation.jsonl。
+# ---------------------------------------------------------------------------
+FUSION_HEALTH_FP = os.path.join(_BASE, "data", "fusion_health.json")
+FUSION_DEGRADE_FP = os.path.join(_BASE, "data", "fusion_degradation.jsonl")
+
+
+def _record_fusion_state(used: str, st: dict) -> None:
+    """落盘融合口径状态; 降级时留痕。**绝不抛异常**(生产主链路)。"""
+    try:
+        os.makedirs(os.path.dirname(FUSION_HEALTH_FP), exist_ok=True)
+        with open(FUSION_HEALTH_FP, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2, default=str)
+        if used != "fusion":
+            with open(FUSION_DEGRADE_FP, "a", encoding="utf-8") as f:
+                f.write(json.dumps(st, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("[fusion_or_fml] 健康度落盘失败(不影响主链路): %s", str(e)[:150])
+
 
 # 报告期可用性(PIT)映射: 与 m5_rebuild / 交易所披露规则一致
 def _avail_date(ts: pd.Timestamp) -> pd.Timestamp:
@@ -756,8 +781,17 @@ def fusion_or_fml(items: list[dict], as_of: str):
         st["used"] = used
         st["n"] = len(sc)
         st["coverage"] = round(len(sc) / req_n, 4) if req_n else 0.0
-        _LOG.info("[fusion_or_fml] used=%s as_of=%s req=%d got=%d cov=%.2f %s",
-                  used, st["as_of"], req_n, len(sc), st["coverage"], st)
+        st["degraded"] = used != "fusion"
+        st["checked_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        if st["degraded"]:
+            # 降级必须吵: ERROR 级 + 落盘留痕(见 _record_fusion_state)
+            _LOG.error("[fusion_or_fml] **降级** used=%s as_of=%s req=%d got=%d "
+                       "cov=%.2f reason=%s", used, st["as_of"], req_n, len(sc),
+                       st["coverage"], st.get("degrade_reason") or "未记录")
+        else:
+            _LOG.info("[fusion_or_fml] used=%s as_of=%s req=%d got=%d cov=%.2f %s",
+                      used, st["as_of"], req_n, len(sc), st["coverage"], st)
+        _record_fusion_state(used, st)
         return sc, used
 
     if req_n == 0:
@@ -775,13 +809,17 @@ def fusion_or_fml(items: list[dict], as_of: str):
                 _LOG.info("[fusion_or_fml] fusion OK as_of=%s pool=%d scored=%d cov=%.2f",
                           r.get("as_of"), r.get("n_pool", 0), len(sc_all), cov)
                 return _finish("fusion", sc)
+            st["degrade_reason"] = (f"fusion 覆盖不足: n_sc={len(sc)} req={req_n} "
+                                    f"cov={cov:.2f} < 门槛 {MIN_COVERAGE}")
             _LOG.warning("[fusion_or_fml] fusion 覆盖率不足/样本少 -> 回退 f_ml "
                          "(as_of=%s n_sc=%d req=%d cov=%.2f)",
                          as_of, len(sc), req_n, cov)
         except Exception as e:  # noqa: BLE001
+            st["degrade_reason"] = f"fusion 异常: {type(e).__name__}: {str(e)[:150]}"
             _LOG.warning("[fusion_or_fml] fusion 异常回退 f_ml: %s: %s",
                          type(e).__name__, e)
     else:
+        st["degrade_reason"] = "融合被禁用(FORCE_FML/FUSION_SCORE)"
         _LOG.info("[fusion_or_fml] 融合被禁用(FORCE_FML/FUSION_SCORE) -> f_ml 路径")
 
     # 旧路径回退
@@ -793,11 +831,17 @@ def fusion_or_fml(items: list[dict], as_of: str):
                 if c in raw and isinstance(raw.get(c), (int, float))}
         if sc_f:
             return _finish("fml_fallback", sc_f)
-        if raw:
-            _LOG.warning("[fusion_or_fml] f_ml 返回 %d 条但均不匹配请求 canon "
-                         "(as_of=%s)", len(raw), as_of)
+        flag = (f"f_ml 返回 {len(raw)} 条但均不匹配请求 canon" if raw
+                else "f_ml 不可用: " + str((res.get("meta") or {}).get("error")
+                                           or "unknown")[:200])
+        st["degrade_reason"] = (str(st.get("degrade_reason") or "") + " | " + flag).strip(" |")
+        _LOG.error("[fusion_or_fml] f_ml 回退未产出 -> 最终 used=equal(排序不含融合加成) "
+                   "as_of=%s: %s", as_of, flag)
     except Exception as e:  # noqa: BLE001
-        _LOG.warning("[fusion_or_fml] f_ml 回退失败: %s: %s", type(e).__name__, e)
+        st["degrade_reason"] = (str(st.get("degrade_reason") or "")
+                                + f" | f_ml 回退异常: {type(e).__name__}: {str(e)[:150]}").strip(" |")
+        _LOG.error("[fusion_or_fml] f_ml 回退异常 -> 最终 used=equal(排序不含融合加成) "
+                   "as_of=%s: %s: %s", as_of, type(e).__name__, e)
     return _finish("equal", {})
 
 

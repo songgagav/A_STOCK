@@ -1,0 +1,250 @@
+{
+  "generated_at": "2026-09-19",
+  "source": "整理自本批次复验记录：docs/pit-valuation.md、docs/preflight-verification.md、docs/acceptance-scope.md",
+  "note": "本文件是漏洞清单的单一事实源（committed）。docs/vulnerability-register.md 由 scripts/render_vulnerability_register.py 生成；面板 /api/health 亦读取本文件渲染阻塞项。请勿只改生成的 md。",
+  "status_legend": {
+    "fixed": "已修",
+    "partial": "部分修复/部分解除",
+    "open": "待修",
+    "decision": "待决策",
+    "deferred": "搁置",
+    "accepted": "已接受风险"
+  },
+  "items": [
+    {
+      "id": "P0-1",
+      "level": "P0",
+      "title": "对账一致性不可验证（无券商通道）",
+      "status": "partial",
+      "detail": "本地 vnpy 模拟盘逐笔对账已建立并 PASS（70 笔带 vt_orderid；H1 价格真实/H2 现金非负/H3 离池必卖/H4a 名义恒等/H5 每日有池 全过）。真实券商回报对账仍不可验证。",
+      "evidence": "docs/pit-valuation.md §⑮；veighna_sim/scripts/reconcile_astock.py；veighna_sim/logs/astock_reconciliation.json",
+      "next": "接入真实券商通道后重做回报对账"
+    },
+    {
+      "id": "E-1",
+      "level": "P0",
+      "title": "非整手成交 ⇒ 对账结论不可外推（P0-1 并列阻塞项）",
+      "status": "open",
+      "detail": "veighna_adapter.py:220 用 volume = max(round(notional/limit_price, 0), 100)，按股取整而非 100 股整手。所有成交（含接入前既有 184 笔 + 本轮 70 笔）均非整手；A 股买入必须整手 ⇒ 台账高估可执行性；对高价股影响显著（688826 一手 ≈ 100×800 ≈ 8 万元）。",
+      "evidence": "docs/acceptance-scope.md §五；reconcile_astock.py --require-lot 可升级为硬失败",
+      "next": "独立批次修复（改共享执行层会影响既有全部策略），修完重跑全部基线；排在 P0-2/P0-3 之后",
+      "acceptance_wording": "E-1 修复前，\"对账通过\"仅代表代码逻辑一致，不代表实盘可执行。"
+    },
+    {
+      "id": "P0-2",
+      "level": "P0",
+      "title": "回测-实盘一致性未通过（偏差 1.02pp，阈值 0.5pp）",
+      "status": "open",
+      "detail": "根因未定。上一版\"两侧池口径不同源\"归因已被证伪（该归因的前提不成立）。",
+      "evidence": "docs/preflight-verification.md 三-1",
+      "next": "本周：池口径统一（不依赖外部）后重测"
+    },
+    {
+      "id": "P0-3",
+      "level": "P0",
+      "title": "实盘风控接线缺失",
+      "status": "open",
+      "detail": "组合回撤 −8% 仅\"暂停加仓\"（不清仓）、无 CVaR/波动率拦截；清仓级熔断只在 drl_train 训练侧、未接 realtime_engine；两套阈值是独立旋钮（PAPER.portfolio_drawdown vs RISK_FIRST.circuit_breaker_drawdown）。",
+      "evidence": "docs/preflight-verification.md 五-3/5",
+      "next": "本月：逐步接入模拟盘并验证"
+    },
+    {
+      "id": "P1-BOM",
+      "level": "P1",
+      "title": "告警链路 BOM 静默失效（读数冻结在健康值）",
+      "status": "fixed",
+      "detail": "metrics_server 以 encoding=utf-8 读 fusion_health.json；PowerShell Set-Content -Encoding UTF8 写入的 BOM 触发 Unexpected UTF-8 BOM，导致 gauge 冻结在最后一次健康值。已改 utf-8-sig，并新增 astock_fusion_health_read_ok 指标与 FusionHealthUnreadable 告警规则。",
+      "evidence": "docs/pit-valuation.md §⑬/§⑭；ops/alert_rules.yml（4 条规则）；告警链 amtool→Alertmanager→alert_hook→logs/alerts.log 已验证",
+      "next": "无"
+    },
+    {
+      "id": "P1-ICCACHE",
+      "level": "P1",
+      "title": "IC 缓存损坏与缺失不可区分（风控静默降级）",
+      "status": "fixed",
+      "detail": "load_ic_cache 对\"文件不存在\"与\"文件损坏\"同样返回 None，风控据此静默降级。已拆分两种情况并分别告警（文件不存在不告警，损坏必告警）。",
+      "evidence": "tests/test_silent_failure_guards.py（新增 2 例）；docs/pit-valuation.md §⑭",
+      "next": "无"
+    },
+    {
+      "id": "P1-FML",
+      "level": "P1",
+      "title": "f_ml 回退链断链（生产实测命中）",
+      "status": "fixed",
+      "detail": "f_ml 链路断链，生产 9/07–9/08 实测命中；fml_samples 断供 15 天。已修回退链。相关盘面后果：data/drl/20260907、20260908 无 target_plan.json，模拟盘因此跨日回退到 selection 档。",
+      "evidence": "docs/pit-valuation.md §⑫；本轮 §⑮ 取池落点表（09-08 为 selection_cross_day）",
+      "next": "无"
+    },
+    {
+      "id": "P1-FACTORISO",
+      "level": "P1",
+      "title": "因子隔离失效不告警",
+      "status": "fixed",
+      "detail": "因子隔离失效时无告警。已加 warn_once(factor_health_unavailable)。",
+      "evidence": "tests/test_silent_failure_guards.py",
+      "next": "无"
+    },
+    {
+      "id": "P1-TRACE",
+      "level": "P1",
+      "title": "目标池来源无留痕（回测/实盘静默用不同池）",
+      "status": "fixed",
+      "detail": "load_targets 是 5 级回退梯子，实际落到哪一级此前无人记录。已新增 data/targets_source.jsonl 留痕，并对跨日回退打日志。",
+      "evidence": "src/realtime_engine.py（TARGETS_SRC_FP / _trace_targets）",
+      "next": "无"
+    },
+    {
+      "id": "P1-FIDELITY",
+      "level": "P1",
+      "title": "保真度脚本全跳过时写出空产物",
+      "status": "fixed",
+      "detail": "fidelity_rebalance.py 在全跳过时写出空的 data/fidelity_rebalance.json，覆盖有效结果。已加\"0 窗口 ⇒ 不写出\"守卫，并从备份恢复。",
+      "evidence": "scripts/fidelity_compare.py；data/fidelity_rebalance_pre_valrebuild.json",
+      "next": "无"
+    },
+    {
+      "id": "P1-OBSDEP",
+      "level": "P1",
+      "title": "观测栈依赖缺失（Redis/Celery/Flower）",
+      "status": "fixed",
+      "detail": "已补装 prometheus_client / psutil / redis<5 / celery / flower。",
+      "evidence": "ops/start_obs_stack.ps1",
+      "next": "注意：由 DSH 工具调用内启动的长驻服务会随该调用被取消而终止，长驻栈应从真实终端或计划任务启动"
+    },
+    {
+      "id": "P1-F1",
+      "level": "P1",
+      "title": "veighna_sim paper 路径只买不卖（无法表达轮动）",
+      "status": "fixed",
+      "detail": "scheduler._build_plan 只发 BUY，且 phase1_target_weight_provider 丢弃 strategy.target_weights() 返回的 _exits；台账实测 184/184 笔全为 BUY。已新增 plan_mode=\"target\" 差分调仓（迭代目标∪当前持仓、卖单上限为持仓市值、卖单先执行释放现金、买单受可用现金约束）。默认 incremental 行为不变，equal_weight 回归仍 12 笔全 BUY。",
+      "evidence": "src/scheduler.py；docs/pit-valuation.md §⑮",
+      "next": "无"
+    },
+    {
+      "id": "P1-F2",
+      "level": "P1",
+      "title": "dry-run 安全闸门命中实盘网关时抛错异常类型",
+      "status": "fixed",
+      "detail": "broker.assert_no_live_gateway 在 f-string 中引用生成器表达式局部变量 kw（Python 3 中不属外层作用域）⇒ 真正命中实盘网关（如 XTP）时抛 NameError 而非 RuntimeError；仍 fail-closed，但按 RuntimeError 捕获的调用方接不住。已改为先取出 hit 再格式化。由 tests/test_broker_safety.py::test_assert_no_live_gateway_blocks_xtp 暴露。",
+      "evidence": "src/veighna_sim/broker.py",
+      "next": "无"
+    },
+    {
+      "id": "P1-F3",
+      "level": "P1",
+      "title": "测试环境隔离不足（读到生产 .env 真实凭据）",
+      "status": "fixed",
+      "detail": "3 例用例只隔离 local_toml_path 未隔离 env_path，而 load_simnow_settings 优先读 .env ⇒ 读到生产凭据，\"缺配置 ⇒ config_missing\" 断言失效。已给 simnow_health_from_local_config 增加 env_path 并让用例同时隔离两个来源。",
+      "evidence": "tests/test_simnow_gateway.py（TestLocalConfigLoading）",
+      "next": "无"
+    },
+    {
+      "id": "P1-F4",
+      "level": "P1",
+      "title": "测试把环境事实写进断言",
+      "status": "fixed",
+      "detail": "test_default_strategies 断言 vnpy_cta_available is False（假定包未安装），随 vnpy==4.4.0 一并安装该包后失效。已改为断言\"如实上报布尔 + 默认 3 策略\"。",
+      "evidence": "tests/test_cta_strategies.py",
+      "next": "无"
+    },
+    {
+      "id": "P1-8",
+      "level": "P1",
+      "title": "gate 迟滞与风险敞口参数待决策",
+      "status": "decision",
+      "detail": "迟滞为 5 天（代码默认 3，data/factor_gate_config.json = 5）；风险触发时敞口仅降 10%（exp_risk=0.90）；unknown/无 IC 数据时按敞口 1.0 通过；日亏 −5% 与 −9% 响应完全相同。",
+      "evidence": "data/factor_gate_config.json；src/factor_gate.py",
+      "next": "需决策是否收紧"
+    },
+    {
+      "id": "SEC-1",
+      "level": "安全",
+      "title": "SimNow 明文密码落盘（veighna_sim/config.local.toml）",
+      "status": "fixed",
+      "detail": "密码已清空、enabled=false；simnow_gateway 支持 VEIGHNA_SIMNOW_* 环境变量（实测：仅环境变量即可构成完整凭据、优先于文件、移除后回退文件）。默认闸门已闭合：status=config_missing / complete=False / connect_disabled=True。veighna_sim 内明文残留扫描 = 0。",
+      "evidence": "veighna_sim/config.local.toml；src/veighna_sim/simnow_gateway.py",
+      "next": "无（simnow 通道已弃用）"
+    },
+    {
+      "id": "SEC-2",
+      "level": "安全",
+      "title": "research_trader/.env 明文凭据（3 处 + PII）",
+      "status": "partial",
+      "detail": "SimNow Password 行已改为占位注释（其余键未动）。同文件仍有 OPENAI_API_KEY、tushare_token 明文，以及 simnow_phonenumber、simnow_username 等 PII。该目录不属于任何 git 仓库，故无\"移出追踪\"可做，风险是磁盘明文本身。",
+      "evidence": "research_trader/.env（本次扫描新发现）",
+      "next": "并入后续凭据治理批次：统一改走环境变量 + 轮换"
+    },
+    {
+      "id": "SEC-3",
+      "level": "安全",
+      "title": "已泄露的 SimNow 密码未轮换",
+      "status": "accepted",
+      "detail": "该明文密码曾出现在会话工具输出中。用户明确决定不轮换（\"不用管\"），此决定已被知悉并记录。",
+      "evidence": "用户 2026-09-19 决定",
+      "next": "无（已接受风险；建议在凭据治理批次重新评估）"
+    },
+    {
+      "id": "SEC-4",
+      "level": "安全",
+      "title": "watchdog/面板 health 载荷与 UI 渲染器形状不匹配",
+      "status": "open",
+      "detail": "renderHealth 期望 {level, summary, generated_at, checks[]}，而 /api/health 返回 {ok, service, pid, ts, deps:{duckdb, arcticdb}} ⇒ 健康卡片渲染为\"OK + 空表\"；退役 DuckDB 的打开失败（deps.duckdb_error）在 UI 上完全不显示。",
+      "evidence": "src/dashboard.py /api/health 与 renderHealth",
+      "next": "本批次修：统一载荷并补 bar_store/h5i 状态与阻塞项汇总"
+    },
+    {
+      "id": "DOC-1",
+      "level": "P2",
+      "title": "README/deployment 的看板启动命令与 h5i 主源不匹配",
+      "status": "open",
+      "detail": "README.md:281 与 docs/deployment.md:39 让用 .venv314\\Scripts\\python.exe 启动 dashboard，但实测 .venv314(3.14) 无 h5i_db（h5i_db=False），会失去 h5i 主源数据；持有 h5i_db 的是 TRAE python 3.10.11。",
+      "evidence": "两个解释器的 importlib.find_spec 实测对比",
+      "next": "修正文档，或给 .venv314 装上 h5i_db"
+    },
+    {
+      "id": "P1-PREMARKET-DUCK",
+      "level": "P1",
+      "title": "premarket 健康检查未适配 h5i 主源（退役 DuckDB 造成连锁误报）",
+      "status": "open",
+      "detail": "data/health/premarket.json 由 premarket_healthcheck.py 产出，其判定仍以 DuckDB 为主源。DuckDB 退役后，面板 /api/health 实测 22 项检查中 8 项 FAIL，其中至少 6 项（duckdb / orderbook / daily_bars_freshness / ic_history / ic_curve / duckdb_pool）是\"legacy_stockdb.duckdb 不存在\"导致的连锁误报，非实际故障。另有 arcticdb / arcticdb_rw / strategy_diag 三项 InternalException（arcticdb 未安装），归属待确认。",
+      "evidence": "面板 /api/health 实测输出（2026-09-19）；src/dashboard.py read_health_merged() 已追加来源说明但不改状态",
+      "next": "更新 premarket_healthcheck.py 改用 h5i 主源；确认 arcticdb 是否已退役"
+    },
+    {
+      "id": "P2-BARFALLBACK",
+      "level": "P2",
+      "title": "vnpy_backtest.py:807 bar 回退口径",
+      "status": "deferred",
+      "detail": "受控实验显示 Δ 均值 +5.50pp、符号 4/4 一致，暂不动。",
+      "evidence": "engine_bias_probe.py",
+      "next": "搁置"
+    },
+    {
+      "id": "P2-SNAPSHOT",
+      "level": "P2",
+      "title": "PaperBook snapshot() 把 cash 四舍五入到分",
+      "status": "deferred",
+      "detail": "内存值 84979.34989499999 vs 快照 84979.35，差 1.05e-4 元；持仓数量与 avg_cost 不受影响。以\"逐位对账\"为标准则不通过。",
+      "evidence": "docs/preflight-verification.md 四-7",
+      "next": "搁置；或明确账务口径为\"以分为单位\""
+    },
+    {
+      "id": "P2-DEDUP",
+      "level": "P2",
+      "title": "_avail_date 存在 5 份实现；_residualize meta 四舍五入到 4 位小数",
+      "status": "deferred",
+      "detail": "重复实现与精度截断，暂无行为影响证据。",
+      "evidence": "docs/preflight-verification.md",
+      "next": "搁置"
+    },
+    {
+      "id": "P2-PUSH",
+      "level": "P2",
+      "title": "推送通道未配置；drop_table→append 窗口未测",
+      "status": "deferred",
+      "detail": "推送通道（邮件/微信）未配置；h5i drop_table 后 append 的时间窗口边界未覆盖测试。",
+      "evidence": "docs/preflight-verification.md",
+      "next": "搁置"
+    }
+  ]
+}
