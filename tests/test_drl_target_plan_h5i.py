@@ -166,6 +166,47 @@ class TestAsOfSectionContract:
         assert pl.get("source") == "h5i_view"
 
 
+class TestDataLagDays:
+    """`data_lag_days`: 截面比 plan 日落后多少**自然日**（用户 2026-09-20 要求）.
+
+    为什么需要它: 行情管道停摆时 plan 仍会照常生成、`source=h5i_view` 看起来完全正常,
+    唯一差别是它基于一份陈旧截面 —— 不把这个差值显式写进产物, 过期信号就会伪装成正常信号
+    混进台账。**只记录不设阈值**（是否"落后到该暂停"属运营判断, 见 METHOD-1）。
+    """
+
+    def _mk(self, env, monkeypatch, tmp_path, plan_day, section):
+        monkeypatch.setattr(T, "DATA_DIR", str(tmp_path))
+        _write_view(env.view, [(c, section, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+                               for c in ("600000", "000001")])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0),
+                                ("000001", 20.0, 0.0, 0.0, 0.0)])
+        d8 = plan_day.replace("-", "")
+        T._build_target_plan(day=plan_day, day_dir=d8,
+                             final_weights={"signal": 1.0}, top_n=1,
+                             as_of=section)
+        with open(os.path.join(str(tmp_path), "drl", d8, "target_plan.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_same_day_is_zero(self, env, monkeypatch, tmp_path):
+        pl = self._mk(env, monkeypatch, tmp_path, "2026-09-07", "2026-09-07")
+        assert pl["data_lag_days"] == 0
+
+    def test_lagging_section_reports_days(self, env, monkeypatch, tmp_path):
+        """★ 管道停摆的形态: plan 日 09-08 却只有 09-07 的截面 ⇒ lag=1。"""
+        pl = self._mk(env, monkeypatch, tmp_path, "2026-09-08", "2026-09-07")
+        assert pl["data_lag_days"] == 1
+
+    def test_large_lag_reports_large_number(self, env, monkeypatch, tmp_path):
+        pl = self._mk(env, monkeypatch, tmp_path, "2026-09-20", "2026-09-07")
+        assert pl["data_lag_days"] == 13
+
+    def test_field_present_even_when_uncomputable(self, env, monkeypatch, tmp_path):
+        """不可计算时字段仍存在（值为 None）—— 缺字段与"值为 0"必须可区分。"""
+        pl = self._mk(env, monkeypatch, tmp_path, None or "2026-09-07", "2026-09-07")
+        assert "data_lag_days" in pl
+
+
 class TestPlanFrameMainPath:
     def test_uses_max_date_row(self, env):
         """只保留 parquet 内 `date` 最大的那一批（历史语义原样保留）。"""

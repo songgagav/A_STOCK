@@ -220,13 +220,22 @@
       "next": "二选一：安装 arcticdb；或确认 ArcticDB 已退役并让 arctic_store 优雅降级（含告警）"
     },
     {
+      "id": "P2-LAKEROOT",
+      "level": "P2",
+      "title": "free_stockdb_sync 的湖根依赖**未设置的** STOCKDB_ROOT，默认路径不存在 ⇒ 静默 scanned=0",
+      "status": "open",
+      "detail": "`free_stockdb_sync._lake_root()` 的解析顺序是 `STOCKDB_ROOT` 环境变量 → 否则 `<repo>/data/stockdb`。实测:\n· `STOCKDB_ROOT` **未设置**;\n· `<repo>/data/stockdb` **不存在**;\n· 真实湖在 **`E:\\A_stockDB`**（5548 个 `kline_parts/*.parquet`）。\n\n**症状是静默的**: 09-08 的复盘里 `free_stockdb_sync` 只报 `ok=false, scanned=0` 且 `parquet_refresh.error='kline_parts 无文件: D:\\...\\data\\stockdb\\kline_parts'`; 而 09-05 同一步骤 `scanned=5548` —— 说明**当时那个进程的环境里有 STOCKDB_ROOT**，而现在没有。也就是说主数据摄入路径**依赖一个未文档化、未持久化的环境变量**；一旦丢失（换终端/换任务/重启），摄入会**静默变成 0 行**而不是报错。\n\n**为什么值得单独登记**: 这与 `P1-DATA-STALE` 是两个独立问题 —— 即使上游 free-stockdb 恢复，只要 `STOCKDB_ROOT` 没设对，本仓仍会**什么都摄入不到**，而且看起来只是『0 行』。",
+      "evidence": "free_stockdb_sync.py:_lake_root() 与 KLINE_PARTS_DIR；Test-Path data/stockdb=False；E:\\A_stockDB\\kline_parts 实测 5548 分片；data/daily/20260908 与 20260905 的 steps.free_stockdb_sync 对比（scanned 0 vs 5548）",
+      "next": "二选一并在文档/启动脚本里固化: (a) 在 `ops/start_daemon.ps1` 与 daemon 的运行环境里显式设置 `STOCKDB_ROOT=E:\\A_stockDB`（并在 `requirements`/README 里写明）; (b) 让 `_lake_root()` 在解析出的路径不存在时**给出明确诊断**（当前只是 scanned=0 的静默结果）。建议两者都做 —— 前者让路径确定, 后者让丢失时响亮。"
+    },
+    {
       "id": "P1-DATA-STALE",
       "level": "P1",
-      "title": "h5i 行情与 IC 数据真实滞后（面板 level=CRITICAL 的主因）",
+      "title": "h5i 行情滞后 —— **根因已查明: 上游 free-stockdb 存储损坏(09-05)且更新器已停**, 属结构性、不自愈",
       "status": "open",
-      "detail": "主源 h5i 最新 bar 日 = 2026-09-08（面板检查时距今日 11 天）；daily_bars_freshness 报落后 10 天；ic_history 报 20260831/20260907 无 IC 行；ic_curve 报 pb_rev/roe/mf_net 文件 MISSING、vol/mom_rev 滞后 5 天。这些是**真实数据问题**，不是代码误报；面板要变绿必须先补数据。",
-      "evidence": "premarket_healthcheck.py 实测输出（source: h5i / latest_bar=20260908）",
-      "next": "补 h5i 日线与 IC 曲线数据；时间点与 f_ml 断链（9/07-9/08）一致，需一并排查"
+      "detail": "**【2026-09-20 根因查明 —— 用户要求『确认 P0-STALE 的根因和预计恢复时间』】** 结论: **结构性, 不自愈**; 重启本仓 daemon **不会**补齐数据。\n\n**四条进入 h5i `daily_bars` 的路径, 全部断了**（逐条实测）:\n| 路径 | 实测状态 |\n|---|---|\n| 外部 free-stockdb 更新器 → `E:\\A_stockDB\\kline_parts\\*.parquet` → `free_stockdb_sync.sync_incremental()` → `h5i_sync.append_daily_bars()`（**设计上的主路径**）| ❌ 湖**冻结**: 5548 个分片最新文件 mtime=**09-05 19:15**, 最新 trade_date=**2026-09-03**; 写入时间线 09-04 写 5197 个 → **09-05 只写 8 个** → 之后归零 |\n| AKShare 兜底（`update_db.update_all` 内 `import akshare as ak`, 局部导入）| ❌ **akshare 未安装于本机任何解释器**（vm-tools 3.10 / Python 3.10.11 / 3.13 / 3.14 / .venv310 / .venv314 全为 False）|\n| legacy DuckDB（`backfill_change_pct` 用）| ❌ 已退役删除; 09-08 复盘原文:『DuckDB 已退役/不存在, change_pct 回填跳过』|\n| 本仓 daemon/`run_daily` | ❌ daemon **自 09-09 08:30 后无日志**（最后一条是『启动盘中引擎 pid=23332』）; 09-19 19:34-19:41 只有 4 条重复的『Web可视化未运行, 已拉起』; 当前**无进程、无相关计划任务** |\n\n**上游损坏的直接证据（外部更新器自己的日志 `E:\\A_stockDB\\log.txt`）**:\n```\n2026-08-31 00:30:18 [ERROR] leveldb_store.cpp(438): get remote0 error: IO error: ./data/034293.ldb: ...\n2026-09-05 17:55:23 [ERROR] leveldb_store.cpp(229): open leveldb failed: Corruption: 9 missing files; e.g.: ./data1/000611.ldb\n2026-09-05 17:55:23 [ERROR] leveldb_store.cpp(289): remote leveldb unavailable: ./data1\n```\n⇒ 上游 free-stockdb（`E:\\A_stockDB` 下的 `stockdb.exe` 0.3.1-stockdb / `数据更新.exe`）的**本地 LevelDB 存储损坏**且**远端 leveldb 不可用**, 时间点 **09-05 17:55:23** —— 比 `kline_parts` 最后一次写入(09-05 19:15)**早约 1.3 小时**, 因果吻合。\n\n**已排除的原因（避免误判）**:\n· **不是域名/网络**: `sync_url.txt` 在 09-05 被改过（`http://a.123128.xyz` → `https://ah.123128.xyz`, 留有 `.bak_20260905`）, 但实测三个源**全部可达**（`a.`→HTTP 204 / `ah.`→204 / `ad.`→204）; 故改动**不是**可达性故障（不过它与故障同日, 仍值得 A/B 复验）。\n· **不是本仓代码缺陷**: 本仓的读取侧（09-08 复盘显示 `factor_views` 仍能成功重建 441527 行）工作正常, 只是**没有新数据可读**。\n\n**预计恢复时间**: **未知, 且不会自愈** —— 取决于上游侧动作。可选的恢复动作（均需用户/上游侧执行, 我不擅自操作第三方程序）:\n (a) 修复上游损坏的 LevelDB（`E:\\A_stockDB\\data1` 报『Corruption: 9 missing files』, 厂商惯例是删除该库后全量重拉）;\n (b) 恢复远端 leveldb 可用性（`remote leveldb unavailable: ./data1`）—— 可先 A/B 试回 09-05 之前的源地址;\n (c) 装 `akshare` 走兜底路径（但代码注释明说它只是『兜底』, 主路径是 parquet 镜像）;\n (d) 若短期无法恢复, **保持 daemon 不启动**以免往台账里写『看起来正常、实则基于 09-03 截面』的日常产物。\n\n**本批次已加的护栏**: `target_plan` 新增 `data_lag_days`（截面比 plan 日落后的**自然日**; 只记录不设阈值, 供每日对照与「>3 天评估暂停」的人工判据使用）。",
+      "evidence": "E:\\A_stockDB\\log.txt（leveldb Corruption / remote unavailable @09-05 17:55:23）；E:\\A_stockDB\\kline_parts 分片 mtime 与 trade_date 实测；data/daily/20260908/daily_summary.json 的 steps.db_update(全 rows=0) / free_stockdb_sync(parquet_refresh.error=kline_parts 无文件) / backfill_change_pct(DuckDB 已退役)；logs/daemon.log 尾部（09-09 08:30 后断档）；六个解释器 importlib.find_spec('akshare')=False；三个同步源 HTTP 204 实测；Get-Process 与 Get-ScheduledTask 均无命中",
+      "next": "**用户决策项**: 先修上游（(a)/(b)/(c) 任一）再启动 daemon —— 符合用户既定规则『结构性滞后 → 先修数据管道，再启动 daemon』。恢复后请: ① 确认 h5i `daily_bars` 最新 bar 日推进到今天; ② 每日对照 `target_plan.data_lag_days` 是否归 0; ③ 若滞后持续 >3 天, 按用户规则评估是否暂停 daemon（避免污染台账）。"
     },
     {
       "id": "P1-PROCALIVE",

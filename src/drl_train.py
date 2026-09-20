@@ -1612,6 +1612,11 @@ class SectionUnavailable(RuntimeError):
     """
 
 
+def _d8(s) -> str:
+    """`YYYY-MM-DD` / `YYYYMMDD` -> `YYYYMMDD`（空值返回空串）。"""
+    return str(s or "").replace("-", "")
+
+
 def _load_plan_frame(as_of: "str | None" = None):
     """为 `_build_target_plan` 取候选池截面 —— **h5i 版**（原为 legacy DuckDB）.
 
@@ -1841,6 +1846,20 @@ def _build_target_plan(day: str, day_dir: str,
 
     res["ok"] = True
     res["top_n"] = len(items)
+    _sec = res.get("section_as_of")
+    # [2026-09-20 用户要求] `data_lag_days`: 该 plan 用的截面比 plan 日**落后多少自然日**。
+    # 为什么需要它: 行情管道停摆时, plan 仍会**照常生成**且 `source=h5i_view` 看起来完全正常,
+    # 唯一的差别是它基于一份陈旧的截面 —— 若不把这个差值显式写进产物, 过期信号会伪装成正常信号
+    # 混进台账（这正是用户担心的"污染台账"）。
+    # **只记录、不设阈值**: 是否"落后到该暂停"属运营判断（METHOD-1: 阈值须基于下游表现），
+    # 由人在每日对照时决定。
+    _lag = None
+    if day and _sec:
+        try:
+            _lag = (dt.datetime.strptime(_d8(day), "%Y%m%d").date()
+                    - dt.datetime.strptime(_d8(_sec), "%Y%m%d").date()).days
+        except Exception:  # noqa: BLE001
+            _lag = None
     payload = {
         "day": day,
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1851,8 +1870,10 @@ def _build_target_plan(day: str, day_dir: str,
         "note": "盘中 realtime_engine 优先消费此文件; 缺失时回退 selection.json",
         # [2026-09-20] 留痕"这条 plan 是怎么来的": 截面日期 + 数据来源 + 是否回补。
         # 回补产物必须能与"当时真的产出了"区分开(用户要求标 source=backfill 且不纳入 OOS)。
-        "section_as_of": res.get("section_as_of"),
+        "section_as_of": _sec,
         "source": source or res.get("source"),
+        # 截面相对 plan 日的落后**自然日**（0=当天截面; 非交易日差, 非交易日计数）
+        "data_lag_days": _lag,
     }
     if source:
         payload["is_backfill"] = True
