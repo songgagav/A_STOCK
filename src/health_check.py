@@ -386,8 +386,11 @@ print("\n[Feedback 9] Trade record consistency")
 print("-" * 40)
 
 daily_dirs = sorted(
+    # [2026-09-20 泛化] 原为 `d != "day"` 的硬编码。生产里出现过两类非规范目录:
+    # `day/`（CLI 占位符）与 `2026-09-03/`（调用点把带横线的 day 当 day_dir 传,
+    # 见登记册 P1-LLMHB）; 硬编码只挡得住第一类 ⇒ 统一改为「必须 8 位数字」。
     [d for d in os.listdir(DAILY_DIR)
-     if os.path.isdir(os.path.join(DAILY_DIR, d)) and d != "day"]
+     if os.path.isdir(os.path.join(DAILY_DIR, d)) and d.isdigit() and len(d) == 8]
 )
 
 # Verify trades_history vs daily paper_book realized progression

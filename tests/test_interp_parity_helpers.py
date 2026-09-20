@@ -148,3 +148,37 @@ class TestOrchestratorDayDirFix:
                  encoding="utf-8").read()
         assert "def run_llm_commentary(day: str, day_dir: str)" in s
         assert 'os.path.join(DATA_DIR, "daily", day_dir)' in s
+
+
+class TestDayDirGuardsGeneralized:
+    """`data/daily/` 的日期口径: 只认 **8 位数字**目录, 不许硬编码单个名字。
+
+    为什么: 实测生产里出现过**两类**非规范目录 —— `day/`（CLI 占位符 `--day`）
+    与 `2026-09-03/`（调用点把带横线的 day 当 day_dir 传）。硬编码 `!= "day"`
+    只挡得住第一类, 所以必须用口径而不是名单。
+    """
+
+    @staticmethod
+    def _src(name):
+        return open(os.path.join(_REPO, "src", name), encoding="utf-8").read()
+
+    def _code_lines(self, name):
+        """剥掉注释行, 只看代码 —— 注释里会引用旧写法作说明, 不该被当成残留。"""
+        out = []
+        for ln in self._src(name).splitlines():
+            s = ln.strip()
+            if s.startswith("#"):
+                continue
+            out.append(ln)
+        return "\n".join(out)
+
+    @pytest.mark.parametrize("fname", ["dashboard.py", "health_check.py"])
+    def test_no_hardcoded_day_name_skip(self, fname):
+        code = self._code_lines(fname)
+        assert 'in ("day",)' not in code, f"{fname} 仍用硬编码名字跳过"
+        assert '!= "day"' not in code, f"{fname} 仍用硬编码名字跳过"
+
+    @pytest.mark.parametrize("fname", ["dashboard.py", "health_check.py"])
+    def test_eight_digit_guard_present(self, fname):
+        code = self._code_lines(fname)
+        assert "isdigit() and len(" in code, f"{fname} 缺 8 位数字口径的判定"

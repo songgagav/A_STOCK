@@ -233,6 +233,10 @@ def read_history(n: int = 10):
         if not os.path.isdir(d):
             continue
         day = os.path.basename(d)
+        # [2026-09-20] 与 read_equity_curve 同口径: 只认 8 位日期目录, 挡掉
+        # `day/` 与 `2026-09-03/` 这类非规范目录（否则历史列表里会混进假日期）。
+        if not (day.isdigit() and len(day) == 8):
+            continue
         sp = os.path.join(d, "daily_summary.json")
         if not os.path.exists(sp):
             continue
@@ -1022,8 +1026,13 @@ def _equity_series():
     """
     seq = {}
     for d in sorted(glob.glob(os.path.join(DAILY_DIR, "*"))):
-        if os.path.basename(d) in ("day",):
-            continue  # 历史误创建的占位目录
+        # [2026-09-20 泛化] 原为硬编码 `if os.path.basename(d) in ("day",)`（只挡字面量
+        # "day"）。实测生产里出现过**两类**非规范目录: `day/`（CLI 占位符 --day）
+        # 与 `2026-09-03/`（调用点把带横线的 day 当 day_dir 传, 见 P1-LLMHB）。
+        # 硬编码只挡得住第一类 ⇒ 改为「必须 8 位数字」这一口径。
+        _bn = os.path.basename(d)
+        if not (_bn.isdigit() and len(_bn) == 8):
+            continue  # 非规范日期目录一律跳过
         sp = os.path.join(d, "daily_summary.json")
         if not os.path.exists(sp):
             continue
