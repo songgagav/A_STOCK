@@ -309,6 +309,15 @@
       "next": "二选一由用户决定：(a) 删除该游离目录（低风险，但属生产数据变更）；(b) 保留但在全仓排查其它脚本是否也有同类『按 * glob 不校验日期』的读取方"
     },
     {
+      "id": "DEC-H5IDIRECT",
+      "level": "决策",
+      "title": "（b）py3.14 直读 h5i 段文件：可行，但 h5i 的 checksum **无法在 py3.14 侧复算** —— 需用户确认是否接受该局限",
+      "status": "decision",
+      "detail": "评估报告见 `docs/h5i-direct-read.md`（结论均实测，非推测）。\n\n**布局**（实测）: `data/h5i/market.db` 是**目录**: `FORMAT` / `catalog/tables/<sha256(表名)>.json` / `tables/<uuid>/{HEAD,manifests/<seq>.json,spec/*.json,segments/*.parquet}`。manifest 的 `segments[]` 还带逐列 min/max/null_count/distinct_values 与 `time_range`，可按段跳读。\n\n**版本校验: 可行且能做得比 h5i_db 更严格** —— `FORMAT` 里有 `format_version` / `min_reader_version` / `created_by`（实测 `h5i-db 0.1.6`），`min_reader_version` 正是上游给读者的兼容性闸门；再叠加 `HEAD.format` / `manifest.format` / `spec_revision` / `schema_revision` 与 `HEAD.sequence` 存在性检查，可在格式变更时**响亮拒绝读取**而非读出错误数据。\n\n**校验和: 硬约束（这是本项的决策要点）** —— 实测两项否定证据:\n· 声明值**不是文件 sha256**: `HEAD.manifest_checksum=39421f6f48e5ced7…` 而 manifest 文件 sha256=`505840823cad315f…`；某 segment 声明 `ed81cfb2ee719208b5a202f7…` 而该 parquet 的 sha256=`480948a2fb7e5e4d3bbee7d5…` ⇒ **均不一致**。唯一对得上的是 `bytes`（3354556 == 3354556）。\n· 算法**不在 Python 层**: 在 h5i_db 安装目录检索 `checksum`/`hashlib`/`sha256` 只命中 `backtest*.py` 里与库格式无关的自用哈希；manifest/segment/HEAD/catalog 的 checksum 计算全在**原生扩展 `_native.pyd`**（仅 CPython 3.10）内 ⇒ py3.14 侧读不到算法。\n\n**因此 py3.14 侧能做的**: 版本闸门；`bytes`（声明 vs 文件大小）与 `rows`（各段之和 vs manifest）交叉校验；manifest 链**声明间**自洽（child.parent_checksum vs parent 自报值，递推至 parent=None）；逐段 time_range 跳读。**不能做的**: 独立复算声明 checksum，从而**无法证明段字节未被篡改**。\n**建议的替代方案（TOFU）**: 首次成功读取时用我们自己的 sha256 登记 sidecar 台账（segment_id/rows/size/sha256），此后按 size+rows+sha256 校验；**只能在首次读取之后**检测篡改与截断，且必须显式记录『首次登记』而非静默信任。开销分级: 每次运行只做版本+size/rows 交叉校验（不读内容）；深度 sha256 仅在首次登记/显式 --deep-verify/size 或 mtime 变化时做（daily_bars 单表 129 段 ~459MB）。",
+      "evidence": "docs/h5i-direct-read.md（布局/版本字段/checksum 实测否定证据/TOFU 方案/风险表）；实测数据见 detail",
+      "next": "**需用户决策**：(1) 接受『校验强度达不到 h5i_db 权威级、只能 TOFU』这一局限 -> 按 docs/h5i-direct-read.md 实施；(2) 不接受 -> 本路径不满足要求，回到 P0-DRLDEP 的 (a) 或 (c)"
+    },
+    {
       "id": "P0-DRLDEP",
       "level": "P0",
       "title": "无任何解释器同时具备 h5i_db 与 torch ⇒ 迁移后 DRL 训练仍无法运行",
