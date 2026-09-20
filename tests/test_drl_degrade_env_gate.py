@@ -248,3 +248,48 @@ class TestRunDailyGate:
         src = self._src()
         assert 'report["steps"]["drl_degrade"]' in src
         assert 'report["drl_status"]' in src
+
+
+class TestSetupScriptMatchesCode:
+    """不变量: 环境搭建脚本必须与代码声明的 `REQUIRED_RUNTIME` 保持同步。
+
+    为什么值得一条测试: `REQUIRED_RUNTIME` 是"DRL 要跑起来需要什么"的**唯一声明**,
+    而 `scripts/setup_py310_drl_venv.ps1` 是把这个声明**变成环境**的地方。若将来有人往
+    REQUIRED_RUNTIME 里加了依赖却忘了改脚本, 症状会是"新环境装出来仍然跑不起来" ——
+    而且只在真正重建环境时才暴露。用一条廉价的文本交叉检查把这个坑提前到 CI。
+
+    （本测试只能验证"脚本提到了该依赖"; 脚本能否真的装上, 由本机实跑 + exit 0 验证 ——
+      CI 无法在容器里下载安装 Windows 版 Python 3.10。）
+    """
+
+    #: import 名 -> 发行包名（两者不一致的只有这两个）
+    _DIST = {"h5i_db": "h5i-db", "stable_baselines3": "stable-baselines3"}
+
+    @staticmethod
+    def _script() -> str:
+        p = os.path.join(_REPO, "scripts", "setup_py310_drl_venv.ps1")
+        with open(p, encoding="utf-8-sig") as f:      # utf-8-sig: 脚本含 BOM
+            return f.read()
+
+    def test_script_exists(self):
+        assert os.path.isfile(os.path.join(_REPO, "scripts", "setup_py310_drl_venv.ps1"))
+
+    def test_every_required_runtime_dep_is_installed_by_script(self):
+        src = self._script()
+        for mod in D.REQUIRED_RUNTIME:
+            dist = self._DIST.get(mod, mod)
+            assert dist in src, \
+                f"REQUIRED_RUNTIME 里的 {mod}（发行包 {dist}）未出现在 setup 脚本里"
+
+    def test_script_pins_installer_checksum_and_verifies_signature(self):
+        """下载即校验: 固定 SHA256 + Authenticode, 不符必须拒绝安装。"""
+        src = self._script()
+        assert "InstallerSha256" in src
+        assert "Get-FileHash" in src and "SHA256" in src
+        assert "Get-AuthenticodeSignature" in src
+        assert "throw" in src, "校验失败必须抛错中止, 而不是警告后继续"
+
+    def test_script_checks_venv_support_before_use(self):
+        """原共享工具解释器就是缺 venv 模块 —— 脚本必须先确认再建环境。"""
+        src = self._script()
+        assert "find_spec('venv')" in src or 'find_spec("venv")' in src
