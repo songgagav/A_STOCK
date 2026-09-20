@@ -26,7 +26,12 @@
 import os
 from functools import lru_cache
 
-_H5I_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "h5i", "market.db")
+# h5i 库路径: 默认 = <本模块所在仓库>/data/h5i/market.db。
+# 注意: 它**刻意不**由 config.DATA_DIR / QUANT_DATA_DIR 派生 —— 沙箱 DATA_DIR 按设计是
+# **部分**数据集(只垫 daily/drl 等), 若据此改指 h5i 会让沙箱内的 h5i 读全部落空。
+# 需要显式改指(如只读挂生产 h5i 到沙箱)时用环境变量 H5I_MARKET_DB。
+_H5I_PATH = os.environ.get("H5I_MARKET_DB") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "h5i", "market.db")
 _DUCK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "legacy_stockdb.duckdb")
 
 
@@ -61,6 +66,32 @@ class H5iBarStore:
             f"SELECT DISTINCT symbol FROM daily_bars WHERE CAST(ts AS DATE)=DATE '{day}'{filt} ORDER BY symbol"
         ).to_pandas()
         return df["symbol"].tolist()
+
+    def closes_window(self, start: str, end: str, decision_time: str | None = None,
+                      positive_close_only: bool = True):
+        """窗口内**全部标的**的 `(d, symbol, close)` —— 供『全市场日均收益』类批量计算。
+
+        为什么需要它（而不是逐日 SQL）
+            legacy DuckDB 侧计算「全 A 日均收益」时，对窗口内**每对相邻交易日**做一次
+            `daily_bars` 自连接（L 次查询）。h5i 是列存、且 `CAST(ts AS DATE)` 无法走索引，
+            逐次全表扫描的代价很高，故改为**一次**取回整窗，再在 pandas 内做等价的
+            inner-join（symbol 需两天都存在）。
+
+        `positive_close_only=True` 与 legacy 的 `WHERE b.close>0 AND p.close>0` 对齐 ——
+        排除退市/停牌等 `close<=0` 异常行，否则 `AVG(close/prev_close - 1)` 会被污染。
+        """
+        w = ""
+        if start:
+            w += f" AND CAST(ts AS DATE) >= DATE '{start}'"
+        if end:
+            w += f" AND CAST(ts AS DATE) <= DATE '{end}'"
+        if positive_close_only:
+            w += " AND close > 0"
+        w += self._decision_filter(decision_time)
+        return self._db.sql(
+            "SELECT CAST(ts AS DATE) AS d, symbol, close, change_pct FROM daily_bars "
+            f"WHERE 1=1{w} ORDER BY d, symbol"
+        ).to_pandas()
 
     def has(self, symbol: str, decision_time: str | None = None) -> bool:
         """检查标的是否存在, 约束截至 decision_time."""

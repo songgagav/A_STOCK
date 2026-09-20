@@ -40,6 +40,7 @@ jobs:
       - name: Run full regression (excluding torch/DRL suites)
         run: |
           python -m pytest tests -q \
+            --ignore=tests/test_drl_factor_state_h5i.py \
             --ignore=tests/test_factor_dynamic_weights.py \
             --ignore=tests/test_factor_value_env.py \
             --ignore=tests/test_factor_weight_env_bounds.py \
@@ -75,7 +76,11 @@ jobs:
           # core job 已对应 --ignore, 故两处仍被完整覆盖, 只是移到有 torch 的 job 执行。
           # [2026-09-20] 新增 tests/test_factor_weight_env_bounds.py -> 需 gymnasium+torch
           #   （FactorWeightEnv 回合终止边界 + _load_factor_state 失败路径; core 同步 --ignore）
-          python -m pytest tests/test_factor_dynamic_weights.py \
+          # [2026-09-20] 新增 tests/test_drl_factor_state_h5i.py -> 经 drl_train 依赖 torch
+          #   （P0-DRLSRC 迁移回归: 不得再碰 DUCKDB_PATH + inner-join 口径 + 单次批量查询;
+          #    用假 store, 故 CI 无需 h5i_db; core 同步 --ignore）
+          python -m pytest tests/test_drl_factor_state_h5i.py \
+            tests/test_factor_dynamic_weights.py \
             tests/test_factor_value_env.py \
             tests/test_factor_weight_env_bounds.py \
             tests/test_llm_drl_integration.py \

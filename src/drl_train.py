@@ -481,35 +481,54 @@ class FactorValueEnv(gymnasium.Env):
 # 数据: 从 DuckDB 取近 N 日 daily_bars, 计算 6 维近似 IC 序列
 # ============================================================
 def _load_factor_state(day: dt.date, lookback_days: int = 60):
-    import duckdb
-    con = duckdb.connect(DUCKDB_PATH, read_only=True)
-    rows = con.execute(
-        "SELECT DISTINCT date FROM daily_bars "
-        "WHERE date<=? AND date>=? ORDER BY date",
-        [day, day - dt.timedelta(days=lookback_days)],
-    ).fetchall()
-    dates = [r[0] for r in rows]
+    """从 **h5i** 取近 N 日 `daily_bars`, 计算 6 维近似 IC 序列。
+
+    [2026-09-20 迁移] 原实现连的是 `data/legacy_stockdb.duckdb`（m4 已于 2026-09-05
+    退役删除）, 实测抛 `IOException: database does not exist` ⇒ 自那日起 DRL 训练完全
+    停摆（登记册 `P0-DRLSRC`）。本函数改为走 h5i 主源（`H5iBarStore`）。
+
+    **口径与 legacy 逐位对齐**（已用 legacy 已落盘产物证毕, 见
+    `scripts/preflight_drl_h5i_parity.py`, 16 样本 8/8 PASS）:
+      · 交易日集合: `SELECT DISTINCT CAST(ts AS DATE)` 落在 `[day-lookback_days, day]`;
+      · `rets[i]` = 相邻交易日 `dates[i-1] -> dates[i]` 上, **两天都存在且 close>0** 的
+        标的的 `AVG(close_t / close_{t-1} - 1)`（= legacy 的 inner-join 语义）;
+      · `rets[0] = 0.0`（首日无前收）。
+    与 legacy 的唯一实质差异是**数据更完整**: h5i 补录了 legacy 缺失的 `2026-09-01`。
+
+    实现上与 legacy 的差异（**仅性能, 不改数值**）: legacy 对每对相邻日做一次自连接
+    （L 次查询）; 本函数**一次**批量取回整窗后在 pandas 内做等价 inner-join。
+
+    h5i 的键列是 **`ts`**（非 legacy 的 `date`）—— 必须写 `CAST(ts AS DATE)`;
+    直接照抄 legacy SQL 会**静默返回空集**而不是报错。
+    """
+    from h5i_bar_store import H5iBarStore  # noqa: 延迟导入, 避免与 db/config 循环
+
+    lo = day - dt.timedelta(days=lookback_days)
+    store = H5iBarStore()
+    df = store.closes_window(str(lo), str(day))
+    if df is None or len(df) == 0:
+        return None, None, None
+
+    df["d"] = df["d"].astype(str)
+    dates = sorted(df["d"].unique())
     if len(dates) < 15:
         return None, None, None
 
-    # 每日平均涨幅 (近似"全 A 收益"). 排除 close<=0 的退市/停牌/异常股,
-    # 否则 AVG(Inf) 会污染整条 IC 序列, 导致 PPO 观测含 NaN -> 网络参数
-    # 全 NaN -> 训练崩溃 (2026-09-02 修复).
-    rets = []
-    for i, d in enumerate(dates):
-        prev = dates[i - 1] if i > 0 else None
-        if prev:
-            r = con.execute(
-                "SELECT AVG(b.close/p.close - 1.0) FROM daily_bars b "
-                "JOIN daily_bars p ON b.symbol=p.symbol AND p.date=? "
-                "WHERE b.date=? AND b.close > 0 AND p.close > 0",
-                [prev, d],
-            ).fetchone()
-            v = r[0] if r and r[0] is not None else 0.0
-            rets.append(v if np.isfinite(v) else 0.0)
-        else:
+    by_day = {k: v for k, v in df.groupby("d")}
+    rets = [0.0]
+    for i in range(1, len(dates)):
+        cur, prev = by_day.get(dates[i]), by_day.get(dates[i - 1])
+        if cur is None or prev is None:
             rets.append(0.0)
-    con.close()
+            continue
+        j = cur.merge(prev, on="symbol", suffixes=("_b", "_p"))
+        if len(j) == 0:
+            rets.append(0.0)
+            continue
+        r = float(np.mean(j["close_b"].to_numpy(dtype=np.float64)
+                          / j["close_p"].to_numpy(dtype=np.float64) - 1.0))
+        rets.append(r if np.isfinite(r) else 0.0)
+
     arr = np.array(rets, dtype=np.float64)
     # 兜底: NaN/Inf 归一化为 0, 防止污染后续 corrcoef/std 计算
     arr = np.where(np.isfinite(arr), arr, 0.0)
@@ -531,7 +550,7 @@ def _load_factor_state(day: dt.date, lookback_days: int = 60):
             ic[t, 5] = -arr[t]   # 反转动量
     # 最终兜底: 全矩阵 NaN/Inf 归一化 (防御后续 np.concatenate 污染观测)
     ic = np.where(np.isfinite(ic), ic, 0.0)
-    return ic, np.array(rets, dtype=np.float64), dates
+    return ic, np.array(arr, dtype=np.float64), dates
 
 
 def _load_base_weights() -> np.ndarray:
