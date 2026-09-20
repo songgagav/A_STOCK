@@ -293,6 +293,42 @@ CI 分为两部分：
 > 验证方式：`& <解释器> -c "import h5i_db; print('ok')"`，以及看板
 > `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
 
+### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db 与 torch）
+
+> **2026-09-20 新增（解决 `P0-DRLDEP`）**。此前项目面临一个**无法回避的两难**：
+>
+> | 解释器 | h5i_db | torch | 后果 |
+> |---|---|---|---|
+> | `.venv314`（Python 3.14） | ❌ | ✅ | DRL 训练起不来（读不了主源） |
+> | 原 3.10 共享工具解释器 | ✅ | ❌ | DRL 训练起不来（缺 torch），且**没有 `venv`/`ensurepip`**、装了会污染 Agent 工具链 |
+>
+> 根因：`h5i_db` 的原生扩展**仅支持 CPython 3.10**（见本文件上方说明），而 torch 装不进 3.14 的
+> `h5i_db` —— 两者**必须在同一个解释器**里，而当时没有任何一个解释器同时具备。
+>
+> **解法**：下载一个独立的 Python 3.10.11，在其上建干净 venv 并把两面都装齐。
+>
+> ```powershell
+> # 一条命令完成：校验 SHA256 + Authenticode 签名 → 静默安装 3.10.11 →
+> # 建 .venv310 → 装 h5i-db / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
+> pwsh -File scripts/setup_py310_drl_venv.ps1
+> ```
+>
+> 装好后请把 `run_daily` / daemon / 看板指向它：
+>
+> ```powershell
+> $env:BAR_STORE = 'h5i'
+> & .venv310\Scripts\python.exe src\run_daily.py
+> & .venv310\Scripts\python.exe src\dashboard.py --port 8000
+> ```
+>
+> **实测收益（可复核）**：
+> - `drl_degrade.probe_runtime()` → `ok=True`（四项全 True），DRL 训练与 `target_plan` 生成恢复；
+> - 全量测试 **682 passed / 1 skipped**（`.venv314` 下为 **664 / 19**）—— 多出的 18 个正是
+>   原先因 `h5i-db 不可用` 而被跳过的 `tests/test_integration_f68.py` 用例，现在真的跑起来了；
+> - `scripts/preflight_drl_h5i_realrun.py` 从 `[BLOCKED]` 变为 **21/21 PASS**。
+>
+> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`（已在 PyPI 上）。
+
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
 ### 一键启动后台栈

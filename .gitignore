@@ -69,6 +69,9 @@ dist/
 venv/
 .venv/
 .venv314/
+# [2026-09-20] 决策 D / (c) 路线新增: 同时具备 h5i_db 与 torch 的干净 3.10 环境。
+# 注意 `.venv-*/` **不**匹配它（`.venv310` 里 `.venv` 后紧跟数字）, 故必须显式列出。
+.venv310/
 .venv-*/
 env/
 ENV/

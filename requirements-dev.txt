@@ -27,4 +27,14 @@ requests>=2.32
 # 请在 **3.10 解释器**里单独安装:
 #     <python3.10> -m pip install "h5i-db>=0.1.6"
 # 注意: DRL 训练还需要 torch/gymnasium/stable-baselines3，且必须与 h5i_db 在**同一个**
-# 解释器里 —— 这就是 P0-DRLDEP 的根因（当前无任何解释器同时具备两者）。
+# 解释器里 —— 这就是 P0-DRLDEP 的根因（此前无任何解释器同时具备两者）。
+#
+# [2026-09-20 更新: 已用 (c) 路线解决, 不必再手工拼装]
+#      pwsh -File scripts/setup_py310_drl_venv.ps1
+#   该脚本会下载并**校验** Python 3.10.11（Windows 上 3.10 的最后一个二进制安装包,
+#   SHA256 与 Authenticode 签名双重校验）, 静默安装, 再建 `.venv310` 并把
+#   h5i-db 与 torch/gymnasium/stable-baselines3 装进**同一个**解释器。
+#   实测: 该环境下 drl_degrade.probe_runtime() 返回 ok=True（四项全 True）;
+#         全量测试 682 passed / 1 skipped（.venv314 下为 664/19 —— 差额正是原先因
+#         `h5i-db 不可用` 而被跳过的 tests/test_integration_f68.py）。
+#   装好后请把 run_daily/daemon/看板指向 .venv310\Scripts\python.exe。
