@@ -78,12 +78,36 @@ def main() -> int:
     if not days:
         print("[export_trade_calendar] 未取到任何交易日, 放弃写出", file=sys.stderr)
         return 2
+
+    # [2026-09-21 修 —— 本脚本曾经"改坏过生产"]
+    # 这份 JSON 同时承载**两套契约**, 而 `days` 是 `trading_calendar.is_trading_day` 的
+    # 权威集合 —— 后者必须能判断**今天/未来**: 其实现就是 `return norm in cal`。
+    # 而本脚本的 days 来自 h5i(只有"已经有数据的日子"), 于是**任何晚于最后数据日的日期
+    # 都会被判成非交易日, 包括"今天"**。
+    # 后果极隐蔽: 守护把交易日当节假日 —— 不跑盘前健康检查、08:30 不启动盘中引擎、
+    # 收盘窗口只跑 --maint。看起来只是"今天没事做"。
+    # 故此处**取并集, 绝不缩小**: 既有内容(通常来自 AKShare 官方日历, 含全年未来日期)
+    # 原样保留, 只在其上补充数据同源的交易日。
+    existing = {}
+    try:
+        if os.path.exists(OUT_FP):
+            with open(OUT_FP, encoding="utf-8-sig") as f:
+                existing = json.load(f) or {}
+    except Exception:
+        existing = {}
+    old_set = {str(x) for x in (existing.get("days") or [])}
+    new_set = {d.replace("-", "") for d in days}
+    union = sorted(old_set | new_set)
+    if len(union) < len(old_set):
+        print("[export_trade_calendar] 拒绝写出: 新的 days 会小于既有集合", file=sys.stderr)
+        return 3
+
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "source": src,
-        "n": len(days),
-        "first": days[0],
-        "last": days[-1],
+        "source": f"{src} | days=union(既有 {len(old_set)} ∪ 本次 {len(new_set)})",
+        "n": len(union),
+        "first": union[0],
+        "last": union[-1],
         # [2026-09-19 修] **双键**, 因为本文件有**两个既有消费方**, 契约不同:
         #   1) `days`: 'YYYYMMDD' 无分隔 —— 项目原有契约。
         #      `src/vnpy_backtest._calendar_from_static_file()` 读 `days` 并自行归一化;
@@ -94,14 +118,19 @@ def main() -> int:
         # 历史教训: 本脚本最初**只写 trading_days**, 而目标路径正是 (1) 所读的文件 ——
         # 等于用不兼容的 schema 覆盖了项目契约文件, 使日历回退链失效(该用例由通过变
         # 为空列表)。故此处**必须**同时写两个键; 请勿删掉其中任何一个。
-        "days": [d.replace("-", "") for d in days],
+        "days": union,
         "trading_days": days,
     }
+    # 保留 `updated`(trading_calendar 用它判缓存年龄); 缺了它, refresh() 每次都会尝试
+    # 联网重抓, 无网时还会把缓存标成 stale。
+    if existing.get("updated"):
+        payload["updated"] = existing["updated"]
     os.makedirs(os.path.dirname(OUT_FP), exist_ok=True)
     with open(OUT_FP, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
-    print(f"[export_trade_calendar] {OUT_FP} n={len(days)} "
-          f"{days[0]}~{days[-1]} src={src} keys=days+trading_days")
+    print(f"[export_trade_calendar] {OUT_FP} n={len(union)} "
+          f"{union[0]}~{union[-1]} src={src} "
+          f"keys=days+trading_days (days=并集: 既有 {len(old_set)} -> {len(union)})")
     return 0
 
 

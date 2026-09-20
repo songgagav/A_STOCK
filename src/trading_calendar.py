@@ -54,20 +54,55 @@ def _load_cache() -> dict:
         return _empty_set()
 
 
+# 本文件有**两个写入方、两套契约**, 且都会读回同一个文件:
+#   1) 本模块(trading_calendar): 需要**官方 AKShare 日历**(含未来日期, 供
+#      `is_trading_day` 判断"今天/明天是不是交易日") 以及 `updated`(缓存年龄判据)。
+#   2) `scripts/export_trade_calendar.py`: 需要**与数据同源的交易日序列**, 写成
+#      `trading_days`(YYYY-MM-DD), 供外部 veighna_sim 判定"前一交易日"。
+#
+# [2026-09-21 实事故] 两者都曾**整体覆写**该文件, 于是轮流抹掉对方的键:
+#   · 导出脚本覆写 ⇒ 丢掉 `updated`, 且 `days` 变成"只有有数据的日子"。
+#     后果**极隐蔽**: `is_trading_day(今天)` 恒为 False(今天必然晚于最后有数据的日子),
+#     守护把**交易日当节假日** —— 不跑盘前健康检查、08:30 不启动盘中引擎、
+#     收盘窗口只跑 `--maint`。看起来只是"今天没事做"。
+#   · 本模块刷新 ⇒ 丢掉 `trading_days`, 外部 veighna_sim 的日历回退链失效。
+#
+# 故此处**保留所有未知键**, 不再整体覆写。
+_PRESERVE_KEYS = ("trading_days", "n", "first", "last", "generated_at")
+
+
 def _save_cache(days) -> dict:
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
+        preserved = {}
+        try:
+            if os.path.exists(CAL_FILE):
+                with open(CAL_FILE, encoding="utf-8-sig") as f:
+                    old = json.load(f)
+                if isinstance(old, dict):
+                    preserved = {k: old[k] for k in _PRESERVE_KEYS if k in old}
+        except Exception:
+            preserved = {}
+        days_sorted = sorted(days)
+        preserved.update(
+            {
+                "days": days_sorted,
+                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "akshare_tool_trade_date_hist_sina",
+            }
+        )
+        # `n`/`first`/`last` 是**由 days 派生**的描述字段。保留它们的同时必须**同步重算**,
+        # 否则会留下"n=8707、last=2026-09-18, 而 days 实际到 2026-12-31"这种自相矛盾 ——
+        # 那比丢掉它们更难排查。
+        if "n" in preserved:
+            preserved["n"] = len(days_sorted)
+        if days_sorted:
+            if "first" in preserved:
+                preserved["first"] = days_sorted[0]
+            if "last" in preserved:
+                preserved["last"] = days_sorted[-1]
         with open(CAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "days": sorted(days),
-                    "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": "akshare_tool_trade_date_hist_sina",
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dump(preserved, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
