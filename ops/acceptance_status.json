@@ -291,6 +291,24 @@
       "next": "无。依赖缺口本身仍见 P0-DRLDEP；解除后本门禁会自动放行训练，无需改代码"
     },
     {
+      "id": "DRL-3",
+      "level": "P0",
+      "title": "DRL 学习后检查 —— 滚动窗口与决策一致性代理已实现（只记录数值）；新旧模型对比/验证集仍缺且已显式标注原因",
+      "status": "partial",
+      "detail": "设计要求五项，本批次的**如实对应**如下（不可算的显式落盘原因，不留空 —— 否则复盘无法区分『检查通过』与『根本没有数据』，这是 DRL-2 的教训）：\n· ✅ **滚动窗口表现**：新增 `src/drl_post.py`（轻量，无 torch/h5i_db），从 `data/daily/*/daily_summary.json` 的权益序列算近 N 日收益 / 年化夏普 / 最大回撤 / 波动。实测真实生产数据 12 个交易日：return 0.132756%、sharpe 0.529669、max_dd −1.130321%、vol 0.383608%；权益无波动时**夏普记 None 并给出 note**（不用 0 冒充，0 会被误读为『表现中性』）。\n· ◐ **决策一致性**：设计要求是『同输入两次推理是否一致』，那需要 torch 推理；本批次实现的是**相邻日 target_plan 的 top_n Jaccard 重合度**作为代理，并**据此命名** `topn_jaccard_*` 而非 `decision_consistency_*`，避免被读成严格结论。实测 9 对相邻日：mean 0.135973、min 0.0、完全相同 0 对。\n· ✅ **参数漂移**：已由 `drl_drift.py` 实现（DRL-7），本模块只做指引。\n· ❌ **新旧模型对比（验证集上新≥旧）**：需加载新旧模型跑同一验证集 ⇒ 需 torch；当前无解释器同时具备 h5i_db 与 torch（P0-DRLDEP）且按决策 D DRL 不训练 ⇒ 落 `unavailable.new_vs_old.reason`。\n· ❌ **验证集切分本身**：尚未定义切分口径 ⇒ 落 `unavailable.validation_set.reason`。\n\n**METHOD-1 纪律**：输出里**不产出任何布尔判定**（无 passed/ok_model/converged/should_deploy），显式 `threshold_applied=false`；由单测 `TestMethod1Discipline` 锁定。落盘 `data/drl_post_metrics.jsonl`，并接入 `run_daily` 的每日复盘（`report['steps']['drl_post']`）—— **放在 run_daily 而非 run_drl_train 内部**，因为 drl_post 轻量，故决策 D 之下（DRL 不训练）依然每天记录；否则 DRL 停摆会把学习后检查一起带走。\n\n**验证**：`tests/test_drl_post.py` 20 用例（轻量，CI core job 可跑）。",
+      "evidence": "src/drl_post.py；src/run_daily.py 复盘接入；tests/test_drl_post.py 20 用例；真实生产数据实测数值见 detail",
+      "next": "待 P0-DRLDEP 解除后补『新旧模型对比』：需先定验证集切分口径，再用 torch 跑新旧模型对比并**只记录数值**，阈值待下游表现数据齐备后再定"
+    },
+    {
+      "id": "P2-STRAYDIR",
+      "level": "P2",
+      "title": "生产 data/daily/ 下存在游离目录 day/（day 字面量为 --day）—— 会污染任何按日期 glob 的统计",
+      "status": "open",
+      "detail": "实测发现 `data/daily/day/daily_summary.json`：其 `day` 字段是**字面量 `--day`**、`summary.equity=100000.0` —— 属某次脚本调用把 CLI 占位符当成日期参数落下的**游离产物**（不是合法交易日分区）。\n\n**危害是可量化的**（不是理论担忧）：`src/drl_post.py` 初版按 `data/daily/*/daily_summary.json` glob，把它收了进来，实测把滚动窗口数值从\n· 正确（`to=20260908`, n=12）：return **0.132756%**、sharpe **0.529669**\n· 被污染（`to=day`, n=13）：return **0.832422%**、sharpe **2.687009**\n—— **收益高估约 6 倍、夏普高估约 5 倍**。任何按日期通配 `data/daily/*/` 的统计都有同样风险。\n\n**已做的处置**：`drl_post.py` 的读数改为**以目录名为准且必须是 8 位数字**，非日期分区一律跳过（`_daily_rows` 与 `_plan_topn` 都是），并由 `TestStrayDirDefence` 两条用例锁定（含『注入游离目录后数值不得改变』）。\n\n**未做的处置**：**没有删除**该目录 —— 它位于生产 data/ 之下，删除生产数据需用户确认（同理也不擅自移动）。登记在册以待处置。",
+      "evidence": "data/daily/day/daily_summary.json 实测 day=--day / equity=100000.0；src/drl_post.py 过滤逻辑与注释；tests/test_drl_post.py::TestStrayDirDefence",
+      "next": "二选一由用户决定：(a) 删除该游离目录（低风险，但属生产数据变更）；(b) 保留但在全仓排查其它脚本是否也有同类『按 * glob 不校验日期』的读取方"
+    },
+    {
       "id": "P0-DRLDEP",
       "level": "P0",
       "title": "无任何解释器同时具备 h5i_db 与 torch ⇒ 迁移后 DRL 训练仍无法运行",
@@ -298,15 +316,6 @@
       "detail": "迁移 `_load_factor_state` 到 h5i 后实测发现：**这是第二个、独立的阻塞项**，与数据源无关，而是**依赖分处两个互斥解释器**。\n\n实测能力矩阵（`importlib.util.find_spec`）：\n· `.venv314`（README 指定的 run_daily 解释器）py=3.14.7：h5i_db ❌ / torch ✅ / gymnasium ✅ / sb3 ✅ / duckdb ✅\n· 虚拟机内 3.10 解释器（数据脚本用）py=3.10.11：h5i_db ✅ / torch ❌ / gymnasium ❌ / sb3 ❌ / duckdb ✅\n\n而 `run_drl_train` **同时**需要两者：h5i_db（读主源）+ torch/gymnasium/sb3（PPO）。⇒ 在**任一**解释器上都跑不到底：\n· 用 `.venv314`：`_load_factor_state` 抛 `ModuleNotFoundError: No module named 'h5i_db'`；\n· 用 3.10 解释器：`import drl_train` 即抛 `ModuleNotFoundError: No module named 'gymnasium'`。\n两者都已用 `scripts/preflight_drl_h5i_realrun.py` 现场复现，并各自给出可操作诊断（该脚本把能力检查前置到 `import drl_train` **之前** —— 否则缺 torch 的解释器会先在导入处崩掉、掩盖诊断）。\n\n**关键约束（决定唯一可行方向）**：README 第 171 行明确写『部分本地 `h5i_db` 数据库组件使用 **CPython 3.10 原生扩展**；运行依赖该组件的数据脚本时，必须使用与 `_native.pyd` 匹配的 Python 3.10 环境』⇒ **h5i_db 不可能装进 3.14 的 `.venv314`**，故登记册 P1-DEPLOY 里『给 .venv314 装 h5i_db』这一选项**技术不可行**（此处构成对 P1-DEPLOY 建议的修正）。\n可行方向：给 **3.10 解释器**装 `torch + gymnasium + stable-baselines3`（PyPI 均有 cp310 wheel；torch 建议 CPU wheel）。\n\n**附带**：`h5i-db` **未出现在任何 requirements 文件里**（`requirements_314.txt` / `requirements-dev.txt` 均无），而它自 m4 起是**主数据源**的必需依赖 —— 依赖声明缺失本身也应补。\n\n**为何本轮不擅自装**：安装会改动生产解释器环境（体积/版本影响面大，torch 版本可能与既有栈冲突），按项目惯例应由用户确认后再执行。",
       "evidence": "两个解释器的 importlib.find_spec 实测矩阵；README.md:171（h5i_db 仅 3.10）；scripts/preflight_drl_h5i_realrun.py 在 venv314 与 3.10 上各复现一次；requirements_314.txt / requirements-dev.txt 中无 h5i-db",
       "next": "**已阻塞: 三项可选路径均需用户决策（本轮新增实测约束后, 已没有『直接照做』的选项）**\n\n实测约束（2026-09-20 第3轮）:\n· (i) 那个 3.10 解释器**不是 venv**（`sys.prefix == sys.base_prefix`）——它是 **TRAE Agent 自带的共享工具解释器**（`…\\ModularData\\ai-agent\\vm\\tools\\python`）。\n· (ii) 它**没有 `venv` 模块、也没有 `ensurepip`**（实测 `find_spec('venv')=False`）⇒ **无法用它创建隔离的 3.10 环境**。所以在它里面装 torch 等于**污染共享工具解释器**（数百 MB~GB 级, 且可能与其自带工具链冲突）, 这与『建个干净 venv』是完全不同的风险量级。\n· (iii) `data/h5i/market.db` **其实是一个目录**（不是单文件库）: 内部为 `tables/<uuid>/segments/*.parquet` + manifest。⇒ 理论上可用 **pyarrow 直接读段文件**，从而在 3.14（有 torch）里完全绕开 h5i_db。但这**绕过 h5i_db 官方读取接口、依赖其内部落盘布局**, 属于脆弱耦合, 不宜擅自动手。\n\n可选路径:\n (a) 给共享 3.10 解释器装 `torch+gymnasium+stable-baselines3`（能立刻跑通, 但按 (ii) 无法隔离, 会污染 Agent 工具环境）;\n (b) 实现 **(iii) 的 pyarrow 直读段文件**读取器（3.14 一站式跑通, 但依赖 h5i_db 内部布局, 有版本脆性）;\n (c) 找一个**独立的 Python 3.10 安装**再建干净 venv 装 h5i_db+torch（最干净, 但需要机器上存在这样的 3.10, 本轮未找到）;\n (d) 明确 DRL 训练暂不在生产运行, 依赖 DRL-4 降级链把它**响亮地**置为 L3 而非静默失效。\n\n**代码侧已全部就绪、不再需要改动**: 解除任一阻塞后, `scripts/preflight_drl_h5i_realrun.py`（绊线已翻转为正向断言）与 `scripts/preflight_drl_e2e_stubbed.py`（26/26 PASS）即为端到端验收。"
-    },
-    {
-      "id": "DRL-3",
-      "level": "P0",
-      "title": "DRL 学习后检查未实现（新旧模型对比 / 验证集 / 滚动窗口 / 决策一致性）",
-      "status": "open",
-      "detail": "设计的学习后检查点为：新旧模型对比（验证集新≥旧）、滚动窗口表现（近20日夏普不降/回撤不扩）、参数漂移、决策一致性、部署检查。实测 `src/drl_train.py` 内**均未实现**（grep `val_|验证集|old_model|prev_model|回滚|rollback` 无命中）。⇒ 新模型只要训练『跑完』就会被当日 plan 采用，没有质量闸门。注：『参数漂移』所需数据**已具备**（train_meta 已落 base_weights/prior_weights/final_weights）。",
-      "evidence": "docs/drl-learning-verification.md §三『学习后』；drl_train.py grep 结果",
-      "next": "优先做低成本项：用已落盘的 base/prior/final_weights 加『权重漂移 ≤ 阈值』断言 + 告警；另见 DRL-5（因子权重边界）与『参数漂移』——后者数据已就绪，是唯一可立即落地的一项"
     },
     {
       "id": "DRL-4",

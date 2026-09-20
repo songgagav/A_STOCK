@@ -646,6 +646,23 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["drl_degrade"] = {"ok": False, "error": str(e)[:200]}
 
+        # ===== DRL 学习后检查（DRL-3, 只记录数值）=====
+        # 放在这里而不是 run_drl_train 内部: drl_post 是**轻量**模块（无 torch/h5i_db）,
+        # 故**决策 D 之下（DRL 不训练）依然每天记录**滚动窗口与决策一致性 ——
+        # 否则一旦 DRL 停摆, 学习后检查会跟着一起"消失", 复盘就断了。
+        try:
+            import drl_post
+            _post = drl_post.record_post_metrics(day)
+            report["steps"]["drl_post"] = {
+                "ok": True, "ledger": drl_post.ledger_path(),
+                "rolling": _post.get("rolling_window"),
+                "topn_jaccard": _post.get("topn_jaccard"),
+                "unavailable": list((_post.get("unavailable") or {}).keys()),
+                "threshold_applied": _post.get("threshold_applied"),
+            }
+        except Exception as e:
+            report["steps"]["drl_post"] = {"ok": False, "error": str(e)[:200]}
+
         # ‌) 存档当前模拟盘状态 (不调 rebalance! 盘中引擎的实时持仓原样保留,
         #    收盘任务只负责"生成次日总标池"与"当日状态归档", 不覆盖盘中调仓结果)
         #    非交易日(maint): 无当日盘中状态, 跳过归档与汇总.
