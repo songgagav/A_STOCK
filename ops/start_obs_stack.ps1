@@ -1,4 +1,4 @@
-# 一键启动 A_stock_rotation 观测栈 (Redis / Prometheus / Grafana / /metrics / Celery worker)
+﻿# 一键启动 A_stock_rotation 观测栈 (Redis / Prometheus / Grafana / /metrics / Celery worker)
 # 用法: powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 $ErrorActionPreference = 'Continue'
 $proj = Split-Path -Parent $PSScriptRoot

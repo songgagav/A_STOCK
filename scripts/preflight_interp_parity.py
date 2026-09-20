@@ -295,20 +295,29 @@ def main() -> int:
         print(f"    [仅B] {ln[:150]}")
 
     # ---------------- 降级/异常原因对比（结构化对比看不到的部分）----------------
-    print("\n--- ③b 降级/异常**原因**对比（结构化产物看不到）---")
+    # 用户要求: `degrade_reason_mismatch` 作为**长期监控项, 每次 dry-run 都输出**。
+    # 故本段**无条件**打印（没有降级也要明确说"两侧均无降级"），而不是只在有降级时才出现
+    # —— "这次没打印"和"这次没降级"必须能被区分开, 否则监控项本身会静默消失。
+    print("\n--- ③b 降级/异常**原因**对比（结构化产物看不到; 长期监控项）---")
     gA, gB = _degrade_reasons(resA), _degrade_reasons(resB)
     for tag, g in (("A", gA), ("B", gB)):
-        print(f"  [{tag}] 缺模块={g['missing_modules'] or '无'}")
+        print(f"  [{tag}] 缺模块={g['missing_modules'] or '无'}  "
+              f"降级行数={len(g['degrade_lines'])}")
         for ln in g["degrade_lines"][:4]:
             print(f"      {ln[:160]}")
     reason_mismatch = False
-    if (gA["degrade_lines"] or gB["degrade_lines"]):
+    if gA["degrade_lines"] or gB["degrade_lines"]:
         keyA = sorted(_reason_key(x) for x in gA["degrade_lines"])
         keyB = sorted(_reason_key(x) for x in gB["degrade_lines"])
         reason_mismatch = keyA != keyB
-        print(f"  降级原因是否同类: {'一致' if not reason_mismatch else '**不一致**'}")
+        print(f"  degrade_reason_mismatch = {reason_mismatch}"
+              f"  ({'两侧降级**原因不同**' if reason_mismatch else '两侧降级原因同类'};"
+              f" A={keyA or '无'} B={keyB or '无'})")
+    else:
+        print("  degrade_reason_mismatch = False  (两侧均无降级, 本项无差异可比)")
     if (gA["missing_modules"] or gB["missing_modules"]):
-        print(f"  ⚠ 有解释器缺模块: A={gA['missing_modules'] or '无'} B={gB['missing_modules'] or '无'}")
+        print(f"  ⚠ 有解释器缺模块: A={gA['missing_modules'] or '无'} "
+              f"B={gB['missing_modules'] or '无'}")
         print("     ⇒ 该侧运行在**降级模式**: 输出可能仍相同, 但那是因为它绕过了主数据源。")
 
     # ---------------- 生产文件 ----------------
@@ -326,8 +335,8 @@ def main() -> int:
     verdict_ok = dec_same and not sem and protected_ok
     print(f"决策一致        : {dec_same}")
     print(f"SEMANTIC 差异   : {len(sem)}  (要求 0)")
-    print(f"降级原因同类    : {not reason_mismatch}"
-          f"{'  <<< 输出相同但原因不同, 需人工确认' if reason_mismatch else ''}")
+    print(f"degrade_reason_mismatch : {reason_mismatch}"
+          f"{'   <<< 输出相同但降级原因不同, 需人工确认' if reason_mismatch else ''}")
     print(f"受保护生产文件  : {'未变' if protected_ok else '**被改写**'}")
     print(f"结论: {'通过 —— 差异均可解释' if verdict_ok else '不通过 —— 见上方 SEMANTIC/决策差异'}")
     if reason_mismatch:

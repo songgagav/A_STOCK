@@ -78,10 +78,63 @@
 ### 第二天
 - [ ] 把 daemon 切到 `.venv310`：`& .venv310\Scripts\python.exe src\daemon.py`
       （`daemon.py` 用 `PY = sys.executable`，故**必须用该解释器启动 daemon 本身**）
+
+      **用包装脚本更稳妥**（带前置检查 + 一行回退）：
+      ```powershell
+      pwsh -File ops/start_daemon.ps1 -CheckOnly        # 只做前置检查, 不启动
+      pwsh -File ops/start_daemon.ps1                   # 用 .venv310 启动（默认）
+      pwsh -File ops/start_daemon.ps1 -Interpreter 314  # 回退到 .venv314
+      ```
+      它会先打印 `probe_runtime()` 的四项能力，**缺项时明确区分两种情况**：
+      `.venv310` 缺项 = 环境没建好 → **拒绝启动**（exit 2）；
+      `.venv314` 缺 `h5i_db` = 预期中的回退环境 → **知情继续**并列出后果。
+      注意：daemon 是长驻进程，**请从真实终端或计划任务启动**，不要经由一次性的工具调用
+      （调用被取消时长驻子进程会一起被终止）。
+
+      > 实测（2026-09-20）：此刻 **`daemon.py` / `run_daily.py` 都没有在运行** ——
+      > 所以"切换"不是热切换，而是"下次启动用哪个解释器"。观测栈
+      > （dashboard / metrics_server / alert_hook）当前跑在 `vm-tools` 那个 3.10 解释器上
+      > （它有 `h5i_db`，看板够用）。
 - [ ] **保留 `.venv314` 作为回退**
 - [ ] 密切观察首日全链路：`data/daily/<day>/daily_summary.json` 的
       `steps.drl_train` / `steps.drl_degrade` / `steps.drl_post`，以及
       `data/drl_degrade_events.jsonl`、`data/drl_post_metrics.jsonl` 是否开始逐日产出
+- [ ] 确认 `data/daily/<YYYYMMDD>/llm_commentary_heartbeat.json` **首次**出现在规范目录内
+      （修复前它一直落在带横线的目录里，见 `P1-LLMHB`）
+
+## 长期监控项（每次 dry-run 都输出）
+
+`degrade_reason_mismatch` 是 `preflight_interp_parity.py` 的**常规输出项**（用户要求长期保留）：
+
+- 它回答的是"**输出相同，但降级原因是否也相同**"。
+- 两侧都无降级时它也**明确打印** `= False (两侧均无降级, 本项无差异可比)` ——
+  「这次没打印」与「这次没降级」必须能被区分开，否则监控项自己会静默消失。
+- 为 `True` 时打 WARN：说明两个解释器**走的数据路径不同**（例如一侧因数据不足降级、
+  另一侧因读不到主源降级），此时"结构化产物 0 差异"不能解释为"解释器无影响"。
+
+## 第二步：回补 target_plan 的前置确认结论（先看清再动手）
+
+用户决定：**只补 `target_plan`、不重训模型**；并明确"需先确认截面数据完整，缺则无意义"。
+前置确认已完成，三条结论都收窄了原计划：
+
+| 项 | 原计划 | 实测 |
+|---|---|---|
+| 回补窗口 | 9/5–9/8 共 **4 个交易日** | **只有 2 个**：`trade_calendar.json` 里该区间仅 `20260907`/`20260908`；且公历上 **09-05 是周六、09-06 是周日** |
+| 0907 截面 | —— | ✅ `v_factor_scores_daily.parquet` 有 **5205 行** ⇒ 可回补 |
+| 0908 截面 | —— | ❌ 该 parquet 里 **0 行** ⇒ 按用户判据 **不可回补**（只能落到 `h5i_bars_fallback` 降级精简版，与"当时真的产出了"不等价） |
+
+另有两处设计约束（原计划未覆盖，动手前必须先解决）：
+
+1. **`_build_target_plan` 不接受日期参数** —— 内部写死 `WHERE v.date = MAX(date)`。
+   今天 views 的 `MAX(date)=2026-09-07`，故对 0907"碰巧正确"，对 0908 会取到 **0907 的陈旧截面**。
+   ⇒ 回补**不能直接复用该函数**，必须显式传目标截面日期。
+2. **0907/0908 没有 `train_meta` ⇒ 没有当日 `final_weights`**。回补须用
+   **严格早于该日的最近一版**权重（0907/0908 的前一版是 **0905**），否则引入**前视**。
+
+⇒ 建议：**只回补 0907**；0908 若要产出，须显式标注为降级产物并单独归类。
+其余按用户已定三条执行：标 `source=backfill`、不纳入 OOS 的 n 计数、模型重训作为独立动作解耦。
+
+---
 
 ### 第三天及以后
 - [ ] 稳定则正式切换

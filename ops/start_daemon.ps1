@@ -1,0 +1,99 @@
+﻿﻿﻿<#
+.SYNOPSIS
+  用**指定解释器**启动生产 daemon（默认 .venv310），并**先做环境前置检查**再启动。
+
+.BACKGROUND 为什么需要这个包装脚本
+  `daemon.py` 里是 `PY = sys.executable`（或 `TRAE_PYTHON` 环境变量）——
+  也就是说"用哪个解释器"完全由**启动 daemon 的那条命令**决定。
+  因此"从 .venv314 切到 .venv310"= 换一条启动命令；"回退"= 换回去。
+  把它固化成一个带参数、带前置检查的脚本，切换与回退都只需改一个 `-Interpreter`。
+
+  前置检查（启动前打印，不通过就**拒绝启动**）:
+    · `drl_degrade.probe_runtime()` —— h5i_db / torch / gymnasium / stable_baselines3
+      是否在**同一个**解释器里齐备（这是 P0-DRLDEP 的核心判据）；
+    · 明确打印将使用哪个解释器, 避免"以为切了其实没切"。
+
+.DAILY ROUTINE
+  daemon.py 是长驻进程: **请从真实终端或计划任务启动**，不要经由一次性的工具调用
+  （工具调用被取消时，长驻子进程会一起被终止 —— 这是本项目已登记的注意事项）。
+
+.USAGE
+  # 默认用 .venv310（具备 h5i_db + torch）
+  pwsh -File ops/start_daemon.ps1
+  # 回退到旧解释器（5 秒内完成；.venv314 保持原样未动）
+  pwsh -File ops/start_daemon.ps1 -Interpreter 314
+  # 只做前置检查、不真正启动
+  pwsh -File ops/start_daemon.ps1 -CheckOnly
+#>
+[CmdletBinding()]
+param(
+  [ValidateSet('310', '314')]
+  [string]$Interpreter = '310',
+  [switch]$CheckOnly
+)
+
+$ErrorActionPreference = 'Stop'
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+
+$map = @{
+  '310' = @{ Dir = '.venv310'; Note = '具备 h5i_db + torch（推荐；DRL 训练可跑）' }
+  '314' = @{ Dir = '.venv314'; Note = '旧环境（无 h5i_db ⇒ fusion 每次都会降级, DRL 会被 L3 门禁拦下）' }
+}
+$pick = $map[$Interpreter]
+$py = Join-Path $RepoRoot "$($pick.Dir)\Scripts\python.exe"
+
+Write-Host "=================================================================="
+Write-Host "生产 daemon 启动（解释器 .venv$Interpreter）"
+Write-Host "=================================================================="
+Write-Host "  python : $py"
+Write-Host "  说明   : $($pick.Note)"
+
+if (-not (Test-Path $py)) {
+  throw "解释器不存在: $py" + $(if ($Interpreter -eq '310') { "`n   提示: 先运行 scripts/setup_py310_drl_venv.ps1 创建 .venv310" } else { "" })
+}
+
+# ---- 前置检查: 必须在同一解释器里齐备（P0-DRLDEP 核心判据）----
+Write-Host "`n[前置检查] drl_degrade.probe_runtime()"
+$probe = & $py -c @"
+import importlib.util as u, sys, json
+need = ('h5i_db','torch','gymnasium','stable_baselines3')
+got = {m: bool(u.find_spec(m)) for m in need}
+print(json.dumps({'python': '.'.join(map(str, sys.version_info[:3])),
+                  'deps': got, 'missing': [k for k,v in got.items() if not v]}))
+"@
+$p = $probe | ConvertFrom-Json
+Write-Host "  python : $($p.python)"
+foreach ($k in $p.deps.PSObject.Properties.Name) {
+  Write-Host ("  {0,-20} = {1}" -f $k, $p.deps.$k)
+}
+
+if ($p.missing.Count -gt 0) {
+  if ($Interpreter -eq '310') {
+    # .venv310 存在的意义就是"四项齐备"；缺任何一项都说明环境没建好，必须拒绝。
+    Write-Host "`n[拒绝启动] .venv310 缺: $($p.missing -join ', ')" -ForegroundColor Red
+    Write-Host "  请先运行: pwsh -File scripts/setup_py310_drl_venv.ps1"
+    exit 2
+  } else {
+    # .venv314 缺 h5i_db 是**已知且被接受的**（决策 D 过渡期的回退环境），
+    # 故这里是"知情继续"而非拒绝 —— 措辞必须与 310 分支区分开，
+    # 否则运维会以为命令失败了（而它其实会照常启动）。
+    Write-Host "`n[知情继续] .venv314 缺: $($p.missing -join ', ')" -ForegroundColor Yellow
+    Write-Host "  这是**预期**的（该环境本就无 h5i_db）。后果（均已登记）："
+    Write-Host "    · fusion 每次都会因『读不到主源』降级到 f_ml（而非因数据不足）;"
+    Write-Host "    · DRL 会被决策 D 的 L3 门禁拦下并记 CRITICAL, 当日不产出新信号。"
+    Write-Host "  仅当你在执行回退/对比时才应继续。"
+  }
+} else {
+  Write-Host "`n  四项齐备 —— DRL 训练与 target_plan 生成可用。" -ForegroundColor Green
+}
+
+if ($CheckOnly) {
+  Write-Host "`n(-CheckOnly: 仅前置检查, 未启动)"
+  exit 0
+}
+
+Write-Host "`n[启动] daemon.py（长驻; Ctrl+C 结束）"
+Write-Host "提示: 回退只需 `pwsh -File ops/start_daemon.ps1 -Interpreter 314`（.venv314 未改动）`n"
+Set-Location $RepoRoot
+& $py (Join-Path $RepoRoot 'src\daemon.py')
+exit $LASTEXITCODE

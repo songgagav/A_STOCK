@@ -182,3 +182,46 @@ class TestDayDirGuardsGeneralized:
     def test_eight_digit_guard_present(self, fname):
         code = self._code_lines(fname)
         assert "isdigit() and len(" in code, f"{fname} 缺 8 位数字口径的判定"
+
+
+class TestPowerShellScriptEncoding:
+    """含非 ASCII 的 `.ps1` **必须**带 UTF-8 BOM。
+
+    为什么值得一条测试: PowerShell 在**无 BOM** 时按 ANSI（中文机器上即 GBK）解析脚本,
+    中文注释被解成乱码, 而乱码字节可能破坏引号配对 ⇒ **级联语法错误**, 且报错位置离真正
+    原因很远（实测报在完全无关的行上）, 极难定位。
+
+    本会话已因此踩过两次: `scripts/setup_py310_drl_venv.ps1` 与 `ops/start_daemon.ps1`。
+    第二次尤其隐蔽 —— 是**用编辑工具改过之后 BOM 被抹掉**造成的（编辑工具按 UTF-8 读、
+    按无 BOM 写）。故这条测试的价值在于: 每次编辑后 CI 都会替你复查一遍。
+    """
+
+    _BOM = b"\xef\xbb\xbf"
+
+    @staticmethod
+    def _ps1_files():
+        out = []
+        for sub in ("scripts", "ops"):
+            d = os.path.join(_REPO, sub)
+            if not os.path.isdir(d):
+                continue
+            for n in sorted(os.listdir(d)):
+                if n.lower().endswith(".ps1"):
+                    out.append(os.path.join(d, n))
+        return out
+
+    def test_at_least_one_ps1_found(self):
+        """前提校验: 若一个都没扫到, 这条测试就是空转。"""
+        assert self._ps1_files(), "未找到任何 .ps1 —— 测试路径可能写错了"
+
+    def test_non_ascii_ps1_has_bom(self):
+        bad = []
+        for p in self._ps1_files():
+            raw = open(p, "rb").read()
+            has_non_ascii = any(b > 0x7F for b in raw)
+            has_bom = raw.startswith(self._BOM)
+            if has_non_ascii and not has_bom:
+                bad.append(os.path.relpath(p, _REPO))
+        assert not bad, (
+            "以下 .ps1 含非 ASCII 但缺 UTF-8 BOM, PowerShell 会按 ANSI/GBK 解析并级联报错: "
+            + ", ".join(bad))
