@@ -55,6 +55,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sys
 
 import config
 from dataguard import warn_once
@@ -402,11 +403,112 @@ def resolve(day: str, train_ok: bool, final_weights: "dict | None" = None,
                 "source_day": day8, "error": f"{type(e).__name__}: {e}"}
 
 
+# --------------------------------------------------------------------- 运行环境 / 显式暂停
+#
+# 用户决策 D（2026-09-20）：DRL 训练**暂不在生产运行**，但必须**响亮地**置 L3，
+# 不得静默失效、也不得回退到旧模型继续生成信号。本节即该决策的落点。
+
+#: DRL 训练运行所需的依赖。**必须全部在同一个解释器里** —— 这正是 P0-DRLDEP 的根因
+#: （.venv314 有 torch 无 h5i_db；唯一的 3.10 有 h5i_db 无 torch）。
+REQUIRED_RUNTIME = ("h5i_db", "torch", "gymnasium", "stable_baselines3")
+
+
+def probe_runtime() -> dict:
+    """探测 DRL 运行所需依赖是否**在同一个解释器里**齐备。
+
+    用 `importlib.util.find_spec` 而非真的 import：只判断可达性，**不触发**
+    torch / h5i_db 的导入副作用与耗时（本函数每次 run_daily 都会调用）。
+
+    ⚠ 为什么必须有这个探测：`run_daily` 里 `from drl_train import run_drl_train`
+    一旦因缺 torch 抛 ImportError，就被那句 `except` 吞成 `{"ok": False}` ——
+    **没有账本、没有告警、没有 L3**，正是用户要消除的静默路径。把探测放在
+    `import drl_train` **之前**，才能在**任何**解释器下都响亮地置 L3。
+    """
+    import importlib.util as _iu
+    deps, missing = {}, []
+    for m in REQUIRED_RUNTIME:
+        try:
+            ok = _iu.find_spec(m) is not None
+        except Exception:  # noqa: BLE001  探测本身绝不抛
+            ok = False
+        deps[m] = ok
+        if not ok:
+            missing.append(m)
+    return {"ok": not missing, "deps": deps, "missing": missing,
+            "python": sys.version.split()[0],
+            "note": "h5i_db 的原生扩展仅支持 CPython 3.10（README:171），"
+                    "故它无法与只支持 3.14 的 torch 侧共存于同一解释器"}
+
+
+def force_halt(day: str, reason: str, extra: dict | None = None) -> dict:
+    """**策略性**暂停交易（L3）：跳过 L1/L2 回退，不生成当日 plan。
+
+    与 `resolve()` 的 L3 的区别（这正本函数独立存在的原因）:
+      · `resolve()` 的 L3 是**推导出的结论** —— "扫遍所有版本都没有可用的";
+      · 本函数的 L3 是**显式决策** —— "运行环境本身不可用（缺依赖）"，此时
+        **不得**回退到旧模型生成信号：环境已损坏，用陈旧模型继续下单的风险
+        高于停一天。故此处**不调用** `resolve()`，以免走进 L2 回退分支。
+    """
+    day8 = str(day or "").replace("-", "")
+    cur = load_pointer()
+    cur_day = str(cur.get("day") or "")
+    rec = record_event(LEVEL_HALT, reason,
+                       "**暂停交易: 显式置 L3, 不生成当日 plan**, 需人工介入", day8,
+                       extra=dict(extra or {}))
+    save_pointer(cur_day, "halt_forced", level=LEVEL_HALT)
+    warn_once(LEVEL_WARN_KEY[3],
+              f"[{LEVEL_SEVERITY[3]}] DRL 降级 {LEVEL_NAME[3]}（显式）: {reason} -> "
+              f"**阻断当日 plan**; 需人工介入")
+    return {"ok": True, "halt": True, "effective_weights": None, "source_day": None,
+            "forced": True, "trigger": reason, **rec}
+
+
+def current_level() -> dict:
+    """当前降级状态（供**每日复盘 / 面板 / Prometheus 指标**读取）。"""
+    cur = load_pointer()
+    lv = int(cur.get("level") or 0)
+    return {"level": lv, "level_name": LEVEL_NAME.get(lv, str(lv)),
+            "severity": LEVEL_SEVERITY.get(lv, "INFO"),
+            "source_day": str(cur.get("day") or "") or None,
+            "pointer_source": cur.get("source"),
+            "updated_at": cur.get("updated_at"),
+            "blocked_plan": lv >= LEVEL_HALT}
+
+
+def last_event() -> "dict | None":
+    """账本里最后一条事件（供复盘展示"最近一次降级/恢复"）。绝不抛异常。"""
+    p = event_ledger_path()
+    if not os.path.isfile(p):
+        return None
+    try:
+        last = None
+        with open(p, encoding="utf-8") as f:
+            for ln in f:
+                if ln.strip():
+                    last = ln
+        return json.loads(last) if last else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def event_count() -> int:
+    """账本行数（供指标/面板判断"是否曾经降级过"）。"""
+    p = event_ledger_path()
+    if not os.path.isfile(p):
+        return 0
+    try:
+        with open(p, encoding="utf-8") as f:
+            return sum(1 for ln in f if ln.strip())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 __all__ = ["LEVEL_OK", "LEVEL_RETAIN", "LEVEL_FALLBACK", "LEVEL_HALT",
            "LEVEL_NAME", "LEVEL_SEVERITY", "EVENT_LEDGER_NAME",
-           "LIVE_MARKER_NAME", "FALLBACK_LOOKBACK_DAYS",
+           "LIVE_MARKER_NAME", "FALLBACK_LOOKBACK_DAYS", "REQUIRED_RUNTIME",
            "event_ledger_path", "validation_ledger_path", "pointer_path",
            "is_live_version", "version_usable", "version_weights",
            "scan_versions", "latest_valid",
            "load_pointer", "save_pointer", "record_event", "record_validation",
-           "resolve"]
+           "resolve", "probe_runtime", "force_halt", "current_level",
+           "last_event", "event_count"]

@@ -1611,6 +1611,27 @@ def read_health_merged():
     else:
         checks.append({"name": "acceptance(P0 阻塞项)", "status": "WARN", "ms": 0,
                        "detail": str(acc.get("error", ""))[:160]})
+    # --- DRL 降级状态（用户决策 D: 必须"每日复盘告警可见"）---
+    # 数据源是 drl_degrade 的**轻量**读取器（指针 + 账本），不需要 torch/h5i_db，
+    # 故在看板（可能跑在无 h5i_db 的解释器上）也能取值。
+    try:
+        import drl_degrade as _dd
+        _lv = _dd.current_level()
+        _lvnum = int(_lv.get("level") or 0)
+        _st = "OK" if _lvnum == 0 else ("CRITICAL" if _lvnum >= 3 else "WARN")
+        _pr = _dd.probe_runtime()
+        checks.append({
+            "name": "DRL 降级状态",
+            "status": _st, "ms": 0,
+            "detail": (f"L{_lvnum} {_lv.get('level_name')}"
+                       f"{'（当日未生成新信号）' if _lv.get('blocked_plan') else ''}"
+                       f"; 环境齐备={_pr.get('ok')}"
+                       f"{'; 缺 ' + '/'.join(_pr.get('missing') or []) if not _pr.get('ok') else ''}"
+                       f"; 账本事件={_dd.event_count()}"),
+        })
+    except Exception as e:  # noqa: BLE001
+        checks.append({"name": "DRL 降级状态", "status": "WARN", "ms": 0,
+                       "detail": "读取失败: " + str(e)[:140]})
     # --- 盘前健康检查(premarket.json) ---
     pm = read_health()
     pm_checks = pm.get("checks") if isinstance(pm, dict) else None

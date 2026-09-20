@@ -53,3 +53,62 @@ groups:
             data/fusion_health.json, astock_fusion_* 各指标可能停留在过期值,
             FusionDegraded 因此可能漏报。请检查该文件编码(需 UTF-8/UTF-8-BOM)
             与内容是否为合法 JSON。
+
+  # DRL 降级 / 暂停交易告警 (2026-09-20, 用户决策 D)
+  #   背景: DRL 训练需要 h5i_db 与 torch 在**同一解释器**; 实测两者分处互斥环境
+  #   (.venv314 有 torch 无 h5i_db; 唯一 3.10 有 h5i_db 无 torch), 故 DRL 暂不在
+  #   生产运行。用户决策 D 要求: **响亮地置 L3、不生成新信号**, 而不是静默失败。
+  #   由 run_daily 的环境门禁调用 drl_degrade.force_halt 落盘账本,
+  #   metrics_server 暴露 astock_drl_* 指标, 此处负责告警。
+  - name: astock_drl_degrade
+    rules:
+      - alert: DrlHalted
+        # L3 = 暂停交易: 当日**未生成新信号**。这是需要人工介入的状态。
+        expr: astock_drl_degrade_level >= 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DRL 已暂停交易 (L3, 当日未生成新信号)"
+          description: >-
+            astock_drl_degrade_level={{ $value }}: DRL 处于 L3。若因运行环境缺依赖,
+            请查 astock_drl_env_ok(=0 表示缺 torch/h5i_db/gymnasium/stable_baselines3),
+            以及 data/drl_degrade_events.jsonl 最近一条的 trigger 字段。
+            在环境恢复前, 当日 target_plan 不会产出, 盘中引擎将回退 selection 档。
+      - alert: DrlDegraded
+        # L1/L2 = 保留旧模型 / 回退上一版: 当日仍会跑, 但用的不是新训练的模型。
+        expr: astock_drl_degrade_level > 0 and astock_drl_degrade_level < 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DRL 已降级 (使用非当日模型)"
+          description: >-
+            astock_drl_degrade_level={{ $value }}: DRL 处于 L1(保留旧模型) 或
+            L2(回退上一有效版本)。请查 data/drl_degrade_events.jsonl 的 trigger 与
+            effective_source_day, 确认回退到的模型是否仍可用。
+      - alert: DrlEnvMissing
+        # 决策 D 的根因暴露: 运行环境不齐备 => run_daily 会显式置 L3。
+        expr: astock_drl_env_ok == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DRL 运行环境缺依赖 (将导致显式 L3)"
+          description: >-
+            astock_drl_env_ok=0: 当前解释器缺少 h5i_db 与 torch 之一(或 gymnasium/
+            stable_baselines3)。注意 h5i_db 仅支持 CPython 3.10, 而 torch 侧在 3.14,
+            故需按登记册 P0-DRLDEP 的四条路径之一决策后才可能齐备。
+      - alert: DrlDegradeStatusUnreadable
+        # 与 FusionHealthUnreadable 同理: 读数失败会让其余 astock_drl_* 停留在过期值,
+        # 使 DrlHalted 漏报 —— 告警源自身失效必须显式暴露。
+        expr: astock_drl_degrade_read_ok == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DRL 降级状态不可读 (告警源已失效)"
+          description: >-
+            astock_drl_degrade_read_ok=0: metrics_server 无法读取 DRL 降级状态
+            (data/drl/current_model.json 指针与 data/drl_degrade_events.jsonl 账本),
+            astock_drl_* 各指标可能停留在过期值, DrlHalted 因此可能漏报。

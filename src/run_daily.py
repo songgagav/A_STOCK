@@ -588,16 +588,63 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["pre_drl_brief"] = {"ok": False, "error": str(e)[:200]}
 
+        # ===== DRL 运行环境门禁（用户决策 D, 2026-09-20）=====
+        # 为什么门禁必须在 `import drl_train` **之前**: drl_train 顶层 `import torch`，
+        # 缺依赖的解释器会在导入处抛 ImportError，被下面的 except 吞成 {"ok": False} ——
+        # 那就是"没有账本、没有告警、没有 L3"的静默路径。drl_degrade 是**轻量**模块
+        # （无 torch / 无 h5i_db），故能在此安全探测并**显式**置 L3。
+        # 用户决策 D: DRL 暂不在生产运行, 且**不得**回退旧模型继续生成信号
+        # （环境已损坏, 用陈旧模型下单的风险高于停一天）。
+        _drl_probe = None
+        _drl_forced = None
         try:
-            from drl_train import run_drl_train
-            from config import CVAR_PPO as _CVAR_CFG
-            report["steps"]["drl_train"] = run_drl_train(
-                day, total_timesteps=800,
-                cvar_alpha=_CVAR_CFG["cvar_alpha"],
-                cvar_coef=_CVAR_CFG["cvar_coef"],
-            )
+            import drl_degrade
+            _drl_probe = drl_degrade.probe_runtime()
+            if not _drl_probe.get("ok"):
+                _why = (f"DRL 运行环境不可用: 缺 {'/'.join(_drl_probe['missing'])} "
+                        f"(python={_drl_probe['python']}); "
+                        f"决策 D: 显式置 L3 且不回退旧模型")
+                _drl_forced = drl_degrade.force_halt(day, _why, extra={"probe": _drl_probe})
+                report["steps"]["drl_train"] = {
+                    "ok": False, "skipped": "drl_env_unavailable",
+                    "error": _why, "degrade": _drl_forced, "probe": _drl_probe,
+                }
+                print(f"[run_daily] DRL L3（显式暂停）: {_why}")
         except Exception as e:
-            report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
+            report["steps"]["drl_probe"] = {"ok": False, "error": str(e)[:200]}
+
+        if _drl_forced is None:
+            try:
+                from drl_train import run_drl_train
+                from config import CVAR_PPO as _CVAR_CFG
+                report["steps"]["drl_train"] = run_drl_train(
+                    day, total_timesteps=800,
+                    cvar_alpha=_CVAR_CFG["cvar_alpha"],
+                    cvar_coef=_CVAR_CFG["cvar_coef"],
+                )
+            except Exception as e:
+                report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
+
+        # ===== DRL 降级状态进每日复盘（可见性: 用户要求"每日复盘告警可见"）=====
+        # 无论走哪条路径都写: 复盘要能一眼看到 DRL 当前级别与最近一次降级事件。
+        try:
+            import drl_degrade as _dd
+            _lv = _dd.current_level()
+            report["steps"]["drl_degrade"] = {
+                "ok": True, "level": _lv["level"], "level_name": _lv["level_name"],
+                "severity": _lv["severity"], "blocked_plan": _lv["blocked_plan"],
+                "source_day": _lv["source_day"],
+                "ledger": _dd.event_ledger_path(),
+                "event_count": _dd.event_count(),
+                "last_event": _dd.last_event(),
+                "probe": _drl_probe,
+            }
+            if _lv["blocked_plan"]:
+                # 复盘状态必须反映"当日 DRL 未产出新信号", 不能仍报 OK。
+                report["drl_status"] = (f"{_lv['severity']}: DRL {_lv['level_name']}"
+                                        f"（未生成新信号）")
+        except Exception as e:
+            report["steps"]["drl_degrade"] = {"ok": False, "error": str(e)[:200]}
 
         # ‌) 存档当前模拟盘状态 (不调 rebalance! 盘中引擎的实时持仓原样保留,
         #    收盘任务只负责"生成次日总标池"与"当日状态归档", 不覆盖盘中调仓结果)

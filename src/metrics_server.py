@@ -74,6 +74,21 @@ _g_fusion_read_ok = Gauge("astock_fusion_health_read_ok",
 FUSION_HEALTH_FP = os.path.join(_BASE, "data", "fusion_health.json")
 FUSION_KINDS = ("fusion", "fml_fallback", "equal")
 
+# ---- DRL 降级状态 (来源: data/drl/current_model.json 指针 + data/drl_degrade_events.jsonl) ----
+# why (用户决策 D, 2026-09-20): DRL 训练暂不在生产运行(无解释器同时具备 h5i_db 与 torch),
+# 要求"响亮地置 L3、每日复盘告警可见"。这四个指标 + ops/alert_rules.yml 的
+# DrlHalted 规则负责把"DRL 已暂停交易、当日未生成新信号"变成可告警的事实。
+_g_drl_level = Gauge("astock_drl_degrade_level",
+                     "DRL 降级级别 (0=正常 1=保留旧模型 2=回退上一版 3=暂停交易)")
+_g_drl_blocked = Gauge("astock_drl_plan_blocked",
+                       "DRL 当日 target_plan 是否被阻断 (1=阻断, 未生成新信号)")
+_g_drl_events = Gauge("astock_drl_degrade_events",
+                      "DRL 降级账本累计事件数 (含恢复事件)")
+_g_drl_env_ok = Gauge("astock_drl_env_ok",
+                      "DRL 运行环境齐备标志 (0=缺依赖 => 显式 L3)")
+_g_drl_read_ok = Gauge("astock_drl_degrade_read_ok",
+                       "DRL 降级状态读取成功标志 (0=读失败, 指标可能已过期)")
+
 
 def _to_f(v):
     try:
@@ -158,6 +173,42 @@ def _refresh_fusion() -> None:
     _g_fusion_checked.set(ep if ep is not None else -1.0)
 
 
+def _refresh_drl_degrade() -> None:
+    """读 DRL 降级状态 -> Prometheus 指标（用户决策 D: L3 必须**可告警**）。
+
+    数据源是 `drl_degrade` 的**轻量**读取器（指针 `current_model.json` + 账本），
+    不 import torch / h5i_db，故在**任何**解释器下都能取值。
+
+    与 `_refresh_fusion` 同样的原则: 拿不到状态时**不设值**（指标缺失优于假的 0，
+    后者会让"L3 暂停"看起来像"一切正常"）。
+    """
+    try:
+        import drl_degrade as _dd
+    except Exception as e:  # noqa: BLE001
+        print("drl_degrade import err:", str(e)[:160], flush=True)
+        return
+    try:
+        cur = _dd.current_level()
+    except Exception as e:  # noqa: BLE001
+        _g_drl_read_ok.set(0)          # 显式暴露"读失败", 不留下健康假象
+        print("drl degrade read err:", str(e)[:160], flush=True)
+        return
+    _g_drl_read_ok.set(1)
+    lv = int(cur.get("level") or 0)
+    _g_drl_level.set(lv)
+    _g_drl_blocked.set(1 if cur.get("blocked_plan") else 0)
+    # 是否**曾经**降级过(L1+): 与"当前级别"分开, 便于区分"恢复过"与"从未降级"
+    try:
+        _g_drl_events.set(_dd.event_count())
+    except Exception:  # noqa: BLE001
+        pass
+    # 运行环境齐备性(决策 D 的根因): 0 = 缺依赖 => L3 显式暂停
+    try:
+        _g_drl_env_ok.set(1 if _dd.probe_runtime().get("ok") else 0)
+    except Exception:  # noqa: BLE001
+        _g_drl_env_ok.set(0)
+
+
 def _refresh() -> None:
     try:
         stats = db_stats.collect_once()
@@ -177,6 +228,11 @@ def _refresh() -> None:
         db_stats.append_history(stats)  # 60s 一条, 足够趋势分辨率
     except Exception as e:  # noqa: BLE001
         print("refresh err:", str(e)[:200], flush=True)
+    # 独立 try: DRL 指标失败**不得**连带跳过 db_stats 历史落盘（上面那步已执行）
+    try:
+        _refresh_drl_degrade()
+    except Exception as e:  # noqa: BLE001
+        print("drl degrade refresh err:", str(e)[:200], flush=True)
 
 
 def main() -> None:
