@@ -131,8 +131,28 @@
 2. **0907/0908 没有 `train_meta` ⇒ 没有当日 `final_weights`**。回补须用
    **严格早于该日的最近一版**权重（0907/0908 的前一版是 **0905**），否则引入**前视**。
 
-⇒ 建议：**只回补 0907**；0908 若要产出，须显式标注为降级产物并单独归类。
-其余按用户已定三条执行：标 `source=backfill`、不纳入 OOS 的 n 计数、模型重训作为独立动作解耦。
+⇒ **已执行（2026-09-20）**：
+- **0905 来源查清 → 合法可用**：其 `daily_summary.json` 是 `mode='maint'` 且
+  `steps.drl_train.ok=true` —— 属 `run_daily --maint` 维护管道的正常产物（daemon 的 docstring
+  明写 maint 含"模型训练/权重反馈"），不是手动测试。其 `last_dates` 与 0904 同为 `2026-09-04`。
+- **0907 已回补**：`data/drl/20260907/target_plan.json` —— `source=backfill`、
+  `is_backfill=true`、`oos_eligible=false`、`section_as_of=2026-09-07`、`universe_size=5205`、
+  权重取 0905（严格早于，无前视）。
+- **0908 已跳过并登记**：**未产出任何产物**；仅往 `data/drl_degrade_events.jsonl` 记一条
+  `kind=backfill_unavailable` + `model_degrade=false`（刻意区分"补不了台账"与"模型降级"）。
+- 工具：`scripts/backfill_target_plan.py`（三道闸门：无前视 / 截面必须存在 / 权重可查）。
+
+> **为什么不能靠 daemon 产出（曾考虑过的更简方案，已证伪）**：
+> `daemon._run_daily` 构造的是 `[PY, run_daily.py]`（+`--maint`），**不传日期**；
+> 而 `run_daily` 是 `day = day or today` ⇒ daemon 只写**今天**的目录，
+> **不可能**产出历史日期的 plan。所以历史回补必须手动、且必须显式传截面日期。
+
+### 关于 `as_of`：从隐式 MAX 改为显式契约
+
+`_build_target_plan` 原先内部写死 `WHERE v.date = (SELECT MAX(date) ...)` ——
+对"当天"碰巧正确，但**回补历史日**时会取到最新的截面（对 0908 就是 0907 的陈旧截面）。
+现已加 `as_of` / `source` 参数：不传时行为与迁移前**完全一致**；传了则取指定日，
+且该日不存在时抛 `SectionUnavailable` **响亮失败**，绝不静默退回降级精简版。
 
 ---
 

@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -77,6 +78,92 @@ def env(tmp_path, monkeypatch):
 
 def _bars(rows):
     return pd.DataFrame(rows, columns=["symbol", "close", "change_pct", "turnover", "amount"])
+
+
+class TestAsOfSectionContract:
+    """`as_of` 显式截面契约（2026-09-20 回补能力）.
+
+    原实现隐式取 `MAX(date)` —— 今天 views 的 MAX=2026-09-07, 故对 0907 碰巧正确,
+    对 0908 会取到 0907 的**陈旧截面**且毫无提示。回补需要显式契约, 且"该日没有截面"
+    必须**响亮失败**, 不得静默退回 daily_bars 降级精简版（那会产出"看起来是那天、
+    实际 f_govern/f_vol/f_mom_rev 被置 0"的信号）。
+    """
+
+    def test_default_still_uses_max_date(self, env):
+        """向后兼容: 不传 as_of 时行为与迁移前一致（取 MAX(date)）。"""
+        _write_view(env.view, [("600000", "2026-09-04", 1, 1, 0, 0, 0, 0),
+                               ("600000", "2026-09-07", 2, 2, 0, 0, 0, 0)])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0)])
+        df, src = T._load_plan_frame()
+        assert src == "h5i_view"
+        assert set(df["date"]) == {"2026-09-07"}, "缺省应取最大日期"
+        assert df["f_signal"].iloc[0] == 2
+
+    def test_explicit_as_of_uses_that_date(self, env):
+        """显式 as_of 时取**指定**那一天, 即使它不是最大日期。"""
+        _write_view(env.view, [("600000", "2026-09-04", 1, 1, 0, 0, 0, 0),
+                               ("600000", "2026-09-07", 2, 2, 0, 0, 0, 0)])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0)])
+        df, _src = T._load_plan_frame(as_of="2026-09-04")
+        assert set(df["date"]) == {"2026-09-04"}
+        assert df["f_signal"].iloc[0] == 1
+
+    @pytest.mark.parametrize("as_of", ["2026-09-08", "20260908"])
+    def test_missing_as_of_raises(self, env, as_of):
+        """★ 该日截面不存在 -> 必须抛 SectionUnavailable（两种日期写法都要认）。"""
+        _write_view(env.view, [("600000", "2026-09-07", 1, 1, 0, 0, 0, 0)])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0)])
+        with pytest.raises(T.SectionUnavailable) as ei:
+            T._load_plan_frame(as_of=as_of)
+        assert "2026-09-08" in str(ei.value) and "拒绝静默改用其它截面" in str(ei.value)
+
+    def test_as_of_with_unreadable_views_raises_not_falls_back(self, env, monkeypatch):
+        """★ 要求显式截面但 views 不可读 -> 也必须失败, **不得**退回降级兜底。
+
+        实测教训: 沙箱化会让 `_VIEW_SCORES_PARQUET` 指向沙箱, 视图找不到就静默走兜底,
+        连"截面缺失"这个拒绝条件都不会被触发。
+        """
+        monkeypatch.setattr(T, "_VIEW_SCORES_PARQUET",
+                            str(env.view.parent / "does_not_exist.parquet"))
+        env.store.days = ["2026-09-08"]
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0)])
+        with pytest.raises(T.SectionUnavailable):
+            T._load_plan_frame(as_of="2026-09-08")
+
+    def test_build_target_plan_marks_backfill(self, env, monkeypatch, tmp_path):
+        """`source=...` 时产物必须带 is_backfill / oos_eligible=false（用户要求）。"""
+        monkeypatch.setattr(T, "DATA_DIR", str(tmp_path))
+        _write_view(env.view, [("600000", "2026-09-07", 1.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+                               ("000001", "2026-09-07", 0.5, 0.5, 0.0, 0.0, 0.0, 0.0)])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0),
+                                ("000001", 20.0, 0.0, 0.0, 0.0)])
+        res = T._build_target_plan(day="2026-09-07", day_dir="20260907",
+                                   final_weights={"signal": 0.5, "trend": 0.5},
+                                   top_n=1, as_of="2026-09-07", source="backfill")
+        assert res.get("ok") is True
+        assert res.get("section_as_of") == "2026-09-07", \
+            "产物必须留痕实际使用的截面日期"
+        with open(os.path.join(str(tmp_path), "drl", "20260907", "target_plan.json"),
+                  encoding="utf-8") as f:
+            pl = json.load(f)
+        assert pl["source"] == "backfill"
+        assert pl["is_backfill"] is True
+        assert pl["oos_eligible"] is False, "回补产物不得纳入 OOS 的 n 计数"
+        assert pl["section_as_of"] == "2026-09-07"
+
+    def test_normal_path_has_no_backfill_marks(self, env, monkeypatch, tmp_path):
+        """正常（非回补）产物不得被标成 backfill —— 否则台账失去区分能力。"""
+        monkeypatch.setattr(T, "DATA_DIR", str(tmp_path))
+        _write_view(env.view, [("600000", "2026-09-07", 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)])
+        env.store.bars = _bars([("600000", 10.0, 0.0, 0.0, 0.0)])
+        T._build_target_plan(day="2026-09-07", day_dir="20260907",
+                             final_weights={"signal": 1.0}, top_n=1)
+        with open(os.path.join(str(tmp_path), "drl", "20260907", "target_plan.json"),
+                  encoding="utf-8") as f:
+            pl = json.load(f)
+        assert pl.get("is_backfill") is None
+        assert pl.get("oos_eligible") is None
+        assert pl.get("source") == "h5i_view"
 
 
 class TestPlanFrameMainPath:

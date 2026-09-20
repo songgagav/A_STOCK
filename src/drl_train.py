@@ -1602,7 +1602,17 @@ _H5I_VIEWS_DIR = os.path.join(DATA_DIR, "h5i", "views")
 _VIEW_SCORES_PARQUET = os.path.join(_H5I_VIEWS_DIR, "v_factor_scores_daily.parquet")
 
 
-def _load_plan_frame():
+class SectionUnavailable(RuntimeError):
+    """指定的 `as_of` 截面在 views 中不存在。
+
+    **刻意用异常而不是返回 None/空表**：回补场景下"那一天没有截面"必须**响亮失败**，
+    否则调用方会静默改用别的截面，产出一个"看起来是那天的、实际不是"的信号 ——
+    这正是本项目反复修过的静默降级模式（参见 `docs/interpreter-transition.md` 的
+    0908 案例：views 里 2026-09-08 为 0 行，只能落到降级精简版，与真实产出不等价）。
+    """
+
+
+def _load_plan_frame(as_of: "str | None" = None):
     """为 `_build_target_plan` 取候选池截面 —— **h5i 版**（原为 legacy DuckDB）.
 
     [2026-09-20 迁移] 逐项对齐 legacy SQL 的口径:
@@ -1656,13 +1666,36 @@ def _load_plan_frame():
         return out
 
     # ---- 主路: views parquet（= legacy 的 v_factor_scores_daily）----
+    # [2026-09-20] 显式要求 as_of 时, views **必须可读** —— 否则无法确认该截面存在,
+    # 绝不能悄悄退回下面的 daily_bars 降级精简版（那会产出"看起来是那天、实际被置 0"的信号）。
+    # 实测教训: 沙箱化 DATA_DIR 会让本模块模块级的 _VIEW_SCORES_PARQUET 指向沙箱,
+    # 于是视图找不到、静默走兜底, 连"截面缺失"这个拒绝条件都不会被触发。
+    if as_of and not os.path.isfile(_VIEW_SCORES_PARQUET):
+        raise SectionUnavailable(
+            f"要求显式截面 {as_of}, 但 views parquet 不可读: {_VIEW_SCORES_PARQUET}"
+            f" —— 无法确认该截面存在, 拒绝回退到降级精简版")
     if os.path.isfile(_VIEW_SCORES_PARQUET):
         v = pd.read_parquet(_VIEW_SCORES_PARQUET,
                             columns=["canon", "date", "f_signal", "f_trend", "f_govern",
                                      "f_liquidity", "f_vol", "f_mom_rev"])
         if v is not None and len(v):
             v["date"] = v["date"].astype(str)
-            vmax = v["date"].max()          # ← 等价于 legacy 的 (SELECT MAX(date) ...)
+            if as_of:
+                # [2026-09-20] **显式截面日期**（回补用）。原实现隐式取 MAX(date) ——
+                # 那是"碰巧正确"而非契约: 今天 views 的 MAX=2026-09-07, 故对 0907 恰好对,
+                # 但对 0908 会取到 0907 的**陈旧截面**而毫无提示。
+                # 显式指定时若该日不存在, **必须响亮失败**, 不得静默回退到别的截面
+                # （否则又是"看起来产出了、实际不是那一天"的静默降级)。
+                want = str(as_of).replace("-", "")
+                want_dash = f"{want[:4]}-{want[4:6]}-{want[6:]}"
+                if want_dash not in set(v["date"]) and want not in set(v["date"]):
+                    raise SectionUnavailable(
+                        f"views 中不存在 {want_dash} 的截面（可用范围 "
+                        f"{v['date'].min()}..{v['date'].max()}）"
+                        f"; 拒绝静默改用其它截面")
+                vmax = want_dash if want_dash in set(v["date"]) else want
+            else:
+                vmax = v["date"].max()      # ← 等价于 legacy 的 (SELECT MAX(date) ...)
             v = v[v["date"] == vmax].copy()
             v["canon"] = v["canon"].astype(str)
 
@@ -1712,7 +1745,9 @@ def _load_plan_frame():
 
 def _build_target_plan(day: str, day_dir: str,
                        final_weights: dict[str, float],
-                       top_n: int = MAX_STOCKS) -> dict:
+                       top_n: int = MAX_STOCKS,
+                       as_of: "str | None" = None,
+                       source: "str | None" = None) -> dict:
     """读 v_universe_snapshot, 用 DRL final_weights 重打分, 写 target_plan.json.
 
     v_universe_snapshot 由 build_factor_views.py 物化, 含 canon / composite_score /
@@ -1760,7 +1795,7 @@ def _build_target_plan(day: str, day_dir: str,
     # 以 `os.path.exists(DUCKDB_PATH)` 前置判断直接返回『DuckDB 不存在』
     # ⇒ 自那日起**不再产出 target_plan.json**（登记册 `P0-DRLSRC`）。现改为读 h5i。
     try:
-        df, plan_src = _load_plan_frame()
+        df, plan_src = _load_plan_frame(as_of=as_of)
     except Exception as e:  # noqa: BLE001
         res["error"] = f"h5i 取数失败: {type(e).__name__}: {str(e)[:200]}"
         return res
@@ -1771,6 +1806,13 @@ def _build_target_plan(day: str, day_dir: str,
 
     res["universe_size"] = int(len(df))
     res["source"] = plan_src
+    # 留痕: 实际用的是哪一天的截面（主路径=views 的 vmax; 兜底路径=daily_bars 最新日）。
+    try:
+        res["section_as_of"] = (str(df["date"].iloc[0])
+                                if df is not None and "date" in df.columns and len(df)
+                                else None)
+    except Exception:  # noqa: BLE001
+        res["section_as_of"] = None
 
 
     # 用 DRL final_weights 重打分
@@ -1807,7 +1849,14 @@ def _build_target_plan(day: str, day_dir: str,
         "universe_size": res["universe_size"],
         "top_n": items,
         "note": "盘中 realtime_engine 优先消费此文件; 缺失时回退 selection.json",
+        # [2026-09-20] 留痕"这条 plan 是怎么来的": 截面日期 + 数据来源 + 是否回补。
+        # 回补产物必须能与"当时真的产出了"区分开(用户要求标 source=backfill 且不纳入 OOS)。
+        "section_as_of": res.get("section_as_of"),
+        "source": source or res.get("source"),
     }
+    if source:
+        payload["is_backfill"] = True
+        payload["oos_eligible"] = False   # 用户要求: 回补产物**不纳入 OOS 的 n 计数**
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     _log(f"DRL target_plan 已生成: {out_path} (top_n={len(items)}, universe={res['universe_size']})")
