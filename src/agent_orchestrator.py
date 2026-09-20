@@ -115,7 +115,15 @@ def post_market_analysis(day: str | None = None,
     if use_llm:
         try:
             from llm_commentary import run_llm_commentary
-            commentary = run_llm_commentary(day, day)
+            # [2026-09-20 修复] 原为 `run_llm_commentary(day, day)` —— 第二个参数是
+            # **day_dir**（无横线的 YYYYMMDD，见 llm_commentary.run_llm_commentary 签名）。
+            # 传带横线的 day 会让心跳与产物落到 `data/daily/2026-09-03/` 这类**非规范目录**；
+            # 而 `premarket_healthcheck` 是按 `<最新日期目录>/<component>_heartbeat.json`
+            # 读心跳的 ⇒ llm_commentary 的心跳**永远被健康检查漏掉**（实测生产里已因此
+            # 留下 4 个游离目录: 2026-09-03 / 09-04 / 09-07 / 09-08，各只含一个心跳文件）。
+            # 同项目其它调用点（如 run_daily.py）传的都是 day_dir，此处与之对齐。
+            _day_dir = day.replace("-", "")
+            commentary = run_llm_commentary(day, _day_dir)
             results["commentary"] = {"ok": commentary is not None and "error" not in str(commentary)}
         except Exception:
             _LOG.warning("LLM 点评失败: %s", traceback.format_exc())

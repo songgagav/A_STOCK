@@ -7,6 +7,7 @@
     "partial": "部分修复/部分解除",
     "open": "待修",
     "decision": "待决策",
+    "dropped": "已评估·不采纳（结论保留作历史证据，不再推进）",
     "deferred": "搁置",
     "accepted": "已接受风险"
   },
@@ -302,20 +303,38 @@
     {
       "id": "P2-STRAYDIR",
       "level": "P2",
-      "title": "生产 data/daily/ 下存在游离目录 day/（day 字面量为 --day）—— 会污染任何按日期 glob 的统计",
-      "status": "open",
+      "title": "data/daily/ 下**两类**非规范目录（day/ 与带横线日期）已隔离 —— 并查明带横线那类的真实根因",
+      "status": "fixed",
       "detail": "实测发现 `data/daily/day/daily_summary.json`：其 `day` 字段是**字面量 `--day`**、`summary.equity=100000.0` —— 属某次脚本调用把 CLI 占位符当成日期参数落下的**游离产物**（不是合法交易日分区）。\n\n**危害是可量化的**（不是理论担忧）：`src/drl_post.py` 初版按 `data/daily/*/daily_summary.json` glob，把它收了进来，实测把滚动窗口数值从\n· 正确（`to=20260908`, n=12）：return **0.132756%**、sharpe **0.529669**\n· 被污染（`to=day`, n=13）：return **0.832422%**、sharpe **2.687009**\n—— **收益高估约 6 倍、夏普高估约 5 倍**。任何按日期通配 `data/daily/*/` 的统计都有同样风险。\n\n**已做的处置**：`drl_post.py` 的读数改为**以目录名为准且必须是 8 位数字**，非日期分区一律跳过（`_daily_rows` 与 `_plan_topn` 都是），并由 `TestStrayDirDefence` 两条用例锁定（含『注入游离目录后数值不得改变』）。\n\n**未做的处置**：**没有删除**该目录 —— 它位于生产 data/ 之下，删除生产数据需用户确认（同理也不擅自移动）。登记在册以待处置。",
       "evidence": "data/daily/day/daily_summary.json 实测 day=--day / equity=100000.0；src/drl_post.py 过滤逻辑与注释；tests/test_drl_post.py::TestStrayDirDefence",
-      "next": "二选一由用户决定：(a) 删除该游离目录（低风险，但属生产数据变更）；(b) 保留但在全仓排查其它脚本是否也有同类『按 * glob 不校验日期』的读取方"
+      "next": "**【2026-09-20 已按用户规则处置完毕】** 用户给出的判据：无代码按名引用则删除；**若有引用则改为『重命名 + 保留一个版本周期』**。\n\n**引用范围核查（实测）**：① 全仓**没有任何代码按名引用** `data/daily/day/`（唯一提及是 `src/drl_post.py` 的缺陷说明与 `tests/test_drl_post.py` 的断言）；② **但**有多处按 `DAILY_DIR/*` 通配枚举：`backtest_engine.py:292`（有 `x.isdigit()` 防护 ✅）、`dashboard.py:1025`（硬编码跳过 `\"day\"` ◐）、`health_check.py:390`（硬编码 `d != \"day\"` ◐），另有 `backtest_engine.py:76` / `dashboard.py:231` / `ic_track.py:188` / `paper_book.py:728` / `performance_report.py:90` / `realtime_engine.py:391` **完全没有日期校验**。⇒ 属『有引用』，故**不删除**。\n\n**处置**：`data/daily/day/` -> `data/_quarantine/daily_day_20260824/`（1.04MB, 5 文件, **原样保留**）。\n**为什么用『移出 daily/』而不是『原地改名』**：改名无效 —— `DAILY_DIR/*` 的 `*` 照样匹配新名字，`listdir` 也照样枚举。只有移出 `daily/` 才能一次性让**全部 9 处**枚举都不再看到它。\n**顺带查明的第二类**：移动后立刻发现 `data/daily/` 下还有 4 个**带横线**的目录（`2026-09-03/04/07/08`），各只含一个 `llm_commentary_heartbeat.json`。根因已定位并修复，见 `P1-LLMHB`。这 4 个同样隔离到 `data/_quarantine/hyphen_2026MMDD/`。\n**结果**：`data/daily/` 现在**只剩 8 位日期目录**（15 个），已实测校验。\n**遗留**：那 6 处无日期校验的通配枚举本身就是隐患（任何未来的游离目录都会再次污染统计）⇒ 另立 `P2-DAYGLOB`。"
     },
     {
       "id": "DEC-H5IDIRECT",
       "level": "决策",
-      "title": "（b）py3.14 直读 h5i 段文件：可行，但 h5i 的 checksum **无法在 py3.14 侧复算** —— 需用户确认是否接受该局限",
-      "status": "decision",
+      "title": "（b）py3.14 直读 h5i 段文件 —— **已解决·不采纳**（.venv310 已解决核心问题，不再需要备选优化）",
+      "status": "dropped",
       "detail": "评估报告见 `docs/h5i-direct-read.md`（结论均实测，非推测）。\n\n**布局**（实测）: `data/h5i/market.db` 是**目录**: `FORMAT` / `catalog/tables/<sha256(表名)>.json` / `tables/<uuid>/{HEAD,manifests/<seq>.json,spec/*.json,segments/*.parquet}`。manifest 的 `segments[]` 还带逐列 min/max/null_count/distinct_values 与 `time_range`，可按段跳读。\n\n**版本校验: 可行且能做得比 h5i_db 更严格** —— `FORMAT` 里有 `format_version` / `min_reader_version` / `created_by`（实测 `h5i-db 0.1.6`），`min_reader_version` 正是上游给读者的兼容性闸门；再叠加 `HEAD.format` / `manifest.format` / `spec_revision` / `schema_revision` 与 `HEAD.sequence` 存在性检查，可在格式变更时**响亮拒绝读取**而非读出错误数据。\n\n**校验和: 硬约束（这是本项的决策要点）** —— 实测两项否定证据:\n· 声明值**不是文件 sha256**: `HEAD.manifest_checksum=39421f6f48e5ced7…` 而 manifest 文件 sha256=`505840823cad315f…`；某 segment 声明 `ed81cfb2ee719208b5a202f7…` 而该 parquet 的 sha256=`480948a2fb7e5e4d3bbee7d5…` ⇒ **均不一致**。唯一对得上的是 `bytes`（3354556 == 3354556）。\n· 算法**不在 Python 层**: 在 h5i_db 安装目录检索 `checksum`/`hashlib`/`sha256` 只命中 `backtest*.py` 里与库格式无关的自用哈希；manifest/segment/HEAD/catalog 的 checksum 计算全在**原生扩展 `_native.pyd`**（仅 CPython 3.10）内 ⇒ py3.14 侧读不到算法。\n\n**因此 py3.14 侧能做的**: 版本闸门；`bytes`（声明 vs 文件大小）与 `rows`（各段之和 vs manifest）交叉校验；manifest 链**声明间**自洽（child.parent_checksum vs parent 自报值，递推至 parent=None）；逐段 time_range 跳读。**不能做的**: 独立复算声明 checksum，从而**无法证明段字节未被篡改**。\n**建议的替代方案（TOFU）**: 首次成功读取时用我们自己的 sha256 登记 sidecar 台账（segment_id/rows/size/sha256），此后按 size+rows+sha256 校验；**只能在首次读取之后**检测篡改与截断，且必须显式记录『首次登记』而非静默信任。开销分级: 每次运行只做版本+size/rows 交叉校验（不读内容）；深度 sha256 仅在首次登记/显式 --deep-verify/size 或 mtime 变化时做（daily_bars 单表 129 段 ~459MB）。",
       "evidence": "docs/h5i-direct-read.md（布局/版本字段/checksum 实测否定证据/TOFU 方案/风险表）；实测数据见 detail",
-      "next": "**需用户决策**：(1) 接受『校验强度达不到 h5i_db 权威级、只能 TOFU』这一局限 -> 按 docs/h5i-direct-read.md 实施；(2) 不接受 -> 本路径不满足要求，回到 P0-DRLDEP 的 (a) 或 (c)"
+      "next": "**【2026-09-20 用户决定：不采纳，正式关闭】** 理由（用户给出）：`.venv310` 解决了核心问题后，(b) 从『唯一出路』降级为『备选优化』；必要性=已不需要 / 风险=依赖内部布局且只能 TOFU 校验 / 维护成本=需跟随 h5i 升级同步 —— 当前没有理由为备选优化承担这些。\n⇒ 评估文档 **原样保留**（`docs/h5i-direct-read.md`）作历史证据，防止未来重新讨论；其中实测结论（声明 checksum 不是文件 sha256、算法在 3.10-only 原生扩展内、故 py3.14 侧无法复算）仍然有效且可复核。若将来 h5i 升级导致 `.venv310` 路线失效，本项可作为**已做过前置调研**的起点重新评估。"
+    },
+    {
+      "id": "P1-LLMHB",
+      "level": "P1",
+      "title": "llm_commentary 心跳写到带横线的非规范目录 ⇒ 盘前健康检查看不到它 —— 已修",
+      "status": "fixed",
+      "detail": "**发现路径**：处置 `P2-STRAYDIR` 时移动 `daily/day/` 后复检，发现 `data/daily/` 下还有 4 个带横线目录（`2026-09-03` / `09-04` / `09-07` / `09-08`），每个**只含**一个 `llm_commentary_heartbeat.json`（443 B）。\n\n**根因**：`src/agent_orchestrator.py:118` 原为 `run_llm_commentary(day, day)` —— 而该函数签名是 `run_llm_commentary(day: str, day_dir: str)`，第二参数**必须是**无横线的 `YYYYMMDD`，且它同时用于心跳与产物落盘（`llm_commentary.py:417` `Heartbeat(os.path.join(DATA_DIR, \"daily\", day_dir), ...)`、`:482` `out_dir = os.path.join(DATA_DIR, \"daily\", day_dir)`）。传带横线的 `day` ⇒ 心跳落到 `data/daily/2026-09-03/`。\n**后果（非仅仅多几个目录）**：`premarket_healthcheck.py:799-815` 的心跳检查是按 `<base_dir>/<最新日期目录>/<component>_heartbeat.json` 读取并做三态判定的 ⇒ **llm_commentary 的心跳永远被健康检查漏掉**（它只会去找 8 位目录）。即一处监控盲区。\n**为何其它调用点没出问题**：`llm_commentary.__main__`（`:575-576`）与 `run_daily.py` 传的都是 `day_dir`，与此处对齐即修复。\n**修复**：`agent_orchestrator.post_market_analysis` 内新增 `_day_dir = day.replace(\"-\", \"\")` 并以 `run_llm_commentary(day, _day_dir)` 调用，附注释说明原因。由 `tests/test_interp_parity_helpers.py::TestOrchestratorDayDirFix` 锁定（断言**调用行**，不断言裸子串 —— 修复说明的注释里也含旧写法，裸子串会误命中）。\n**同时**：那 4 个已产生的带横线目录隔离到 `data/_quarantine/hyphen_2026MMDD/`（不删除，保留一个版本周期）。",
+      "evidence": "src/agent_orchestrator.py 修复处注释；src/llm_commentary.py:406/417/482 签名与落盘；src/premarket_healthcheck.py:799-815 心跳读取方式；data/_quarantine/hyphen_*；tests/test_interp_parity_helpers.py",
+      "next": "无。观察下一个交易日：`data/daily/<YYYYMMDD>/llm_commentary_heartbeat.json` 应开始出现在**规范目录**内（此前一直缺席）"
+    },
+    {
+      "id": "P2-DAYGLOB",
+      "level": "P2",
+      "title": "多处按 DAILY_DIR/* 通配枚举但**不校验日期** —— 任何非规范目录都会再次污染统计",
+      "status": "open",
+      "detail": "`P2-STRAYDIR` 的处置把现存两类非规范目录清出了 `data/daily/`，但**隐患仍在**：共 9 处枚举 `DAILY_DIR`，其中 2 处用硬编码名字跳过、6 处**完全没有日期校验**。\n\n| 位置 | 模式 | 日期校验 |\n|---|---|---|\n| `backtest_engine.py:292` | `listdir` | ✅ 有 `x.isdigit()` |\n| `dashboard.py:1025` | `glob(*/daily_summary.json)` | ◐ 硬编码跳过 `\"day\"`（实测注释写『历史误创建的占位目录』）|\n| `health_check.py:390` | `listdir` | ◐ 硬编码 `d != \"day\"` |\n| `backtest_engine.py:76` | `glob(*/)` | ❌ 无 |\n| `dashboard.py:231` | `glob(*/)` | ❌ 无 |\n| `ic_track.py:188` | `listdir` | ❌ 无 |\n| `paper_book.py:728` | `listdir` | ❌ 无 |\n| `performance_report.py:90` | `glob(*)` | ❌ 无 |\n| `realtime_engine.py:391` | `listdir` | ❌ 无 |\n\n**为什么值得修而不是靠『别再产生游离目录』**：本次两类游离目录的产生原因彼此无关（一类是 CLI 占位符 `--day`，一类是调用点传错参数），说明『靠不出错』不可持续；而症状是**静默的统计污染** —— 实测 `data/daily/day/` 一旦被纳入滚动窗口，收益被高估约 6 倍、夏普高估约 5 倍（见 `drl_post` 的回归用例）。\n**建议做法**：在 `config.py`（或 `db.py` 旁的小工具模块）加一个共享迭代器（如 `iter_day_dirs(root)`：只产出 **8 位数字**且是目录的项），把上表 6 处改为调用它；两处硬编码跳过也随之泛化（硬编码只挡得住字面量 `\"day\"`，挡不住 `2026-09-03` 这类）。\n**本轮未做**：属跨 6 个模块的重构，且会触碰 dashboard/回测/绩效统计的取数口径，宜单独成批次（`drl_post` 已在自己的读数里做了正确的 8 位过滤，故本项不影响 DRL 链路）。",
+      "evidence": "各文件行号见上表；污染幅度证据见 tests/test_drl_post.py::TestStrayDirDefence 与 drl_post 的注释",
+      "next": "单独批次：加 `iter_day_dirs()` 共享工具 + 改上述 6 处 + 两处硬编码泛化；每处配一条『非规范目录必须被忽略』的用例"
     },
     {
       "id": "P0-DRLDEP",
