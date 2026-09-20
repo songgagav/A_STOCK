@@ -18,3 +18,13 @@ prometheus_client>=0.20
 flower>=2.0
 psutil>=6.0
 requests>=2.32
+# --- 主数据源 h5i 的依赖（**仅 CPython 3.10 可装**）---
+# h5i_db 的原生扩展只支持 CPython 3.10（见 README 第 171 行），故**不能**作为本文件的
+# 生效依赖: 本文件面向 .venv314(Python 3.14)，写进去会让整个文件装不上。
+# 但自 m4(2026-09-05) 起 h5i 是**主数据源**，h5i-db 是必需依赖 —— 此前在
+# requirements_314.txt / requirements-dev.txt 中**均无声明**（登记册 P0-DRLDEP）。
+# 需要读写主源数据（含 DRL 的 _load_factor_state / _load_target_plan 取数）时，
+# 请在 **3.10 解释器**里单独安装:
+#     <python3.10> -m pip install "h5i-db>=0.1.6"
+# 注意: DRL 训练还需要 torch/gymnasium/stable-baselines3，且必须与 h5i_db 在**同一个**
+# 解释器里 —— 这就是 P0-DRLDEP 的根因（当前无任何解释器同时具备两者）。
