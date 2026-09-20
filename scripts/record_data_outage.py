@@ -78,17 +78,85 @@ def _d8(s: str) -> str:
     return str(s or "").replace("-", "")
 
 
+def _resolution_reason(lo: str, hi: str) -> str:
+    """**当场探测**恢复状态再写结论（不写死）。
+
+    与 `_akshare_state` 同一条教训: 恢复与否是**环境事实**, 必须现场量。
+    """
+    parts = []
+    try:
+        import h5i_sync
+        parts.append(f"h5i daily_bars MAX(date)={h5i_sync.max_bar_date(force=True)}")
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"h5i 读取失败({type(e).__name__}: {e})")
+    try:
+        import engine_bars_sync as E
+        p = E.engine_available()
+        tag = f"引擎探针 ok={p.get('ok')} day={p.get('day')}"
+        if p.get("error"):
+            tag += f" err={p['error']}"
+        parts.append(tag)
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"引擎探针异常({type(e).__name__}: {e})")
+    return (f"行情数据已恢复: " + "; ".join(parts)
+            + f"; 断供窗口 {lo}..{hi} 已由 src/engine_bars_sync.py 经厂商 SDK 直连补齐"
+            + "（登记册 P1-DATA-STALE / P1-MIRRORDEAD）")
+
+
+def _record_resolution(lo: str, hi: str, apply: bool) -> int:
+    """追加一条『断供已恢复』记录。幂等: 同窗口已有 resolved 记录则跳过。"""
+    import drl_degrade as D
+    lp = D.event_ledger_path()
+    if os.path.isfile(lp):
+        try:
+            with open(lp, encoding="utf-8-sig") as f:
+                for ln in f:
+                    if not ln.strip():
+                        continue
+                    r = json.loads(ln)
+                    if r.get("kind") == "data_outage_resolved" and r.get("window") == [lo, hi]:
+                        print(f"[跳过] 已有同窗口恢复记录 (at={r.get('at')}) —— 幂等")
+                        return 0
+        except Exception as e:  # noqa: BLE001
+            print(f"  [警告] 读取既有账本失败, 按未记录处理: {type(e).__name__}: {e}")
+
+    reason = _resolution_reason(lo, hi)
+    print("=" * 78)
+    print("记录『行情断供已恢复』")
+    print("=" * 78)
+    print(f"  窗口   : {lo}..{hi}")
+    print(f"  原因   : {reason}")
+    if not apply:
+        print("\n(--预演: 未写账本; 加 --apply 落盘)")
+        return 0
+    rec = D.record_event(
+        D.LEVEL_OK, reason,
+        "恢复常规产出: 后续 target_plan 由引擎直连数据生成, 不再有断供豁免",
+        hi, extra={"kind": "data_outage_resolved", "model_degrade": False,
+                   "window": [lo, hi],
+                   "source": "engine_bars_sync (stockdb.exe SDK 直连)",
+                   "ref": "登记册 P1-DATA-STALE / P1-MIRRORDEAD / P1-ENGINEDEP"})
+    print(f"\n[已记录] at={rec.get('at')} level={rec.get('level')} kind=resolved")
+    print(f"  账本现有事件数: {D.event_count()}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="d_from", required=True, help="断供起 YYYY-MM-DD")
     ap.add_argument("--to", dest="d_to", required=True, help="断供止 YYYY-MM-DD（含）")
     ap.add_argument("--apply", action="store_true", help="真正写账本（默认预演）")
+    ap.add_argument("--resolve", action="store_true",
+                    help="改记『断供已恢复』（幂等; 恢复后应记这条, 以便 last_event 不再停留在断供态）")
     args = ap.parse_args()
 
     lo, hi = _d8(args.d_from), _d8(args.d_to)
     if not (lo.isdigit() and hi.isdigit() and len(lo) == 8 and len(hi) == 8 and lo <= hi):
         print("[FAIL] 日期区间非法")
         return 1
+
+    if args.resolve:
+        return _record_resolution(lo, hi, apply=args.apply)
 
     import config
     import drl_degrade as D

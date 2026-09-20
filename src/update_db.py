@@ -376,21 +376,36 @@ def sync_daily_bars(con, day: dt.date, start_symbol: str | None = None,
     import akshare as ak  # noqa: F401
 
     if use_fast_path and start_symbol is None and end_symbol is None:
-        fast_start = (day - dt.timedelta(days=10)).isoformat()
+        # [2026-09-21 换源, 用户决策 A] 主源改为**厂商引擎 SDK 直连**(engine_bars_sync):
+        #   旧镜像 kline_parts 自 2026-09-04 冻结、其生成器在本机失踪, 且厂商文档从未承认
+        #   该产物(登记册 P1-MIRRORDEAD)。镜像降级为**回退路径**。
+        _engine_ok = False
         try:
-            from free_stockdb_sync import sync_incremental
+            from engine_bars_sync import sync_to_latest
+            _er = sync_to_latest(apply=True)
+            _engine_ok = bool(_er.get("ok"))
+            _log(f"  快路径[引擎直连主源] used={_er.get('used')} appended={_er.get('appended')} "
+                 f"h5i {_er.get('h5i_max_before')}->{_er.get('h5i_max_after')} "
+                 f"days={len(_er.get('planned_days') or [])} err={_er.get('errors')}")
         except Exception as e:  # noqa: BLE001
-            _log(f"  free_stockdb_sync 导入失败, 走纯 AKShare 兜底: {e}")
-        else:
+            _log(f"  引擎直连主源不可用({type(e).__name__}: {e}), 回退镜像 kline_parts")
+
+        if not _engine_ok:
+            fast_start = (day - dt.timedelta(days=10)).isoformat()
             try:
-                r = sync_incremental(max_workers=8, since_date=fast_start,
-                                     progress_every=2000)
-                _log(f"  快路径[镜像主源] scanned={r.get('scanned')} "
-                     f"new_rows={r.get('new_rows')} syms={r.get('symbols_with_data')} "
-                     f"max_new={r.get('max_new_date')} elapse={r.get('elapsed_seconds')}s")
+                from free_stockdb_sync import sync_incremental
             except Exception as e:  # noqa: BLE001
-                _log(f"  镜像主源异常, 走 AKShare 兜底: {type(e).__name__}: {e}")
-        # 快路径走独立连接写库; 此处重读 existing, 使 AKShare 仅补镜像未覆盖的 symbol
+                _log(f"  free_stockdb_sync 导入失败, 走纯 AKShare 兜底: {e}")
+            else:
+                try:
+                    r = sync_incremental(max_workers=8, since_date=fast_start,
+                                         progress_every=2000)
+                    _log(f"  快路径[镜像回退] scanned={r.get('scanned')} "
+                         f"new_rows={r.get('new_rows')} syms={r.get('symbols_with_data')} "
+                         f"max_new={r.get('max_new_date')} elapse={r.get('elapsed_seconds')}s")
+                except Exception as e:  # noqa: BLE001
+                    _log(f"  镜像回退源异常, 走 AKShare 兜底: {type(e).__name__}: {e}")
+        # 快路径走独立连接写库; 此处重读 existing, 使 AKShare 仅补主源未覆盖的 symbol
         # (避免同一日期的重复拉取, 兼作主源覆盖率兜底)。
 
     syms = _list_active_symbols(con, start=start_symbol, end=end_symbol)

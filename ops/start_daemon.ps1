@@ -33,6 +33,10 @@ param(
   # 未设置时回退 <repo>/data/stockdb —— 而该路径**不存在**, 真实湖在 E:\A_stockDB。
   # 后果是**静默**的(scanned=0, 看起来只是今天没数据), 故在此显式钉住并打印校验结果。
   [string]$StockdbRoot = '',
+  # [2026-09-21 引擎闸门] SDK 直连(stockdb.exe)已成为新的生产摄入主路径。它是个
+  # **要人手双击启动**的常驻服务 —— 机器重启/被关掉时, run_daily 会静默摄入 0 行,
+  # 看起来又只是"今天没数据"。故此处当闸门用: 探针不通过即拒绝启动(exit 4)。
+  [switch]$AllowStaleEngine,
   [switch]$CheckOnly
 )
 
@@ -118,6 +122,60 @@ if ($nparts -eq 0) {
   exit 3
 }
 Write-Host "  (已导出到子进程环境; daemon.py 用 sys.executable 启动 run_daily, 会继承该变量)" -ForegroundColor Green
+
+# ---- 厂商行情引擎（SDK 直连 = 新的生产摄入主路径）----
+# 为什么是闸门而不是提示: stockdb.exe 需要**人工双击启动**, 一旦它没跑,
+# free_stockdb_sync / engine_bars_sync 都会拿不到数据 —— 而症状是"今天没有新数据",
+# 与"今天是节假日"无法从下游区分。这正是 P2-LAKEROOT 的同类病症, 故在此拒绝启动。
+Write-Host "`n[厂商引擎] stockdb.exe @ 127.0.0.1:7899 (SDK 直连主路径)"
+$probeOut = ''
+try {
+  $probeOut = (& $py (Join-Path $RepoRoot 'src\engine_bars_sync.py') --probe 2>&1 | Out-String)
+} catch {
+  $probeOut = "probe exception: $_"
+}
+$probe = $null
+$brace = $probeOut.IndexOf('{')
+if ($brace -ge 0) {
+  try { $probe = $probeOut.Substring($brace) | ConvertFrom-Json } catch { $probe = $null }
+}
+if ($null -eq $probe) {
+  Write-Host "  [拒绝启动] 无法解析引擎探针输出:" -ForegroundColor Red
+  Write-Host "  $probeOut"
+  Write-Host "  请确认: ① stockdb.exe 已双击启动并保持运行; ② STOCKDB_ROOT 指向真实湖(含 pybao)。"
+  exit 4
+}
+if (-not $probe.ok) {
+  Write-Host "  [拒绝启动] 引擎不可用: $($probe.error)" -ForegroundColor Red
+  Write-Host "  怎么办: 双击 E:\A_stockDB\stockdb.exe 启动数据库(它是常驻服务, 请保持运行);"
+  Write-Host "          首次使用需先双击 数据更新.exe 并等到『同步完成』。"
+  Write-Host "          症状识别: 引擎不在时摄入是 0 行, 与『今天没数据』无法区分 —— 故这里直接拒绝。"
+  exit 4
+}
+Write-Host "  引擎正常: 参考股票全历史覆盖到 $($probe.day) (共 $($probe.trading_days) 个交易日)" -ForegroundColor Green
+
+# 新鲜度: 与**本仓已记录的交易日历**比 —— 用可观测值比对, 不拍脑袋定天数阈值。
+$calFp = Join-Path $RepoRoot 'data\trade_calendar.json'
+if (Test-Path $calFp) {
+  try {
+    $cal = Get-Content $calFp -Raw -Encoding UTF8 | ConvertFrom-Json
+    $calLast = ([string]$cal.last).Replace('-', '')
+    $engDay = [string]$probe.day
+    if ($engDay -lt $calLast) {
+      Write-Host "  [告警] 引擎数据($engDay) 落后于本仓交易日历末条($calLast) —— 摄入会滞后。" -ForegroundColor Yellow
+      if (-not $AllowStaleEngine) {
+        Write-Host "  [拒绝启动] 引擎数据落后。若确认要以此状态启动, 显式加 -AllowStaleEngine。" -ForegroundColor Red
+        Write-Host "  说明: 用陈旧数据起服会让台账里出现无法区分于『正常但无新数据』的日子。"
+        exit 4
+      }
+      Write-Host "  [知情继续] 已显式指定 -AllowStaleEngine。" -ForegroundColor Yellow
+    } else {
+      Write-Host "  新鲜度: 引擎($engDay) 不落后于交易日历末条($calLast)。" -ForegroundColor Green
+    }
+  } catch {
+    Write-Host "  [告警] 交易日历读取失败, 跳过新鲜度比对: $_" -ForegroundColor Yellow
+  }
+}
 
 if ($CheckOnly) {
   Write-Host "`n(-CheckOnly: 仅前置检查, 未启动)"

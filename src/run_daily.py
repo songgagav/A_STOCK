@@ -381,30 +381,69 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["db_update"] = {"ok": False, "error": str(e)[:200]}
 
-        # 1.05) free-stockDB 双向增量同步。先消费 parquet；若外部更新器因重定向
-        #        失效，再用已由行情链路推进的 DuckDB daily_bars 反向修复 parquet 水位。
+        # 1.05) 行情增量摄入。**主源 = 厂商引擎 SDK 直连**（2026-09-21 换源, 用户决策 A）;
+        #        离线镜像 kline_parts 自 09-04 冻结、生成器在本机失踪（登记册 P1-MIRRORDEAD）,
+        #        故降级为**回退路径**。切换必须有留痕: 报告里写清用了哪个源、为什么回退 ——
+        #        "两个源"若无记录, 就会变成无人察觉的口径漂移。
+        _eng = None
         try:
-            from free_stockdb_sync import refresh_parquet_from_duckdb, sync_incremental
-            # [2026-09-05] 主源改造: since_date 强制近窗 (而非"仅 > 每只 max(date) 水位"),
-            #   修复"某 symbol 缺 09-01 但已有 09-02 -> 水位跳洞永久漏同步"问题; 近窗重读
-            #   由主键去重, 幂等. 镜像消费快(列裁剪 ~1min), AKShare 仅剩 db_update 内兜底.
-            _recent = (datetime.now() - timedelta(days=12)).strftime("%Y-%m-%d")
-            sync = sync_incremental(max_workers=8, since_date=_recent,
-                                    progress_every=2000)
-            parquet_refresh = refresh_parquet_from_duckdb()
-            report["steps"]["free_stockdb_sync"] = {
-                "ok": sync.get("ok"),
-                "scanned": sync.get("scanned"),
-                "new_rows": sync.get("new_rows"),
-                "symbols_with_data": sync.get("symbols_with_data"),
-                "min_new_date": sync.get("min_new_date"),
-                "max_new_date": sync.get("max_new_date"),
-                "elapsed_seconds": sync.get("elapsed_seconds"),
-                "parquet_refresh": parquet_refresh,
-                "note": sync.get("note") or "盘后双向同步 free_stockdb <-> daily_bars",
+            from engine_bars_sync import sync_to_latest
+            _eng = sync_to_latest(apply=True)
+            report["steps"]["engine_bars_sync"] = {
+                "ok": _eng.get("ok"),
+                "used": _eng.get("used"),
+                "h5i_max_before": _eng.get("h5i_max_before"),
+                "h5i_max_after": _eng.get("h5i_max_after"),
+                "engine_last_day": _eng.get("engine_last_day"),
+                "appended": _eng.get("appended"),
+                "planned_days": _eng.get("planned_days"),
+                "missing_trading_days": _eng.get("missing_trading_days"),
+                "truncated_days": _eng.get("truncated_days"),
+                "errors": _eng.get("errors"),
+                "note": "厂商引擎 SDK 直连(stockdb.exe @127.0.0.1:7899) 主源",
             }
-        except Exception as e:
-            report["steps"]["free_stockdb_sync"] = {"ok": False, "error": str(e)[:200]}
+        except Exception as e:  # noqa: BLE001
+            report["steps"]["engine_bars_sync"] = {"ok": False, "error": str(e)[:300]}
+
+        if isinstance(_eng, dict) and _eng.get("ok"):
+            # 主源成功: 不再跑镜像 —— 它已冻结, 跑它只会 scanned=0 白等约 1 分钟。
+            report["steps"]["free_stockdb_sync"] = {
+                "ok": True, "skipped": True,
+                "note": "已由 engine_bars_sync(主源) 完成; 镜像路径跳过 —— kline_parts 自 "
+                        "2026-09-04 冻结且生成器失踪(登记册 P1-MIRRORDEAD)",
+            }
+        else:
+            # 回退镜像: 必须先记录**为什么**回退
+            _why = "engine_bars_sync 未成功"
+            if isinstance(_eng, dict):
+                _why = (_eng.get("error")
+                        or ", ".join(_eng.get("errors") or [])
+                        or _why)
+            else:
+                _why = (report["steps"].get("engine_bars_sync") or {}).get("error") or _why
+            try:
+                from free_stockdb_sync import refresh_parquet_from_duckdb, sync_incremental
+                # [2026-09-05 既有修复, 保留] since_date 强制近窗, 覆盖"水位线跳洞"问题。
+                _recent = (datetime.now() - timedelta(days=12)).strftime("%Y-%m-%d")
+                sync = sync_incremental(max_workers=8, since_date=_recent,
+                                        progress_every=2000)
+                parquet_refresh = refresh_parquet_from_duckdb()
+                report["steps"]["free_stockdb_sync"] = {
+                    "ok": sync.get("ok"),
+                    "fallback": True,
+                    "fallback_reason": _why,
+                    "scanned": sync.get("scanned"),
+                    "new_rows": sync.get("new_rows"),
+                    "symbols_with_data": sync.get("symbols_with_data"),
+                    "min_new_date": sync.get("min_new_date"),
+                    "max_new_date": sync.get("max_new_date"),
+                    "elapsed_seconds": sync.get("elapsed_seconds"),
+                    "parquet_refresh": parquet_refresh,
+                    "note": sync.get("note") or "回退源: 镜像 kline_parts (free_stockdb <-> daily_bars)",
+                }
+            except Exception as e:  # noqa: BLE001
+                report["steps"]["free_stockdb_sync"] = {"ok": False, "fallback": True,
+                                                        "error": str(e)[:200]}
 
         # 1.055) change_pct 历史回填: 增量同步后, 扫描 daily_bars 把 change_pct IS NULL
         #        且前一日 close 在 DuckDB 中可得的行, 用 (cur-prev)/prev*100 重算.
