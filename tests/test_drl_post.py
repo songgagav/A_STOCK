@@ -20,6 +20,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import pytest
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -179,12 +180,137 @@ class TestMethod1Discipline:
         un = rec["unavailable"]
         assert un["new_vs_old"]["available"] is False
         assert len(un["new_vs_old"]["reason"]) > 20
-        assert un["validation_set"]["available"] is False
-        assert "验证集" in un["validation_set"]["reason"]
+        # 切分口径已定义 -> 不再属于"不可用", 而是随记录一起落盘的口径说明
+        assert "validation_set" not in un, "验证集切分口径已定义, 不应再标为不可用"
+        assert rec["validation_split"]["method"] == "temporal_holdout_tail"
+        assert "噪声" in rec["validation_split"]["limitation"]
 
     def test_params_drift_points_to_drl7(self, tmp_path):
         rec = P.summarize("2026-09-20")
         assert "drl_weight_drift" in rec["params_drift"]["see"]
+
+
+class TestValidationSplit:
+    def test_scored_range_matches_env_steps(self):
+        """评分区间必须与 FactorWeightEnv 可评步一致: t ∈ [lookback, n-1]。"""
+        sp = P.split_validation(45, lookback=10, val_days=5)
+        assert sp["scored"] == list(range(10, 45))
+        assert sp["val"] == [40, 41, 42, 43, 44]
+        assert sp["train"] == list(range(10, 40))
+
+    def test_no_shuffle_keeps_temporal_order(self):
+        sp = P.split_validation(30, lookback=5, val_days=3)
+        assert sp["train"] == sorted(sp["train"])
+        assert sp["val"] == sorted(sp["val"])
+        assert max(sp["train"]) < min(sp["val"]), "训练段必须全部早于验证段"
+
+    def test_insufficient_data_leaves_val_empty_with_note(self):
+        sp = P.split_validation(12, lookback=10, val_days=5)
+        assert sp["val"] == []
+        assert any("不足" in n for n in sp["notes"])
+
+    def test_zero_val_days(self):
+        sp = P.split_validation(45, lookback=10, val_days=0)
+        assert sp["val"] == []
+
+
+class TestScoreWeights:
+    def test_base_weights_score_exactly_zero(self):
+        """自洽性检查: 奖励式是 (w·ic − base·ic)·…, 故 w==base 时恒为 0。"""
+        ic = np.random.RandomState(1).randn(30, 6) * 0.05
+        base = np.ones(6) / 6
+        s = P.score_weights(ic, base, base, [12, 15, 20])
+        assert s["n"] == 3 and s["mean"] == 0.0 and s["std"] == 0.0
+
+    def test_matches_env_formula_on_one_day(self):
+        """逐字复核 env 的式子: (w·ic[t] − base·ic[t])·10/(1+ic_vol·10)。"""
+        ic = np.random.RandomState(2).randn(40, 6) * 0.05
+        base, w = np.ones(6) / 6, np.array([0.5, 0.1, 0.1, 0.1, 0.1, 0.1])
+        t = 25
+        win = ic[max(0, t - 20):t]
+        vol = max(0.001, float(np.std(win)))
+        expect = (float(np.dot(w, ic[t])) - float(np.dot(base, ic[t]))) * 10.0 / (1 + vol * 10)
+        assert P.score_weights(ic, base, w, [t])["mean"] == pytest.approx(expect, abs=1e-9)
+
+    def test_empty_index_gives_none(self):
+        ic = np.zeros((5, 6))
+        s = P.score_weights(ic, np.ones(6) / 6, np.ones(6) / 6, [])
+        assert s["n"] == 0 and s["mean"] is None
+
+    def test_out_of_range_index_skipped(self):
+        ic = np.zeros((5, 6))
+        assert P.score_weights(ic, np.ones(6) / 6, np.ones(6) / 6, [99, -1])["n"] == 0
+
+
+class TestValidationCompare:
+    def _ic(self, n=45, seed=0):
+        return np.random.RandomState(seed).randn(n, 6) * 0.05
+
+    def test_delta_is_new_minus_old(self):
+        ic = self._ic()
+        base = np.ones(6) / 6
+        new, old = np.array([0.5, .1, .1, .1, .1, .1]), np.array([.1, .5, .1, .1, .1, .1])
+        v = P.validation_compare(ic, base, new, old, lookback=10, val_days=5)
+        assert v["delta_new_minus_old"] == pytest.approx(v["new"]["mean"] - v["old"]["mean"],
+                                                        abs=1e-9)
+        assert v["n_train"] == 30 and v["val_days"] == 5
+        assert v["val_index"] == (40, 44)
+
+    def test_no_old_weights_yields_none_delta_with_note(self):
+        v = P.validation_compare(self._ic(), np.ones(6) / 6, np.ones(6) / 6, None)
+        assert v["old"] is None and v["delta_new_minus_old"] is None
+        assert any("未提供上一版" in n for n in v["notes"])
+
+    def test_split_spec_is_recorded(self):
+        v = P.validation_compare(self._ic(), np.ones(6) / 6, np.ones(6) / 6)
+        assert v["split"]["method"] == "temporal_holdout_tail"
+        assert "shuffle" in v["split"]["desc"]
+        assert "噪声" in v["split"]["limitation"]
+
+    def test_no_boolean_verdict(self):
+        v = P.validation_compare(self._ic(), np.ones(6) / 6,
+                                 np.array([.5, .1, .1, .1, .1, .1]))
+        txt = json.dumps(v, ensure_ascii=False)
+        for bad in ("passed", "should_deploy", "ok_model", "\"better\""):
+            assert bad not in txt
+        assert v["threshold_applied"] is False
+
+    def test_insufficient_data_is_explicit(self):
+        v = P.validation_compare(np.zeros((12, 6)), np.ones(6) / 6, np.ones(6) / 6)
+        assert v["new"]["n"] == 0
+        assert any("验证段为空" in n for n in v["notes"])
+
+
+class TestValidationFromTrainMeta:
+    def test_reads_post_train_validation(self, tmp_path):
+        import config as _c
+        d = os.path.join(str(tmp_path), "drl", "20260905")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "train_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"day": "2026-09-05",
+                       "post_train_validation": {"val_days": 5, "delta_new_minus_old": 0.1}}, f)
+        v = P.validation_from_train_meta("2026-09-05")
+        assert v == {"val_days": 5, "delta_new_minus_old": 0.1}
+
+    def test_missing_or_bad_day_returns_none(self, tmp_path):
+        assert P.validation_from_train_meta("2026-09-06") is None
+        assert P.validation_from_train_meta(None) is None
+        assert P.validation_from_train_meta("day") is None
+
+    def test_record_picks_it_up_automatically(self, tmp_path):
+        d = os.path.join(str(tmp_path), "drl", "20260905")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "train_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"post_train_validation": {"val_days": 5}}, f)
+        rec = P.record_post_metrics("2026-09-05")
+        assert rec["new_vs_old"] == {"val_days": 5}
+        assert "new_vs_old" not in rec["unavailable"], "已取到就不该再标为不可用"
+
+    def test_record_without_validation_marks_unavailable(self, tmp_path):
+        rec = P.record_post_metrics("2026-09-05")
+        assert rec["new_vs_old"] is None
+        assert rec["unavailable"]["new_vs_old"]["available"] is False
+        assert rec["validation_split"]["method"] == "temporal_holdout_tail"
 
 
 class TestLedger:

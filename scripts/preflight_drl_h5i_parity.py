@@ -268,6 +268,77 @@ def main() -> int:
             mk = s["market"].astype(str).str.lower()
             print(f"  symbols: {len(s)} 行, market 分布={dict(mk.value_counts().head(4))}")
 
+    # ------------------------------------------------------------------
+    # ⑤ DRL-3 学习后验证: 用**真实 h5i 数据** + **真实已落盘模型权重** 算新旧对比
+    # ------------------------------------------------------------------
+    # 说明: 本脚本不 import drl_train（需 torch）, 故此处按 docstring 说明**镜像**
+    # `_load_factor_state` 的 IC 构造块。日/收益序列本身已由第①节气验证过与 legacy 一致;
+    # 且新旧两侧用**同一个** ic, 故即使镜像有偏差, 依然是同口径的相对比较（delta 有效）。
+    print("\n--- ⑤ DRL-3 学习后验证（真实 h5i + 真实模型权重）---")
+    try:
+        sys.path.insert(0, os.path.join(_ROOT, "src"))
+        import drl_post as POST  # noqa: E402
+        import numpy as _np  # noqa: E402
+        _day = samples[-1][0]
+        _dates, _rets = _h5i_dates_and_rets(store, _day)
+        _n = len(_rets)
+        _ic = _np.zeros((_n, 6), dtype=_np.float64)
+        for _t in range(_n):
+            if _t >= 5:
+                _w = _rets[max(0, _t - 19):_t + 1]
+                if len(_w) > 1 and _np.all(_np.isfinite(_w)):
+                    _c = _np.corrcoef(_w, _np.arange(len(_w)))[0, 1]
+                    _ic[_t, 0] = _c if _np.isfinite(_c) else 0.0
+                _ic[_t, 1] = _rets[_t]
+                _ic[_t, 2] = _rets[_t] - _rets[max(0, _t - 5):_t].mean()
+                _ic[_t, 3] = _np.std(_w) if len(_w) > 1 else 0.0
+                _ic[_t, 4] = -_ic[_t, 3]
+                _ic[_t, 5] = -_rets[_t]
+        _ic = _np.where(_np.isfinite(_ic), _ic, 0.0)
+
+        # 取两个真实版本的权重: 最新可用 = new, 次新 = old
+        _wts = []
+        for _d8 in sorted([d for d in os.listdir(os.path.join(data_dir, "drl"))
+                           if d.isdigit() and len(d) == 8], reverse=True):
+            _fp = os.path.join(data_dir, "drl", _d8, "train_meta.json")
+            if not os.path.isfile(_fp):
+                continue
+            try:
+                _m = json.load(open(_fp, encoding="utf-8"))
+            except Exception:
+                continue
+            _fw = _m.get("final_weights")
+            if isinstance(_fw, dict) and _fw:
+                _wts.append((_d8, [float(_fw.get(k, 0.0)) for k in
+                                   ("signal", "trend", "govern", "liquidity",
+                                    "vol", "mom_rev")]))
+            if len(_wts) >= 2:
+                break
+        _base = _np.ones(6) / 6.0
+        if len(_wts) >= 2:
+            (_nd, _nw), (_od, _ow) = _wts[0], _wts[1]
+            _v = POST.validation_compare(_ic, _base, _np.asarray(_nw), _np.asarray(_ow),
+                                         lookback=10, val_days=5)
+            print(f"  真实序列: n={_n} ({_dates[0]}..{_dates[-1]})")
+            print(f"  new={_nd} old={_od}  验证段={_v['val_index']} "
+                  f"({_v['val_days']} 天, 训练段 {_v['n_train']})")
+            print(f"  val_new={_v['new']['mean']}  val_old={_v['old']['mean']}  "
+                  f"delta={_v['delta_new_minus_old']}")
+            _check(_v["new"]["n"] == _v["val_days"] and _v["new"]["n"] > 0,
+                   "新模型在真实验证段上得到分数", f"n={_v['new']['n']}")
+            _check(_v["old"] is not None and _v["old"]["n"] > 0,
+                   "旧模型在同一验证段上得到分数", f"n={( _v['old'] or {}).get('n')}")
+            _check(_v["delta_new_minus_old"] is not None,
+                   "delta_new_minus_old 已算出（**不做任何判定**）",
+                   f"{_v['delta_new_minus_old']}")
+            _check(_v["threshold_applied"] is False and "passed" not in json.dumps(_v),
+                   "只记录数值、无布尔判定（METHOD-1）")
+        else:
+            _check(False, "取到两个真实模型版本以做新旧对比",
+                   f"只找到 {len(_wts)} 个")
+    except Exception as e:  # noqa: BLE001
+        _check(False, "第⑤节可执行", f"{type(e).__name__}: {e}")
+
     fails = [lbl for ok, lbl in _RESULTS if not ok]
     print("\n" + "=" * 78)
     print(f"结论: {'全部一致' if not fails else '有差异'}  "

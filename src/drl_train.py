@@ -1348,6 +1348,33 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         except Exception as e:  # noqa: BLE001
             meta["extreme_weights"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+        # ===== DRL-3 学习后验证: 新旧模型在同一**留出验证段**上的对比 =====
+        # 只记录数值, 不判定（METHOD-1）。放在这里是因为只有训练跑过才有
+        # `env.weights`（新）与上一版模型权重（旧）; 落账本由 run_daily 统一做,
+        # 以免同一天写两条（见 drl_post.validation_from_train_meta 的说明）。
+        try:
+            import drl_post as _post
+            _old_w = None
+            try:
+                _prev = drl_degrade.load_pointer()
+                _pd8 = str(_prev.get("day") or "")
+                if _pd8 and _pd8 != day_dir:
+                    _w = drl_degrade.version_weights(_pd8)
+                    if _w:
+                        _old_w = [float(_w.get(k, 0.0)) for k in SCORE_FACTORS]
+            except Exception:  # noqa: BLE001
+                _old_w = None
+            meta["post_train_validation"] = _post.validation_compare(
+                ic, base_w, np.asarray(env.weights, dtype=np.float64), _old_w,
+                lookback=int(getattr(env, "lookback", 10)))
+            _v = meta["post_train_validation"]
+            _log(f"DRL-3 学习后验证: val_new={(_v['new'] or {}).get('mean')} "
+                 f"val_old={(_v['old'] or {}).get('mean') if _v.get('old') else None} "
+                 f"delta={_v.get('delta_new_minus_old')} (阈值未施加)")
+        except Exception as e:  # noqa: BLE001  绝不影响训练主链路
+            meta["post_train_validation"] = {"ok": False,
+                                            "error": f"{type(e).__name__}: {e}"}
+
         # 二次写盘 (含 target_plan + weight_drift + extreme_weights)
         with open(os.path.join(out_dir, "train_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
