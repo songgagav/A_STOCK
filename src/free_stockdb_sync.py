@@ -42,11 +42,34 @@ import pandas as pd
 _LOG = logging.getLogger("free_stockdb_sync")
 
 def _lake_root() -> str:
-    """本地行情数据根目录 (可移植: 由 STOCKDB_ROOT 环境变量指定)."""
+    """本地行情数据根目录 (可移植: 由 STOCKDB_ROOT 环境变量指定).
+
+    [2026-09-20 加固] 原实现只做"取值", 解析结果**是否真的存在**无人校验 —— 后果是
+    **静默的**: 实测 09-08 的复盘里 `free_stockdb_sync` 只报 `ok=false, scanned=0`
+    和一句 `parquet_refresh.error='kline_parts 无文件'`, 而在 09-05 同一步骤是 `scanned=5548`。
+    也就是说: 主数据摄入路径依赖一个**未文档化、未持久化**的环境变量
+    (`STOCKDB_ROOT`), 一旦丢失(换终端/换任务/重启), 摄入会静默变成 0 行而**看起来只是没数据**。
+    故此处把"解析出的路径不存在"变成**一次响亮的告警**(warn_once 去重打印但不丢计数),
+    让运维一眼看到"是路径配错了", 而不是去猜"为什么今天没有新数据"。
+    """
     _r = os.environ.get("STOCKDB_ROOT", "").strip()
-    if _r:
-        return _r
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "stockdb")
+    src = "env:STOCKDB_ROOT" if _r else "默认(<repo>/data/stockdb)"
+    root = _r or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "data", "stockdb")
+    try:
+        if not os.path.isdir(root):
+            from dataguard import warn_once
+            warn_once("stockdb_root_missing",
+                      f"[WARN] 行情湖根目录不存在: {root} (来源={src}) ⇒ free_stockdb_sync "
+                      f"会扫到 0 个分片而**静默无产出**; 请设置 STOCKDB_ROOT 指向真实湖 "
+                      f"(实测本机在 E:\\A_stockDB), 见登记册 P2-LAKEROOT")
+        elif not os.path.isdir(os.path.join(root, "kline_parts")):
+            from dataguard import warn_once
+            warn_once("stockdb_kline_parts_missing",
+                      f"[WARN] 湖根存在但缺 kline_parts: {root} (来源={src}) ⇒ 同样会无产出")
+    except Exception:  # noqa: BLE001  诊断本身绝不影响主链路
+        pass
+    return root
 
 # 路径配置
 FREE_STOCKDB_DIR = _lake_root()

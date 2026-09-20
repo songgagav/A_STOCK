@@ -1,4 +1,4 @@
-﻿﻿﻿<#
+﻿<#
 .SYNOPSIS
   用**指定解释器**启动生产 daemon（默认 .venv310），并**先做环境前置检查**再启动。
 
@@ -29,6 +29,10 @@
 param(
   [ValidateSet('310', '314')]
   [string]$Interpreter = '310',
+  # [2026-09-20 P2-LAKEROOT] 行情湖根。free_stockdb_sync._lake_root() 读 STOCKDB_ROOT,
+  # 未设置时回退 <repo>/data/stockdb —— 而该路径**不存在**, 真实湖在 E:\A_stockDB。
+  # 后果是**静默**的(scanned=0, 看起来只是今天没数据), 故在此显式钉住并打印校验结果。
+  [string]$StockdbRoot = '',
   [switch]$CheckOnly
 )
 
@@ -86,6 +90,34 @@ if ($p.missing.Count -gt 0) {
 } else {
   Write-Host "`n  四项齐备 —— DRL 训练与 target_plan 生成可用。" -ForegroundColor Green
 }
+
+# ---- 行情湖根（P2-LAKEROOT）：显式设置 STOCKDB_ROOT，并校验它真的有 kline_parts ----
+Write-Host "`n[行情湖] STOCKDB_ROOT"
+$root = $StockdbRoot
+if (-not $root) { $root = $env:STOCKDB_ROOT }
+if (-not $root) {
+  # 实测本机真实湖在 E:\A_stockDB（5548 个 kline_parts 分片）；仓库内默认路径不存在。
+  $guess = 'E:\A_stockDB'
+  if (Test-Path $guess) { $root = $guess }
+}
+if (-not $root) {
+  Write-Host "  [拒绝启动] 未指定行情湖根, 且 E:\A_stockDB 不存在。" -ForegroundColor Red
+  Write-Host "  free_stockdb_sync 若拿不到湖, 会**静默**扫到 0 分片(scanned=0), 看起来只是没数据。"
+  Write-Host "  请显式指定: pwsh -File ops/start_daemon.ps1 -StockdbRoot <湖根>"
+  exit 3
+}
+$env:STOCKDB_ROOT = $root
+$kparts = Join-Path $root 'kline_parts'
+$nparts = 0
+if (Test-Path $kparts) { $nparts = (Get-ChildItem $kparts -Filter '*.parquet' -ErrorAction SilentlyContinue).Count }
+Write-Host "  STOCKDB_ROOT = $root"
+Write-Host "  kline_parts  = $kparts  ($nparts 个分片)"
+if ($nparts -eq 0) {
+  Write-Host "  [拒绝启动] 该湖根下没有 kline_parts 分片 ⇒ 摄入必然是 0 行。" -ForegroundColor Red
+  Write-Host "  请先修复上游（free-stockdb 更新器）再启动; 见登记册 P1-DATA-STALE / P2-LAKEROOT。"
+  exit 3
+}
+Write-Host "  (已导出到子进程环境; daemon.py 用 sys.executable 启动 run_daily, 会继承该变量)" -ForegroundColor Green
 
 if ($CheckOnly) {
   Write-Host "`n(-CheckOnly: 仅前置检查, 未启动)"
