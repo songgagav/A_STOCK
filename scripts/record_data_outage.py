@@ -30,11 +30,48 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
-REASON = ("行情数据断供: 上游 free-stockdb 存储损坏(09-05 17:55 leveldb Corruption/remote "
-          "unavailable) + 更新器停摆 + AKShare 兜底未装 + legacy DuckDB 已退役 "
-          "⇒ h5i daily_bars 无新数据（登记册 P1-DATA-STALE）")
 ACTION = ("**不产出断供期的 target_plan**（避免用陈旧截面伪造日常产物污染台账）; "
           "待上游恢复后按用户第三步流程验证并重启 daemon")
+
+
+def _akshare_state() -> dict:
+    """AKShare 兜底路径的**运行时**可用性。
+
+    [2026-09-20 订正] 原实现把『AKShare 兜底未装』**硬编码**在 REASON 字符串里, 后果是
+    **写入即错**: 本账本 2026-09-20 20:30:58 的那条记录断言"未装", 而 akshare 1.18.88
+    早在 **20:30:08** 就已装入 `.venv310` —— 文本比事实晚了 50 秒, 且此后会**永久**说谎
+    (账本是 append-only, 没人会回头改)。教训与 METHOD-1 同源: 凡"环境事实"都必须**当场探测**,
+    不得写死在字符串常量里。
+    """
+    import importlib.util as u
+    try:
+        spec = u.find_spec("akshare")
+    except Exception as e:  # noqa: BLE001
+        return {"installed": None, "version": None, "interpreter": sys.executable,
+                "probe_error": f"{type(e).__name__}: {e}"}
+    ver = None
+    if spec is not None:
+        try:
+            import akshare as ak
+            ver = getattr(ak, "__version__", None)
+        except Exception:  # noqa: BLE001  装了但导入失败也算"不可用"
+            ver = None
+    return {"installed": bool(spec), "version": ver, "interpreter": sys.executable}
+
+
+def _reason(ak: dict) -> str:
+    """按**探测结果**拼装断供原因, 不预设兜底路径的状态。"""
+    if ak.get("installed") and ak.get("version"):
+        ak_txt = (f"AKShare 兜底**已装**(akshare {ak['version']}, 解释器 {ak['interpreter']})"
+                  f"但**尚未验证能否真正产出** ⇒ 不计入『已恢复』的证据")
+    elif ak.get("installed"):
+        ak_txt = (f"AKShare 兜底**已装但 import 失败**(解释器 {ak['interpreter']}) "
+                  f"⇒ 实际不可用")
+    else:
+        ak_txt = f"AKShare 兜底未装(解释器 {ak['interpreter']} 无 akshare)"
+    return ("行情数据断供: 上游 free-stockdb 存储损坏(09-05 17:55 leveldb Corruption/remote "
+            "unavailable) + 更新器停摆 + " + ak_txt + " + legacy DuckDB 已退役 "
+            "⇒ h5i daily_bars 无新数据（登记册 P1-DATA-STALE）")
 
 
 def _d8(s: str) -> str:
@@ -94,10 +131,22 @@ def main() -> int:
     print(f"  已有 plan（如回补）: {have_plan or '（无）'}")
     print(f"  枚举受限（日历末条 {cal_last} < 窗口止 {hi}）: {enum_limited}")
 
+    # 兜底路径状态**当场探测**（见 _akshare_state 的订正说明）
+    ak = _akshare_state()
+    print(f"\n  --- 兜底路径 AKShare（当场探测, 不写死）---")
+    print(f"    解释器      : {ak.get('interpreter')}")
+    print(f"    已装        : {ak.get('installed')}")
+    print(f"    版本        : {ak.get('version')}")
+    if ak.get("probe_error"):
+        print(f"    探测异常    : {ak['probe_error']}")
+    if ak.get("installed") and ak.get("version"):
+        print("    注: 已装 **不等于** 该路径能产出 —— 需实跑 update_all 验证后才可当作已恢复。")
+
     extra = {"kind": "data_outage", "model_degrade": False,
              "window": [lo, hi], "affected_days": affected,
              "days_with_plan": have_plan, "calendar_last_day": cal_last,
              "enumeration_limited": enum_limited,
+             "akshare": ak,
              "upstream": "free-stockdb (E:\\A_stockDB)",
              "ref": "登记册 P1-DATA-STALE / P2-LAKEROOT"}
 
@@ -121,7 +170,7 @@ def main() -> int:
         print("\n(--预演: 未写账本; 加 --apply 落盘)")
         return 0
 
-    rec = D.record_event(D.LEVEL_FALLBACK, REASON, ACTION, hi, extra=extra)
+    rec = D.record_event(D.LEVEL_FALLBACK, _reason(ak), ACTION, hi, extra=extra)
     print(f"\n[已记录] at={rec.get('at')} level={rec.get('level')} "
           f"severity={rec.get('severity')} kind={rec.get('kind')}")
     print(f"  账本现有事件数: {D.event_count()}")
