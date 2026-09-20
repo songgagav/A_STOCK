@@ -139,10 +139,24 @@ def main() -> int:
         print(f"  n_dates={m.get('n_dates')} total_timesteps={m.get('total_timesteps')} "
               f"final_weights 因子数={len(m.get('final_weights') or {})}")
         tp = m.get("target_plan") or {}
-        print(f"  target_plan: ok={tp.get('ok')} error={tp.get('error')}")
-        _check(tp.get("ok") is not True,
-               "（已知遗留）target_plan 仍未产出 —— `_build_target_plan` 迁移是下一步",
+        print(f"  target_plan: ok={tp.get('ok')} top_n={tp.get('top_n')} "
+              f"universe={tp.get('universe_size')} error={tp.get('error')}")
+        # [2026-09-20 步骤② 完成后翻转] 原为绊线断言『target_plan 仍未产出』;
+        # `_build_target_plan` 迁到 h5i 后必须改为**正向**断言, 否则验收会假通过。
+        _check(tp.get("ok") is True, "target_plan 已产出（h5i 迁移生效）",
                f"error={tp.get('error')}")
+        _check(int(tp.get("top_n") or 0) > 0, "target_plan top_n 非空", f"{tp.get('top_n')}")
+        plan_p = os.path.join(out_dir, "target_plan.json")
+        _check(os.path.isfile(plan_p), "target_plan.json 文件存在")
+        if os.path.isfile(plan_p):
+            with open(plan_p, encoding="utf-8") as f:
+                pl = json.load(f)
+            items = pl.get("top_n") or []
+            _check(len(items) > 0, "target_plan.json top_n 列表非空", f"{len(items)} 项")
+            _check(all("." in str(it.get("canon")) or str(it.get("canon")).isdigit()
+                       for it in items), "canon 形态合法（带后缀或纯 6 位）")
+            _check(int(pl.get("universe_size") or 0) > 0, "候选池非空",
+                   f"universe_size={pl.get('universe_size')}")
 
     if prod:
         print("\n--- ③ 生产状态文件未被改动 ---")

@@ -26,7 +26,10 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import DATA_DIR, DUCKDB_PATH, MAX_STOCKS  # noqa: E402
+from config import DATA_DIR, MAX_STOCKS  # noqa: E402
+# [2026-09-20] 不再 import DUCKDB_PATH: m4 退役后本模块**完全不再读 DuckDB**
+# （登记册 P0-DRLSRC 的两处迁移均已落地）。这是一条可验证的性质:
+# 源码中不得再出现 duckdb / DUCKDB_PATH —— 由 tests/test_drl_factor_state_h5i.py 锁定。
 import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 torch)
 import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
 import drl_metrics  # noqa: E402  (学习中断指标 DRL-2; 轻量模块, 不拖入 torch)
@@ -1567,6 +1570,118 @@ FACTOR_TO_VIEW = {
     "mom_rev": "f_mom_rev",
 }
 
+#: h5i 侧 views 物化目录（build_factor_views.py 产出；dashboard 也读这里）
+_H5I_VIEWS_DIR = os.path.join(DATA_DIR, "h5i", "views")
+_VIEW_SCORES_PARQUET = os.path.join(_H5I_VIEWS_DIR, "v_factor_scores_daily.parquet")
+
+
+def _load_plan_frame():
+    """为 `_build_target_plan` 取候选池截面 —— **h5i 版**（原为 legacy DuckDB）.
+
+    [2026-09-20 迁移] 逐项对齐 legacy SQL 的口径:
+
+    ====================  ==========================================  ====================
+    legacy (DuckDB)       本条 h5i 实现                                说明
+    ====================  ==========================================  ====================
+    `v_factor_scores_daily`  `data/h5i/views/v_factor_scores_daily.parquet`  列名逐一对应
+    `WHERE v.date = MAX(date)`  同（取 parquet 内 `date` 的最大值）        **语义原样保留**
+    `LEFT JOIN daily_bars`  `H5iBarStore.bars_on_day(<max date>)`       键列 `ts` 需 CAST
+    `LEFT JOIN symbols`  `db._h5i_symbols_df()`（含 market/is_active）    现成读取器
+    canon 补后缀 CASE      同（由 `market` 决定 `.SH/.SZ/.BJ`）          未激活则不加后缀
+    `fsd_exists=False` 兜底  保留：视图缺失时用 daily_bars 现算精简版
+    ====================  ==========================================  ====================
+
+    返回 `(df, source)`; `source` 取值 `"h5i_view"` / `"h5i_bars_fallback"`，
+    便于把"实际走了哪条路"记进 `res`（不再静默）。
+
+    **保留的历史语义（勿顺手改）**：`v.date` 取的是**视图内的最新日**，而不是入参 `day`。
+    实测 legacy 遗留产物可佐证该行为的后果 —— `data/drl/20181019/target_plan.json` 里
+    `688836.SH` 的价格是 546.02、`20200630`/`20210210`/`20211231` 同价同 `change_pct`，
+    且 `universe_size` 一律 5205 ⇒ 那些年份的 plan 其实是"**同一个最新截面** × 当日权重"，
+    并非真正的当日截面。这是独立于本次迁移的语义问题，迁移只做等价替换，不擅自改；
+    已在登记册 `P0-DRLSRC` 记录待核对。
+    """
+    # ---- symbols: 纯 6 位 -> canon(带后缀) 的映射 ----
+    sym = None
+    try:
+        from db import _h5i_symbols_df
+        _s = _h5i_symbols_df()
+        if _s is not None and len(_s) and "symbol" in _s.columns and "market" in _s.columns:
+            sym = _s[["symbol", "market"]].copy()
+            if "is_active" in _s.columns:
+                sym = sym[_s["is_active"].astype(bool).to_numpy()]
+            sym["symbol"] = sym["symbol"].astype(str)
+            sym["market"] = sym["market"].astype(str).str.lower()
+    except Exception:  # noqa: BLE001  symbols 缺失不应致命（legacy 同样是可选 JOIN）
+        sym = None
+
+    def _suffix(bare):
+        """复刻 legacy 的 CASE：按 market 补 .SH/.SZ/.BJ，未知则原样返回。"""
+        if sym is None:
+            return bare.astype(str)
+        m = dict(zip(sym["symbol"].tolist(), sym["market"].tolist()))
+        mk = bare.astype(str).map(m)
+        out = bare.astype(str)
+        for tag in ("sh", "sz", "bj"):
+            hit = (mk == tag).to_numpy()
+            if hit.any():
+                out = out.mask(hit, out[hit] + "." + tag.upper())
+        return out
+
+    # ---- 主路: views parquet（= legacy 的 v_factor_scores_daily）----
+    if os.path.isfile(_VIEW_SCORES_PARQUET):
+        v = pd.read_parquet(_VIEW_SCORES_PARQUET,
+                            columns=["canon", "date", "f_signal", "f_trend", "f_govern",
+                                     "f_liquidity", "f_vol", "f_mom_rev"])
+        if v is not None and len(v):
+            v["date"] = v["date"].astype(str)
+            vmax = v["date"].max()          # ← 等价于 legacy 的 (SELECT MAX(date) ...)
+            v = v[v["date"] == vmax].copy()
+            v["canon"] = v["canon"].astype(str)
+
+            from h5i_bar_store import H5iBarStore
+            bars = H5iBarStore().bars_on_day(vmax)
+            if bars is not None and len(bars):
+                bars = bars.copy()
+                bars["symbol"] = bars["symbol"].astype(str)
+                v = v.merge(bars, left_on="canon", right_on="symbol", how="left")
+            else:
+                # LEFT JOIN 的"右表缺失"分支：价格列全为空（legacy 同样会是 NULL）
+                v["close"] = float("nan")
+                v["change_pct"] = float("nan")
+                v["turnover"] = float("nan")
+                v["amount"] = float("nan")
+
+            v["canon"] = _suffix(v["canon"])
+            v["signal"] = "HOLD"
+            v.loc[(v["f_trend"] > 0) & (v["f_signal"] > 0), "signal"] = "BUY"
+            v.loc[(v["f_trend"] < 0) & (v["f_signal"] < 0), "signal"] = "SELL"
+            return v, "h5i_view"
+
+    # ---- 兜底: 视图缺失 -> 用 daily_bars 现算精简版（复刻 legacy 的 else 分支）----
+    _log("v_factor_scores_daily(h5i) 不存在, 用 daily_bars 现算精简版")
+    from h5i_bar_store import H5iBarStore
+    store = H5iBarStore()
+    days = store.trading_days()
+    if not days:
+        return None, "h5i_bars_fallback"
+    last = str(days[-1])
+    b = store.bars_on_day(last)
+    if b is None or len(b) == 0:
+        return None, "h5i_bars_fallback"
+    b = b.copy()
+    b["symbol"] = b["symbol"].astype(str)
+    b["date"] = last
+    b["f_signal"] = b["change_pct"].astype(float) / 10.0
+    b["f_trend"] = b["change_pct"].astype(float) / 10.0
+    b["f_govern"] = 0.0
+    b["f_liquidity"] = b["turnover"].fillna(0).astype(float)
+    b["f_vol"] = 0.0
+    b["f_mom_rev"] = 0.0
+    b["signal"] = "HOLD"
+    b["canon"] = _suffix(b["symbol"])
+    return b, "h5i_bars_fallback"
+
 
 def _build_target_plan(day: str, day_dir: str,
                        final_weights: dict[str, float],
@@ -1582,7 +1697,6 @@ def _build_target_plan(day: str, day_dir: str,
     dict: {"ok": bool, "path": str, "top_n": int, "universe_size": int,
            "method": str, "error": str|None}
     """
-    import duckdb
     out_dir = os.path.join(DATA_DIR, "drl", day_dir)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "target_plan.json")
@@ -1615,94 +1729,22 @@ def _build_target_plan(day: str, day_dir: str,
         "error": None,
     }
 
-    if not os.path.exists(DUCKDB_PATH):
-        res["error"] = "DuckDB 不存在"
-        return res
-
+    # [2026-09-20 迁移] 原实现连 `data/legacy_stockdb.duckdb`（m4 已于 2026-09-05 退役删除）,
+    # 以 `os.path.exists(DUCKDB_PATH)` 前置判断直接返回『DuckDB 不存在』
+    # ⇒ 自那日起**不再产出 target_plan.json**（登记册 `P0-DRLSRC`）。现改为读 h5i。
     try:
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-    except Exception as e:
-        res["error"] = f"DuckDB 打开失败: {e}"
+        df, plan_src = _load_plan_frame()
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"h5i 取数失败: {type(e).__name__}: {str(e)[:200]}"
         return res
-
-    try:
-        # 优先用 v_factor_scores_daily 取最新一日的全 A 6 因子分,
-        # 再 LEFT JOIN daily_bars 取价/量. 该视图由 build_factor_views.py 物化.
-        fsd_exists = con.execute(
-            "SELECT 1 FROM duckdb_tables WHERE schema_name='main' "
-            "AND table_name='v_factor_scores_daily'"
-        ).fetchone()
-        # symbols 表用于把纯6位补成 canon (带 .SH/.SZ/.BJ 后缀)
-        sym_exists = con.execute(
-            "SELECT 1 FROM duckdb_tables WHERE schema_name='main' "
-            "AND table_name='symbols'"
-        ).fetchone()
-        sym_join = (
-            "LEFT JOIN (SELECT symbol, market FROM symbols WHERE is_active) s "
-            "ON s.symbol = v.canon"
-            if sym_exists else ""
-        )
-        if fsd_exists:
-            df = con.execute(f"""
-                SELECT
-                    CASE
-                        WHEN s.market = 'sh' THEN v.canon || '.SH'
-                        WHEN s.market = 'sz' THEN v.canon || '.SZ'
-                        WHEN s.market = 'bj' THEN v.canon || '.BJ'
-                        ELSE v.canon
-                    END AS canon,
-                    v.date, b.close, b.change_pct, b.turnover, b.amount,
-                    v.f_signal, v.f_trend, v.f_govern, v.f_liquidity, v.f_vol, v.f_mom_rev,
-                    CASE
-                        WHEN v.f_trend > 0 AND v.f_signal > 0 THEN 'BUY'
-                        WHEN v.f_trend < 0 AND v.f_signal < 0 THEN 'SELL'
-                        ELSE 'HOLD'
-                    END AS signal
-                FROM v_factor_scores_daily v
-                LEFT JOIN daily_bars b
-                    ON b.symbol = v.canon AND b.date = v.date
-                {sym_join}
-                WHERE v.date = (SELECT MAX(date) FROM v_factor_scores_daily)
-            """).df()
-        else:
-            # 物化表不在 -> 用 daily_bars 现算精简版 (0/1/turnover 近似)
-            _log("v_factor_scores_daily 不存在, 用 daily_bars 现算精简版")
-            sym_join2 = (
-                "LEFT JOIN (SELECT symbol, market FROM symbols WHERE is_active) s "
-                "ON s.symbol = b.symbol"
-                if sym_exists else ""
-            )
-            df = con.execute(f"""
-                SELECT
-                    CASE
-                        WHEN s.market = 'sh' THEN b.symbol || '.SH'
-                        WHEN s.market = 'sz' THEN b.symbol || '.SZ'
-                        WHEN s.market = 'bj' THEN b.symbol || '.BJ'
-                        ELSE b.symbol
-                    END AS canon,
-                    b.date, b.close, b.change_pct, b.turnover, b.amount,
-                    change_pct / 10.0 AS f_signal,
-                    change_pct / 10.0 AS f_trend,
-                    0.0 AS f_govern,
-                    COALESCE(b.turnover, 0) AS f_liquidity,
-                    0.0 AS f_vol,
-                    0.0 AS f_mom_rev,
-                    'HOLD' AS signal
-                FROM daily_bars b
-                {sym_join2}
-                WHERE b.date = (SELECT MAX(date) FROM daily_bars)
-            """).df()
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
 
     if df is None or df.empty:
         res["error"] = "候选池为空"
         return res
 
     res["universe_size"] = int(len(df))
+    res["source"] = plan_src
+
 
     # 用 DRL final_weights 重打分
     score = np.zeros(len(df), dtype=np.float64)

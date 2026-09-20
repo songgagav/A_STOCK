@@ -41,6 +41,7 @@ jobs:
         run: |
           python -m pytest tests -q \
             --ignore=tests/test_drl_factor_state_h5i.py \
+            --ignore=tests/test_drl_target_plan_h5i.py \
             --ignore=tests/test_factor_dynamic_weights.py \
             --ignore=tests/test_factor_value_env.py \
             --ignore=tests/test_factor_weight_env_bounds.py \
@@ -80,6 +81,7 @@ jobs:
           #   （P0-DRLSRC 迁移回归: 不得再碰 DUCKDB_PATH + inner-join 口径 + 单次批量查询;
           #    用假 store, 故 CI 无需 h5i_db; core 同步 --ignore）
           python -m pytest tests/test_drl_factor_state_h5i.py \
+            tests/test_drl_target_plan_h5i.py \
             tests/test_factor_dynamic_weights.py \
             tests/test_factor_value_env.py \
             tests/test_factor_weight_env_bounds.py \

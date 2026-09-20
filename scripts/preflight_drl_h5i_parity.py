@@ -230,6 +230,44 @@ def main() -> int:
     print(f"  rets: n={len(rets)} mean={np.mean(rets):+.6f} std={np.std(rets):.6f} "
           f"min={np.min(rets):+.4f} max={np.max(rets):+.4f}")
 
+    # ------------------------------------------------------------------
+    # ④ target_plan 取数（步骤②）: 真实 h5i 上验证 views parquet + bars join
+    # ------------------------------------------------------------------
+    print("\n--- ④ target_plan 取数（步骤②）真实数据验证 ---")
+    import pandas as pd  # noqa: E402
+    view_p = os.path.join(data_dir, "h5i", "views", "v_factor_scores_daily.parquet")
+    sym_p = os.path.join(data_dir, "h5i", "static", "symbols.parquet")
+    _check(os.path.isfile(view_p), "views parquet 存在（= legacy 的 v_factor_scores_daily）")
+    _check(os.path.isfile(sym_p), "symbols parquet 存在（提供 market/is_active）")
+    if os.path.isfile(view_p):
+        v = pd.read_parquet(view_p)
+        need = ["canon", "date", "f_signal", "f_trend", "f_govern",
+                "f_liquidity", "f_vol", "f_mom_rev"]
+        _check(all(c in v.columns for c in need), "views 列与 legacy SQL 所需一一对应",
+               f"缺={[c for c in need if c not in v.columns]}")
+        v["date"] = v["date"].astype(str)
+        vmax = v["date"].max()
+        cur = v[v["date"] == vmax]
+        print(f"  views: {len(v)} 行, 最新截面 date={vmax} 共 {len(cur)} 只")
+        _check(len(cur) > 3000, "最新截面规模合理（>3000 只）", f"{len(cur)}")
+        b = store.bars_on_day(vmax)     # h5i daily_bars, 键列 ts 需 CAST
+        print(f"  daily_bars({vmax}): {0 if b is None else len(b)} 行")
+        if b is not None and len(b):
+            j = cur.merge(b, left_on="canon", right_on="symbol", how="left")
+            hit = int(j["close"].notna().sum())
+            print(f"  LEFT JOIN 命中: {hit}/{len(j)}")
+            _check(len(j) == len(cur), "LEFT JOIN 不丢行（LEFT 语义）",
+                   f"{len(j)} vs {len(cur)}")
+            _check(hit > len(j) * 0.5, "多数标的能 join 到当日价格", f"{hit}/{len(j)}")
+        else:
+            _check(False, "最新截面当日有 daily_bars", f"date={vmax}")
+        if os.path.isfile(sym_p):
+            s = pd.read_parquet(sym_p)
+            _check({"symbol", "market"}.issubset(set(s.columns)),
+                   "symbols 含 symbol/market（+可选 is_active）", f"cols={list(s.columns)}")
+            mk = s["market"].astype(str).str.lower()
+            print(f"  symbols: {len(s)} 行, market 分布={dict(mk.value_counts().head(4))}")
+
     fails = [lbl for ok, lbl in _RESULTS if not ok]
     print("\n" + "=" * 78)
     print(f"结论: {'全部一致' if not fails else '有差异'}  "

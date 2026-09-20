@@ -93,6 +93,18 @@ class H5iBarStore:
             f"WHERE 1=1{w} ORDER BY d, symbol"
         ).to_pandas()
 
+    def bars_on_day(self, day: str, decision_time: str | None = None):
+        """某一交易日的**全部标的**日线（含 `turnover`/`amount`）—— 供截面打分/选股。
+
+        与 `closes_window` 的分工: 前者是"整窗 × 全标的"的批量收盘价（给日均收益类计算），
+        本方法是"单日 × 全标的"的完整列（给截面 join）。名字与用途一一对应，便于审阅。
+        """
+        w = self._decision_filter(decision_time)
+        return self._db.sql(
+            "SELECT symbol, close, change_pct, turnover, amount FROM daily_bars "
+            f"WHERE CAST(ts AS DATE) = DATE '{day}'{w} ORDER BY symbol"
+        ).to_pandas()
+
     def has(self, symbol: str, decision_time: str | None = None) -> bool:
         """检查标的是否存在, 约束截至 decision_time."""
         filt = self._decision_filter(decision_time)

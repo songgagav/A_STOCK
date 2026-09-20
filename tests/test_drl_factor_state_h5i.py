@@ -82,17 +82,17 @@ def _rows(days, closes_by_day):
 
 
 class TestH5iMigration:
-    def test_does_not_touch_duckdb_path(self, fake_store, monkeypatch):
-        """迁移的核心: 不得再连 legacy DuckDB。
+    def test_module_no_longer_reads_duckdb(self):
+        """迁移后本模块**完全不再依赖 DuckDB** —— 这是一条可验证的性质。
 
-        把 DUCKDB_PATH 指到一个**不存在**的路径; 若实现仍读它就会抛异常。
+        m4（2026-09-05）退役删除 `legacy_stockdb.duckdb` 后，`_load_factor_state` 与
+        `_build_target_plan` 都改为读 h5i；故模块不应再 import duckdb、也不应再持有
+        `DUCKDB_PATH`（否则"已迁移"就只是口头声明）。
         """
-        monkeypatch.setattr(T, "DUCKDB_PATH", os.path.join("Z:", "nope", "x.duckdb"))
-        days = _days(20)
-        closes = [{f"S{i:03d}": 10.0 + i for i in range(5)} for _ in days]
-        fake_store.frame = _frame(_rows(days, closes))
-        ic, rets, dates = T._load_factor_state(days[-1], 60)
-        assert ic is not None and rets is not None
+        import inspect
+        src = inspect.getsource(T)
+        assert "import duckdb" not in src, "模块仍 import duckdb"
+        assert not hasattr(T, "DUCKDB_PATH"), "模块仍持有 DUCKDB_PATH"
 
     def test_returns_none_below_min_days(self, fake_store):
         days = _days(10)
