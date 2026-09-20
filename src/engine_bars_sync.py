@@ -340,6 +340,56 @@ def sync_to_latest(rd=None, apply: bool = True, max_days: int = 30,
     return res
 
 
+def freshness(engine_day: str | None = None, today=None) -> dict:
+    """引擎数据是否追平"最后一个**已收盘**的交易日"。
+
+    **为什么不是与 `trade_calendar.days[-1]` 比**（闸门初版的实际故障）:
+    那是**官方日历的年尾**（实测 `20261231`），与"引擎此刻该有多少数据"根本不是一回事 ——
+    拿它比会把**每一个正常交易日**都判成落后（因为年尾永远远大于今天）。
+    实测: 恢复官方日历后, 闸门立刻把一次**完全正常**的启动误拒为
+    `引擎数据(20260918) 落后于本仓交易日历末条(20261231)`。
+    这正是本项目 METHOD-1 说的: 判据要基于"该值发生时的下游表现",
+    而不是拿一个语义不同的字段硬比。
+
+    正确判据: 引擎至少应覆盖**今天之前的最后一个交易日**。
+    （今天若已收盘, 引擎通常会覆盖今天, 那也满足 >= 该下界。）
+    """
+    import datetime as _dt
+    out = {"ok": False, "engine_day": str(engine_day) if engine_day else None,
+           "expected_day": None, "lag_trading_days": None, "today": None, "error": None}
+    today = today or _dt.date.today()
+    if isinstance(today, str):
+        today = _dt.date.fromisoformat(today.replace("/", "-"))
+    out["today"] = today.isoformat()
+
+    try:
+        import trading_calendar as TC
+        expected = TC.latest_calendar_day(today - _dt.timedelta(days=1))
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"交易日历不可用: {type(e).__name__}: {e}"
+        return out
+    if expected is None:
+        out["error"] = "交易日历里找不到今天之前的交易日"
+        return out
+    out["expected_day"] = expected.strftime("%Y%m%d")
+
+    if not engine_day:
+        out["error"] = "未提供引擎数据日"
+        return out
+    if str(engine_day) < out["expected_day"]:
+        out["error"] = (f"引擎数据({engine_day}) 落后于最后已收盘交易日"
+                        f"({out['expected_day']}) —— 摄入会滞后")
+        try:
+            cal = TC._calendar_days() or set()
+            out["lag_trading_days"] = sum(
+                1 for d in cal if str(engine_day) < d <= out["expected_day"])
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+    out["ok"] = True
+    return out
+
+
 def _calendar_days(lo: str, hi: str) -> list:
     a = dt.date.fromisoformat(lo.replace("/", "-"))
     b = dt.date.fromisoformat(hi.replace("/", "-"))
@@ -363,7 +413,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.probe:
-        print(json.dumps(engine_available(), ensure_ascii=False, indent=2))
+        # 探针输出里**一并给出新鲜度判定**, 使 ops/start_daemon.ps1 的闸门只需读 JSON,
+        # 不必在 PowerShell 里重做日期比较(那里做不出可测的逻辑)。
+        # 退出码固定 0: 这是**诊断**, 放行/拒绝由调用方(闸门)决定。
+        p = engine_available()
+        p["freshness"] = freshness(p.get("day"))
+        print(json.dumps(p, ensure_ascii=False, indent=2))
         return 0
 
     days, non_trading = [], []

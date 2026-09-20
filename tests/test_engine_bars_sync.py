@@ -426,6 +426,75 @@ class TestSyncToLatest:
         assert seen["appended"] == [], "引擎故障时绝不能已经写过库"
 
 
+class TestFreshness:
+    """新鲜度判据: "引擎是否追平**今天之前最后一个已收盘的交易日**"。
+
+    这里全部注入假交易日历 —— CI 里 `data/` 被 gitignore, 没有真实日历文件。
+    """
+
+    CAL = {"20260917", "20260918", "20260921", "20260922"}
+
+    @pytest.fixture
+    def fake_cal(self, monkeypatch):
+        import trading_calendar as TC
+        monkeypatch.setattr(TC, "_calendar_days", lambda: set(self.CAL), raising=False)
+        return self.CAL
+
+    def test_engine_caught_up_on_a_monday(self, fake_cal):
+        """今天周一 -> 最后已收盘交易日是上周五; 引擎有周五即算追平。"""
+        f = E.freshness("20260918", today="2026-09-21")
+        assert f["ok"] is True
+        assert f["expected_day"] == "20260918"
+
+    def test_engine_behind_is_flagged_with_lag_count(self, fake_cal):
+        f = E.freshness("20260917", today="2026-09-21")
+        assert f["ok"] is False and f["lag_trading_days"] == 1
+        assert "落后" in f["error"]
+
+    def test_weekend_today_still_expects_friday(self, fake_cal):
+        for t in ("2026-09-19", "2026-09-20"):
+            f = E.freshness("20260918", today=t)
+            assert f["ok"] is True, t
+            assert f["expected_day"] == "20260918", t
+
+    def test_official_calendar_year_end_is_not_the_target(self, fake_cal):
+        """**闸门初版故障的固化**: 比对目标绝不能取 `max(cal)`。
+
+        官方日历覆盖到**年尾**(实测 20261231), 它永远远大于今天。若拿它当目标,
+        **每一次正常启动**都会被判落后 —— 实测正是:
+        `引擎数据(20260918) 落后于本仓交易日历末条(20261231)`, 一次完全正常的启动被误拒。
+        """
+        f = E.freshness("20260918", today="2026-09-21")
+        assert f["expected_day"] != max(fake_cal), "比对目标被错当成了日历年尾"
+        assert f["expected_day"] == "20260918" and f["ok"] is True
+
+    def test_missing_engine_day_is_an_error(self, fake_cal):
+        f = E.freshness(None, today="2026-09-21")
+        assert f["ok"] is False and "未提供" in f["error"]
+
+    def test_no_calendar_is_error_not_silent_pass(self, monkeypatch):
+        """日历拿不到时**必须报错**, 不能默认放行 —— 否则闸门形同虚设。"""
+        import trading_calendar as TC
+        monkeypatch.setattr(TC, "_calendar_days", lambda: None, raising=False)
+        f = E.freshness("20260918", today="2026-09-21")
+        assert f["ok"] is False and f["error"]
+
+    def test_accepts_iso_date_object(self, fake_cal):
+        import datetime as _dt
+        f = E.freshness("20260918", today=_dt.date(2026, 9, 21))
+        assert f["ok"] is True and f["today"] == "2026-09-21"
+
+    def test_probe_payload_carries_freshness(self, monkeypatch):
+        """闸门(PowerShell)只读探针 JSON, 故 freshness 必须随 --probe 一起输出。"""
+        import trading_calendar as TC
+        monkeypatch.setattr(TC, "_calendar_days",
+                            lambda: {"20260917", "20260918"}, raising=False)
+        p = E.engine_available(rd=FakeRd())
+        p["freshness"] = E.freshness(p.get("day"))
+        assert p["freshness"]["ok"] is True
+        assert p["freshness"]["engine_day"] == "20260918"
+
+
 # --------------------------------------------------------------------------
 # 5) 与生产约定的耦合关系（回退时会自动报警）
 # --------------------------------------------------------------------------

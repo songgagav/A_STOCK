@@ -154,27 +154,25 @@ if (-not $probe.ok) {
 }
 Write-Host "  引擎正常: 参考股票全历史覆盖到 $($probe.day) (共 $($probe.trading_days) 个交易日)" -ForegroundColor Green
 
-# 新鲜度: 与**本仓已记录的交易日历**比 —— 用可观测值比对, 不拍脑袋定天数阈值。
-$calFp = Join-Path $RepoRoot 'data\trade_calendar.json'
-if (Test-Path $calFp) {
-  try {
-    $cal = Get-Content $calFp -Raw -Encoding UTF8 | ConvertFrom-Json
-    $calLast = ([string]$cal.last).Replace('-', '')
-    $engDay = [string]$probe.day
-    if ($engDay -lt $calLast) {
-      Write-Host "  [告警] 引擎数据($engDay) 落后于本仓交易日历末条($calLast) —— 摄入会滞后。" -ForegroundColor Yellow
-      if (-not $AllowStaleEngine) {
-        Write-Host "  [拒绝启动] 引擎数据落后。若确认要以此状态启动, 显式加 -AllowStaleEngine。" -ForegroundColor Red
-        Write-Host "  说明: 用陈旧数据起服会让台账里出现无法区分于『正常但无新数据』的日子。"
-        exit 4
-      }
-      Write-Host "  [知情继续] 已显式指定 -AllowStaleEngine。" -ForegroundColor Yellow
-    } else {
-      Write-Host "  新鲜度: 引擎($engDay) 不落后于交易日历末条($calLast)。" -ForegroundColor Green
-    }
-  } catch {
-    Write-Host "  [告警] 交易日历读取失败, 跳过新鲜度比对: $_" -ForegroundColor Yellow
+# 新鲜度: 由 Python 侧 `engine_bars_sync.freshness()` 判定 —— 判据是"引擎是否追平
+# **今天之前最后一个已收盘的交易日**"。
+# [2026-09-21 订正] 初版在此直接拿 `trade_calendar.json` 的 `last` 比, 那是**官方日历的
+# 年尾**(实测 20261231), 与"引擎此刻该有多少数据"语义根本不同 —— 它把**每一次正常启动**
+# 都误判成落后(实测: 引擎 20260918 被报"落后于 20261231")。故判据移入 Python 并加测试。
+$fresh = $probe.freshness
+if ($null -eq $fresh) {
+  Write-Host "  [告警] 探针未返回 freshness 字段(版本不一致?), 跳过新鲜度比对。" -ForegroundColor Yellow
+} elseif ($fresh.ok) {
+  Write-Host "  新鲜度: 引擎($($fresh.engine_day)) 已追平最后已收盘交易日($($fresh.expected_day))。" -ForegroundColor Green
+} else {
+  Write-Host "  [告警] $($fresh.error)" -ForegroundColor Yellow
+  if ($fresh.lag_trading_days) { Write-Host "        落后交易日数: $($fresh.lag_trading_days)" }
+  if (-not $AllowStaleEngine) {
+    Write-Host "  [拒绝启动] 引擎数据落后于最后已收盘交易日。若确认要以此状态启动, 显式加 -AllowStaleEngine。" -ForegroundColor Red
+    Write-Host "  说明: 用陈旧数据起服会让台账里出现无法区分于『正常但无新数据』的日子。"
+    exit 4
   }
+  Write-Host "  [知情继续] 已显式指定 -AllowStaleEngine。" -ForegroundColor Yellow
 }
 
 if ($CheckOnly) {
