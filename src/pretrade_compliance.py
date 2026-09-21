@@ -329,7 +329,7 @@ def approved_orders(path: str | None = None) -> list:
 
 
 def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
-         audit_fp: str | None = None, now=None) -> dict:
+         audit_fp: str | None = None, now=None, gates: bool | None = None) -> dict:
     """**引擎侧咽喉点**：一单的三段式处置 + 留痕（生产入口）。
 
     **卖出只做合规, 绝不进高危队列**（重要取舍）：
@@ -337,6 +337,16 @@ def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
       与 kill switch『只停新开仓, 绝不停离场』是同一条纪律。
       故 `liquidate_position` 只对**买入侧**有意义；卖出侧仍校验可卖数量与价格合法性
       （那是硬合规, 违反说明这笔单本身不成立）。
+
+    [路线图 #15] 买入侧在**单笔合规之后、高危判定之前**增加第二段：
+    组合层交易前清单（`pretrade_gates.evaluate`：单笔仓位上限 / 组合回撤 /
+    IC 门控态 / 数据新鲜度 / 单日亏损）。清单未通过 => `reject`（不下单），
+    理由与各项明细一并落审计。
+    阈值全部来自 `config.PAPER` 既有项（`pretrade_gates.thresholds_from_paper`），
+    **不新增数字**；ctx 缺字段的检查项记为 `skip` 而非 fail，故老调用方
+    （只传 order/tradable/position_qty/equity/cash）行为不变 —— 那一组 ctx
+    恰好能判"单笔仓位"与"组合回撤"两项，其余四项 skip。
+    `gates=False` 或 `PAPER.pretrade_gates=False` 可整体关闭该段。
 
     返回 {'decision': 'execute'|'reject'|'pending_approval', 'reasons': [...]}；
     判定过程异常时**返回 execute**（不阻断交易）—— 否则一个 bug 就让系统静默停手。
@@ -350,6 +360,39 @@ def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
                    "qty": (order or {}).get("qty"), "price": (order or {}).get("price"),
                    "reasons": reasons, "actor": actor}, path=audit_fp, now=now)
             return {"decision": "reject", "reasons": reasons}
+
+        # ---- 第二段: 组合层交易前清单 (路线图 #15, 买入侧) ----
+        if side == "buy":
+            _use_gates = gates
+            if _use_gates is None:
+                try:
+                    from config import PAPER as _P
+                    _use_gates = bool(_P.get("pretrade_gates", True))
+                except Exception:  # noqa: BLE001
+                    _use_gates = True       # 取不到开关 => 启用(清单全是 skip 也无害)
+            if _use_gates:
+                try:
+                    import pretrade_gates as _PG
+                    _g = _PG.evaluate(order, ctx, **_PG.thresholds_from_paper())
+                except Exception as _ge:  # noqa: BLE001
+                    # 清单自身出错 => 记一条 warn 留痕但**放行**(与 kill switch 同纪律:
+                    # 判定异常不得让系统静默停手), 且必须响亮写在审计里
+                    audit({"action": "execute", "symbol": (order or {}).get("symbol"),
+                           "side": side, "qty": (order or {}).get("qty"),
+                           "price": (order or {}).get("price"),
+                           "reasons": [f"交易前清单执行异常(不阻断, 需排查): "
+                                       f"{type(_ge).__name__}: {_ge}"],
+                           "actor": actor}, path=audit_fp, now=now)
+                    _g = None
+                if _g is not None and not _g.get("ok"):
+                    audit({"action": "reject", "symbol": (order or {}).get("symbol"),
+                           "side": side, "qty": (order or {}).get("qty"),
+                           "price": (order or {}).get("price"),
+                           "reasons": _g.get("reasons") or [],
+                           "pretrade_gates": _g.get("checks") or [],
+                           "actor": actor}, path=audit_fp, now=now)
+                    return {"decision": "reject", "reasons": _g.get("reasons") or [],
+                            "pretrade_gates": _g}
 
         if side == "sell":                      # 离场不排队(见 docstring)
             audit({"action": "execute", "symbol": (order or {}).get("symbol"), "side": side,

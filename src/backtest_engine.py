@@ -322,6 +322,16 @@ class BacktestRunner:
         # 止损阈值对齐实盘引擎: realtime_engine 用 PAPER.stop_loss(-3%),
         # 此处不再硬编码 8%(历史偏差), 统一读 config, 保证回测/实盘行为一致.
         stop = float(PAPER.get("stop_loss", 0.03) or 0.03)
+        # [路线图 #10] 移动止损: 与实盘/虚拟盘同源开关与参数(config.PAPER),
+        # 判定走纯函数 trailing_stop, 使"回测里的移动止损"与"实盘里的移动止损"
+        # 不可能各自漂移成两套实现。
+        _use_trail = bool(PAPER.get("trailing_stop", False))
+        _giveback = float(PAPER.get("trailing_giveback", 0.0) or 0.0)
+        _hard_floor = float(PAPER.get("trailing_hard_floor", 0.0) or 0.0)
+        _TS = None
+        if _use_trail and _giveback > 0:
+            import trailing_stop as _TS
+        _trail_hits = 0          # 由峰值线(而非固定线)砍掉的笔数, 落盘供归因
 
         tag = tag or datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join(BACKTEST_DIR, tag)
@@ -448,17 +458,46 @@ class BacktestRunner:
             # 2) 止损 (仅可卖部分, 未跌停/停牌; T+1 原生保护)
             #    遍历全部持仓(不限于目标池内): gate 关闭期间跌出池的持仓
             #    也需要止损保护, 与实盘引擎行为一致.
-            for canon in list(pb.positions.keys()):
-                p = pb.positions[canon]
-                pr = pb.market_price(canon)
-                if pr <= 0 or not _sellable(canon):
-                    continue
-                dd = pr / p["avg_cost"] - 1
-                if dd < -stop:
+            #    [路线图 #10] 开关开启时改为移动止损: 止损线 = max(固定线, 峰值线),
+            #    峰值(peak_price)跨日保存在持仓 dict 上, 由 trailing_stop 推进。
+            if _TS is not None:
+                _hits = _TS.apply_to_positions(
+                    pb.positions, lambda c: pb.market_price(c),
+                    _giveback, stop_loss=stop, hard_floor=_hard_floor)
+                for h in _hits:
+                    canon = h["canon"]
+                    p = pb.positions.get(canon)
+                    if not p:
+                        continue
+                    pr = h["price"]
+                    if pr <= 0 or not _sellable(canon):
+                        continue
+                    # 只卖可卖部分(T+1 由账本原生锁定; sell 内部会截到可卖量)
                     r = pb.sell(canon, p["qty"], pr)
                     if r:
                         _cooled.add(canon)   # 止损减仓 -> 当日不再回补
-                        trades_day.append(("S", canon, r["qty"], round(pr, 3), f"止损{dd*100:.1f}%"))
+                        if h["trigger"] == "trailing":
+                            _trail_hits += 1
+                            trades_day.append(
+                                ("S", canon, r["qty"], round(pr, 3),
+                                 f"移动止损 峰值{h['peak']:.2f}回吐"
+                                 f"{h['drawdown_from_peak']:.1f}%"))
+                        else:
+                            trades_day.append(
+                                ("S", canon, r["qty"], round(pr, 3),
+                                 f"止损{(pr / p['avg_cost'] - 1) * 100:.1f}%"))
+            else:
+                for canon in list(pb.positions.keys()):
+                    p = pb.positions[canon]
+                    pr = pb.market_price(canon)
+                    if pr <= 0 or not _sellable(canon):
+                        continue
+                    dd = pr / p["avg_cost"] - 1
+                    if dd < -stop:
+                        r = pb.sell(canon, p["qty"], pr)
+                        if r:
+                            _cooled.add(canon)   # 止损减仓 -> 当日不再回补
+                            trades_day.append(("S", canon, r["qty"], round(pr, 3), f"止损{dd*100:.1f}%"))
 
             # 3) 补仓目标池到目标权重 (涨停/停牌/冷却/小单门槛/换手预算/调仓间隔 跳过)
             # 策略层优化 (2026-09-05, 与实盘引擎对齐): 消费每项 target_weight.
@@ -565,6 +604,14 @@ class BacktestRunner:
             "trade_days": len(self.days_list),
             "total_trades": len(trade_log),
             "max_drawdown_pct": self._max_dd(curve),
+            # [路线图 #10] 移动止损留痕: 让"这次回放里有多少笔是被峰值线砍的"
+            # 可自证, 而不是只能从日志文本里数。
+            "trailing_stop": {
+                "enabled": bool(_use_trail and _giveback > 0),
+                "giveback": _giveback,
+                "hard_floor": _hard_floor,
+                "trailing_exits": _trail_hits,
+            },
             "method": "执行日D直接用 load_targets(D) 当日池(与虚拟盘完全一致), D当日收盘价撮合",
             "note": "每个执行日D的池 == 实盘当日 load_targets(D): 优先 DRL target_plan"
                     "(校验窗口=[D前一交易日16:00, D 00:00), 只基于D之前数据, 无前视), "

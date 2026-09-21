@@ -50,6 +50,9 @@ class PaperBook:
         self.trades_history: dict = {}
         # P2: 已入账的分红/除权事件key, 避免跨日/重启重复记账
         self.applied_corp: set = set()
+        # [路线图 #10] 上一次 _apply_stop_loss 中由**峰值线**(移动止损)触发的标的;
+        # 由 apply_risk_controls 读出作为归因, 不靠反向解析日志文本.
+        self._last_trailing_hits: list = []
 
     # ---------- 工具 ----------
     def _commission(self, amount: float, is_sell: bool) -> float:
@@ -357,9 +360,54 @@ class PaperBook:
 
     def _apply_stop_loss(self) -> list:
         """单票止损: 对浮亏跌破 -stop_loss 的持仓卖出可卖部分. 返回触发的canon列表.
-        跌停/无价由调用方(引擎_tradable)过滤; 此处只做撮合层兜底."""
+        跌停/无价由调用方(引擎_tradable)过滤; 此处只做撮合层兜底.
+
+        [路线图 #10] 启用 `PAPER.trailing_stop` 时改为**移动止损**: 止损线随
+        "入场以来有利极值"(持仓 dict 的 `peak_price`) 上移, 锁住已实现的浮盈。
+        判定与极值推进放在纯函数模块 `trailing_stop` 里(可单测), 本方法只负责
+        取价、T+1 可卖量、调用 `sell` 与留痕 —— 即"决策"与"撮合"分离。
+
+        **向后兼容**: 关闭开关时逐位回到原实现(只看 avg_cost, 不建 peak 字段)。
+        开启时也保证止损线 = max(固定线, 峰值线) —— 只上移不下移,
+        **永不比固定止损更早砍仓**。
+        """
         stop = PAPER.get("stop_loss", 0.03)
         out = []
+        by_trailing: list = []          # 由**峰值线**(而非固定线)砍掉的标的
+        use_trail = bool(PAPER.get("trailing_stop", False))
+        giveback = float(PAPER.get("trailing_giveback", 0.0) or 0.0)
+        floor = float(PAPER.get("trailing_hard_floor", 0.0) or 0.0)
+        if use_trail and giveback > 0:
+            import trailing_stop as _TS
+            hits = _TS.apply_to_positions(
+                self.positions, lambda c: self.market_price(c),
+                giveback, stop_loss=stop, hard_floor=floor)
+            for h in hits:
+                canon = h["canon"]
+                p = self.positions.get(canon)
+                if not p or p.get("avg_cost", 0) <= 0:
+                    continue
+                # 只卖可卖部分: T+1 锁定仅当日买入不可卖, 跨日自动解锁
+                _locked = p.get("locked_qty", 0) if p.get("buy_date") == self.trade_date else 0
+                qty = p["qty"] - _locked
+                if qty <= 0:
+                    continue
+                self.sell(canon, qty, h["price"])
+                if h["trigger"] == "trailing":
+                    _why = (f"移动止损: 峰值 {h['peak']:.3f} 回吐 "
+                            f"{h['drawdown_from_peak']:.1f}% 触及线 {h['line']:.3f} "
+                            f"(锁定 {h['lock_pct']:+.1f}%, 回吐上限 "
+                            f"{giveback * 100:.0f}%)")
+                    by_trailing.append(canon)
+                else:
+                    _why = (f"单票浮亏 "
+                            f"{(h['price'] / p['avg_cost'] - 1) * 100:.1f}% "
+                            f"< -{stop * 100:.0f}% 止损")
+                self._risk_log_record("stop_loss", canon, _why)
+                out.append(canon)
+            self._last_trailing_hits = by_trailing
+            return out
+        # ---- 原固定止损路径(开关关闭时逐位一致) ----
         for canon in list(self.positions.keys()):
             p = self.positions[canon]
             pr = self.market_price(canon)
@@ -417,15 +465,22 @@ class PaperBook:
     def apply_risk_controls(self) -> dict:
         """组合风控主入口: 依次执行 熔断判定(先,决定后续可否加仓) / 单票止损 / 集中度压回.
         返回当日风控动作摘要 {drawdown, stopped, trimmed, state}.
-        在盘中每 tick(rebalance前/后)调用一次, 由引擎驱动."""
+        在盘中每 tick(rebalance前/后)调用一次, 由引擎驱动.
+        [路线图 #10] 单票止损在 `PAPER.trailing_stop` 开启时为移动止损(见
+        `_apply_stop_loss`); 摘要额外给出 `trailing` 字段列出实际由**峰值线**
+        (而非固定线)触发的标的 —— 归因取自 `_apply_stop_loss` 当次返回的判定
+        `trigger` 字段, **不靠反向解析日志文本**(那样一个措辞改动就会让归因静默失效)。
+        """
         dd = self._update_drawdown_state()
         stopped = self._apply_stop_loss()
         trimmed = self._apply_concentration_cap()
+        trailing = list(getattr(self, "_last_trailing_hits", []) or [])
         return {
             "drawdown_pct": round(dd * 100, 2),
             "state": self.state,
             "stopped": stopped,
             "trimmed": trimmed,
+            "trailing": trailing,
         }
 
     # ---------- 调仓 ----------

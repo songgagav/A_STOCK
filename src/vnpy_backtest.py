@@ -163,6 +163,143 @@ def _out_dir(day_dir: str, out_tag: str = "") -> str:
     return os.path.join(DATA_DIR, "vnpy_backtest", name)
 
 
+#: [路线图 #9] 多场景结果缓存: key = (day, top_n, lookback_days, sel_n, weight_mode,
+#: forward, scenario)。同一进程内重复请求同一场景直接复用 —— 选股(PIT)是耗时大头,
+#: 而它在各场景间**完全相同**, 重算等于把 CPU 花在重复劳动上。缓存**不跨进程**,
+#: 因此不会把上一次的费率假设偷偷带进下一次运行。
+_REGIME_CACHE: dict = {}
+
+
+def run_regime_scenarios(day: str, scenarios=None, **kwargs) -> dict:
+    """[路线图 #9] 同一段回测在多个成本/延迟场景下各跑一遍, 给出可比结果。
+
+    "可比"是这里唯一重要的事: 所有场景**共用**同一份目标池、同一份 bar、同一个
+    撮合引擎, 唯一变量是费率倍率与信号延迟。因此 `delta_return_pct` =
+    "这套信号在压力成本下会损失多少", 而不是两套不同假设下不可比的两个数。
+
+    Parameters
+    ----------
+    scenarios : 场景名序列; None 时取 `PAPER.regime_scenarios`(标准测试项, 现行
+        normal+stress)。非法名会由 `regime_costs.resolve_scenario` **抛错**
+        (不静默回退到 normal —— 那会让"压力测试通过了"变成一句空话)。
+    **kwargs : 透传 `run_vnpy_backtest`(top_n / lookback_days / sel_n / weight_mode /
+        forward / persist_arctic ...)。`scenario` 由本函数接管。
+
+    返回 {'ok','day','scenarios': {name: {...}}, 'comparison': [...],
+          'baseline': str, 'kwargs': {...}}
+    """
+    import regime_costs as _RC
+
+    if scenarios is None:
+        scenarios = PAPER.get("regime_scenarios") or [DEFAULT_SCENARIO_NAME]
+    names = [str(s) for s in scenarios]
+    for n in names:                      # fail fast: 先校验全部场景名
+        _RC.resolve_scenario(n)
+    base = names[0] if names else "normal"
+    if kwargs.pop("scenario", None) is not None:
+        raise TypeError("run_regime_scenarios 自行接管 scenario 参数, 不要透传")
+
+    out: dict = {}
+    _base_tag = kwargs.pop("out_tag", "") or ""
+    for n in names:
+        # 每个场景写到独立目录(data/vnpy_backtest/<day>__regime_<name>/):
+        # 同一目录会被后一个场景覆盖, 使"压力场景的数字"与"常态场景"无从区分 ——
+        # 那正是本功能要消除的失效模式。显式传入的 out_tag 仍作为前缀保留。
+        _tag = f"{_base_tag}__regime_{n}" if _base_tag else f"regime_{n}"
+        out[n] = run_vnpy_backtest(day, scenario=n, out_tag=_tag, **kwargs)
+
+    def _stat(res: dict, key: str):
+        st = (res or {}).get("stats") or {}
+        for k in (key, f"{key}_pct"):
+            if st.get(k) is not None:
+                return st[k]
+        return None
+
+    base_res = out.get(base) or {}
+    comparison = []
+    for n in names:
+        res = out.get(n) or {}
+        row = {
+            "scenario": n,
+            "ok": bool(res.get("ok")),
+            "total_return_pct": _stat(res, "total_return"),
+            "max_drawdown_pct": _stat(res, "max_drawdown"),
+            "final_balance": _stat(res, "end_balance") or _stat(res, "final_balance"),
+            "regime": (res.get("regime") or {}),
+            "fallback": bool(res.get("fallback")),
+        }
+        b = _stat(base_res, "total_return")
+        r = _stat(res, "total_return")
+        row["delta_return_pct"] = (round(float(r) - float(b), 4)
+                                  if (r is not None and b is not None) else None)
+        comparison.append(row)
+    return {"ok": all(bool((out.get(n) or {}).get("ok")) for n in names),
+            "day": day, "scenarios": out, "comparison": comparison,
+            "baseline": base, "kwargs": {k: v for k, v in kwargs.items()}}
+
+
+#: 兼容别名: 默认场景名(避免调用方为了一个字符串去 import regime_costs)
+DEFAULT_SCENARIO_NAME = "normal"
+
+
+def run_regime_batch(days, scenarios=None, *, stop_on_error: bool = False,
+                     **kwargs) -> dict:
+    """[路线图 #9] 对**多个交易日**跑多场景, 汇总成"成本敏感性"面板。
+
+    这是把 regime 场景接进日常流程的入口: 单日回测只能说明"这一天如何", 而
+    成本敏感性是个**分布**性质 —— 必须在多天上平均才有意义。故本函数返回
+    逐日逐场景的明细 **以及** 按场景聚合的均值, 后者才是可用于决策的数。
+
+    days : 交易日序列(YYYY-MM-DD)
+    stop_on_error : False(默认)时某天失败记录 error 继续跑完其余天 —— 一天数据
+        缺失不该让整批无结果; True 则首错即停(供 CI 用)。
+    返回 {'ok','days':[...], 'per_day':{day: {scenario: row}}, 'summary':
+          {scenario: {'n_days','n_ok','mean_return_pct','mean_delta_pct',
+                      'worst_delta_pct','mean_max_dd_pct','degraded_days'}}}
+    """
+    per_day: dict = {}
+    errs: list = []
+    for d in days:
+        try:
+            res = run_regime_scenarios(d, scenarios=scenarios, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            errs.append({"day": d, "error": f"{type(e).__name__}: {e}"})
+            if stop_on_error:
+                raise
+            continue
+        per_day[d] = {row["scenario"]: row for row in res.get("comparison") or []}
+
+    names = sorted({s for rows in per_day.values() for s in rows})
+    summary: dict = {}
+    for n in names:
+        rets, deltas, dds = [], [], []
+        for rows in per_day.values():
+            row = rows.get(n) or {}
+            if row.get("total_return_pct") is not None:
+                rets.append(float(row["total_return_pct"]))
+            if row.get("delta_return_pct") is not None:
+                deltas.append(float(row["delta_return_pct"]))
+            if row.get("max_drawdown_pct") is not None:
+                dds.append(float(row["max_drawdown_pct"]))
+
+        def _mean(xs):
+            return round(sum(xs) / len(xs), 4) if xs else None
+
+        summary[n] = {
+            "n_days": len(per_day),
+            "n_ok": len(rets),
+            "mean_return_pct": _mean(rets),
+            "mean_delta_pct": _mean(deltas),
+            "worst_delta_pct": round(min(deltas), 4) if deltas else None,
+            "mean_max_dd_pct": _mean(dds),
+            # 相对基准场景收益变差的交易日占比 —— "压力场景下这套信号还成立吗"
+            "degraded_days": sum(1 for x in deltas if x < 0),
+        }
+    return {"ok": bool(per_day) and not errs, "days": list(days),
+            "per_day": per_day, "summary": summary, "scenarios": names,
+            "errors": errs}
+
+
 def _make_weights(targets: list[dict], mode: str = "equal") -> list[float]:
     """按配置构造目标权重(和为 1)。PBO 参数扫描的第二根轴。
 
@@ -582,17 +719,36 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
                       sel_n: int = 0, out_tag: str = "",
                       persist_arctic: bool = True,
                       weight_mode: str = "equal",
-                      forward: bool = False) -> dict:
+                      forward: bool = False,
+                      scenario: str | None = None) -> dict:
     """vnpy 回测. day 语义随 forward 变化:
 
     forward=False (默认, 历史行为): day = 窗口**终点**; 窗口为 [day-lookback_days, day];
         目标池为 as-of day 的选股。注意: 评估期落在决策日之前, 存在前视
         (见 _load_bars_forward 上方注释), 仅用于回溯归因, 不可用于样本外评估。
-    forward=True: day = **决策日**; 目标池为 PIT(数据 <= day) 选股; 持有期
+    forward=True: day = **决策日**; 目标池为 PIT(数据 <= day) 的选股; 持有期
         [day, day+lookback_days 个交易日], 全部在决策日之后 -> 无前视, 用于 OOS。
+    scenario: [路线图 #9] 成本/延迟场景(normal / stress); None 时按
+        `PAPER.regime_scenario` -> 环境变量 REGIME_SCENARIO -> normal 解析。
+        **默认 normal 的倍率全为 1、延迟 0, 与既有单场景结果逐位一致**;
+        stress 只在显式指定时生效, 绝不静默混入既有产物。
     """
     day_dt = dt.datetime.strptime(day, "%Y-%m-%d").date()
     day_dir = day.replace("-", "")
+
+    # [路线图 #9] 场景解析与缓存放在最前面(在昂贵的选股之前): 多场景回测下
+    # 同一 (day, 参数, 场景) 只应真跑一次。缓存命中时**返回深拷贝** ——
+    # 否则调用方对返回值的任何就地修改都会污染缓存, 使后续场景拿到被改过的数。
+    import regime_costs as _RC
+    _sc = _RC.resolve_scenario(
+        scenario if scenario is not None
+        else (PAPER.get("regime_scenario") or None))
+    _ck = (day, int(top_n), int(lookback_days), int(sel_n), str(weight_mode),
+           bool(forward), _sc["name"])
+    if _ck in _REGIME_CACHE:
+        import copy as _copy
+        _log(f"[regime:{_sc['name']}] 命中场景缓存, 复用本进程内已有结果")
+        return _copy.deepcopy(_REGIME_CACHE[_ck])
 
     # 前向模式先在昂贵的选股之前校验未来数据是否充足(fail fast, 且不依赖 vnpy)
     if forward and not forward_window_days(day_dt, lookback_days):
@@ -700,8 +856,20 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
             _log(f"动态滑点计算失败, 回退固定 {dyn_slippage}: {e}")
         BUY_RATE = comm + transfer + dyn_slippage + impact
         SELL_RATE = comm + stamp + transfer + dyn_slippage + impact
+        # [路线图 #9] Regime 场景投影: normal 恒等(倍率 1/延迟 0), stress 按
+        # 滑点×4/费×2 放大。slippage_share 显式给出, 使"费"的部分只吃 fee_mult、
+        # "滑点"的部分只吃 slippage_mult —— 否则一次放大两块, 归因不出来。
+        # `_SCEN` 已在函数入口解析(并为缓存建键), 此处只做投影。
+        _SCEN = _sc
+        _slip_abs = dyn_slippage + impact
+        _slip_share = (_slip_abs / BUY_RATE) if BUY_RATE > 0 else None
+        _proj = _RC.project_rates(BUY_RATE, SELL_RATE, _SCEN, slippage_share=_slip_share)
+        BUY_RATE, SELL_RATE = _proj["buy_rate"], _proj["sell_rate"]
         # 将动态滑点率写入 summary 供审计追溯
         dynamic_slippage_rate = dyn_slippage
+        _log(f"[regime:{_SCEN['name']}] {_RC.describe(_SCEN)} | "
+             f"买费率 {BUY_RATE:.6f} 卖费率 {SELL_RATE:.6f} "
+             f"(滑点占比 {(_slip_share or 0)*100:.1f}%)")
         for vt in vt_symbols:
             lab.add_contract_setting(vt, long_rate=BUY_RATE, short_rate=SELL_RATE,
                                      size=1, pricetick=0.01)
@@ -718,12 +886,31 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
             lab.save_bar_data(blist)
 
         # 3) 构造等权 signal_df
+        # [路线图 #9] 延迟成交: 引擎只在 dt 当根 bar 上消费 datetime==dt 的信号
+        # (`BacktestingEngine.get_signal` 是 filter(datetime == dt), 且 bar 是逐根
+        # 喂入的, 所以**把信号行的日期整体后移 N 根 bar 即等于"决策后 N 根 bar 才
+        # 成交"**)。末 N 根的信号被推出窗口 -> 不成交, 这正是延迟的真实代价, 不补。
+        _lat = int(_proj.get("latency_bars", 0) or 0)
+        _axis = sorted({pd.Timestamp(d) for df in bar_map.values() for d in df["date"]})
+        _shift: dict = {}
+        for _i, _d in enumerate(_axis):
+            _shift[_d] = _axis[_i + _lat] if (_lat and _i + _lat < len(_axis)) else None
         sig_rows = []
+        _dropped = 0
         for s6, vt in zip(symbol6_list, vt_symbols):
             if s6 not in bar_map:
                 continue
             for d in bar_map[s6]["date"]:
-                sig_rows.append({"datetime": pd.Timestamp(d), "symbol": vt, "signal": 1.0})
+                _ts = pd.Timestamp(d)
+                if _lat:
+                    _ts = _shift.get(_ts)
+                    if _ts is None:      # 后移后落在窗口外 -> 当次决策没有执行日
+                        _dropped += 1
+                        continue
+                sig_rows.append({"datetime": _ts, "symbol": vt, "signal": 1.0})
+        if _lat:
+            _log(f"[regime:{_SCEN['name']}] 信号延迟 {_lat} 根 bar: "
+                 f"窗口末 {_dropped} 条信号无执行 bar, 已如实丢弃(不补做)")
         signal_df = pl.DataFrame(sig_rows) if sig_rows else pl.DataFrame(
             schema={"datetime": pl.Datetime, "symbol": pl.Utf8, "signal": pl.Float64}
         )
@@ -802,6 +989,20 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
             "stats": stats_dict,
             "curve_points": len(curve),
             "dynamic_slippage": round(dynamic_slippage_rate, 6),
+            # [路线图 #9] Regime 场景留痕: 场景名/倍率/延迟/实际费率 一并落盘,
+            # 使"这份 summary 是在什么成本假设下跑的"可自证, 不必去翻日志。
+            "regime": {
+                "scenario": _SCEN.get("name"),
+                "label": _SCEN.get("label", ""),
+                "slippage_mult": _proj.get("slippage_mult"),
+                "fee_mult": _proj.get("fee_mult"),
+                "latency_bars": _proj.get("latency_bars"),
+                "buy_rate": round(BUY_RATE, 8),
+                "sell_rate": round(SELL_RATE, 8),
+                "slippage_share": (round(_slip_share, 6)
+                                   if _slip_share is not None else None),
+                "signals_dropped_by_latency": _dropped if _lat else 0,
+            },
             "adj_close_enabled": True,
         }
         _inject_risk_ratios(stats_dict, [p.get("balance") for p in curve])
@@ -830,6 +1031,9 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
             )
         _log(f"vnpy 回测完成: {len(bar_map)} 标的, {len(all_bars)} bars, "
              f"curve={len(curve)}pts, fallback={summary.get('fallback', False)}")
+        # [路线图 #9] 落场景缓存(仅成功路径): 多场景回测下同场景不重复跑。
+        # 缓存值自身不可被调用方就地修改 —— 由入口处的 deepcopy 保证。
+        _REGIME_CACHE[_ck] = summary
         return summary
     except Exception as e:
         import traceback

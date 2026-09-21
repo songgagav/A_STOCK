@@ -255,6 +255,26 @@ PAPER = {
     # ---- 风控 (行为层, 撮合时强制拦截) ----
     "stop_loss": 0.03,       # 单票浮亏跌破 -3% 触发减仓止损
     "max_single_weight": 0.08,  # 单票市值占总权益上限 8% (防集中)
+    # ---- 移动止损 / Trailing Stop (路线图 #10, 2026-09 接入) ----
+    # 固定止损只锚定**成本**(price/avg_cost-1 < -stop_loss), 于是"赚过又跌回去"
+    # 的单与"从未赚过"的单被同等对待: 一只票 +20% 后回落到 +2% 时固定止损认为
+    # "还赚着, 不动", 而账户已实际吐出 18pp。移动止损改为同时锚定**峰值**:
+    #   peak <= 成本 -> 止损线 = 固定线(原口径不变)
+    #   peak >  成本 -> 止损线 = peak * (1 - trailing_giveback)
+    #   最终取 max(两者, 硬地板) —— 只上移不下移, **永不比固定止损更早砍仓**。
+    "trailing_stop": True,      # 是否启用移动止损(False = 完全回到原固定止损行为)
+    # 允许从峰值回吐的比例。取值依据(推导, 非拍脑袋):
+    #   入场后**目标**是赚到能覆盖"固定止损所锚定的那段风险"的倍数。固定线锚定
+    #   entry*(1-stop_loss)=entry*0.97, 即入场承受 1 个 stop_loss 的风险; 若要求
+    #   至少锁住 1 倍于该风险的利润 = 3% 回吐, log(0.97)/log(0.99) ≈ 3.0 -> 因此
+    #   用 2 倍 = 6% 回吐, 对应"赚到 +6% 才让峰值线超过固定线、开始真正锁利",
+    #   与 max_single_weight=8% 的单票体量同一量级, 不会在 1-2 个 tick 内抖动触发。
+    "trailing_giveback": 0.06,
+    # 硬地板: 无论峰值多高, 永远不容忍跌到 entry*(1-该值) 以下。
+    # 9% 的依据: A 股主板单日涨跌停 ±10%, 一个跌停板不足以击穿该地板(即地板不会
+    # 被单根 bar 的跳空直接打穿而变成无效约束); 同时 9% < portfolio_drawdown 8%
+    # 的单票放大上限(8%*1.55≈12.4% 集中度触发线), 与既有集中度风控同量级。
+    "trailing_hard_floor": 0.09,
     # 集中度触发系数: 压回触发线 = max_single_weight * concentration_trigger_mult.
     # 2026-09-05 由硬编码 1.35(触发 10.8%)上调至 1.55(触发 12.4%):
     # 配合 fml 目标加权(单票上限 11.5%) 留出安全边际, 避免加权目标自我触发压回振荡.
@@ -291,6 +311,24 @@ PAPER = {
     #    空头/离场标签(source_signal 非多), 其预期边际收益不足以覆盖往返
     #    手续费, 禁止买入. 强多头 source_signal=BUY 才允许开新仓.
     "min_signal_buy": True,
+    # ---- Regime 成本场景 (路线图 #9, 2026-09 接入) ----
+    # 回测的成本/延迟从"单场景写死"改为可按场景投影(normal / stress)。
+    # 默认 normal —— **倍率全 1、无延迟 = 与既有回测逐位一致**, 保证历史产物可比;
+    # stress(滑点×4/费×2/延迟+1bar)由 scripts/regime_backtest.py 或
+    # 环境变量 REGIME_SCENARIO=stress 显式触发, 不静默混入。
+    "regime_scenario": "normal",
+    # 标准测试项: 这两个场景在每次标准化回测中都要跑, 缺一个就不算"过了场景检验"。
+    # 名字必须存在于 regime_costs.SCENARIOS, 否则 resolve_scenario 会抛错(fail loud)。
+    "regime_scenarios": ["normal", "stress"],
+    # ---- 交易前风险检查清单 (路线图 #15, 2026-09 接入) ----
+    # 在下单咽喉点(pretrade_compliance.gate)强制校验组合层闸门。
+    # 阈值取自 pretrade_gates.thresholds_from_paper(): 回撤/日亏损复用既有
+    # portfolio_drawdown; 仓位上限与数据新鲜度**默认不判定**(只记数) —— 理由见该函数
+    # docstring(8% 是压回线不是下单上限; data_lag_days 是自然日差, 按 ==0 判会让每个
+    # 周一静默停手)。两者都有显式开关:
+    #   PAPER["pretrade_max_position_pct"] / PRETRADE_MAX_POSITION_PCT
+    #   PAPER["pretrade_strict_freshness"] / PRETRADE_STRICT_FRESHNESS
+    "pretrade_gates": True,
 }
 
 # ---- 每日调度时间 ----

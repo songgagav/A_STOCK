@@ -261,6 +261,13 @@ def _plan_to_targets(plan: dict, day: str, d: str):
         "universe_size": plan.get("universe_size"),
         "generated_at": plan.get("generated_at"),
         "top_n": top_n,
+        # [路线图 #15] 把 plan 里已有的新鲜度元数据透传出来 —— 数据新鲜度是
+        # 交易前清单的一项(`pretrade_gates` 的 data_freshness), 而它在
+        # target_plan 里**早已写好**(drl_train 生成 payload 时落盘), 此前只是
+        # 被 `_plan_to_targets` 丢掉, 使清单无从判定该项。**纯增量**: 不改任何
+        # 选股/权重结果, 只是不再丢弃已有字段。
+        "section_as_of": plan.get("section_as_of"),
+        "data_lag_days": plan.get("data_lag_days"),
     }
     return top_n, info
 
@@ -875,23 +882,59 @@ class RealtimeEngine:
                         log(f"卖出({canon}) 离开目标池 @{pr:.3f}")
 
         # 2) 单票止损 (可卖部分; 跌停/停牌跳过). 阈值与 config.PAPER.stop_loss 统一 -> -3%.
+        #    [路线图 #10] 启用 PAPER.trailing_stop 时改为**移动止损**: 止损线随
+        #    入场以来有利极值上移(max(固定线, 峰值线*(1-回吐)), 只上移不下移)。
+        #    判定走纯函数 trailing_stop, 与 PaperBook / backtest_engine 同一实现。
         stop = PAPER.get("stop_loss", 0.03)
-        for canon in list(self.pb.positions.keys()):
-            p = self.pb.positions[canon]
-            tb, reason = self._tradable(canon)
-            if tb is False or tb == "buy_only":
-                log(f"跳过止损({canon}) {reason}")
-                continue
-            pr = self.pb.market_price(canon)
-            if pr <= 0:
-                continue
-            drawdown = pr / p["avg_cost"] - 1
-            if drawdown < -stop:
-                qty = p["qty"] - p.get("locked_qty", 0)   # 只卖可卖部分
+        _use_trail = bool(PAPER.get("trailing_stop", False))
+        _giveback = float(PAPER.get("trailing_giveback", 0.0) or 0.0)
+        _hard_floor = float(PAPER.get("trailing_hard_floor", 0.0) or 0.0)
+        if _use_trail and _giveback > 0:
+            import trailing_stop as _TS
+            _hits = _TS.apply_to_positions(
+                self.pb.positions, lambda c: self.pb.market_price(c),
+                _giveback, stop_loss=stop, hard_floor=_hard_floor)
+            for h in _hits:
+                canon = h["canon"]
+                p = self.pb.positions.get(canon)
+                if not p:
+                    continue
+                tb, reason = self._tradable(canon)
+                if tb is False or tb == "buy_only":
+                    log(f"跳过止损({canon}) {reason}")
+                    continue
+                pr = self.pb.market_price(canon)
+                if pr <= 0:
+                    continue
+                locked = p.get("locked_qty", 0) if p.get("buy_date") == self.pb.trade_date else 0
+                qty = p["qty"] - locked           # 只卖可卖部分
                 if qty > 0:
                     self.pb.sell(canon, qty, pr)
-                    self._cooled.add(canon)   # 止损减仓 -> 当日不再回补
-                    log(f"止损卖出({canon}) {drawdown*100:.1f}% @{pr:.3f}")
+                    self._cooled.add(canon)       # 止损减仓 -> 当日不再回补
+                    if h["trigger"] == "trailing":
+                        log(f"移动止损({canon}) 峰值{h['peak']:.3f} 回吐"
+                            f"{h['drawdown_from_peak']:.1f}% 触及线{h['line']:.3f} "
+                            f"(锁定{h['lock_pct']:+.1f}%) @{pr:.3f}")
+                    else:
+                        log(f"止损卖出({canon}) "
+                            f"{(pr / p['avg_cost'] - 1) * 100:.1f}% @{pr:.3f}")
+        else:
+            for canon in list(self.pb.positions.keys()):
+                p = self.pb.positions[canon]
+                tb, reason = self._tradable(canon)
+                if tb is False or tb == "buy_only":
+                    log(f"跳过止损({canon}) {reason}")
+                    continue
+                pr = self.pb.market_price(canon)
+                if pr <= 0:
+                    continue
+                drawdown = pr / p["avg_cost"] - 1
+                if drawdown < -stop:
+                    qty = p["qty"] - p.get("locked_qty", 0)   # 只卖可卖部分
+                    if qty > 0:
+                        self.pb.sell(canon, qty, pr)
+                        self._cooled.add(canon)   # 止损减仓 -> 当日不再回补
+                        log(f"止损卖出({canon}) {drawdown*100:.1f}% @{pr:.3f}")
 
         # 2.1) 组合级风控: 熔断判定 + 集中度压回 (集中度压回由 PaperBook 兜底执行)
         risk = self.pb.apply_risk_controls()
@@ -996,17 +1039,31 @@ class RealtimeEngine:
                         log(f"跳过买入({canon}) 超当日换手预算(已用{self._to_used:.0f}/{to_budget:.0f})")
                         continue
                     # [路线图 #3] 每单强制合规 + 高危单转人工(不执行, 入待批队列)
-                    # ctx 只给**确定知道**的字段: 缺字段 = 无信息, 不会造成误拒
-                    # (equity/cash 用 getattr 探, 探到即自动生效, 探不到只是少一项检查;
-                    #  PAPER 无 max_pos 键, 故等权槽位那一项高危检查暂不激活)
+                    # [路线图 #15] 同一咽喉点追加组合层交易前清单(仓位/回撤/IC门控/
+                    #   数据新鲜度/单日亏损)。阈值全部来自 config.PAPER 既有项;
+                    #   ctx 里能给的都给了, 给不到的项在清单里记为 skip 而非 fail
+                    #   (沿用"缺字段不据此拒单"的纪律, 绝不让一个缺失字段把系统静默停手)。
+                    #   equity/cash 用 getattr 探, 探到即自动生效, 探不到只是少一项检查;
+                    #   PAPER 无 max_pos 键, 故等权槽位那一项高危检查暂不激活。
                     try:
                         import pretrade_compliance as _PC
+                        _lag = None
+                        try:
+                            # self.sel 即 load_targets 返回的 sel_info; 非 DRL 来源
+                            # (selection/现场选股) 没有该字段 -> 清单里该项自然 skip
+                            _lag = (self.sel or {}).get("data_lag_days")
+                        except Exception:  # noqa: BLE001
+                            _lag = None
                         _g = _PC.gate(
                             {"symbol": canon, "side": "buy", "qty": qty, "price": pr},
                             {"tradable": tb,
                              "position_qty": (self.pb.positions.get(canon) or {}).get("qty"),
                              "equity": getattr(self.pb, "equity", None),
-                             "cash": getattr(self.pb, "cash", None)})
+                             "cash": getattr(self.pb, "cash", None),
+                             "regime": (self._gate or {}).get("regime"),
+                             "freeze_new_buys": (self._gate or {}).get("freeze_new_buys"),
+                             "data_lag_days": _lag,
+                             "day_start_equity": getattr(self, "_day_start_eq", None)})
                         if _g.get("decision") != "execute":
                             log(f"下单前拦截({canon}) [{_g.get('decision')}] "
                                 f"{'; '.join(_g.get('reasons') or [])[:160]}")
