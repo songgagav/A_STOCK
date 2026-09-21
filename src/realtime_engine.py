@@ -974,6 +974,25 @@ class RealtimeEngine:
                     if self._to_used + mv > to_budget:   # 换手预算门控(买入计入)
                         log(f"跳过买入({canon}) 超当日换手预算(已用{self._to_used:.0f}/{to_budget:.0f})")
                         continue
+                    # [路线图 #3] 每单强制合规 + 高危单转人工(不执行, 入待批队列)
+                    # ctx 只给**确定知道**的字段: 缺字段 = 无信息, 不会造成误拒
+                    # (equity/cash 用 getattr 探, 探到即自动生效, 探不到只是少一项检查;
+                    #  PAPER 无 max_pos 键, 故等权槽位那一项高危检查暂不激活)
+                    try:
+                        import pretrade_compliance as _PC
+                        _g = _PC.gate(
+                            {"symbol": canon, "side": "buy", "qty": qty, "price": pr},
+                            {"tradable": tb,
+                             "position_qty": (self.pb.positions.get(canon) or {}).get("qty"),
+                             "equity": getattr(self.pb, "equity", None),
+                             "cash": getattr(self.pb, "cash", None)})
+                        if _g.get("decision") != "execute":
+                            log(f"下单前拦截({canon}) [{_g.get('decision')}] "
+                                f"{'; '.join(_g.get('reasons') or [])[:160]}")
+                            continue
+                    except Exception as _ce:  # noqa: BLE001
+                        # 判定异常**不阻断交易**(否则一个 bug 就让系统静默停手), 但响亮报出
+                        log(f"下单前合规判定异常(不阻断, 需排查): {type(_ce).__name__}: {_ce}")
                     self.pb.buy(canon, qty, pr)
                     self._to_used += mv
                     log(f"买入({canon}) {qty}股 @{pr:.3f} 名义额{mv:.0f}")

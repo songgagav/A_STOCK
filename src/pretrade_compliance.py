@@ -268,6 +268,47 @@ def approved_orders(path: str | None = None) -> list:
             if it.get("status") == "approved"]
 
 
+def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
+         audit_fp: str | None = None, now=None) -> dict:
+    """**引擎侧咽喉点**：一单的三段式处置 + 留痕（生产入口）。
+
+    **卖出只做合规, 绝不进高危队列**（重要取舍）：
+      把止损/离场单排进人工审批 = 把风险锁在仓里（跌了也出不来），
+      与 kill switch『只停新开仓, 绝不停离场』是同一条纪律。
+      故 `liquidate_position` 只对**买入侧**有意义；卖出侧仍校验可卖数量与价格合法性
+      （那是硬合规, 违反说明这笔单本身不成立）。
+
+    返回 {'decision': 'execute'|'reject'|'pending_approval', 'reasons': [...]}；
+    判定过程异常时**返回 execute**（不阻断交易）—— 否则一个 bug 就让系统静默停手。
+    """
+    try:
+        side = str((order or {}).get("side") or "").lower()
+        chk = check_order(order, ctx)
+        if not chk["ok"]:
+            reasons = [v["detail"] for v in chk["violations"]]
+            audit({"action": "reject", "symbol": (order or {}).get("symbol"), "side": side,
+                   "qty": (order or {}).get("qty"), "price": (order or {}).get("price"),
+                   "reasons": reasons, "actor": actor}, path=audit_fp, now=now)
+            return {"decision": "reject", "reasons": reasons}
+
+        if side == "sell":                      # 离场不排队(见 docstring)
+            audit({"action": "execute", "symbol": (order or {}).get("symbol"), "side": side,
+                   "qty": (order or {}).get("qty"), "price": (order or {}).get("price"),
+                   "reasons": ["离场单: 仅合规校验, 不进高危队列"], "actor": actor},
+                  path=audit_fp, now=now)
+            return {"decision": "execute", "reasons": []}
+
+        rk = classify_risk(order, ctx)
+        if rk["high_risk"]:
+            it = enqueue(order, {**(ctx or {}), "_reasons": [f["detail"] for f in rk["flags"]]},
+                         actor=actor, path=path, audit_fp=audit_fp, now=now)
+            return {"decision": "pending_approval",
+                    "reasons": [f["detail"] for f in rk["flags"]], "id": it["id"]}
+        return {"decision": "execute", "reasons": []}
+    except Exception as e:  # noqa: BLE001
+        return {"decision": "execute", "reasons": [], "error": f"{type(e).__name__}: {e}"}
+
+
 def _main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="每单合规 + 高危识别 + 订单审计 + 高危单审批")
