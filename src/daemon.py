@@ -221,10 +221,22 @@ def _ensure_dashboard():
         if pid and _proc_alive(pid):
             return True
         out = open(DASH_LOG, "a", encoding="utf-8")
-        p = subprocess.Popen([PY, os.path.join(_BASE, "dashboard.py"),
-                              "--port", str(DASH_PORT)],
+        # [2026-09-21 修] 原为 os.path.join(_BASE, "dashboard.py") —— **该文件不存在**,
+        # dashboard.py 在 src/ 下。Popen 对不存在的脚本不抛异常(解释器起来后自己报错退出),
+        # 于是本函数会把一个**已死的 pid** 写进 pidfile 并记「已拉起」= 假成功;
+        # 面板一旦挂掉就永远拉不回来, 日志还一片"成功"。改为真实路径, 并**校验存活**再报成功。
+        _dash_py = os.path.join(_BASE, "src", "dashboard.py")
+        if not os.path.exists(_dash_py):
+            _log(f"拉起 Web 可视化失败: 脚本不存在 {_dash_py}")
+            return False
+        p = subprocess.Popen([PY, _dash_py, "--port", str(DASH_PORT)],
                              cwd=_BASE, stdout=out, stderr=out,
                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        # 等一拍再确认真的活着: 否则"启动即崩"(缺依赖/端口占用)会被记成成功
+        time.sleep(1.5)
+        if not _proc_alive(p.pid):
+            _log(f"拉起 Web 可视化失败: pid={p.pid} 启动后立即退出(见 {DASH_LOG})")
+            return False
         if os.path.exists(DASH_PIDFILE):
             try:
                 os.remove(DASH_PIDFILE)
