@@ -1641,6 +1641,35 @@ def read_health_merged():
     except Exception as e:  # noqa: BLE001
         checks.append({"name": "DRL 降级状态", "status": "WARN", "ms": 0,
                        "detail": "读取失败: " + str(e)[:140]})
+    # --- 运行态降级状态机（路线图 #2；读**已发布快照**, 不跑引擎探针）---
+    # 为什么读快照而不是现算: 引擎探针实测 1.71s(查 4 只参考股全历史, 见 engine_bars_sync),
+    # 而本面板前端每 3 秒轮询一次 /api/health —— 探针放进请求路径会直接拖垮面板。
+    # 快照由守护进程按既有 5 分钟看护节奏发布(dashboard.py 无需 h5i_db / 无需 STOCKDB_ROOT)。
+    try:
+        import health_state as _hs
+        _h = _hs.read_published()
+        if not _h.get("available"):
+            checks.append({"name": "运行态降级状态机", "status": "WARN", "ms": 0,
+                           "detail": "无快照: " + str(_h.get("error", ""))[:150]})
+        else:
+            _st = {"NORMAL": "OK", "DEGRADED": "WARN",
+                   "HALTED": "CRITICAL"}.get(_h.get("state"), "WARN")
+            _age = _h.get("age_s")
+            _agetxt = (f"{_age/60:.1f} 分钟前" if isinstance(_age, (int, float)) else "年龄未知")
+            _rs = _h.get("reasons") or []
+            # 必须带上"观测时段": 夜间引擎已停, tick 延迟的滚动窗口**冻结在最后一次 tick**,
+            # 如 23:30 报 p50=11.9s 其实描述的是 15:02 那段盘。不写清就会被读成"现在"。
+            _obs_ts = (_h.get("observed") or {}).get("live_data_ts")
+            checks.append({
+                "name": "运行态降级状态机", "status": _st, "ms": 0,
+                "detail": (f"{_h.get('state')}; 快照 {_h.get('ts')} ({_agetxt})"
+                           + (f"; 观测时段 {_obs_ts}" if _obs_ts else "")
+                           + ("【快照陈旧】" if _h.get("stale") else "")
+                           + ("; " + "; ".join(_rs) if _rs else "; 各项正常"))[:400],
+            })
+    except Exception as e:  # noqa: BLE001
+        checks.append({"name": "运行态降级状态机", "status": "WARN", "ms": 0,
+                       "detail": "读取失败: " + str(e)[:140]})
     # --- 盘前健康检查(premarket.json) ---
     pm = read_health()
     pm_checks = pm.get("checks") if isinstance(pm, dict) else None
@@ -1666,7 +1695,10 @@ def read_health_merged():
     worst = "OK"
     if any(c["status"] == "FAIL" for c in checks):
         worst = "FAIL"
-    elif any(c["status"] == "WARN" for c in checks):
+    elif any(c["status"] in ("CRITICAL", "WARN") for c in checks):
+        # 2026-09-21 修: 此前只认 FAIL/WARN, 于是 status=CRITICAL 的项(DRL L3、
+        # 以及新增的降级状态机 HALTED)在 summary/level 里**完全隐身** ——
+        # 检查项写着 CRITICAL, 摘要却说 OK。CRITICAL 归入 DEGRADED(本字段只有三档词汇)。
         worst = "DEGRADED"
     level = pm.get("level") if isinstance(pm, dict) and pm.get("level") else worst
     return {

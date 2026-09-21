@@ -395,7 +395,12 @@ def test_cpcv_and_rolling():
         "cagrs": cagrs,
         "dds": dds,
         "loo_sharpes": loo_sharpes,
-        "sharpe_vol": sharpe_vol,
+        # 注(2026-09-21 修): 此处曾有 "sharpe_vol": sharpe_vol —— 2026-09-13 把 std 离散度
+        # 换成 MAD 稳健离散度(sharpe_dispersion_stat)时删掉了局部变量、漏删了这个键,
+        # 于是本函数**每次都在 return 处抛 NameError**, 整个 CPCV+滚动窗口审计的结果
+        # (n_folds/sharpes/win_rate…)全部进不了 overfitting_report.json, 只留一条失败检查。
+        # 该键全仓无消费方, 且与 09-13 的"改用稳健离散度"决策相悖, 故直接删除;
+        # 需要离散度的消费方可从下面的 `sharpes` 自行计算。
         "pos_sharpe_ratio": pos_sharpe / len(vnpy),
         "win_rate": win_rate,
     }

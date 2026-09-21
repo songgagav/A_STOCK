@@ -309,6 +309,25 @@ def _start_obs_component(name: str, cmd: list[str], cwd: str = None) -> bool:
         return False
 
 
+def _publish_health_state() -> None:
+    """发布运行态健康快照（路线图 #2 的**发布者**, 单一出口）。
+
+    为什么由守护进程发布、面板只读快照:
+      引擎探针实测 1.71s（查 4 只参考股全历史）, 而面板前端每 3 秒轮询 /api/health ——
+      探针放进请求路径会拖垮面板; 且守护进程以 LocalSystem 运行, `STOCKDB_ROOT` 由
+      NSSM `AppEnvironmentExtra` 注入, 环境依赖收敛在这一处即可。
+
+    节奏复用本循环已有的 5 分钟看护（dash_tick>=20）, 不新造计时器。
+    **失败绝不影响守护主循环** —— 健康发布挂掉不能连带把引擎看护也拖死。
+    """
+    try:
+        import health_state
+        r = health_state.publish()
+        _log(f"健康快照已发布: state={r.get('state')} reasons={r.get('reasons') or '无'}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"健康快照发布失败(不影响守护主循环): {type(e).__name__}: {e}")
+
+
 def _ensure_obs_stack() -> None:
     """崩溃自愈: 每轮周期检查观测栈组件, 缺谁拉起谁.
 
@@ -495,6 +514,7 @@ def run_loop():
             dash_tick = 0
             _ensure_dashboard()
             _ensure_obs_stack()
+            _publish_health_state()
 
         # 非交易日(周末/节假日): 不启动盘中引擎, 不跑收盘选股.
         # 仅在维护窗口(15:05~22:00)每天跑一次 maint 维护管道 = 数据拉取+模型训练.

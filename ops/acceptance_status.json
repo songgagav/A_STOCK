@@ -569,6 +569,42 @@
       "detail": "**路线图 #2 的第一增量。** 阈值全部来自本仓观测, 不照抄外部项目:\n\n| 可观测量 | 判据 | 证据(2026-09-21 实测) |\n|---|---|---|\n| tick 延迟 | p50 > 1s 或 p95 > 2s | 健康 p50≈7.3ms/p95≈20ms(13:08); 退化 p50≈11.9s/p95≈14.4s(15:02, AtlasCore 抖动) —— 双峰差三个数量级, 阈值取空旷地带 |\n| 数据滞后 | freshness().ok=False | 复用引擎闸门判据(追平最后一个已收盘交易日, 有自己的事故史) |\n| 账户估值 | live_source == duckdb_reference_held | P2-LIVESRC 三态语义 |\n| 策略停摆 | 当日 L3 事件数 > 0 | 决策 D 的门禁语义 |\n\n**实现**: `src/health_state.py`\n· `assemble(snap)` —— **纯函数**(CI 可测), 输出 {state, reasons};\n· `gather()` —— 采集真实可观测量(live_state / 引擎探针 / 降级账本), 供 CLI/面板;\n· HALTED 权重最高(L3 优先于一切 DEGRADED 原因); 未知字段忽略、脏输入不崩。\n\n**实测**: 深夜真实采集 => DEGRADED(reason=p50=11888ms) —— 该值是滚动窗口(n=240)\n**冻结在引擎最后一次 tick(15:02)** 的快照, 如实记录了下午退化的盘。\n\n**刻意留白**: 快照自身的**新鲜度**(数据停流多久)不在此装配器里 —— 那是 #4 看门狗的域,\n不做语义未定义的混入。装配器输出 `live_data_ts`, 由消费方决定如何处理陈旧快照。",
       "evidence": "src/health_state.py(assemble 纯函数 + gather 采集) + tests/test_health_state.py 17 项; 阈值证据: live_state.ops.tick_ms 13:08 采样 p50=7.3/p95=10349 vs 15:02 采样 p50=11887.7/p95=14356.4; 深夜真实采集输出 state=DEGRADED, live_data_ts=2026-09-21 15:02:45; 全量回归含 17 项",
       "next": "下一增量: 把 `health_state.gather()` 接入 `check_daemon_first_day.py` 与 dashboard 单一出口; 再之后做 #4 看门狗, 补上『快照新鲜度』维度(in_session 且 data_ts 停流超过 N 个 tick 周期 => 告警)。阈值 p50>1s / p95>2s 是**初值**(单日观测), 随观测积累再校准 —— 校准依据仍必须是本仓自己的数据。"
+    },
+    {
+      "level": "P2",
+      "title": "健康状态机第二增量：发布者/读取者分离 + 探针失败归因修正",
+      "status": "fixed",
+      "detail": "**路线图 #2 的第二增量, 并修掉第一增量自身的一个范畴错误。**\n\n**(1) 归因修正 — 探针失败不得冒充「厂商滞后」**\n第一增量把探针自身失败也写成 `freshness_ok=False`, 于是实测到的\n`ModuleNotFoundError: stock_sdk`(本机 shell 未继承 User 级 STOCKDB_ROOT)\n被装配成 **「厂商未发布当日数据」** —— 与本仓事故史同类的范畴错误:\n运维会去等厂商, 而真正要做的是配环境。现为三态, 各给各的行动:\n探针成功+没追平 => 厂商滞后(等厂商); 探针失败 => 监测盲区(查环境/查引擎),\n并按 config / unreachable / unknown 分类(`_classify_probe_error`)。\n探针失败仍计入 DEGRADED(盲区必须可见), 但原因文本不冒充滞后。\n\n**(2) 发布者/读取者分离 — 因为探针不能进请求路径**\n实测 `engine_available()` 查 4 只参考股全历史: SDK 可用时 **1.71s**\n(SDK 缺失时 0.11s 快速失败), 且走 AtlasCore 代理(有 15.5s/请求 抖动史,\nP2-ATLASPROXY), 最坏数十秒。而面板前端**每 3 秒**轮询 /api/health。\n故 `publish()`(慢, 需 STOCKDB_ROOT, 由守护进程发布) 与\n`read_published()`(**快**, 纯文件读, 不依赖任何环境变量) 分离。\n实证: 清空 STOCKDB_ROOT 后读取方仍取到 `state=DEGRADED, age_s=0.32`。\n\n**为什么环境依赖必须收敛在发布者**: 守护进程以 LocalSystem 运行, 而\nSTOCKDB_ROOT 是本机 **User 级** 变量(Machine 级为空), 靠 NSSM\n`AppEnvironmentExtra` 显式注入才有(已核实服务配置); 面板可能被外部脚本\n以别的身份拉起。\n\n**(3) 接线**: 守护进程复用既有 5 分钟看护节奏发布(dash_tick>=20, 不新造计时器,\n发布异常绝不影响主循环); 面板 `/api/health` 单一出口读快照并显示**观测时段**\n(夜间引擎已停, tick 窗口冻结在最后一次 tick, 不写清会被读成「现在」)。\n\n**(4) 顺带修掉一个让告警隐身的既有盲区**: `read_health_merged` 的 `worst`\n只认 FAIL/WARN, `status=CRITICAL` 的项(DRL L3、HALTED)**在 summary/level 里\n完全隐身** —— 检查项写着 CRITICAL, 摘要却说 OK。现归入 DEGRADED。\n\n**边界**: 快照 `age_s`/`stale` 只作信息性标记, 不改状态语义;\n「盘中数据停流多久算事故」是 **#4 看门狗**的域, 此处不抢答。",
+      "evidence": "src/health_state.py(publish/read_published/_write_atomic/_classify_probe_error) + tests/test_health_state.py 增至 34 项; 探针耗时实测 1.71s(带 STOCKDB_ROOT) vs 0.11s(SDK 缺失); NSSM: STOCKDB_ROOT=E:\\A_stockDB 经 AppEnvironmentExtra 注入(用户级变量, Machine 级为空); 端到端: --publish 落盘 -> 清空环境后 --read 取到 state=DEGRADED age_s=0.32; 面板: read_health_merged() 出现「运行态降级状态机」项(含观测时段)",
+      "next": "阈值 p50>1s/p95>2s 是单日观测的初值, 随观测积累再校准(依据仍须是本仓数据); 其余见 #4。",
+      "id": "P2-HEALTHPUB"
+    },
+    {
+      "level": "P1",
+      "title": "盘前 daily_bars_freshness 拿日历当期望 => 「厂商没发」被报成 FAIL 并指向正常的入库管道",
+      "status": "open",
+      "detail": "**与 P2-HEALTHPUB 同一类的归因错误。**\n\n实测(2026-09-21 夜)面板 6 项 FAIL 之一:\n```text\npremarket:daily_bars_freshness  FAIL\n{'source':'h5i','latest_date':'20260918','today':'2026-09-21',\n 'days_lag':3,'expected_lag':3,'expected':'2026-09-21',\n 'action':'...请检查 h5i 入库管道'}\n```\n`expected_lag=3` 的成因: `check_daily_bars_freshness()` 的 `expected` 来自\n**交易日历**(`_expected_bar_day`), 而 h5i 的**可达上限被厂商是否发布卡住** ——\n同一时刻厂商引擎自身也停在 20260918(09-21 收盘数据厂商尚未发布)。\n即: 我们的管道没有落后, 是上游没发; 却报了 FAIL 并叫人去查一条正常的管道。\n`_expected_bar_day` 那次修复(期望=最后一个**已收盘**交易日, 非当天)只解决了\n**时段基准**问题, 没解决**可达上限**问题。\n\n**正确判据(建议)**: 期望 = min(最后一个已收盘交易日, 厂商引擎已发布日)。\n这样两类情况被区分开:\n  厂商已发当日而 h5i 没有 => 真实入库滞后 => FAIL(要保留)\n  厂商自身也没发       => 无可达数据缺失 => INFO/WARN + 注明「厂商未发布」\n可复用 `engine_bars_sync.freshness()` 作为上限来源(它已有该判据的事故史沉淀)。\n代价: 盘前检查会多一次引擎探针(实测 1.71s, 一次性可接受)。",
+      "evidence": "面板 read_health_merged() 实测输出 premarket:daily_bars_freshness=FAIL, detail 内 days_lag=3/expected_lag=3/expected=2026-09-21 而 latest_date=20260918; 同时刻 engine_bars_sync 探针 engine_day=20260918 == expected_day(厂商自身也未发布); src/premarket_healthcheck.py:439-475",
+      "next": "修 check_daily_bars_freshness 的期望基准(取可达上限), 并加回归测试锁住两类情形。",
+      "id": "P1-PREMARKET-FALSEFAIL"
+    },
+    {
+      "level": "P2",
+      "title": "退役存储 arcticdb 的残留检查以 FAIL 污染健康卡 => 真实 FAIL 被淹没",
+      "status": "open",
+      "detail": "面板 6 项 FAIL 中 **3 项**是退役存储残留, 全是 `ModuleNotFoundError: No module named 'arcticdb'`:\n`premarket:arcticdb` / `premarket:arcticdb_rw` / `premarket:strategy_diag`。\n\n危害不是「多几行红字」, 而是**信噪比**: 健康卡长期挂着 3 条永远为红的噪音,\n真正的 FAIL(如 P1-PREMARKET-FALSEFAIL)就淹在里面 —— 与「狼来了」同构,\n会让运维对 FAIL 脱敏。\n\n面板已有 `_RETIRED` 注记机制, 但只覆盖 `legacy_stockdb.duckdb`, 未覆盖 arcticdb。\n根治应改 `premarket_healthcheck.py`: 退役存储不参与 FAIL 判定(降为 SKIP/INFO,\n或与 duckdb 一样加退役说明), 与「不粉饰」原则不冲突 —— 退役组件不存在是**预期事实**,\n不是故障。",
+      "evidence": "面板 read_health_merged() 实测 6 项 FAIL 明细: arcticdb/arcticdb_rw/strategy_diag 三项均为 ModuleNotFoundError: No module named 'arcticdb'; 另三项为 daily_bars_freshness(见 P1-PREMARKET-FALSEFAIL) 与 ic_history/ic_curve",
+      "next": "在 premarket_healthcheck 里把 arcticdb 系列标为退役(不参与 FAIL); 顺带复核 ic_history/ic_curve 两项是否也属误判。",
+      "id": "P2-HEALTHNOISE"
+    },
+    {
+      "level": "P2",
+      "title": "overfitting_test 悬空名 sharpe_vol => CPCV+滚动窗口审计每次都在 return 处崩, 结果全丢",
+      "status": "fixed",
+      "detail": "`src/overfitting_test.py::test_cpcv_and_rolling` 抛\n`NameError: name 'sharpe_vol' is not defined`(全量回归捕获)。\n\n**根因**: 2026-09-13 把 std 离散度换成 MAD 稳健离散度(`sharpe_dispersion_stat`)\n时删掉了局部变量 `sharpe_vol`, 却漏删返回字典里的 `\"sharpe_vol\": sharpe_vol` 一行。\n于是该函数**每次都在 return 处抛异常** —— 前面的 CPCV/滚动窗口全部白算,\n`n_folds`/`sharpes`/`win_rate` 等结果进不了 overfitting_report.json。\n\n**为什么不容易被发现**: `main()` 把每项测试包在 try/except 里, 异常只记成\n**一条失败检查**并继续跑后面的项 —— 表现为「审计跑完了, 只是 CPCV 那项没过」,\n而不是「审计崩了」。\n\n**修法**: 删除该键(全仓零消费方, 且与 09-13「改用稳健离散度」的决策相悖),\n并在原处留注释说明为何删、以及历史键的来龙去脉; 需要离散度的消费方从 `sharpes` 自算。\n修复后实测返回 `n_folds=8, sharpes=[8 个], cagrs/dds/loo_sharpes 齐备,\npos_sharpe_ratio=0.75, win_rate=0.75`(6/8 窗口正收益)。",
+      "evidence": "全量回归 1 failed 855 passed: src/overfitting_test.py::test_cpcv_and_rolling - NameError: name 'sharpe_vol' is not defined; 全仓 grep 'sharpe_vol' 仅命中该行(无消费方); 修复后直接调用返回完整字典, 且该测试通过(35 passed 含 overfitting 6 项)",
+      "next": "无。若要防同类: 该函数已被 pytest 收集, 悬空名会在 CI 立刻暴露(本次即为回归捕获)。",
+      "id": "P2-CPCVDANGLING"
     }
   ]
 }
