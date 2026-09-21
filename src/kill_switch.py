@@ -148,13 +148,17 @@ def record(layer: str, action: str, actor: str, reason: str,
              "action": action, "actor": actor or "?", "reason": reason or ""}
     try:
         fp = ledger_path(ledger)
-        d = os.path.dirname(fp)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(fp, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # [路线图 #6] 走哈希链: 每条带 prev/hash, 改行/删行/换序/截尾均可验证。
+        # 兼容既有记录: 无 hash 的历史条目不追溯补算, 验证器如实报 pre_chain。
+        import audit_chain as _AC
+        _AC.append(fp, entry, now=now)
     except Exception:  # noqa: BLE001
-        pass
+        # 兜底: 链模块不可用时退回裸追加(留痕优先于格式完美)
+        try:
+            with open(ledger_path(ledger), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
     return entry
 
 

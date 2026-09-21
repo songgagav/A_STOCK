@@ -66,14 +66,20 @@ def audit(entry: dict, path: str | None = None, now=None) -> dict:
     rec = dict(entry or {})
     rec.setdefault("ts", (now or datetime.now()).strftime(_TS_FMT))
     try:
-        fp = audit_path(path)
-        d = os.path.dirname(fp)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(fp, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # [路线图 #6] 订单流水同样走哈希链(改行/删行/换序/截尾可验证);
+        # 无 hash 的历史条目不追溯补算, 验证器报 pre_chain。
+        import audit_chain as _AC
+        _AC.append(audit_path(path), rec, now=now)
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            fp = audit_path(path)
+            d = os.path.dirname(fp)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(fp, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
     return rec
 
 
