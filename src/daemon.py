@@ -208,7 +208,13 @@ def _start_engine(day: date):
             f.write(str(p.pid))
     except Exception:
         pass
-    _log(f"{day} 开盘前 | 启动盘中引擎 pid={p.pid} (刷新实时快照, 盘中自动撮合/午间重选)")
+    # [2026-09-21] 不校验存活就记「已启动」是**假成功**的同款隐患(见 P1-DASHRESTORE)。
+    # 这里控制流保持不变(仍写 state/pidfile, 下一轮 _proc_alive 判死会自动重试),
+    # 只把**日志说法**改成实话, 以便"启动即崩"在日志里看得见而不是被成功掩盖。
+    if not _proc_alive(p.pid):
+        _log(f"{day} 启动盘中引擎失败: pid={p.pid} 启动后立即退出(见 {ENGINE_LOG}); 下一轮将自动重试")
+    else:
+        _log(f"{day} 开盘前 | 启动盘中引擎 pid={p.pid} (刷新实时快照, 盘中自动撮合/午间重选)")
     _write_state()
 
 
@@ -314,6 +320,14 @@ def _start_obs_component(name: str, cmd: list[str], cwd: str = None) -> bool:
     try:
         p = subprocess.Popen(cmd, cwd=cwd or _BASE,
                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        # [2026-09-21] 必须校验存活再报成功。背景: 本函数曾把"已拉起"当成功, 而
+        # `_obs_procs()` 识别不到刚起的进程时, 每轮(5 分钟)会把 8 个组件**全部重启一遍**,
+        # 实测堆积 48 个 alert_hook(见 _ensure_obs_stack docstring)。不校验存活, 这类
+        # "起了但立刻死/认不出"的循环就会在日志里显示为一片成功。
+        time.sleep(1.0)
+        if not _proc_alive(p.pid):
+            _log(f"观测栈 {name} 拉起失败: pid={p.pid} 启动后立即退出(见 logs/)")
+            return False
         _log(f"观测栈 {name} 未运行, 已拉起 pid={p.pid}")
         return True
     except Exception as e:  # noqa: BLE001
