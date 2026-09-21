@@ -168,6 +168,41 @@ class TestFreshnessAttribution:
         assert C(None) == "unknown"
 
 
+class TestFlowIntegration:
+    """#4 看门狗结论并入状态机：HALTED 语义 = **系统实际上已停止工作**。"""
+
+    def test_flow_critical_forces_halted(self):
+        r = assemble(_snap(flow={"level": "CRITICAL", "cause": "stalled",
+                                 "reason": "主循环疑似死锁: 盘中 300s 未写状态"}))
+        assert r["state"] == "HALTED"
+        assert any("数据停流" in x for x in r["reasons"])
+
+    def test_flow_critical_keeps_watchdog_attribution_text(self):
+        """归因文本必须原样带上 —— 面板要能看出是死锁还是行情源坏了。"""
+        r = assemble(_snap(flow={"level": "CRITICAL", "cause": "feed_stale",
+                                 "reason": "盘中数据停更 600s, 但**不是主循环死锁** —— 行情源错误: x"}))
+        assert "不是主循环死锁" in " ".join(r["reasons"])
+
+    def test_flow_warn_is_degraded_not_halted(self):
+        """『无法判定』是盲区(要人看), 不等于『已停摆』—— 两者不可混为一谈。"""
+        r = assemble(_snap(flow={"level": "WARN", "cause": "unknown", "reason": "时间戳不可解析"}))
+        assert r["state"] == "DEGRADED"
+
+    def test_flow_ok_and_idle_do_not_affect_state(self):
+        for lvl in ("OK",):
+            assert assemble(_snap(flow={"level": lvl, "cause": "idle", "reason": "非盘中"}))["state"] == "NORMAL"
+
+    def test_missing_flow_key_is_backward_compatible(self):
+        assert assemble(_snap())["state"] == "NORMAL"
+        assert assemble(_snap(flow=None))["state"] == "NORMAL"
+
+    def test_l3_and_flow_critical_accumulate(self):
+        r = assemble(_snap(l3_today=1, flow={"level": "CRITICAL", "cause": "dead_process",
+                                            "reason": "引擎进程不存在"}))
+        assert r["state"] == "HALTED"
+        assert len(r["reasons"]) == 2
+
+
 class TestPublishRead:
     """发布者/读取者分离：读取方必须**快**且**不编造状态**。
 

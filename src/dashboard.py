@@ -843,26 +843,17 @@ def read_weights():
 
 
 def _proc_alive(pid):
-    """探测 pid 进程是否存活 (Windows: OpenProcess; 其它: os.kill(pid,0))."""
-    if not pid:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-            if not h:
-                return False
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    """探测 pid 进程是否存活。
+
+    [2026-09-21] 改为委托 `proc_alive.alive()` —— 本函数原先自己用 OpenProcess 实现,
+    既没有 daemon 那条"句柄残留 => 已终止进程被 OpenProcess 成功打开"的退出码校验,
+    又**把『打不开』一律当成『已死』**: 实测以交互用户身份检查以 LocalSystem 运行的
+    守护/面板时, OpenProcess 因拒绝访问失败, 告警中心于是把三个**确实存活**的进程报成
+    `[critical] 进程未存活`。跨身份(面板被外部脚本以别的身份拉起)就会规律性出现假 CRITICAL。
+    正确判据: ERROR_ACCESS_DENIED 本身**证明进程存在**; 详见 `src/proc_alive.py`。
+    """
+    from proc_alive import alive as _alive
+    return _alive(pid)
 
 
 def read_overview():
@@ -1263,6 +1254,26 @@ def read_riskops():
     return out
 
 
+def _engine_expected_now(now=None) -> bool:
+    """此刻盘中引擎**本该**在运行吗？（交易日 08:30~15:03）
+
+    用来把"预期内的退出"从告警里摘掉：收盘后引擎本就不该存在，报 critical 是噪音。
+    窗口取自守护的实际调度(daemon.py: 08:30 启动 / 15:03 收盘)，不另造时间。
+    """
+    from datetime import time as _t
+    now = now or datetime.now()
+    try:
+        import sys as _s
+        _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from trading_calendar import is_trading_day as _itd
+        if not _itd(now.date()):
+            return False
+    except Exception:  # noqa: BLE001
+        # 交易日历不可用时**不**据此静音(宁可报警, 不可漏报)
+        return True
+    return _t(8, 30) <= now.time() < _t(15, 3)
+
+
 def read_alerts():
     """告警中心: 规则评估 (门控/进程/引擎心跳/数据滞后/回撤/单日亏损/冻结)."""
     out = {"ok": True, "alerts": [], "critical": 0, "warn": 0}
@@ -1293,22 +1304,36 @@ def read_alerts():
                 pid = int(open(p, encoding="utf-8").read().strip() or 0)
         except Exception:
             pid = None
-        alive = _proc_alive(pid) if pid else False
-        if not alive:
-            adds("critical", f"{name}进程", f"pid={pid} 未存活")
+        # [2026-09-21] 三态报告: 探测受限时**不得**声称"未存活"(假 CRITICAL 会让运维去重启
+        # 健康进程, 比不报警更糟)。见 src/proc_alive.py。
+        try:
+            from proc_alive import probe as _probe
+            st = _probe(pid) if pid else False
+        except Exception:  # noqa: BLE001
+            st = None
+        if st is False:
+            # [2026-09-21] 引擎只在交易日 08:30~15:03 该活着 —— 收盘后它**本就该退出**,
+            # 此前一律报 critical, 于是每天夜里面板都挂着一条假 critical(实测 23:50 仍在报)。
+            # 与 HALTED/夜间状态机同一条纪律: 预期内的缺席不是故障, 不该喊狼来了。
+            # 另两项(守护/仪表台)常驻, 不设窗口。
+            if name == "盘中引擎" and not _engine_expected_now():
+                continue
+            adds("critical", f"{name}进程", f"pid={pid} 确认不存在")
+        elif st is None:
+            adds("warn", f"{name}进程", f"pid={pid} 无法判定(权限受限, 非故障)")
+    # 数据流动（#4 看门狗，替换此前的内联 120s 规则）
+    # [2026-09-21] 此处曾自己写死"盘中且 age>120 => warn"。同一条判据出现在两处就会漂移，
+    # 故收敛到 flow_watchdog 单一事实源；顺带升级了能力: 能区分**主循环死锁 / 行情源冻住 /
+    # 进程不在**（三种运维动作不同），并把 tick 计数器未推进作为死锁硬证据带出来。
     try:
-        with open(os.path.join(DATA_DIR, "live_state.json"), encoding="utf-8") as f:
-            lv = json.load(f)
-        upd = lv.get("updated") or ""
-        if upd:
-            try:
-                age = (datetime.now() - datetime.strptime(upd, "%Y-%m-%d %H:%M:%S")).total_seconds()
-                if lv.get("in_session") and age > 120:
-                    adds("warn", "引擎心跳", f"盘中状态但 {int(age)}s 未刷新")
-            except Exception:
-                pass
-    except Exception:
-        pass
+        import flow_watchdog as _fw
+        _f = _fw.gather()
+        if _f.get("level") == "CRITICAL":
+            adds("critical", "数据流动(#4)", str(_f.get("reason")))
+        elif _f.get("level") == "WARN":
+            adds("warn", "数据流动(#4)", str(_f.get("reason")))
+    except Exception as e:  # noqa: BLE001
+        adds("warn", "数据流动(#4)", f"看门狗不可用: {type(e).__name__}: {str(e)[:110]}")
     # 数据滞后
     rep = os.path.join(DATA_DIR, "check_data_report.json")
     try:

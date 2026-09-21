@@ -86,6 +86,10 @@ _state = {
     "last_error": None,
 }
 
+#: 数据流动看门狗(#4)的上次结论, 用于"只在结论变化/每 5 分钟"记日志, 避免刷屏。
+#: 不落盘: 守护重启后重新判定一次即可, 无需跨进程记忆。
+_FLOW_LAST: dict = {}
+
 
 def _write_state():
     try:
@@ -122,38 +126,15 @@ def _trim_tail(max_lines=4000, max_bytes=512 * 1024):
 
 
 def _proc_alive(pid):
-    if not pid:
-        return False
-    try:
-        import ctypes
-        # PROCESS_QUERY_INFORMATION | SYNCHRONIZE 权限位, 进程结束后 OpenProcess 返回 NULL.
-        # 旧代码用 1 (PROCESS_TERMINATE) 会对已结束进程误判为"存活", 使看护不重建崩溃的 dashboard.
-        #
-        # [2026-09-19 再修] 仅靠 OpenProcess 成功**仍不足以**判定存活: Windows 上只要还有
-        # **任何句柄**指向已终止的进程对象, OpenProcess 就会成功 —— 而 subprocess.Popen 在
-        # wait() 之后**仍持有句柄**(直到该对象被回收)。故看护若曾 wait 过该子进程、或持有其
-        # Popen 对象, 就会把一个**已崩溃**的进程判为存活, 从而**不重建** —— 与上面那条旧缺陷
-        # 是同一故障模式; 换权限位解决不了句柄残留。
-        # 实测(2026-09-19, 经故障注入演练发现): 子进程已 exit(7)、未释放其 Popen 句柄时
-        #     daemon._proc_alive(pid) = True    (错)
-        #     GetExitCodeProcess       = False  (对)
-        # 故必须**同时**校验退出码: 仍在运行 => STILL_ACTIVE(259)。
-        STILL_ACTIVE = 259
-        k = ctypes.windll.kernel32
-        h = k.OpenProcess(0x0400, False, int(pid))
-        if not h:
-            return False
-        try:
-            code = ctypes.c_ulong()
-            if not k.GetExitCodeProcess(h, ctypes.byref(code)):
-                # 拿不到退出码: 保守沿用旧语义(能打开即算存活), 以免在受限句柄/非 Windows
-                # 场景把**活进程**误判为死亡而反复重建。
-                return True
-            return code.value == STILL_ACTIVE
-        finally:
-            k.CloseHandle(h)
-    except Exception:
-        return False
+    """探测 pid 进程是否存活（**保守**: 无法判定时按存活处理）。
+
+    [2026-09-21] 实现已抽到 `src/proc_alive.py` 单一事实源 —— 面板此前自己写了一份,
+    缺了下面那条退出码校验、又把"打不开"当"已死", 于是把活着的进程报成"未存活"。
+    抽公共实现时**保持**本处语义: 未知一律按存活, 以免探测受限时反复重建健康进程
+    (那正是守护最该避免的"重启风暴")。
+    """
+    from proc_alive import alive as _alive
+    return _alive(pid, unknown_means_alive=True)
 
 
 def _is_trading_day(d):
@@ -333,6 +314,34 @@ def _start_obs_component(name: str, cmd: list[str], cwd: str = None) -> bool:
     except Exception as e:  # noqa: BLE001
         _log(f"拉起观测栈 {name} 失败: {e}")
         return False
+
+
+def _check_flow() -> None:
+    """数据流动看门狗（路线图 #4）：引擎**活着**但数据停流时报警。
+
+    与 pid 监护互补：`_proc_alive` 抓不到"进程活着、主循环卡住/行情源冻住"这类静默停摆。
+    **只报告, 不擅自重启** —— 重启一个活着的引擎可能丢掉它正持有的状态, 属高风险动作,
+    按既定红线应转人工处置（阈值与归因分类见 `flow_watchdog.py` 的 docstring）。
+
+    不刷屏：结论变化时记一条, 持续期间每 5 分钟复述一次 —— 否则每 15 秒一行会淹没日志,
+    而这正是让告警失效的老路。
+    """
+    try:
+        import flow_watchdog as FW
+        r = FW.gather()
+    except Exception as e:  # noqa: BLE001
+        _log(f"数据流动看门狗异常(不影响主循环): {type(e).__name__}: {e}")
+        return
+    lvl = r.get("level")
+    now = time.time()
+    if lvl == "OK":
+        if _FLOW_LAST.get("level") not in (None, "OK"):
+            _log(f"数据流动已恢复(cause={r.get('cause')}): {r.get('reason')}")
+        _FLOW_LAST.update(level="OK", ts=now)
+        return
+    if lvl != _FLOW_LAST.get("level") or (now - float(_FLOW_LAST.get("ts") or 0)) >= 300:
+        _log(f"[{lvl}] 数据流动看门狗: {r.get('reason')}")
+        _FLOW_LAST.update(level=lvl, ts=now)
 
 
 def _publish_health_state() -> None:
@@ -578,6 +587,11 @@ def run_loop():
                         _state["running_day"] = None
                         _state["engine_done"] = True
                         _write_state()
+                else:
+                    # 进程活着 -> 再问一句"数据还在流吗"(路线图 #4)。
+                    # 这是 pid 监护**原理上抓不到**的一类: 主循环卡住/行情源冻住时,
+                    # 进程一切正常, 盘面却静静冻住, 直到收盘才发现整天没动。
+                    _check_flow()
             _sync_sub_logs()
         else:
             _sync_sub_logs()

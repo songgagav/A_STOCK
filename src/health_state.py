@@ -20,8 +20,9 @@
 状态语义
 --------
   NORMAL    全部可观测量正常
-  DEGRADED  有任一降级原因（延迟/数据滞后/账户静态估值），但策略未被 L3 停摆
-  HALTED    当日存在 L3 降级事件 —— 策略维度停摆，权重最高
+  DEGRADED  有任一降级原因（延迟/数据滞后/账户静态估值），但系统仍在工作
+  HALTED    **系统实际上已停止工作**：当日 L3 事件（策略停摆）或盘中数据停流
+            （引擎死了/主循环死锁/行情源冻住，见 #4 `flow_watchdog`）—— 权重最高
 
 归因纪律（2026-09-21 修，第二增量）
 ------------------------------------
@@ -59,7 +60,9 @@ freshness_ok=False 且探针成功         厂商确实滞后 => 等厂商
 快照把"环境依赖"收敛在发布者一处。
 
 快照自身的`age_s` 只作**信息性**标记（`stale`），不改状态语义 ——
-"数据停流多久算事故"是 **#4 看门狗**的域，此处不抢答。
+"数据停流多久算事故"归 **#4 看门狗**（`src/flow_watchdog.py`，阈值 120s 及其
+三条本仓证据见该模块 docstring）。本模块**消费**它的结论（`assemble` 的 `flow` 入参），
+不重复定义阈值：同一件事只允许有一个数字。
 """
 from __future__ import annotations
 
@@ -138,7 +141,19 @@ def assemble(snap: dict) -> dict:
     if l3:
         reasons.append(f"当日 {l3} 个 L3 降级事件(策略停摆)")
 
-    state = "HALTED" if l3 else ("DEGRADED" if reasons else "NORMAL")
+    # #4 看门狗结论（进程活着但数据停流）—— 归因文本原样带上, 不在这一层改写
+    flow = snap.get("flow") or {}
+    flevel = flow.get("level")
+    if flevel == "CRITICAL":
+        reasons.append(f"盘中数据停流(#4 看门狗): {flow.get('reason')}")
+    elif flevel == "WARN":
+        reasons.append(f"数据流动无法判定(#4 看门狗): {flow.get('reason')}")
+
+    # HALTED 语义 = **系统实际上已停止工作**: 策略停摆(L3) 或 盘中数据停流(引擎死了/死锁/
+    # 行情源冻住)。这两种情况下账户既不会正确估值、也不会正确执行, 故同为 HALTED;
+    # 归因文本各自保留, 由消费方区分该去查策略还是查引擎。
+    halted = bool(l3) or flevel == "CRITICAL"
+    state = "HALTED" if halted else ("DEGRADED" if reasons else "NORMAL")
     return {"state": state, "reasons": reasons}
 
 
@@ -204,6 +219,17 @@ def gather() -> dict:
                 snap["l3_today"] = n
     except Exception:  # noqa: BLE001
         pass
+
+    # 4) 数据流动 —— #4 看门狗（进程活着但数据停流）
+    #    复用同一个判据, 不在这里重写阈值; 看门狗自己会读 live_state + 引擎 pid。
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(root, "src"))
+        import flow_watchdog as FW
+        snap["flow"] = FW.gather()
+    except Exception as e:  # noqa: BLE001
+        snap["flow"] = None
+        snap["flow_error"] = f"{type(e).__name__}: {e}"
 
     return {"observed": snap, **assemble(snap)}
 
