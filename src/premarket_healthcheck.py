@@ -55,6 +55,30 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+
+def _arcticdb_retired() -> bool:
+    """ArcticDB 是否**根本没装** => 视为已退役(主源=h5i)。
+
+    [2026-09-22 修, 登记册 P2-HEALTHNOISE] 此前 `check_arcticdb` / `check_arcticdb_rw` /
+    `check_strategy_diagnostics` 三项在未装 arcticdb 时各自抛 ModuleNotFoundError 并被记成
+    **FAIL**, 于是健康卡长期挂着 3 条永远为红的噪音(实测面板 `critical=3` 里有它们),
+    真正的 FAIL 反而被淹没 —— 与"狼来了"同构。
+    退役组件不存在是**预期事实**, 不是故障: 与 legacy DuckDB 的处理口径保持一致。
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec("arcticdb") is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _retired_record(name: str, t0: float) -> dict:
+    """退役组件的记录: SKIP(不参与 FAIL 判定), 但**留痕**说明未执行该项检查。"""
+    return _record(name, "SKIP",
+                   {"retired": True,
+                    "note": "ArcticDB 已退役(主源=h5i); 未安装属预期, 本项未执行检查, "
+                            "不计入 FAIL/告警"}, t0)
+
 def _record(name: str, status: str, detail: Any, t0: float) -> dict:
     return {
         "name": name,
@@ -284,6 +308,8 @@ def check_duckdb() -> dict:
 def check_arcticdb() -> dict:
     t0 = time.time()
     name = "arcticdb"
+    if _arcticdb_retired():
+        return _retired_record(name, time.time())
     try:
         from arctic_store import get_store
         store = get_store()
@@ -436,6 +462,65 @@ def _expected_bar_day(nowd: "date | None" = None, now_t=None) -> "date":
     return nowd - timedelta(days=back)
 
 
+
+def _norm_day(x):
+    """把日期正规化成 datetime.date。
+
+    存在的理由(实测踩到): `engine_bars_sync.engine_available()['day']` 返回的是
+    **字符串** '20260918', 而本模块的 `expected`/`latest_d` 是 `datetime.date` ——
+    直接 min() 会抛 `TypeError: '<' not supported between instances of 'str' and 'datetime.date'`。
+    故纯函数在入口统一正规化, 接受 date / 'YYYYMMDD' / 'YYYY-MM-DD' / None。
+    """
+    if x is None:
+        return None
+    if hasattr(x, "isoformat") and not isinstance(x, str):
+        return x
+    t = str(x).strip().replace("-", "")
+    if len(t) >= 8 and t[:8].isdigit():
+        try:
+            return date(int(t[:4]), int(t[4:6]), int(t[6:8]))
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _freshness_verdict(latest_d, expected, engine_day=None, engine_error=None) -> tuple:
+    """**纯函数**: 主源日线新鲜度的判据(便于测试)。
+
+    关键修正(登记册 P1-PREMARKET-FALSEFAIL): 期望不能只看**日历**, 还要看**可达上限** ——
+    h5i 的最高可能水位被"厂商是否发布"卡住。若厂商自己也没发, 我们的管道并没有落后,
+    此时报 FAIL 并让人去查入库管道是**归因错误**(指向一条正常的管道)。
+
+    返回 (status, basis):
+      厂商已发当日而主源没有  => FAIL  (真实入库滞后, 必须保留)
+      厂商自身也没发          => OK    (无可达数据缺失; basis 说明原因)
+      落后 1 天               => WARN
+      引擎探针不可用          => WARN  (**不猜**: 无法判定是我们的滞后还是厂商的)
+    """
+    if latest_d is None or expected is None:
+        return "FAIL", "无法解析最新 bar 日或期望交易日"
+    latest_d, expected = _norm_day(latest_d), _norm_day(expected)
+    engine_day = _norm_day(engine_day)
+    if latest_d is None or expected is None:
+        return "FAIL", "日期正规化失败(无法解析最新 bar 日或期望交易日)"
+    ceiling = expected
+    if engine_day is not None:
+        ceiling = min(expected, engine_day)
+    elif engine_error:
+        lag = (expected - latest_d).days
+        return ("WARN",
+                f"引擎探针不可用, 无法判定可达上限(不能断定是主源滞后): {str(engine_error)[:120]}; "
+                f"按日历落后 {lag} 天")
+    lag_ceiling = (ceiling - latest_d).days
+    if engine_day is not None and engine_day < expected and latest_d >= engine_day:
+        return "OK", (f"厂商亦未发布(引擎最新 {engine_day}, 日历期望 {expected}) —— "
+                      f"主源已追平**可达上限**, 不是入库滞后")
+    if lag_ceiling >= 2:
+        return "FAIL", f"落后可达上限 {ceiling} 共 {lag_ceiling} 天"
+    if lag_ceiling == 1:
+        return "WARN", f"落后可达上限 {ceiling} 共 1 天"
+    return "OK", "已追平可达上限" if engine_day else "已追平期望交易日"
+
 def check_daily_bars_freshness() -> dict:
     """主源日线新鲜度: 最新 bar 日 vs 期望交易日. 数据取自 h5i 主源(DuckDB 已退役,
     仅在文件存在时作回退), 因此不再因 legacy 库缺失而误报 FAIL."""
@@ -457,21 +542,32 @@ def check_daily_bars_freshness() -> dict:
         nowd = date.today()
         expected = _expected_bar_day(nowd, datetime.now().time())
         expected_lag = (expected - latest_d).days if latest_d else None
-        if expected_lag is None or expected_lag > 1:
-            status = "FAIL"
-        elif expected_lag == 1:
-            status = "WARN"
-        else:
-            status = "OK"
+        # [2026-09-22 修, P1-PREMARKET-FALSEFAIL] 判据改为**可达上限**并抽成纯函数。
+        # 探针实测 1.71s(engine_bars_sync), 盘前一次性检查可接受; 探针失败 => WARN 而非 FAIL
+        # (归因纪律: 探不到不等于厂商滞后, 也不等于我们滞后)。
+        _engine_day = _engine_error = None
+        try:
+            import engine_bars_sync as _EBS
+            _p = _EBS.engine_available()
+            if _p.get("ok"):
+                _engine_day = _p.get("day")
+            else:
+                _engine_error = _p.get("error")
+        except Exception as _e:  # noqa: BLE001
+            _engine_error = f"{type(_e).__name__}: {_e}"
+        status, _basis = _freshness_verdict(latest_d, expected, _engine_day, _engine_error)
         detail = {"source": src, "latest_date": latest, "today": today,
                   "days_lag": days_lag, "expected_lag": expected_lag,
                   "expected": expected.isoformat(), "universe_size": n_uni,
+                  "engine_day": _engine_day, "basis": _basis,
                   "expected_basis": "最后一个已收盘交易日(非当天)",
                   "legacy_duckdb_retired": not os.path.exists(DUCKDB_PATH)}
-        if status != "OK":
-            detail["action"] = (f"主源({src})最新 bar 日 {latest}, 落后期望交易日 "
-                                f"{expected.isoformat()} {expected_lag} 天; "
-                                f"请检查 h5i 入库管道")
+        if status == "FAIL":
+            detail["action"] = (f"主源({src})最新 bar 日 {latest}, 落后**可达上限**; "
+                                f"厂商已发布到 {_engine_day} => 属真实入库滞后, 请检查 h5i 入库管道")
+        elif status == "WARN":
+            detail["action"] = f"需人工看一眼: {_basis}"
+        # OK 时不给 action —— 避免像修复前那样让人去查一条完全正常的管道
         return _record(name, status, detail, t0)
     except Exception as e:
         return _record_duckdb(e, name, t0)
@@ -1142,6 +1238,8 @@ def check_arcticdb_rw() -> dict:
     import time as _t
     t0 = time.time()
     name = "arcticdb_rw"
+    if _arcticdb_retired():
+        return _retired_record(name, time.time())
     try:
         from arctic_store import get_store, ARCTIC_URI
         store = get_store()
@@ -1478,6 +1576,8 @@ def check_strategy_diagnostics() -> dict:
     产出一份 normal/watch/warning 状态标签 + 各项'生命体征'."""
     t0 = time.time()
     name = "strategy_diag"
+    if _arcticdb_retired():
+        return _retired_record(name, time.time())
     try:
         import performance_report as pr
         # ---- 1) 绩效体检 (收益/夏普/回撤) ----

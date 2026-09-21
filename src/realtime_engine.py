@@ -301,20 +301,37 @@ TARGETS_SRC_FP = os.path.join(DATA_DIR, "targets_source.jsonl")
 #: 视为"当日同源"的档位; 其余档位 = 跨日回退或现场选股, 必须留痕
 _RUNG_SAME_DAY = ("drl_same_day", "selection_same_day")
 
+#: load_targets 的计时起点(供 _trace_targets 记录选股耗时; 0 表示尚未开始计时)。
+#: [2026-09-22] P0-FREEZE-0925 的"选股耗时预算"告警需要真实耗时, 此前只记档位与只数。
+_LT_T0 = 0.0
+
 
 def _trace_targets(day: str, sel_day: str, rung: str, n: int) -> None:
     """记录目标池的实际来源档位。**绝不抛异常**(选股主链路)。"""
+    _elapsed = (time.perf_counter() - _LT_T0) if _LT_T0 else None
     try:
         os.makedirs(os.path.dirname(TARGETS_SRC_FP), exist_ok=True)
         with open(TARGETS_SRC_FP, "a", encoding="utf-8") as f:
             f.write(json.dumps({"at": datetime.now().isoformat(timespec="seconds"),
                                 "consume_day": day, "sel_day": sel_day,
-                                "rung": rung, "n": int(n)}, ensure_ascii=False) + "\n")
+                                "rung": rung, "n": int(n),
+                                "elapsed_s": round(_elapsed, 3) if _elapsed else None},
+                               ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
         pass
     if rung not in _RUNG_SAME_DAY:
         log(f"[targets] **非当日同源**: 消费日 {day} 实际使用 {rung} 的池"
             f"(来源日 {sel_day}, {n} 只) —— 当日无正式计划, 已回退")
+    # [2026-09-22, P0-FREEZE-0925 纯告警版] 把"落到哪一档 + 耗时 + 完成时刻"从日志
+    # 升级为**告警 + 哈希链事件账本**。**只观察不干预**: 不丢弃、不改写、不阻断任何信号,
+    # 故信号路径未变(dry-run 结果仍代表当前系统)。
+    try:
+        import signal_freeze_watch as _SFW
+        _r = _SFW.observe(rung=rung, pool_size=int(n), elapsed_s=_elapsed)
+        for _a in (_r.get("alerts") or []):
+            log(f"[signal-freeze/{_a['severity']}] {_a['detail']}")
+    except Exception as _e:  # noqa: BLE001
+        log(f"[signal-freeze] 观测异常(不影响选股): {type(_e).__name__}: {_e}")
 
 
 def load_targets(day: str):
@@ -340,6 +357,10 @@ def load_targets(day: str):
     盘前视角(见该函数 docstring 的 v1/v2/v3 修复史)。
     """
     d = day.replace("-", "")
+    # [2026-09-22] 计时起点: 供 _trace_targets 记录"选股耗时"(P0-FREEZE-0925 的
+    # 耗时预算告警需要它; 此前只记档位与只数, 没有耗时)。
+    global _LT_T0
+    _LT_T0 = time.perf_counter()
 
     # P8: 消费日的前一实际交易日(跨周末/节假日), 供 DRL plan 正式窗口校验使用
     prev_trade_day = _prev_trade_day(day)
