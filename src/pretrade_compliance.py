@@ -189,6 +189,85 @@ def record_review(order: dict, ctx: dict, actor: str = "engine",
     return r
 
 
+# ------------------------------------------------------------- 高危单待批队列
+
+def pending_path(path: str | None = None) -> str:
+    return path or os.path.join(_repo_root(), "data", "pending_orders.json")
+
+
+def _read_pending(path: str | None) -> dict:
+    fp = pending_path(path)
+    try:
+        with open(fp, encoding="utf-8-sig") as f:
+            j = json.load(f)
+        return j if isinstance(j, dict) else {"orders": []}
+    except Exception:  # noqa: BLE001
+        return {"orders": []}
+
+
+def _write_pending(path: str | None, doc: dict) -> None:
+    fp = pending_path(path)
+    d = os.path.dirname(fp)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, fp)
+
+
+def enqueue(order: dict, ctx: dict, actor: str = "engine",
+            path: str | None = None, audit_fp: str | None = None, now=None) -> dict:
+    """高危单入待批队列（**不执行**）。返回队列项（含 id）。"""
+    now = now or datetime.now()
+    doc = _read_pending(path)
+    seq = len(doc.get("orders") or []) + 1
+    item = {"id": f"{now.strftime('%Y%m%d%H%M%S')}-{seq}",
+            "ts": now.strftime(_TS_FMT), "order": dict(order or {}),
+            "reasons": list(ctx.get("_reasons") or []) if isinstance(ctx, dict) else [],
+            "actor": actor, "status": "pending"}
+    r = review(order, ctx) if isinstance(ctx, dict) else {"reasons": []}
+    item["reasons"] = r.get("reasons") or item["reasons"]
+    doc.setdefault("orders", []).append(item)
+    _write_pending(path, doc)
+    audit({"action": "pending_approval", "id": item["id"], "symbol": (order or {}).get("symbol"),
+           "side": (order or {}).get("side"), "qty": (order or {}).get("qty"),
+           "price": (order or {}).get("price"), "reasons": item["reasons"],
+           "actor": actor}, path=audit_fp, now=now)
+    return item
+
+
+def decide(order_id: str, approve: bool, actor: str = "human", reason: str = "",
+           path: str | None = None, audit_fp: str | None = None, now=None) -> dict:
+    """人工批准/驳回。**已决的单不可再决**（防重复放行）。"""
+    now = now or datetime.now()
+    doc = _read_pending(path)
+    for it in doc.get("orders") or []:
+        if it.get("id") == order_id:
+            if it.get("status") != "pending":
+                return {"ok": False, "error": f"该单已决: status={it.get('status')}"}
+            it["status"] = "approved" if approve else "rejected"
+            it["decided_by"] = actor
+            it["decided_at"] = now.strftime(_TS_FMT)
+            it["decision_reason"] = reason
+            _write_pending(path, doc)
+            audit({"action": "approved" if approve else "rejected", "id": order_id,
+                   "symbol": (it.get("order") or {}).get("symbol"),
+                   "side": (it.get("order") or {}).get("side"),
+                   "qty": (it.get("order") or {}).get("qty"),
+                   "price": (it.get("order") or {}).get("price"),
+                   "reasons": [reason] if reason else [], "actor": actor},
+                  path=audit_fp, now=now)
+            return {"ok": True, "item": it}
+    return {"ok": False, "error": f"未找到待批单: {order_id}"}
+
+
+def approved_orders(path: str | None = None) -> list:
+    """取出**已批准但尚未执行**的单（引擎下一 tick 放行的对象）。"""
+    return [it for it in (_read_pending(path).get("orders") or [])
+            if it.get("status") == "approved"]
+
+
 def _main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="每单合规 + 高危识别 + 订单审计")
