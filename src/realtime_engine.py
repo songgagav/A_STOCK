@@ -891,6 +891,33 @@ class RealtimeEngine:
             if self._gate.get("freeze_new_buys") and self.pb.state != "DRAW_DOWN":
                 log("门控冻结: 暂停新买入 (仅止损/风控离场)")
             return 0
+        # 3.0) 三层 Kill Switch（路线图 #1）—— 补上此前**完全缺失**的人工层(GLOBAL),
+        #      并顺带把 #4 的"行情源冻住"接进来(按陈旧价开新仓是本闸门的核心场景之一)。
+        #      上面两层(账户 DRAW_DOWN / IC 门控)保持原样不动, 以免改变既有行为与日志措辞。
+        #      **只拦新开仓, 绝不拦止损/离场** —— 把卖出也闸掉等于把风险锁在仓里。
+        #      留痕落到 data/kill_switch_ledger.jsonl(append-only), 这正是 P0-FREEZE-0925
+        #      所缺的"不可变 + 留痕"那一半。
+        try:
+            import kill_switch as _KS
+            _ks = _KS.verdict(
+                account={"state": self.pb.state},
+                strategy={"ic_freeze": bool(self._gate.get("freeze_new_buys")),
+                          "feed_stale": bool(getattr(self.feed, "last_error", "") or "")})
+            if _ks.get("blocked"):
+                _sig = tuple(_ks.get("layers") or ())
+                if getattr(self, "_ks_last_sig", None) != _sig:
+                    self._ks_last_sig = _sig
+                    _msg = "Kill Switch 拦截新开仓: " + "; ".join(_ks.get("reasons") or [])
+                    log(_msg)
+                    try:
+                        _KS.record("KILL_SWITCH", "block", "engine", _msg)
+                    except Exception:  # noqa: BLE001
+                        pass        # 留痕失败不得拖垮交易路径
+                return 0
+            self._ks_last_sig = None
+        except Exception as _e:  # noqa: BLE001
+            # 判定异常时**不阻断交易**(否则一个 bug 会让系统静默停手), 但必须响亮报出
+            log(f"Kill Switch 判定异常(不阻断, 需排查): {type(_e).__name__}: {_e}")
         if gate_open:
             for t in self.targets:
                 canon = t["canon"]
