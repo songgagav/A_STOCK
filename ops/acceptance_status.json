@@ -542,6 +542,24 @@
       "detail": "**【2026-09-21 自查自纠 —— 这是我在修 P1-OBSLEAK 时引入的回归】**\n\n修 `P1-OBSLEAK` 时为消除“名字子串误命中第三方进程”（`ivms320-redis-server`），我给 `_obs_procs()` 统一加了**路径约束**（要求命令行含本仓/观测栈目录）。\n\n**但 celery/flower 是用 `-m` 启动的**：\n```\n[PY, \"-m\", \"celery\", \"-A\", \"src.tasks_db\", \"worker\", \"--pool=solo\", ...]\n[PY, \"-m\", \"celery\", \"-A\", \"src.tasks_db\", \"flower\", \"--port=5555\"]\n```\n**命令行里根本没有本仓路径** ⇒ 判据 `repo in cmdline` 恒为假 ⇒ 它们被**永远判为“未运行”** ⇒ daemon 每轮重启一次。实测日志节奏完全吻合：**13:29 / 14:19 / 15:10 / 16:00 / 16:51 / 17:41，每约 50 分钟一次**（修 P1-OBSLEAK 之前的老判据 `\"celery\" in cl and \"tasks_db\" in cl` 本来是能命中的）。\n\n**教训**：判据要**贴合各自的启动形态**，不能一刀切。\n· 按**脚本绝对路径**启动的（metrics_server / alert_hook / 原生 exe）→ 路径约束正确；\n· 按 **`-m` 模块**启动的（celery / flower）→ 路径约束**必然失效**，应改用**模块名**判据。\n\n**修复**：celery/flower 改为 `repo in cl or \"src.tasks_db\" in cl` —— `src.tasks_db` 足够 specific，既能命中，又不会误命中第三方同名进程。",
       "evidence": "src/daemon.py 原 celery/flower 启动命令为 [PY,'-m','celery','-A','src.tasks_db',...]（无路径）; 实测 daemon.log 中 celery 被拉起的时间戳: 13:29/14:19/15:10/16:00/16:51/17:41(每约 50 分钟); 修复后以假进程验证: _obs_procs() = {'celery': 1, 'flower': 2} 且**不含**第三方 ivms320-redis-server; 全量回归 811 passed",
       "next": "**改动需 daemon 重启才生效**（正在跑的 daemon 仍是旧代码）—— 但**不必现在重启**：celery/flower 每约 50 分钟被重启一次只是浪费，不阻塞交易。下次因别的原因重启服务时自然生效。另注：本次也顺带证实 `ivms320-redis-server` 那条误命中已被消除（两个 bug 同时修好）。"
+    },
+    {
+      "id": "P1-DQGUARD",
+      "level": "P1",
+      "title": "入库结构哨兵已上线：任何来源、任何量纲下都不可能合法的行一律拒绝写入 h5i daily_bars",
+      "status": "fixed",
+      "detail": "**路线图 #5 的第一刀（P0 级动机，落地为持续闸门）。**\n\n动机: 2026-09-04 事故（406 只 volume 错 100 倍静默进库）暴露当时的防线只有 **dtype 约束**\n—— 但 dtype 管不了**值域与关系**（100 倍错的 volume 依然是合法 float64）。\n\n**实现**: `src/data_quality_guard.py`\n· `validate_daily_bars(df)` —— 五项与来源无关的结构检查:\n  `ohlc_relations`(high<max(open,close,low) 或 low>min(...)) / `positive_prices`(OHLC 任一≤0) /\n  `nonneg_volume` / `nonneg_amount` / `core_nan`(核心列 NaN)。\n· **刻意不查** `change_pct`/`turnover` 的 NaN（历史合法: 镜像未提供 turnover 而留空）;\n  volume 量纲(手/股)留给有第二数据源的**对账**工具。\n· `gate_decision(r)` —— 判定抽成纯函数, 供 CI 测试（append_daily_bars 需要 h5i_db, CI 没有）。\n· **接线点选在 `h5i_sync.append_daily_bars`** —— 它是 h5i daily_bars 的**唯一写入点**\n  （engine_bars_sync / free_stockdb_sync / update_db 三条路都汇于此）, 一道闸全拦。\n\n**基线扫描证据（动手前先跑存量）**: 最近 10 个交易日, 09-09..09-18 **零坏行**（引擎路径干净）;\n09-07 有 3 行、09-08 有 4 行坏行 —— 全是**零填充占位行**（open=high=low=0, 仅 close 有值）,\n符号 `600825/600929/688291/688432`, 全部属于**引擎覆盖缺口**的旧镜像数据（见 P2-ENGINEGAP）。\n\n**闸门语义**: fail-closed —— 结构违规**整批拒绝**, 错误信息带检查名/行数/符号,\n而不是一句『校验失败』。端到端实测: 真实坏行喂入 => 响亮拒绝, `appended=0`。",
+      "evidence": "src/data_quality_guard.py + tests/test_data_quality_guard.py 17 项; 基线扫描: 09-07 3 坏行/09-08 4 坏行(600825/600929/688291/688432 零填充), 09-09..09-18 全 0 坏行; 端到端: append_daily_bars(坏行) => ok=False, appended=0, error='结构校验未通过: ohlc_relations=1行, positive_prices=1行'; 全量回归 828 passed",
+      "next": "存量那 7 行零填充行**没有修**（与 P1-H5IUNIT-0904 同理: 改历史行需用户显式授权, 见 P1-ZEROFILL）。后续: 若要把阈值扩到『量纲量级』(如 volume 与 amount 的量级关系), 需要第二数据源, 属对账工具范畴。"
+    },
+    {
+      "id": "P1-ZEROFILL",
+      "level": "P1",
+      "title": "h5i daily_bars 存量有 7 行零填充占位行（open=high=low=0，仅 close 有值）",
+      "status": "open",
+      "detail": "**入库哨兵的基线扫描顺带揪出**（这正是『先看下游表现再定阈值』的回报）:\n\n| 日 | 符号 | 形态 |\n|---|---|---|\n| 09-07 | 600825 / 600929 / 688432 | open=high=low=0, close=有值, volume=0 |\n| 09-08 | 600825 / 600929 / 688291 / 688432 | 同上 |\n\n符号全部属于**引擎覆盖缺口**的旧镜像数据（P2-ENGINEGAP 清单内）;\n来源是 09-07/09-08 那两天写 h5i 的旧路径（当时镜像已冻结, 这些行由其它源补入）。\n\n**危害**: `open=0` 进入因子计算会产出无限/NaN 收益而无人察觉 —— 与 09-04 单位损坏同源,\n都是『坏数据静默在库』。\n\n**为什么没有当场修**: 改历史行需用户显式授权（P1-H5IUNIT-0904 同规则）。",
+      "evidence": "src/data_quality_guard.py 基线扫描输出: 09-07 3 坏行(600825/600929/688432)、09-08 4 坏行(600825/600929/688291/688432), 均同时违反 ohlc_relations 与 positive_prices; 直接查库确认 open=high=low=0.0 且仅 close 有值、volume=amount=0; 688291 在 09-07 是真实 OHLC、09-08 变零填充",
+      "next": "**用户决策项**: 是否修复这 7 行。可选: ① 按停牌惯例改写为『昨收复制』(open=high=low=close=前收, volume=0); ② 直接删除这 7 行(当日无有效 OHLC); ③ 暂不动(反正哨兵已拦住未来写入)。无论选哪个, 修复需绕过 h5i 单调追加约束改历史行, 须显式授权后再做。"
     }
   ]
 }
