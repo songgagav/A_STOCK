@@ -490,6 +490,9 @@ def run_loop():
     _log(f"守护进程启动 pid={os.getpid()}")
     _log(f"交易日时间表: 引擎{MARKET_OPEN:%H:%M}启动 / 收盘{MARKET_CLOSE:%H:%M}选股 | 免OS计划任务 | 崩溃自动拉起")
     _write_state()
+    # 启动即发布一次健康快照: 否则要等第一个 5 分钟看护轮次, 面板在这段窗口里会显示
+    # "快照陈旧" —— 那是**发布者还没跑**, 不是系统有病, 不该让人误读。
+    _publish_health_state()
 
     dash_tick = 0  # dashboard 健康检查轮次计数(周期性看护, 兜底外部 keep_alive)
 
