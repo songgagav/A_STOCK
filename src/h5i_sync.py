@@ -152,6 +152,21 @@ def append_daily_bars(df: pd.DataFrame) -> dict:
     if new.empty:
         return base
     new = new.sort_values(["_d", "symbol"]).reset_index(drop=True)
+    # [2026-09-21 路线图#5 入库结构哨兵] 任何来源、任何量纲下都不可能合法的行
+    # (OHLC 关系/非正价格/负量/核心 NaN) 一律**拒绝写入**。
+    # 证据(基线扫描): 存量 09-07/09-08 有 7 行零填充占位行(open=high=low=0,
+    # 仅 close 有值; 符号 600825/600929/688291/688432 —— 均为引擎覆盖缺口的旧镜像数据),
+    # 而引擎路径 09-09..09-18 一行都没有 => 哨兵拦的是旧源那类垃圾, 不误伤新源。
+    from data_quality_guard import validate_daily_bars, gate_decision
+    _g = gate_decision(validate_daily_bars(new))
+    if _g.get("reject"):
+        base.update({"ok": False,
+                     "error": "结构校验拒绝写入: " + str(_g.get("error")),
+                     "structural_bad_rows": _g.get("bad_rows"),
+                     "structural_checks": _g.get("checks"),
+                     "structural_sample": _g.get("sample")})
+        _log(f"结构校验拒绝写入: {_g.get('error')}")
+        return base
     with _LOCK:
         db = _open_h5i()
         if db is None:
