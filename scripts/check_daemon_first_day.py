@@ -251,10 +251,27 @@ def verdict(d: dict, phase: str) -> list:
         add("今日已生成新计划（19:10 后）", pg.get("exists") is True,
             f"exists={pg.get('exists')} generated_at={pg.get('generated_at')}")
         if pg.get("exists"):
-            add("section_as_of == 2026-09-21（换源生效的判据）",
-                str(pg.get("section_as_of")) == str(TODAY),
-                f"section_as_of={pg.get('section_as_of')} data_lag_days={pg.get('data_lag_days')} "
-                f"source={pg.get('source')}")
+            # ★ 判据按**场景**判定, 不再拿"今天"硬比。三个字段的真实语义(2026-09-21 实测订正):
+            #   · section_as_of  —— 实际用的**截面日**; 期望值是"最后一个**已收盘**交易日"
+            #                        (= prev_trading_day)。等于今天只在厂商已发布当日数据时成立。
+            #   · data_lag_days  —— **自然日**差(09-18→09-21 = 3), **不是**交易日差, 故不会是 0/1。
+            #   · source         —— **截面来源**(实测 `h5i_view`); **不是**因子融合路径 ——
+            #                        融合降级在**盘中引擎**另一条日志(`fusion_or_fml`)里, 两者别混。
+            got = str(pg.get("section_as_of"))
+            exp = str(d.get("prev_trading_day"))
+            if got == str(TODAY):
+                tag = "场景1: 厂商已发布当日数据 ⇒ 该日**可作干净评估样本**"
+                ok = True
+            elif got == exp:
+                tag = ("场景2: **厂商延迟发布** ⇒ target_plan 正常产出但截面滞后; "
+                       "该日**不计入干净评估样本**, 顺延至 section_as_of 追上当天为止")
+                ok = True          # 场景2 不是本仓故障, 故判 PASS 但明确标注
+            else:
+                tag = f"**异常**: section_as_of({got}) 既不等于今天({TODAY}) 也不等于上一交易日({exp})"
+                ok = False
+            add("section_as_of 场景判定", ok,
+                f"{tag}\n         section_as_of={got} 期望(上一交易日)={exp} "
+                f"data_lag_days={pg.get('data_lag_days')}(自然日) source={pg.get('source')}(截面来源)")
     else:
         add("盘后选股前不产出今日计划（预期如此，非故障）", pg.get("exists") is False,
             f"exists={pg.get('exists')} —— 选股在 19:10 盘后; 09:25 是**信号冻结截止**"
