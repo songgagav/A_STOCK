@@ -36,7 +36,7 @@ import socket
 import sys
 import time
 import traceback
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 from typing import Any
 from urllib import request, error
 
@@ -404,6 +404,38 @@ def check_orderbook() -> dict:
         return _record_duckdb(e, name, t0)
 
 
+def _expected_bar_day(nowd: "date | None" = None, now_t=None) -> "date":
+    """本检查应期望的最新 bar 日 = **最后一个已收盘交易日**（**不是当天**）。
+
+    [2026-09-21] 本检查在 08:30 **盘前**运行, 当天的 bar 必然还不存在; 原实现却把
+    周一~周五的期望设为**当天**, 于是:
+      · 周一盘前: latest=上周五 ⇒ lag=3 ⇒ **FAIL**（2026-09-21 实测纯误报）
+      · 周二~周五盘前: latest=昨日 ⇒ lag=1 ⇒ WARN
+    即**该检查在它的既定运行时刻永远不可能 OK**。这与"拿今天当基准而非最后已收盘
+    交易日"是同一类范畴错误（同类已在 src/engine_bars_sync.py::freshness 修过）。
+
+    收盘前(15:05 之前) → 今天之前的最近交易日; 收盘后 → 当天若是交易日则用当天。
+    日历不可用时退回星期近似（周一回退 3 天、周日 2 天、其余 1 天），至少不再每周一误报。
+    """
+    nowd = nowd or date.today()
+    now_t = now_t or datetime.now().time()
+    try:
+        from trading_calendar import latest_calendar_day as _lcd
+        # 坑(实测踩了两次): 本模块顶部是 `import time`(模块), 裸 `time(15,5)` 会 TypeError;
+        # 而 `datetime.time` 是 datetime **类上的实例方法描述符**(d.time()), 同样不可调用,
+        # 实测抛 "descriptor 'time' ... doesn't apply to a 'int' object"。
+        # 二者都会被下面的 except 吞掉 => **永远走 fallback**, 表面能跑却对日历一无所知。
+        # 故从 datetime 显式导入 `time as dtime`。
+        cutoff = nowd - timedelta(days=1) if now_t < dtime(15, 5) else nowd
+        got = _lcd(cutoff)
+        if got is not None:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    back = 3 if nowd.weekday() == 0 else (2 if nowd.weekday() == 6 else 1)
+    return nowd - timedelta(days=back)
+
+
 def check_daily_bars_freshness() -> dict:
     """主源日线新鲜度: 最新 bar 日 vs 期望交易日. 数据取自 h5i 主源(DuckDB 已退役,
     仅在文件存在时作回退), 因此不再因 legacy 库缺失而误报 FAIL."""
@@ -421,16 +453,9 @@ def check_daily_bars_freshness() -> dict:
         today = date.today().isoformat()
         latest_d = _parse_day(latest)
         days_lag = (date.today() - latest_d).days if latest_d else None
-        # 交易日期望校正: 周六/周日闭市, 最近"应有"交易日自然回退到周五(周一/周三亦前移),
-        # 避免首发 check 见 days_lag=2 就误报 FAIL 的周末误报. 仅查看自然日星期, 不依赖节假日表.
-        weekend = {"sat": 5, "sun": 6}
+        # [2026-09-21 修] 期望 = **最后一个已收盘交易日**（不是当天）—— 见 _expected_bar_day 的说明。
         nowd = date.today()
-        if nowd.weekday() == weekend["sat"]:
-            expected = nowd - timedelta(days=1)      # 周六 → 期望周五
-        elif nowd.weekday() == weekend["sun"]:
-            expected = nowd - timedelta(days=2)      # 周日 → 期望周五
-        else:
-            expected = nowd                           # 周一~周五 → 期望当天
+        expected = _expected_bar_day(nowd, datetime.now().time())
         expected_lag = (expected - latest_d).days if latest_d else None
         if expected_lag is None or expected_lag > 1:
             status = "FAIL"
@@ -441,6 +466,7 @@ def check_daily_bars_freshness() -> dict:
         detail = {"source": src, "latest_date": latest, "today": today,
                   "days_lag": days_lag, "expected_lag": expected_lag,
                   "expected": expected.isoformat(), "universe_size": n_uni,
+                  "expected_basis": "最后一个已收盘交易日(非当天)",
                   "legacy_duckdb_retired": not os.path.exists(DUCKDB_PATH)}
         if status != "OK":
             detail["action"] = (f"主源({src})最新 bar 日 {latest}, 落后期望交易日 "

@@ -16,10 +16,11 @@
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('start', 'stop', 'status', 'restart', 'heal')]
+  [ValidateSet('start', 'stop', 'status', 'restart', 'heal', 'diag')]
   [string]$Action = 'status',
   [string]$ServiceName = 'AStockDaemon',
   [string[]]$StrayServices = @('__probe_svc__'),
+  [string]$DiagDump = '',
   [int]$TimeoutSec = 90
 )
 
@@ -67,6 +68,83 @@ Step "当前状态: $($svc.Status)"
 
 if ($Action -eq 'status') {
   Step "daemon 进程: $((DaemonProcs).Id -join ', ')"
+  exit 0
+}
+
+# ---- 诊断: 提权才能读到 LocalSystem 进程的命令行 (非提权下 CommandLine 为空) ----
+# 用途: 查清 daemon 名下不断累积的子进程**到底是什么** —— 进程泄漏只报数量没用,
+# 必须知道是哪个组件在漏, 才能决定"补模块"还是"关掉它"。
+if ($Action -eq 'diag') {
+  $dump = if ($DiagDump) { $DiagDump } else { Join-Path $LogDir 'service_diag.txt' }
+  $lines = New-Object System.Collections.Generic.List[string]
+  function W([string]$s) { $lines.Add($s); Write-Host $s }
+
+  W ("诊断时间: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+  W ("服务 $ServiceName 状态: " + (Get-Service -Name $ServiceName).Status)
+
+  $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+  $svcHost = (Get-CimInstance Win32_Process -Filter "Name='nssm.exe'" -ErrorAction SilentlyContinue |
+              Select-Object -First 1).ProcessId
+  W ("nssm 宿主 pid: " + $svcHost)
+
+  # daemon 进程(带命令行)
+  W "`n--- daemon.py 进程 ---"
+  $daemons = @($all | Where-Object { $_.CommandLine -and $_.CommandLine -match 'daemon\.py' })
+  foreach ($d in $daemons) {
+    W ("  pid={0,-7} ppid={1,-7} 创建={2}" -f $d.ProcessId, $d.ParentProcessId,
+       $(if ($d.CreationDate) { $d.CreationDate.ToString('MM-dd HH:mm:ss') } else { '?' }))
+    W ("      {0}" -f $d.CommandLine)
+  }
+  $dpid = ($daemons | Sort-Object CreationDate | Select-Object -Last 1).ProcessId
+  W ("取最新 daemon pid = " + $dpid)
+
+  # daemon 的子进程: 这是泄漏的现场
+  W "`n--- daemon 子进程按命令行归类 ---"
+  $kids = @($all | Where-Object { $_.ParentProcessId -eq $dpid })
+  W ("  子进程总数 = " + $kids.Count)
+  $groups = $kids | Group-Object {
+    $cl = $_.CommandLine
+    if (-not $cl) { return '<命令行不可读>' }
+    $cl
+  } | Sort-Object Count -Descending
+  foreach ($g in $groups) {
+    W ("  {0,3} 个 x {1}" -f $g.Count, $(if ($g.Name.Length -gt 150) { $g.Name.Substring(0, 150) } else { $g.Name }))
+  }
+
+  # 逐个子进程明细(含创建时间, 判断泄漏节奏)
+  W "`n--- daemon 子进程明细(按创建时间) ---"
+  foreach ($k in ($kids | Sort-Object CreationDate)) {
+    $mem = try { [math]::Round((Get-Process -Id $k.ProcessId -ErrorAction Stop).WorkingSet64 / 1MB, 1) } catch { 0 }
+    W ("  {0}  pid={1,-7} ppid={2,-7} {3,7} MB  {4}" -f
+       $(if ($k.CreationDate) { $k.CreationDate.ToString('HH:mm:ss') } else { '?' }),
+       $k.ProcessId, $k.ParentProcessId, $mem,
+       $(if ($k.CommandLine -and $k.CommandLine.Length -gt 110) { $k.CommandLine.Substring(0, 110) } else { $k.CommandLine }))
+  }
+
+  # 全机 python 概览
+  W "`n--- 全机 python 进程概览 ---"
+  $pys = @($all | Where-Object { $_.Name -match 'python' })
+  W ("  总数 = " + $pys.Count)
+  $byParent = $pys | Group-Object ParentProcessId | Sort-Object Count -Descending | Select-Object -First 10
+  foreach ($g in $byParent) {
+    $par = $all | Where-Object { $_.ProcessId -eq [int]$g.Name } | Select-Object -First 1
+    W ("  父 pid={0,-7} ({1}) -> {2} 个子进程" -f $g.Name, $(if ($par) { $par.Name } else { '已退出' }), $g.Count)
+  }
+
+  # 端口占用(观测栈冲突现场)
+  W "`n--- 关键端口占用 ---"
+  foreach ($port in 3000, 9090, 9093, 9101, 6379, 5555, 8123, 8000) {
+    $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) {
+      $pr = $all | Where-Object { $_.ProcessId -eq $c.OwningProcess } | Select-Object -First 1
+      W ("  {0,-6} 被 pid={1,-7} ({2}) 占用 创建={3}" -f $port, $c.OwningProcess,
+         $(if ($pr) { $pr.Name } else { '?' }),
+         $(if ($pr -and $pr.CreationDate) { $pr.CreationDate.ToString('MM-dd HH:mm:ss') } else { '?' }))
+    } else { W ("  {0,-6} 空闲" -f $port) }
+  }
+
+  [System.IO.File]::WriteAllLines($dump, $lines, (New-Object System.Text.UTF8Encoding($true)))
+  Write-Host "`n已写出: $dump"
   exit 0
 }
 

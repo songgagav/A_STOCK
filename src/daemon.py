@@ -247,37 +247,51 @@ def _ensure_dashboard():
 # 2026-09-08: 数据库监控模块 (db_stats/Celery/Prometheus) 挂入本守护周期自愈.
 # -------------------------------------------------------------------------
 _OBS_DIR = os.path.normpath(os.path.join(_BASE, "..", "obs-stack"))
+# 观测栈总开关 (ASTOCK_OBS_STACK=0|false|no 关闭)。默认开 —— 与既有行为一致。
+_OBS_ENABLED = os.environ.get("ASTOCK_OBS_STACK", "1").strip().lower() not in ("0", "false", "no")
 _OBS_ALERT_HOOK = os.path.join(_BASE, "ops", "alert_hook.py")
 
 
 def _obs_procs() -> dict:
-    """按进程名/命令行识别观测栈各组件 pid."""
+    """按进程名/命令行识别观测栈各组件 pid.
+
+    [2026-09-21 修] 原判据是**纯名字子串**匹配, 实测被第三方进程误命中:
+    本机有一个 `ivms320-redis-server`(海康威视监控软件自带的 redis), 名字里含
+    `redis-server` ⇒ `_obs_procs()` 误以为观测栈的 redis 在跑 ⇒ **从不启动真正的 redis**
+    ⇒ celery 连不上 127.0.0.1:6379, 每约 55 分钟起一次又退出(日志表现为 celery 反复"已拉起")。
+    这与"诊断脚本匹配到自己"是同一类通病: **子串匹配无法区分'同名'与'同一个'**。
+
+    修正: 原生组件要求命令行里出现**观测栈目录**; 脚本组件要求出现**本仓目录**。
+    """
     try:
         import psutil
     except Exception:
         return {}
+    obs = _OBS_DIR.lower()
+    repo = _BASE.lower()
     out: dict[str, int] = {}
     for p in psutil.process_iter(["name", "cmdline"]):
         try:
             nm = (p.info.get("name") or "").lower()
             cl = " ".join(p.info.get("cmdline") or [])
+            cll = cl.lower()
         except Exception:
             continue
-        if "redis-server" in nm or "redis-server" in cl.lower():
+        if ("redis-server" in nm or "redis-server" in cll) and obs in cll:
             out.setdefault("redis", p.pid)
-        elif "alertmanager" in nm:
+        elif "alertmanager" in nm and obs in cll:
             out.setdefault("alertmanager", p.pid)
-        elif "prometheus" in nm and "promtool" not in nm:
+        elif "prometheus" in nm and "promtool" not in nm and obs in cll:
             out.setdefault("prom", p.pid)
-        elif "grafana-server" in nm:
+        elif "grafana-server" in nm and obs in cll:
             out.setdefault("grafana", p.pid)
-        elif "metrics_server" in cl:
+        elif "metrics_server" in cll and repo in cll:
             out.setdefault("metrics", p.pid)
-        elif "alert_hook" in cl:
+        elif "alert_hook" in cll and repo in cll:
             out.setdefault("hook", p.pid)
-        elif "flower" in cl and "celery" in cl and "worker" not in cl:
+        elif "flower" in cll and "celery" in cll and "worker" not in cll and repo in cll:
             out.setdefault("flower", p.pid)
-        elif "celery" in cl and "tasks_db" in cl:
+        elif "celery" in cll and "tasks_db" in cll and repo in cll:
             out.setdefault("celery", p.pid)
     return out
 
@@ -294,7 +308,17 @@ def _start_obs_component(name: str, cmd: list[str], cwd: str = None) -> bool:
 
 
 def _ensure_obs_stack() -> None:
-    """崩溃自愈: 每轮周期检查观测栈组件, 缺谁拉起谁."""
+    """崩溃自愈: 每轮周期检查观测栈组件, 缺谁拉起谁.
+
+    [2026-09-21] 加总开关。事故: `.venv310` 缺 `psutil` ⇒ `_obs_procs()` **恒返回空字典**
+    ⇒ 每个组件都被判"未运行" ⇒ 每轮(约 5 分钟)把 8 个组件**全部重启一遍**; 其中
+    `alert_hook` 新起的实例不退出, 实测堆积 **48 个**、并持续以 ~1 个/5 分钟增长。
+    补齐 psutil 后判据恢复(`_obs_procs()` 返回非空), 循环即停。
+    保留开关的意义: 让"不想要观测栈"的部署能**干脆关掉**, 而不是靠"碰巧缺包"来关掉 ——
+    后者既不可见也不可靠。
+    """
+    if not _OBS_ENABLED:
+        return
     try:
         run = _obs_procs()
         missing = []
