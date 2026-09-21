@@ -216,11 +216,65 @@ def _write_pending(path: str | None, doc: dict) -> None:
     os.replace(tmp, fp)
 
 
+def consume_approved(order: dict, path: str | None = None, audit_fp: str | None = None,
+                     actor: str = "engine", now=None) -> dict | None:
+    """「批准即白名单」：取一张**匹配的已批准票**并消费掉（一次性）。
+
+    匹配规则（刻意**不引入任何新阈值**）：
+      · 同标的 + 同方向；
+      · 本单数量 **<= 票上记录的数量** —— 批准的是"至多这么多股"。引擎每 tick 会因价格
+        变动重算数量, 故不能按精确数量匹配(永远匹配不上); 而"不超过"是**单调安全**的界:
+        绝不会执行一笔比人看过的更大的单。要更多股 => 必须重新送审。
+      · 一次性: 命中即把票标记 `executed`, 防止同一张票被反复消费。
+
+    返回被消费的票（dict）或 None。
+    """
+    now = now or datetime.now()
+    o = order or {}
+    sym, side = o.get("symbol"), str(o.get("side") or "").lower()
+    qty = o.get("qty")
+    doc = _read_pending(path)
+    for it in doc.get("orders") or []:
+        if it.get("status") != "approved":
+            continue
+        io = it.get("order") or {}
+        if io.get("symbol") != sym or str(io.get("side") or "").lower() != side:
+            continue
+        approved_qty = io.get("qty")
+        if isinstance(qty, (int, float)) and isinstance(approved_qty, (int, float)):
+            if qty > approved_qty:
+                continue        # 想下得比人批过的更多 => 不认这张票, 重新送审
+        it["status"] = "executed"
+        it["executed_at"] = now.strftime(_TS_FMT)
+        it["executed_qty"] = qty
+        _write_pending(path, doc)
+        audit({"action": "approved_executed", "id": it["id"], "symbol": sym, "side": side,
+               "qty": qty, "price": o.get("price"),
+               "reasons": [f"人工已批准(票 {it['id']}, 批准数量 {approved_qty})"],
+               "actor": actor}, path=audit_fp, now=now)
+        return it
+    return None
+
+
 def enqueue(order: dict, ctx: dict, actor: str = "engine",
             path: str | None = None, audit_fp: str | None = None, now=None) -> dict:
-    """高危单入待批队列（**不执行**）。返回队列项（含 id）。"""
+    """高危单入待批队列（**不执行**）。返回队列项（含 id）。
+
+    **同标的同方向已在队列中则不重复入队**（返回原票并标 `deduped`）—— 引擎每 tick 都会
+    重新生成同一笔单, 不去重的话队列会以 15 秒一条的速度被同一个单塞满, 人工侧看到的是
+    一屏重复行, 真正不同的高危单反而被淹没。
+    """
     now = now or datetime.now()
     doc = _read_pending(path)
+    o = order or {}
+    for it in doc.get("orders") or []:
+        if it.get("status") != "pending":
+            continue
+        io = it.get("order") or {}
+        if io.get("symbol") == o.get("symbol") and \
+                str(io.get("side") or "").lower() == str(o.get("side") or "").lower():
+            it["deduped"] = True
+            return it
     seq = len(doc.get("orders") or []) + 1
     item = {"id": f"{now.strftime('%Y%m%d%H%M%S')}-{seq}",
             "ts": now.strftime(_TS_FMT), "order": dict(order or {}),
@@ -300,10 +354,18 @@ def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
 
         rk = classify_risk(order, ctx)
         if rk["high_risk"]:
+            # 「批准即白名单」：人工批准过的票, 下一 tick 同标的同方向且不超过批准数量 => 放行
+            hit = consume_approved(order, path=path, audit_fp=audit_fp, actor=actor, now=now)
+            if hit:
+                return {"decision": "execute",
+                        "reasons": [f"人工已批准, 放行(票 {hit['id']}, "
+                                    f"批准人 {hit.get('decided_by')})"],
+                        "approved_ticket": hit["id"]}
             it = enqueue(order, {**(ctx or {}), "_reasons": [f["detail"] for f in rk["flags"]]},
                          actor=actor, path=path, audit_fp=audit_fp, now=now)
             return {"decision": "pending_approval",
-                    "reasons": [f["detail"] for f in rk["flags"]], "id": it["id"]}
+                    "reasons": [f["detail"] for f in rk["flags"]], "id": it["id"],
+                    "deduped": bool(it.get("deduped"))}
         return {"decision": "execute", "reasons": []}
     except Exception as e:  # noqa: BLE001
         return {"decision": "execute", "reasons": [], "error": f"{type(e).__name__}: {e}"}
