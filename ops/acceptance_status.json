@@ -560,6 +560,15 @@
       "detail": "**入库哨兵的基线扫描顺带揪出**（这正是『先看下游表现再定阈值』的回报）:\n\n| 日 | 符号 | 形态 |\n|---|---|---|\n| 09-07 | 600825 / 600929 / 688432 | open=high=low=0, close=有值, volume=0 |\n| 09-08 | 600825 / 600929 / 688291 / 688432 | 同上 |\n\n符号全部属于**引擎覆盖缺口**的旧镜像数据（P2-ENGINEGAP 清单内）;\n来源是 09-07/09-08 那两天写 h5i 的旧路径（当时镜像已冻结, 这些行由其它源补入）。\n\n**危害**: `open=0` 进入因子计算会产出无限/NaN 收益而无人察觉 —— 与 09-04 单位损坏同源,\n都是『坏数据静默在库』。\n\n**为什么没有当场修**: 改历史行需用户显式授权（P1-H5IUNIT-0904 同规则）。",
       "evidence": "src/data_quality_guard.py 基线扫描输出: 09-07 3 坏行(600825/600929/688432)、09-08 4 坏行(600825/600929/688291/688432), 均同时违反 ohlc_relations 与 positive_prices; 直接查库确认 open=high=low=0.0 且仅 close 有值、volume=amount=0; 688291 在 09-07 是真实 OHLC、09-08 变零填充",
       "next": "**用户决策项**: 是否修复这 7 行。可选: ① 按停牌惯例改写为『昨收复制』(open=high=low=close=前收, volume=0); ② 直接删除这 7 行(当日无有效 OHLC); ③ 暂不动(反正哨兵已拦住未来写入)。无论选哪个, 修复需绕过 h5i 单调追加约束改历史行, 须显式授权后再做。"
+    },
+    {
+      "id": "P2-HEALTHSTATE",
+      "level": "P2",
+      "title": "多指标自动降级状态机（第一增量：状态装配器）—— NORMAL/DEGRADED/HALTED 单一出口",
+      "status": "fixed",
+      "detail": "**路线图 #2 的第一增量。** 阈值全部来自本仓观测, 不照抄外部项目:\n\n| 可观测量 | 判据 | 证据(2026-09-21 实测) |\n|---|---|---|\n| tick 延迟 | p50 > 1s 或 p95 > 2s | 健康 p50≈7.3ms/p95≈20ms(13:08); 退化 p50≈11.9s/p95≈14.4s(15:02, AtlasCore 抖动) —— 双峰差三个数量级, 阈值取空旷地带 |\n| 数据滞后 | freshness().ok=False | 复用引擎闸门判据(追平最后一个已收盘交易日, 有自己的事故史) |\n| 账户估值 | live_source == duckdb_reference_held | P2-LIVESRC 三态语义 |\n| 策略停摆 | 当日 L3 事件数 > 0 | 决策 D 的门禁语义 |\n\n**实现**: `src/health_state.py`\n· `assemble(snap)` —— **纯函数**(CI 可测), 输出 {state, reasons};\n· `gather()` —— 采集真实可观测量(live_state / 引擎探针 / 降级账本), 供 CLI/面板;\n· HALTED 权重最高(L3 优先于一切 DEGRADED 原因); 未知字段忽略、脏输入不崩。\n\n**实测**: 深夜真实采集 => DEGRADED(reason=p50=11888ms) —— 该值是滚动窗口(n=240)\n**冻结在引擎最后一次 tick(15:02)** 的快照, 如实记录了下午退化的盘。\n\n**刻意留白**: 快照自身的**新鲜度**(数据停流多久)不在此装配器里 —— 那是 #4 看门狗的域,\n不做语义未定义的混入。装配器输出 `live_data_ts`, 由消费方决定如何处理陈旧快照。",
+      "evidence": "src/health_state.py(assemble 纯函数 + gather 采集) + tests/test_health_state.py 17 项; 阈值证据: live_state.ops.tick_ms 13:08 采样 p50=7.3/p95=10349 vs 15:02 采样 p50=11887.7/p95=14356.4; 深夜真实采集输出 state=DEGRADED, live_data_ts=2026-09-21 15:02:45; 全量回归含 17 项",
+      "next": "下一增量: 把 `health_state.gather()` 接入 `check_daemon_first_day.py` 与 dashboard 单一出口; 再之后做 #4 看门狗, 补上『快照新鲜度』维度(in_session 且 data_ts 停流超过 N 个 tick 周期 => 告警)。阈值 p50>1s / p95>2s 是**初值**(单日观测), 随观测积累再校准 —— 校准依据仍必须是本仓自己的数据。"
     }
   ]
 }
