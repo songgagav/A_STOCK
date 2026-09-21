@@ -25,7 +25,7 @@ SEC-2 原描述为『research_trader/.env 明文凭据』，容易被读成"凭�
   known_prefix      已知密钥前缀(sk- / ghp_ / AKIA / xox?-) 或 PEM 私钥块 => CRITICAL
   hardcoded_secret  形如 `SOMETHING_KEY = "12 位以上字面量"`(名字含 key/secret/token/passwd
                     /authcode/appid) => HIGH
-  url_with_creds    `scheme://user:password@host` => HIGH
+  url_with_creds    形如 scheme://user:password@host 的内嵌凭据 => HIGH  # secret-scan: ok: 规则文档示例, 非真实凭据
 
 豁免: 行尾 `# secret-scan: ok: 理由`（必须写理由, 与 lookahead 扫描器同一约定）。
 """
@@ -87,6 +87,11 @@ def scan_text(text: str, filename: str = "<text>") -> list:
     """扫描一段文本（**纯函数**, CI 可测）。返回 findings。"""
     out: list = []
     lines = text.splitlines()
+
+    # 文件级豁免: 扫描器**自身的测试夹具**必须包含伪造的密钥形态, 否则无法做正向控制。
+    # 与 lookahead 扫描器同一约定; 代价是该文件内的真泄露不会被报 —— 故仅限夹具文件使用。
+    if any("secret-scan: skip-file" in ln for ln in lines[:5]):
+        return out
 
     base = os.path.basename(filename)
     if base.startswith(".env") and base not in ENV_ALLOW:

@@ -513,17 +513,20 @@ class TestNoSilentFailurePathsInTrain:
     def test_import_present(self):
         assert "import drl_degrade" in self._src()
 
-    def test_helper_defined_and_used_three_times(self):
+    def test_helper_defined_and_used_by_every_failure_path(self):
         src = self._src()
         assert "def _degrade_on_failure(" in src
-        assert src.count("_degrade_on_failure(") == 4, \
-            "1 处定义 + 3 处调用（数据源不可用 / 数据不足 / 外层 except）"
+        # 1 处定义 + 4 处调用。第 4 条是 2026-09-22 新增的 **DRL-1 学习前检查未通过**
+        # (drl_precheck: 最小样本量 + 净值连续性) —— 它同样携带 degrade 走同一条链,
+        # 故本不变量(『每条失败路径都走降级链, 不留静默路径』)的本意未被破坏。
+        assert src.count("_degrade_on_failure(") == 5, \
+            "1 处定义 + 4 处调用（数据源不可用 / 数据不足 / 学习前检查未通过(DRL-1) / 外层 except）"
 
     def test_every_failure_return_carries_degrade(self):
         src = self._src()
-        assert src.count('"degrade": _degrade_on_failure') == 2   # 数据源 + 数据不足
+        assert src.count('"degrade": _degrade_on_failure') == 3   # 数据源 + 数据不足 + 学习前检查
         assert src.count('"degrade": _dec}') == 1                 # 外层 except
-        assert src.count('"degrade": ') == 3
+        assert src.count('"degrade": ') == 4
 
     def test_data_source_path_goes_through_chain(self):
         """`_load_factor_state` 抛异常也必须走降级链（原先在外层 try 之外 -> 逃出函数）。"""

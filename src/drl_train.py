@@ -1039,6 +1039,28 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         return {"ok": False, "error": "数据不足 (<15 日)", "rows": 0,
                 "degrade": _degrade_on_failure(day, _reason)}
 
+    # [2026-09-22, DRL-1] 学习**前**的独立检查点: 最小样本量断言 + 净值连续性。
+    # 原先只有上面那句隐式判据 `len(rets) < 15` —— 不留痕、不落检查结论, 事后无法回答
+    # "当天到底检查了什么、结论是什么"。此处把它显式化(阈值仍沿用那同一个 15 日, 不新造),
+    # 结论落盘 precheck.json, 失败走**同一条**降级链(DRL-4), 不新增静默路径。
+    try:
+        import drl_precheck as _PC
+        _pre = _PC.evaluate(n_dates=len(rets), net_values=_PC.load_net_values(day_dir))
+        _PC.record(day_dir, _pre)
+        if not _pre.get("ok"):
+            _reason = "学习前检查未通过: " + "; ".join(
+                str(i.get("detail")) for i in (_pre.get("issues") or []))
+            _log(_reason)
+            hb.stop(phase="precheck_failed", ok=False, error=_reason[:200])
+            return {"ok": False, "error": _reason[:300], "rows": len(rets),
+                    "precheck": _pre, "degrade": _degrade_on_failure(day, _reason)}
+        _log(f"学习前检查通过: 样本 {len(rets)} 日(下限 {_PC.MIN_TRAIN_DAYS}); "
+             + ("净值连续性已校验" if _pre.get("net_checked")
+                else "净值序列取不到 => 该项记为未判定(不假装通过)"))
+    except Exception as _pe:  # noqa: BLE001
+        # 检查器自身异常**不阻断**训练(否则一个 bug 就让当天没有 plan), 但必须响亮报出
+        _log(f"学习前检查异常(不阻断, 需排查): {type(_pe).__name__}: {_pe}")
+
     # 市场状态感知特征: 从全 A 平均收益率序列计算 3 维市场状态
     regime_features = _compute_regime_features(rets)
     _log(f"市场状态特征已计算: {len(rets)} 日, "
