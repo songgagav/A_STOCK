@@ -230,8 +230,15 @@ def _ensure_dashboard():
             except Exception:
                 pass
         try:
-            with open(DASH_PIDFILE, "w", encoding="utf-8") as f:
+            # [2026-09-22, P1-PIDFILE-MULTIWRITER] 改**原子替换**（写 tmp + os.replace）。
+            # 原先是"先 remove 再 write": 两步之间存在**空窗期**, 期间 pidfile 不存在,
+            # 而任何把"文件不存在"解读为"面板未运行"的代码都会在那一刻去拉一个新实例
+            # (实测 2026-09-21 23:36 出现过这个空窗)。os.replace 同盘原子, 读者要么看到旧
+            # 内容、要么看到新内容, 不存在"没有文件"的瞬间。
+            _tmp = DASH_PIDFILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 f.write(str(p.pid))
+            os.replace(_tmp, DASH_PIDFILE)
         except Exception:
             pass
         _log(f"Web可视化未运行, 已拉起 pid={p.pid} -> http://localhost:{DASH_PORT}/")

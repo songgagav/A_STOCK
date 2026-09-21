@@ -123,7 +123,16 @@ if __name__ == "__main__":
         print("=" * 76)
         print("h5i daily_bars 结构基线扫描（最近 %d 个交易日）" % len(days))
         print("=" * 76)
-        all_bad = 0
+        # [2026-09-22, P1-ZEROFILL] 区分『**已知排除**行』与『**新出现**的坏行』。
+        # 前者是历史既成事实(用户决定标记为排除项、不改写历史), 后者才是要人立刻看的东西 ——
+        # 不区分的话, 这 7 行会让每次扫描都红着, 真出问题时反而被当成"老样子"。
+        try:
+            import quality_exclusions as Q
+            _excl = Q.excluded_keys()
+        except Exception:  # noqa: BLE001
+            Q, _excl = None, set()
+
+        all_bad = new_bad = known_bad = 0
         for d in days:
             iso = str(d)[:10]
             df = db.sql(
@@ -131,11 +140,29 @@ if __name__ == "__main__":
                 f"FROM daily_bars WHERE CAST(ts AS DATE) = CAST('{iso}' AS DATE)").to_pandas()
             r = validate_daily_bars(df)
             all_bad += r["bad_rows"]
-            flag = "OK " if r["ok"] else "BAD"
+            # 逐符号判定该日坏行是否已在排除登记中（用 sample 里已给出的符号清单）
+            _n_known = 0
+            if Q is not None and not r["ok"]:
+                try:
+                    _syms = []
+                    for s in r["sample"]:
+                        _syms.extend(s.get("symbols") or [])
+                    _syms = list(dict.fromkeys(_syms))
+                    if _syms and all(Q.is_excluded(sym, iso, path=None) for sym in _syms):
+                        _n_known = r["bad_rows"]      # 全部已登记 => 整日视为"已知"
+                except Exception:  # noqa: BLE001
+                    _n_known = 0
+            known_bad += _n_known
+            new_bad += max(r["bad_rows"] - _n_known, 0)
+            flag = "OK " if r["ok"] else ("已知" if _n_known >= r["bad_rows"] else "BAD")
             print(f"  [{flag}] {iso}  rows={len(df):5d}  bad={r['bad_rows']:4d}  {r['checks']}")
             for s in r["sample"]:
                 print(f"         · {s['check']}: {s['n']} 行  {s['symbols']}")
-        print(f"\n  合计坏行: {all_bad}")
+        print(f"\n  合计坏行: {all_bad}  = 已登记排除 {known_bad} + **新出现 {new_bad}**")
+        if new_bad:
+            print("  !! 新出现的坏行必须在当天解释清楚(排除登记里没有它们)")
+        else:
+            print("  结论: 全部坏行都已在排除登记中(登记文件 data/quality_exclusions.json)")
     finally:
         try:
             db.close()

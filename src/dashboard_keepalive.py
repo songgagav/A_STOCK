@@ -34,6 +34,12 @@ KEEP_LOG = os.path.join(LOG_DIR, "dashboard_keepalive.log")
 DASH_LOG = os.path.join(LOG_DIR, "dashboard.log")
 DASH_PORT = int(os.environ.get("DASH_PORT", "8000"))
 DASH_URL = f"http://localhost:{DASH_PORT}"
+
+#: 是否允许本进程**动手**管理 dashboard（重建 / kill）。
+#: [2026-09-22, 登记册 P1-PIDFILE-MULTIWRITER] 用户决定: **守护进程是唯一管理者**。
+#: 故默认关闭 —— 本进程只做探测与告警, 以免两个管理者在同一时刻都判"未运行"而各起一个实例
+#: (实测 pidfile 空窗期正是这种时刻; 第二个实例绑不上 8000 会退出, 于是各自再拉, 形成重启风暴)。
+_MANAGE = os.environ.get("ASTOCK_DASH_KEEPALIVE_MANAGE", "0").strip().lower() in ("1", "true", "yes")
 PY = sys.executable
 _TRAE_PY = os.environ.get("TRAE_PYTHON", "")  # 可选: 指定含依赖的外部 Python 解释器
 if os.path.exists(_TRAE_PY):
@@ -182,16 +188,26 @@ def run_loop():
         if not alive:
             _log(f"dashboard 不在运行 (pid_file={dash_pid})")
             consecutive_fail = 0
-            _start_dashboard(force_kill=True)
+            if _MANAGE:
+                _start_dashboard(force_kill=True)
+            else:
+                _log("[ALERT] dashboard 不在运行 —— 按 2026-09-22 决定: **唯一管理者是守护进程**"
+                     "(daemon.py 每 5 分钟看护会拉起它)。本进程只报不动手, 以免两个管理者"
+                     "同时判『未运行』而各起一个实例(实测 pidfile 空窗期正是这种时刻)。"
+                     " 如需恢复旧的自动重建: 设 ASTOCK_DASH_KEEPALIVE_MANAGE=1")
             continue
         if not healthy:
             consecutive_fail += 1
             _log(f"dashboard pid={dash_pid} 在跑但健康检查失败 (consec={consecutive_fail})")
             if consecutive_fail >= 3:
-                _log(f"连续 {consecutive_fail} 次失败, kill 并重启 dashboard")
-                _kill_pid(dash_pid)
-                time.sleep(2)
-                _start_dashboard(force_kill=True)
+                if _MANAGE:
+                    _log(f"连续 {consecutive_fail} 次失败, kill 并重启 dashboard")
+                    _kill_pid(dash_pid)
+                    time.sleep(2)
+                    _start_dashboard(force_kill=True)
+                else:
+                    _log(f"[ALERT] dashboard 连续 {consecutive_fail} 次健康检查失败 —— "
+                         f"只报不动手(唯一管理者=守护进程); 它自己会在下一轮看护处理")
                 consecutive_fail = 0
             time.sleep(5)
             continue
@@ -201,23 +217,23 @@ def run_loop():
 
 
 def _stop():
-    """停止守护, 同时杀 dashboard."""
+    """停止 keepalive **自身**。
+
+    [2026-09-22] 原实现会连 dashboard 一起杀掉并删除 `logs/dashboard.pid` —— 那是
+    『两个管理者』的一部分: 面板的生命周期不该由本进程决定(唯一管理者=守护进程)。
+    现在只停自己, 并**不碰** pidfile: 面板继续跑, 守护继续看护。
+    """
     pid = _read_pid(KEEP_PID)
     if pid and _proc_alive(pid):
         _kill_pid(pid)
-        _log(f"keepalive 已停止 pid={pid}")
+        _log(f"keepalive 已停止 pid={pid} (dashboard 不受影响: 其唯一管理者是守护进程)")
     else:
         _log("keepalive 不在运行")
-    dash = _read_pid(DASH_PIDFILE)
-    if dash and _proc_alive(dash):
-        _kill_pid(dash)
-        _log(f"dashboard 已停止 pid={dash}")
-    for f in (KEEP_PID, DASH_PIDFILE):
-        try:
-            if os.path.exists(f):
-                os.remove(f)
-        except Exception:
-            pass
+    try:
+        if os.path.exists(KEEP_PID):
+            os.remove(KEEP_PID)
+    except Exception:
+        pass
 
 
 def _status():
