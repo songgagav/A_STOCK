@@ -154,6 +154,28 @@ def collect() -> dict:
     out["plan_consumed_today"] = _plan(consume)
     out["plan_generated_today"] = _plan(own)
 
+    # ---- DRL 护栏产物（train_metrics / post_train_validation）----
+    # ★ 位置**不是** data/drl/<day>/：实测本机 16 份 data/drl/*/train_meta.json **全都**
+    #   没有这两个键，而 data/drl_factor_value/20260904/train_meta.json 有。
+    #   即这两个护栏属于 **drl_factor_value 那条流水线**。故此处两处都查、不预设。
+    drl = []
+    for sub in ("drl", "drl_factor_value"):
+        fp = os.path.join(_REPO, "data", sub, _d8(TODAY), "train_meta.json")
+        j = _read_json(fp)
+        if not j:
+            drl.append({"where": sub, "path": fp, "exists": False})
+            continue
+        tm = j.get("train_metrics")
+        pt = j.get("post_train_validation")
+        drl.append({"where": sub, "path": fp, "exists": True,
+                    "ok": j.get("ok"),
+                    "train_metrics_n": len(tm) if isinstance(tm, dict) else None,
+                    "train_metrics_keys": sorted(tm.keys()) if isinstance(tm, dict) else None,
+                    "actual_timesteps": (tm or {}).get("actual_timesteps") if isinstance(tm, dict) else None,
+                    "post_train_ok": (pt or {}).get("ok") if isinstance(pt, dict) else None,
+                    "val_new": (pt or {}).get("val_new") if isinstance(pt, dict) else None})
+    out["drl_artifacts"] = drl
+
     # ---- 降级台账 ----
     lp = os.path.join(_REPO, "data", "drl_degrade_events.jsonl")
     ev = []
@@ -236,6 +258,22 @@ def verdict(d: dict, phase: str) -> list:
 
     add("无 L3 降级事件", not d["degrade_L3_today"],
         f"今日 L3 事件数={len(d['degrade_L3_today'])}；账本末条={d.get('degrade_last')}")
+
+    # ---- DRL 护栏产物（仅收盘后要求）----
+    if phase == "close":
+        arts = d.get("drl_artifacts") or []
+        exist = [a for a in arts if a.get("exists")]
+        add("至少一处 train_meta.json 已生成（drl 或 drl_factor_value）", bool(exist),
+            "; ".join(f"{a['where']}={'有' if a.get('exists') else '无'}" for a in arts))
+        withtm = [a for a in exist if a.get("train_metrics_n")]
+        add("train_metrics 已落盘（含 actual_timesteps）", bool(withtm),
+            "; ".join(f"{a['where']}: {a.get('train_metrics_n')} 键 "
+                      f"actual_timesteps={a.get('actual_timesteps')}"
+                      for a in exist) or "两处 train_meta 均无 train_metrics")
+        withpt = [a for a in exist if a.get("post_train_ok") is not None]
+        add("post_train_validation 已落盘（含 val_new）", bool(withpt),
+            "; ".join(f"{a['where']}: ok={a.get('post_train_ok')} val_new={a.get('val_new')}"
+                      for a in exist) or "两处 train_meta 均无 post_train_validation")
     return v
 
 
@@ -286,6 +324,10 @@ def main() -> int:
           f"{d['plan_consumed_today'].get('path')}")
     print(f"  今日已生成计划              = {d['plan_generated_today'].get('exists')} "
           f"section_as_of={d['plan_generated_today'].get('section_as_of')}")
+    for a in (d.get("drl_artifacts") or []):
+        print(f"  DRL {a['where']:<16} = exists={a.get('exists')} "
+              f"train_metrics={a.get('train_metrics_n')} "
+              f"post_val_ok={a.get('post_train_ok')} val_new={a.get('val_new')}")
     print(f"  账本末条                    = {d.get('degrade_last')}")
 
     print("\n--- 判据 ---")
