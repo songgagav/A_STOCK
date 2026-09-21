@@ -621,6 +621,87 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["vnpy_backtest"] = {"ok": False, "error": str(e)[:200]}
 
+        # 2.6) [路线图 #9/#11 接线] 多场景回测 + 多策略组合回测 (2026-09-22)
+        #  为什么接在日更里: 这两件事的价值都是**分布性质** ——
+        #    · 多场景: 单日只能说明"这天如何", 成本敏感性要在多天上平均;
+        #    · 组合回测: "组合相对单腿改善了多少"必须与单腿**同一撮合口径**才可比。
+        #  故每天跑一段滚动窗口并把结果落盘, 累积成面板。
+        #  性能: 窗口由 PAPER.vnpy_regime_days / portfolio_bt_days 控制(默认 5/10),
+        #  两者都**独立容错** —— 回测失败不得影响选股/持仓归档主链路。
+        #  注意: 组合回测走 hist_pit(候选目录 C < D 的盘前视角), 与虚拟盘同源但
+        #  **不调用** load_targets(它依赖调用时刻的磁盘状态, 事后跑会停在不同档)。
+        try:
+            from config import PAPER as _P
+            _pdays = int(_P.get("portfolio_bt_days", 10) or 0)
+            if _pdays > 0:
+                import portfolio_live as _PL
+                _win = _PL.recent_trading_days(_pdays)
+                report["steps"]["portfolio_backtest"] = _PL.run_live_portfolio_backtest(
+                    _win, live_pool=False,
+                    save_to=os.path.join(DATA_DIR, "portfolio_backtest_latest.json"))
+            else:
+                report["steps"]["portfolio_backtest"] = {
+                    "ok": False, "skip": True,
+                    "reason": "PAPER.portfolio_bt_days=0 已关闭"}
+        except Exception as e:
+            report["steps"]["portfolio_backtest"] = {"ok": False, "error": str(e)[:200]}
+
+        try:
+            from config import PAPER as _P2
+            _rdays = int(_P2.get("vnpy_regime_days", 5) or 0)
+            _scen = list(_P2.get("regime_scenarios") or ["normal", "stress"])
+            if _rdays > 0:
+                from vnpy_backtest import run_regime_batch
+                from h5i_bar_store import H5iBarStore
+                _all = list(H5iBarStore().trading_days())
+                # 只取"未来数据充足"的日子(forward 窗口需要 lookback 根之后的数据),
+                # 否则末尾几天必然报"未来数据不足" —— 那是日期选取问题, 不是策略问题。
+                _lb = 20
+                _cand = _all[-(_rdays + _lb):- 1] if len(_all) > _rdays + _lb else _all[:-1]
+                _pick = _cand[-_rdays:] if _cand else []
+                if _pick:
+                    _rb = run_regime_batch(_pick, _scen, top_n=10, lookback_days=_lb,
+                                           forward=True, persist_arctic=False)
+                    _rb["days_used"] = _pick
+                    report["steps"]["regime_scenarios"] = _rb
+                else:
+                    report["steps"]["regime_scenarios"] = {
+                        "ok": False, "skip": True, "reason": "可用交易日不足"}
+            else:
+                report["steps"]["regime_scenarios"] = {
+                    "ok": False, "skip": True, "reason": "PAPER.vnpy_regime_days=0 已关闭"}
+        except Exception as e:
+            report["steps"]["regime_scenarios"] = {"ok": False, "error": str(e)[:200]}
+
+        # 2.7) [路线图 ⑭ 接线] 因子假设的日更巡检: lint -> 假设级证据 -> (通过者)收益评估。
+        #  为什么值得每天跑: 这是唯一一条**先问"逻辑成不成立"再看收益**的路径,
+        #  它每天都在消耗当日的因子截面 —— 而截面一旦过去就补不回来。
+        #  假设来源: data/factor_hypotheses_proposed.json(没有就 skip, 不凭空造假设)。
+        try:
+            from config import PAPER as _P3
+            _hd = int(_P3.get("hypothesis_days", 60) or 0)
+            _hpath = os.path.join(DATA_DIR, "factor_hypotheses_proposed.json")
+            if _hd > 0 and os.path.exists(_hpath):
+                import json as _json
+                import factor_hypothesis as _FH
+                import factor_hypothesis_eval as _FHE
+                with open(_hpath, encoding="utf-8") as _f:
+                    _raw = _json.load(_f)
+                _hyps = [(_FH.Hypothesis(**h) if isinstance(h, dict) else h)
+                         for h in (_raw.get("hypotheses") if isinstance(_raw, dict) else _raw)]
+                from h5i_bar_store import H5iBarStore as _HBS
+                _alld = list(_HBS().trading_days())
+                _evd = _alld[-_hd:] if len(_alld) > _hd else _alld
+                report["steps"]["factor_hypotheses"] = _FHE.run_hypothesis_evaluation(
+                    _evd, _hyps, evaluate=True)
+            else:
+                report["steps"]["factor_hypotheses"] = {
+                    "ok": False, "skip": True,
+                    "reason": ("PAPER.hypothesis_days=0 已关闭" if _hd <= 0
+                               else f"无假设文件 {_hpath}")}
+        except Exception as e:
+            report["steps"]["factor_hypotheses"] = {"ok": False, "error": str(e)[:200]}
+
         try:
             from pre_drl_brief import run_pre_drl_brief
             report["steps"]["pre_drl_brief"] = run_pre_drl_brief(day, day_dir)

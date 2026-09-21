@@ -799,6 +799,14 @@ class RealtimeEngine:
         if TRADE_BROKER != "paper":
             log(f"止损: 实盘通道(easytrader)未接入, 拒绝下单 TRADE_BROKER={TRADE_BROKER}")
             return 0
+        # [P0 清单第6项] Dead-Man's Switch: 每次调仓留一次 tick。
+        # 注册表把 realtime_engine 标为 trading_hours_only, 故收盘后不再 tick
+        # 不会被判失联(判定会用 trading_calendar 确认"此刻本就不该有 tick")。
+        try:
+            import deadman_switch as _DMS
+            _DMS.beat("realtime_engine", note=f"rebalance {self.pb.trade_date}")
+        except Exception:  # noqa: BLE001
+            pass
         total_target_mv = INIT_CAPITAL * MAX_POS_RATIO
         n = max(len(self.targets), 1)
         band = total_target_mv / n            # 等权参考(缺省回退/日志)
@@ -948,6 +956,21 @@ class RealtimeEngine:
             log(f"冷却集更新: {sorted(self._cooled)} (共{len(self._cooled)}只)")
         if risk["state"] == "DRAW_DOWN":
             log(f"组合熔断: 回撤 {risk['drawdown_pct']}%, 暂停加仓 (仅止损/离场)")
+
+        # 2.2) [路线图 ⑮ 卖侧接线] 账实相符金丝雀: 引擎的"计划卖出量"与账本的
+        #      "可卖量"由两条代码路径算出, 一旦分叉, 症状是"卖了不在账上的股票"
+        #      或"该卖的没卖掉" —— 两者都不报错。本步**只读+记账+告警**:
+        #      一致时静默, 不一致时缩量到可卖(缩量本来就发生在 PaperBook.sell 内)
+        #      并落订单审计。**绝不取消卖出** —— 取消离场等于把风险锁在仓里
+        #      (与 kill_switch『只停新开仓, 绝不停离场』同一条纪律)。
+        try:
+            import live_gates as _LG
+            _sg = _LG.apply_to_engine(self, log_fn=log)
+            if _sg.get("anomalies"):
+                log(f"[卖侧闸门] 账实不一致 {len(_sg['anomalies'])} 笔, 已缩量成交并留痕: "
+                    f"{_sg['anomalies']}")
+        except Exception as _e:  # noqa: BLE001
+            log(f"[卖侧闸门] 接线异常(不阻断, 需排查): {type(_e).__name__}: {_e}")
 
         # 3) 补仓目标池到等权 (保留现金底线; 涨停/停牌跳过; 受调仓间隔 gate)
         #    组合熔断(DRAW_DOWN)或 IC 门控冻结/单日重亏时暂停一切加仓

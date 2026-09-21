@@ -537,12 +537,29 @@ def run_loop():
     _publish_health_state()
 
     dash_tick = 0  # dashboard 健康检查轮次计数(周期性看护, 兜底外部 keep_alive)
+    # [P0 清单第6项] Dead-Man's Switch: 主循环每个自然分钟留一次 tick。
+    # 为什么它是既有心跳/看门狗**覆盖不到**的那一块: 心跳是"等组件回应",
+    # 看门狗是"观测数据是否流动" —— 两者都要求**监测者自己还活着**。
+    # 守护进程自身被杀死时, 心跳文件停更与"组件没在跑"不可区分, 看门狗也不再
+    # 产报告。而死手开关判的是"本该出现的 tick 没出现", 失联本身即是证据。
+    # 阈值 = 3 × 60s = 180s(与 heartbeat/flow_watchdog 的"3×标称周期"房规一致)。
+    _dm_last = 0.0
 
     while True:
         now = datetime.now()
         today = now.date()
         cur_time = now.time()
         day_str = today.strftime("%Y-%m-%d")
+
+        # 死手开关 tick(每分钟一次, 失败静默 —— 留痕不得拖垮守护)
+        try:
+            import time as _t
+            if _t.time() - _dm_last >= 60.0:
+                import deadman_switch as _DMS
+                if _DMS.beat("daemon", note=f"day={day_str} t={cur_time.strftime('%H:%M')}"):
+                    _dm_last = _t.time()
+        except Exception:  # noqa: BLE001
+            pass
 
         # 优雅停止
         if os.path.exists(STOP_FILE):

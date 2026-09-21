@@ -44,17 +44,139 @@ _TIMEOUT_S = float(os.environ.get("AGENT_TOOL_TIMEOUT_S", "60") or 60)
 
 
 # ============================================================
+# 连接器能力声明 (P0 清单第 7 项, 2026-09-22)
+# ============================================================
+# 为什么要有这个字段: 这份注册表是 Agent 与外部世界之间**唯一**的接口面。
+# 在这之前,"某个工具会不会下单/会不会写库"这件事只存在于工具名与调用方的
+# 记忆里 —— 而**一个看起来只读的工具(如 ic_backtest / spc_check)如果能落盘,
+# 那么"Agent 只做研究、执行权集中"这条边界就只是口头约定**。
+# 能力声明把它变成**可校验的机器事实**: 清单可断言、可枚举、可在调用前拦截。
+#
+# 本分类法按**本仓实际存在的资源**定义, 不照抄外部框架:
+CAPABILITY_TAXONOMY: dict[str, str] = {
+    "read:market":   "读行情/因子/估值数据",
+    "read:kb":       "读本地知识库(GraphRAG/图谱)",
+    "read:model":    "读模型预测结果(不训练)",
+    "compute":       "在内存中计算(不落盘、不下单)",
+    "write:artifact": "写研究产物(报告/缓存/样本表)",
+    "write:ledger":  "写审计或台账(不可逆的留痕)",
+    "veto":          "对交易给出否决/风险结论(不改持仓)",
+    "order":         "产生或提交交易指令",
+}
+
+#: 需要写权限的能力 —— 多个工具声明的"只读"边界由它校验
+WRITE_CAPABILITIES = ("write:artifact", "write:ledger")
+#: 与资金/持仓相关的能力
+MONEY_CAPABILITIES = ("order", "veto")
+
+#: 工具名 -> 能力集合。**显式列举**, 不按名字猜(按名字猜等于把安全边界
+#: 建立在一个约定俗成的命名习惯上; 新增工具时忘了归类会在 `audit_capabilities`
+#: 里被报成 unclassified, 而不是静默获得一个默认能力)。
+CAPABILITIES: dict[str, tuple] = {
+    # 只读研究类
+    "graphrag_search":       ("read:kb", "compute"),
+    "knowledge_graph":       ("read:kb", "read:market", "compute"),
+    "market_panel":          ("read:market", "compute"),
+    "daily_bars_query":      ("read:market",),
+    "explainable_rl_trace":  ("read:model", "compute"),
+    "cafpo_latent_extract":  ("read:model", "compute"),
+    # 计算类(在内存里算, 不落盘)
+    "ml_fusion_predict":     ("read:model", "read:market", "compute"),
+    "factor_score":          ("read:market", "compute"),
+    "ic_backtest":           ("read:market", "compute"),
+    "symbolic_ta":           ("read:market", "compute"),
+    "logic_q_analysis":      ("read:market", "compute"),
+    "dynamic_factor_weights": ("read:market", "compute"),
+    "wavelet_decompose":     ("read:market", "compute"),
+    "hi_darts_analyze":      ("read:model", "compute"),
+    "stock_marl_simulate":   ("read:model", "compute"),
+    "slippage_decompose":    ("read:market", "compute"),
+    "risk_factor_optimize":  ("read:market", "compute"),
+    # 风控结论类: 给判断, 不动仓位
+    "risk_first_check":      ("read:market", "read:model", "compute", "veto"),
+    "spc_check":             ("read:market", "compute", "veto"),
+    "strategy_validation":   ("read:market", "compute", "veto"),
+}
+
+#: 需要写权限的工具(在本仓里, 这些工具会把研究产物落盘)。显式列出以便审计:
+#: "哪个工具能写盘"是能力边界里最容易被忽略的一项。
+WRITE_TOOLS: dict[str, tuple] = {
+    "ic_backtest": "write:artifact",       # 落 IC 曲线缓存
+    "stock_marl_simulate": "write:artifact",  # 落仿真轨迹
+}
+for _t, _c in WRITE_TOOLS.items():
+    if _t in CAPABILITIES:
+        CAPABILITIES[_t] = tuple(sorted(set(CAPABILITIES[_t]) | {_c}))
+
+#: 允许产生交易指令的工具。**当前为空** —— 这是有意的:
+#: 下单必须走 `realtime_engine` 的咽喉点(合规 -> 高危 -> 人工), 不由 Agent
+#: 工具直接发起。任何新增工具若要进这里, 必须同时在 pretrade_compliance 里
+#: 过一遍三段式, 否则等于在闸门外开了一条通道。
+ORDER_TOOLS: tuple = ()
+
+
+def capabilities_of(name: str) -> tuple:
+    """取某工具的能力集合。未分类返回 `('unclassified',)` —— **不是空元组**:
+    空集合看起来像"什么都能做"还是"什么都不能做"没有共识, 而一个显式的
+    `unclassified` 会在 `audit_capabilities()` 里被直接报出来。"""
+    if name in CAPABILITIES:
+        return tuple(CAPABILITIES[name])
+    return ("unclassified",)
+
+
+def has_capability(name: str, cap: str) -> bool:
+    return cap in capabilities_of(name)
+
+
+def is_read_only(name: str) -> bool:
+    """是否**不**具备任何写/下单能力。供"风控 Agent 只读"这条边界做机器校验。"""
+    caps = set(capabilities_of(name))
+    return not caps.intersection(set(WRITE_CAPABILITIES) | set(MONEY_CAPABILITIES))
+
+
+def audit_capabilities() -> dict:
+    """能力边界审计: 哪些工具没归类、哪些声称只读但其实能写、哪些能下单。
+
+    返回 {'n_tools','unclassified':[...],'writers':[...],'money':[...],
+          'read_only':[...], 'ok': bool}
+    这个函数是**给测试与运维用的**: 它让"边界漂移"变成一次可复跑的检查,
+    而不是等人 review 时偶然发现。
+    """
+    all_names = list(_TOOLS.keys()) if _TOOLS else list(CAPABILITIES.keys())
+    unclassified = [n for n in all_names if "unclassified" in capabilities_of(n)]
+    writers = [n for n in all_names
+               if set(capabilities_of(n)) & set(WRITE_CAPABILITIES)]
+    money = [n for n in all_names if set(capabilities_of(n)) & set(MONEY_CAPABILITIES)]
+    orders = [n for n in all_names if has_capability(n, "order")]
+    return {
+        "n_tools": len(all_names),
+        "unclassified": sorted(unclassified),
+        "writers": sorted(writers),
+        "money": sorted(money),
+        "order_tools": sorted(orders),
+        "read_only": sorted(n for n in all_names if is_read_only(n)),
+        "taxonomy": CAPABILITY_TAXONOMY,
+        # "没有工具能直接下单"是本仓的**边界不变量**, 不是当前状态的描述。
+        # 一旦有人加了一个 order 工具而没在 pretrade_compliance 里过闸, 这里会红。
+        "ok": (not unclassified) and (not orders),
+    }
+
+
+# ============================================================
 # 工具定义
 # ============================================================
 class Tool:
-    __slots__ = ("name", "description", "parameters", "execute")
+    __slots__ = ("name", "description", "parameters", "execute", "capabilities")
 
     def __init__(self, name: str, description: str, parameters: dict,
-                 execute: Callable):
+                 execute: Callable, capabilities: tuple | None = None):
         self.name = name
         self.description = description
         self.parameters = parameters
         self.execute = execute
+        # 显式传入优先; 否则按注册表查(未分类 -> ('unclassified',))
+        self.capabilities = tuple(capabilities) if capabilities is not None \
+            else capabilities_of(name)
 
 
 # ============================================================
@@ -760,21 +882,57 @@ def get_tool(name: str) -> Tool | None:
     return _TOOLS.get(name)
 
 
-def list_tools() -> list[dict]:
-    return [{"name": t.name, "description": t.description,
-             "parameters": t.parameters} for t in _TOOLS.values()]
+def list_tools(include_capabilities: bool = True) -> list[dict]:
+    """列出工具。默认带 `capabilities`(P0 清单第 7 项) —— 能力是调用方决定
+    "这个工具能不能给它用"的必要信息, 默认不给等于逼每个调用方自己去查表。"""
+    out = []
+    for t in _TOOLS.values():
+        d = {"name": t.name, "description": t.description,
+             "parameters": t.parameters}
+        if include_capabilities:
+            d["capabilities"] = list(getattr(t, "capabilities", ()) or ())
+        out.append(d)
+    return out
 
 
-def get_tool_schemas() -> list[dict]:
-    return [{"name": t.name, "description": t.description,
-             "input_schema": t.parameters} for t in _TOOLS.values()]
+def get_tool_schemas(include_capabilities: bool = True) -> list[dict]:
+    out = []
+    for t in _TOOLS.values():
+        d = {"name": t.name, "description": t.description,
+             "input_schema": t.parameters}
+        if include_capabilities:
+            d["capabilities"] = list(getattr(t, "capabilities", ()) or ())
+        out.append(d)
+    return out
 
 
-def execute(name: str, params: dict | None = None) -> dict:
+def execute(name: str, params: dict | None = None,
+            require: tuple | None = None, forbid: tuple | None = None) -> dict:
+    """执行工具。可选**调用前**能力校验:
+
+    require: 必须同时具备这些能力, 否则拒绝执行(不调用工具)
+    forbid : 具备其中任一能力即拒绝执行
+
+    为什么把校验放在这里而不是让调用方自己查: 边界若只写在文档里, 它就会
+    随调用点增多而失效。放在唯一入口上, "拿不到就别想调"是结构性的。
+    """
     tool = _TOOLS.get(name)
     if tool is None:
         return {"ok": False, "error": f"未知工具: {name}",
                 "available_tools": list(_TOOLS.keys())}
+    caps = set(getattr(tool, "capabilities", ()) or ())
+    if require:
+        missing = sorted(set(require) - caps)
+        if missing:
+            return {"ok": False, "tool": name, "error": "capability_denied",
+                    "reasons": [f"缺少所需能力: {missing}"],
+                    "capabilities": sorted(caps)}
+    if forbid:
+        hit = sorted(set(forbid) & caps)
+        if hit:
+            return {"ok": False, "tool": name, "error": "capability_denied",
+                    "reasons": [f"命中禁用能力: {hit}"],
+                    "capabilities": sorted(caps)}
     return _safe_execute(name, tool.execute, params or {})
 
 

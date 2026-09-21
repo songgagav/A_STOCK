@@ -1,0 +1,129 @@
+# -*- coding: utf-8 -*-
+"""第二轮接线 (虚拟盘 / run_daily / 收益评估) 的**接线存在性**回归测试。
+
+为什么要有这个文件: 接线代码写在 `run_daily.run_daily()` 的函数体里, 无法在不跑
+整条日更链路的前提下被单测覆盖。但"接线被误删/改名"是本仓真实发生过的一类事故
+(如 `_plan_to_targets` 丢字段、f_ml 回退链断链)。故这里用**源码级断言**锁住:
+
+  · 三个新步骤确实写在 run_daily 里;
+  · 三个步骤都能**独立容错**(有 try/except, 不会拖垮主链路);
+  · 开关存在于 config, 且 0 表示关闭;
+  · 引擎侧确实调用了卖侧闸门与死手开关;
+  · 收益门槛与回看窗口的一致性(见 test_factor_hypothesis_eval 的同名断言)。
+"""
+from __future__ import annotations
+
+import inspect
+import os
+import sys
+
+import pytest
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
+
+
+def _src(mod_name: str) -> str:
+    import importlib
+    m = importlib.import_module(mod_name)
+    return inspect.getsource(m)
+
+
+@pytest.fixture(scope="module")
+def _run_daily_src():
+    return _src("run_daily")
+
+
+class TestRunDailySteps:
+    @pytest.fixture(autouse=True)
+    def src(self, _run_daily_src):
+        self._src_text = _run_daily_src
+
+    def test_step_is_wired(self):
+        for step in ("portfolio_backtest", "regime_scenarios", "factor_hypotheses"):
+            assert f'"{step}"' in self._src_text, f"run_daily 里找不到步骤 {step}(接线被误删?)"
+
+    def test_step_is_independently_fault_tolerant(self):
+        """每一步都必须在自己那段里被 try/except 包住 —— 回测/研究步骤失败
+        绝不允许影响选股与持仓归档主链路。"""
+        for step in ("portfolio_backtest", "regime_scenarios", "factor_hypotheses"):
+            i = self._src_text.find(f'"{step}"')
+            assert i > 0
+            window = self._src_text[max(0, i - 1500):i]
+            assert "try:" in window and "except Exception" in window, \
+                f"步骤 {step} 缺少独立容错"
+
+    def test_modules_are_importable(self):
+        for mod in ("portfolio_live", "factor_hypothesis_eval", "vnpy_backtest"):
+            __import__(mod)
+
+    def test_regime_step_avoids_data_tail(self):
+        """多场景回测必须避开数据末尾 —— 末尾几天必然报『未来数据不足』,
+        那是日期选取问题而不是策略问题, 会让该步骤天天假失败。"""
+        i = self._src_text.find('"regime_scenarios"')
+        assert i > 0
+        window = self._src_text[max(0, i - 2500):i + 800]
+        assert "forward=True" in window, "多场景步骤未走前向窗口"
+        # 必须从末尾"退让"若干天再取窗口(见 _cand = _all[-(_rdays + _lb):-1])
+        assert "[:- 1]" in window or "[:-1]" in window, "未避开数据末尾"
+
+
+class TestConfigSwitches:
+    def test_windows_present_and_zero_means_off(self):
+        from config import PAPER
+        for k in ("portfolio_bt_days", "vnpy_regime_days", "hypothesis_days"):
+            assert k in PAPER, f"缺开关 {k}"
+            assert int(PAPER[k]) >= 0
+
+    def test_sell_gate_defaults_on(self):
+        from config import PAPER
+        assert bool(PAPER.get("sell_gate")) is True
+        assert float(PAPER.get("sell_cash_tolerance")) > 0
+
+    def test_eval_thresholds_have_no_hidden_defaults(self):
+        """收益门槛必须显式配置 —— 缺键时 thresholds_from_config 抛错。"""
+        import factor_hypothesis_eval as FE
+        from config import FACTOR_HYPOTHESIS_EVAL
+        assert {"min_ic", "min_icir", "min_obs_days"} <= set(FACTOR_HYPOTHESIS_EVAL)
+        assert FE.thresholds_from_config()["min_obs_days"] == FACTOR_HYPOTHESIS_EVAL["min_obs_days"]
+
+
+class TestLiveWiring:
+    def test_realtime_engine_calls_sell_gate(self):
+        s = _src("realtime_engine")
+        assert "live_gates" in s and "apply_to_engine" in s
+
+    def test_realtime_engine_beats_deadman(self):
+        s = _src("realtime_engine")
+        assert "deadman_switch" in s and 'beat("realtime_engine"' in s
+
+    def test_daemon_beats_deadman(self):
+        s = _src("daemon")
+        assert "deadman_switch" in s and 'beat("daemon"' in s
+
+    def test_daemon_beat_is_time_gated(self):
+        """守护主循环每轮约 15s; 必须做时间闸门, 否则账本每天多出数千行。"""
+        s = _src("daemon")
+        i = s.find("deadman_switch")
+        window = s[max(0, i - 900):i + 500]
+        assert ">= 60" in window or ">= 60.0" in window
+
+    def test_paperbook_trailing_stop_present(self):
+        s = _src("paper_book")
+        assert "trailing_stop" in s and "_last_trailing_hits" in s
+
+    def test_backtest_engine_trailing_stop_present(self):
+        s = _src("backtest_engine")
+        assert "trailing_stop" in s and "trailing_exits" in s
+
+
+class TestPlanToTargetsPassthrough:
+    def test_freshness_fields_are_not_dropped(self):
+        """**回归锁**: `_plan_to_targets` 曾把 plan 里已有的 data_lag_days /
+        section_as_of 丢掉, 使交易前清单的新鲜度项永远只能 skip。"""
+        s = _src("realtime_engine")
+        assert "data_lag_days" in s and "section_as_of" in s
+        i = s.find("def _plan_to_targets")
+        assert i > 0
+        body = s[i:i + 2500]
+        assert "data_lag_days" in body, "section_as_of/data_lag_days 未透传"
