@@ -524,6 +524,24 @@
       "detail": "**【2026-09-21 发现并修复（用户要求\"成本最低、立即修\"）】**\n\n`live_state.json` 的 `live_source` 本应回答**\"我现在是按实时价撮合吗\"**，\n但原判据是「候选池里**任一只**缺价 ⇒ 整批标 `duckdb_reference`」：\n\n```python\nmissing = [c for c in all_codes if c not in latest or not latest.get(c)]\nif missing or not latest:\n    ...\n    live_src = \"duckdb_reference\"\n```\n\n于是该字段**失去区分能力** —— 一个**账户完全健康**的会话，与\"账户被静态价兜底\"\n在状态文件里长得一模一样。\n\n**实测证据（当天盘中）**：`live_source = duckdb_reference`，但持仓 `301655.SZ` 的价格\n其实**实时在动**（80 秒内 23.29 → 23.20）；而池里只是有个别标的没取到价。\n即：**字段还在，但已经不携带信息** —— 与本仓最忌讳的那类信号退化同源。\n\n**修复**（抽出可测函数 `realtime_engine._live_src_label`）：\n| 标记 | 含义 |\n|---|---|\n| `akshare_spot` | 持仓与候选池全部取到实时价 |\n| `duckdb_reference_pool` | 仅**候选池**有缺价 —— 账户仍是实时估值，影响的是**下次调仓** |\n| `duckdb_reference_held` | **持仓**有缺价 —— 账面已用最近收盘价兜底，**不能**当实时看 |\n\n另修一处**时序陷阱**：`missing` / `held_missing` 必须在**用参考价补齐之前**计算 ——\n补齐之后 `latest` 人人有价，再算就**永远判不出谁是被兜底的**。\n并在两种缺价情形下各打一条明确日志（原先只有池缺价时无任何提示）。",
       "evidence": "src/realtime_engine.py 原 `if missing or not latest: ... live_src='duckdb_reference'`; 实测当天 live_source=duckdb_reference 而持仓 301655.SZ 80 秒内 23.29->23.20(实时在动); 修复: 新增 _live_src_label(held_missing, pool_missing) 三态标记, 且 missing/held_missing 在参考价补齐**之前**计算; tests/test_live_src_label.py 6 项(含'三种状态必须可区分'与'回退旧判据会被抓住')",
       "next": "**改动要等引擎重启才生效** —— 引擎按计划 15:03 自停，下一次启动是 **2026-09-22 08:30**，届时才会写新的三态标记。明天盘中核对 `live_state.json` 的 `live_source` 是否落在 `akshare_spot` / `duckdb_reference_pool` / `duckdb_reference_held` 三者之一（不再是旧值）。"
+    },
+    {
+      "id": "P2-ATLASPROXY",
+      "level": "P2",
+      "title": "实时源经本地代理 AtlasCore(127.0.0.1:6696) 单次请求 15.5s ⇒ 盘中 tick 频率减半（不阻塞，暂缓处理）",
+      "status": "open",
+      "detail": "**现象**: 盘中 tick 延迟双峰 —— `p50 7.3ms` 但 `p95 ≈ 10.5s / p99 ≈ 13.8s`；`data_ts` 实际每 ~26 秒才推进一次（配置 `interval=15.0s`）⇒ **循环只跑到约一半频率**。\n\n**根因（实测，非推断）**：请求经**本地代理** `127.0.0.1:6696`（占用者 = **`AtlasCore_amd64`**，pid 40596，启动 09-18 21:24，42.4MB；不在服务列表、不在自启项，应为手动或自带更新器拉起；路径读不到）。\n环境变量 `HTTP_PROXY`/`HTTPS_PROXY` **全部未设**，但 **WinINET(注册表)代理 `ProxyEnable=1`** —— `requests`/akshare 在 Windows 上会读注册表，故实际走的就是它。\n\n同一接口对照（决定性）：\n| 路径 | 结果 |\n|---|---|\n| 默认（走系统代理） | **15544 ms** |\n| 绕开代理 `ProxyHandler({})` | **三次全失败** `RemoteDisconnected` |\n| 裸 TCP 直连 | 36 ms 建连 ✓ 但 HTTP 被重置 ✗ |\n\n⇒ **“换直连更快”这个假设被实测否掉**：出口必须经该代理，`NO_PROXY` 提速不可行。\n\n**影响面被限制住了（故定 P2 不定 P1）**：\n· `feed.get_latest` 走的是 **watchlist 路径**（`_fetch_spot_with_timeout(fetch_all=False)`，仅持仓+候选池约 10 只），**不是**每 tick 全A快照 —— 所以慢**不是请求体太大**；\n· **超时保护早已实现**（`SPOT_TIMEOUT`，线程+超时），超时即放弃本次刷新并落 `_fetch_from_duckdb()` 兜底 ⇒ **数据质量不受影响**，只影响**反应速度**（风控及时性）。\n⇒ 不是当前阻塞项；可选方案（让代理变快 / 换不经代理的兜底源）都需要外部协调。",
+      "evidence": "127.0.0.1:6696 占用者实测 = AtlasCore_amd64 pid 40596; HKCU Internet Settings ProxyEnable=1 ProxyServer=127.0.0.1:6696; HTTP(S)_PROXY 环境变量均未设; 同接口对照: 默认(走系统代理) 15544ms / 绕开代理三次全失败 RemoteDisconnected / 裸 TCP 82.push2.eastmoney.com:443 878ms(首次) 36ms 38ms 但 HTTP 被重置; live_state.ops.tick_ms: p50 7.3 / p95 10349-10949 / p99 13533-13779 / last 11219-14328; data_ts 实测每 ~26s 推进(配置 interval=15.0s); paper_book.py:1014-1038 证实 fetch_all=False 仅拉 watchlist 且已有 SPOT_TIMEOUT 兜底",
+      "next": "**暂缓**（用户判定：不阻塞、需外部协调）。有完整余量时再做：\n① 查清 `AtlasCore_amd64` 是哪个程序、有无直连/更快模式；\n② 或给实时价加一条**不经该代理**的兜底源（注意：已实测裸直连 HTTP 会被重置，故需另找源）。\n**不要**为了这个去改 `SPOT_TIMEOUT` —— 超时早就有了，且已实测不是根因。"
+    },
+    {
+      "id": "P2-CELERYDET",
+      "level": "P2",
+      "title": "celery/flower 判据二次修正：路径约束对 `-m` 启动的组件必然失效（曾导致每约 50 分钟重启一次）",
+      "status": "fixed",
+      "detail": "**【2026-09-21 自查自纠 —— 这是我在修 P1-OBSLEAK 时引入的回归】**\n\n修 `P1-OBSLEAK` 时为消除“名字子串误命中第三方进程”（`ivms320-redis-server`），我给 `_obs_procs()` 统一加了**路径约束**（要求命令行含本仓/观测栈目录）。\n\n**但 celery/flower 是用 `-m` 启动的**：\n```\n[PY, \"-m\", \"celery\", \"-A\", \"src.tasks_db\", \"worker\", \"--pool=solo\", ...]\n[PY, \"-m\", \"celery\", \"-A\", \"src.tasks_db\", \"flower\", \"--port=5555\"]\n```\n**命令行里根本没有本仓路径** ⇒ 判据 `repo in cmdline` 恒为假 ⇒ 它们被**永远判为“未运行”** ⇒ daemon 每轮重启一次。实测日志节奏完全吻合：**13:29 / 14:19 / 15:10 / 16:00 / 16:51 / 17:41，每约 50 分钟一次**（修 P1-OBSLEAK 之前的老判据 `\"celery\" in cl and \"tasks_db\" in cl` 本来是能命中的）。\n\n**教训**：判据要**贴合各自的启动形态**，不能一刀切。\n· 按**脚本绝对路径**启动的（metrics_server / alert_hook / 原生 exe）→ 路径约束正确；\n· 按 **`-m` 模块**启动的（celery / flower）→ 路径约束**必然失效**，应改用**模块名**判据。\n\n**修复**：celery/flower 改为 `repo in cl or \"src.tasks_db\" in cl` —— `src.tasks_db` 足够 specific，既能命中，又不会误命中第三方同名进程。",
+      "evidence": "src/daemon.py 原 celery/flower 启动命令为 [PY,'-m','celery','-A','src.tasks_db',...]（无路径）; 实测 daemon.log 中 celery 被拉起的时间戳: 13:29/14:19/15:10/16:00/16:51/17:41(每约 50 分钟); 修复后以假进程验证: _obs_procs() = {'celery': 1, 'flower': 2} 且**不含**第三方 ivms320-redis-server; 全量回归 811 passed",
+      "next": "**改动需 daemon 重启才生效**（正在跑的 daemon 仍是旧代码）—— 但**不必现在重启**：celery/flower 每约 50 分钟被重启一次只是浪费，不阻塞交易。下次因别的原因重启服务时自然生效。另注：本次也顺带证实 `ivms320-redis-server` 那条误命中已被消除（两个 bug 同时修好）。"
     }
   ]
 }

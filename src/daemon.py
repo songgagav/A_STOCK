@@ -289,9 +289,11 @@ def _obs_procs() -> dict:
             out.setdefault("metrics", p.pid)
         elif "alert_hook" in cll and repo in cll:
             out.setdefault("hook", p.pid)
-        elif "flower" in cll and "celery" in cll and "worker" not in cll and repo in cll:
+        elif "flower" in cll and "celery" in cll and "worker" not in cll and (
+                repo in cll or "src.tasks_db" in cll):
             out.setdefault("flower", p.pid)
-        elif "celery" in cll and "tasks_db" in cll and repo in cll:
+        elif "celery" in cll and "tasks_db" in cll and (
+                repo in cll or "src.tasks_db" in cll):
             out.setdefault("celery", p.pid)
     return out
 
