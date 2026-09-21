@@ -429,6 +429,28 @@ def load_targets(day: str):
     return sel.get("top_n", []), sel, d
 
 
+def _live_src_label(held_missing, pool_missing) -> str:
+    """按**持仓**缺价判定实时来源标记 —— 使该字段能直接回答"我在实时撮合吗".
+
+    [2026-09-21 修] 原逻辑是"池里**任一只**缺价 ⇒ 整批标 `duckdb_reference`",
+    于是该字段**失去区分能力**: 无法区分
+      · "账户按实时价估值, 只是候选池里有个别标的没取到价"(仍可相信账面), 与
+      · "持仓本身被静态价兜底"(账面/风控都该打折看待)。
+    实测当天池 10 只中有个别缺价 ⇒ 整批标成 duckdb_reference, 但持仓 301655.SZ
+    的价格其实是**实时在动**的(80 秒内 23.29→23.20)。
+
+    新语义:
+      `akshare_spot`            持仓与候选池**全部**取到实时价
+      `duckdb_reference_pool`   仅**候选池**有缺价 —— 账户仍是实时估值, 影响的是**下次调仓**
+      `duckdb_reference_held`   持仓有缺价 —— 账面已用最近收盘价兜底, **不能**当实时看
+    """
+    if held_missing:
+        return "duckdb_reference_held"
+    if pool_missing:
+        return "duckdb_reference_pool"
+    return "akshare_spot"
+
+
 class RealtimeEngine:
     def __init__(self, interval: float = 15.0, intraday_only: bool = True):
         self.interval = interval
@@ -566,8 +588,14 @@ class RealtimeEngine:
         if errors:
             log(f"实时源告警: {errors[:120]}")
         live_src = "akshare_spot"
-        # 兜底: 实时源断连/缺失价 -> 用 DuckDB 最近收盘价补齐, 保证撮合恒有价
+        # ★ 判据必须在**用参考价补齐之前**算: 补齐之后 latest 人人有价,
+        #   再算就永远判不出"谁是被静态价兜底的"。实测 2026-09-21 就是因为
+        #   原实现只看"池里任一只缺价"就把整批标成 duckdb_reference, 使该字段
+        #   **无法区分"账户按实时价估值"与"账户被静态价兜底"**。
         missing = [c for c in all_codes if c not in latest or not latest.get(c)]
+        held = list(self.pb.positions.keys())
+        held_missing = [c for c in held if c in missing]
+        # 兜底: 实时源断连/缺失价 -> 用最近收盘价补齐, 保证撮合恒有价
         if missing or not latest:
             ref = self._disk_ref_prices(missing)
             if ref:
@@ -579,7 +607,16 @@ class RealtimeEngine:
                             self.feed.quotes[c] = {"price": p, "last_close": p,
                                                    "limit_up": None, "limit_down": None,
                                                    "volume": 0, "suspended": False}
-                live_src = "duckdb_reference"
+        # 来源标记**按持仓缺价**判定, 使该字段能直接回答"我在实时撮合吗":
+        #   · held 有缺价  => 账户被静态价兜底, **不能**算实时(记账/风控都该打折看待)
+        #   · 仅池内有缺价 => 账户仍是实时估值, 只是候选池不全(影响下次调仓, 不影响当前账面)
+        live_src = _live_src_label(held_missing, missing)
+        if held_missing:
+            log(f"实时源告警: 持仓缺实时价 {len(held_missing)}/{len(held)} 只 "
+                f"({','.join(held_missing[:5])}) -> 账面已用最近收盘价兜底")
+        elif missing:
+            log(f"实时源告警: 仅候选池缺价 {len(missing)}/{len(all_codes)} 只, "
+                f"持仓 {len(held)} 只全部实时")
 
         # 用实时价更新账面撮合价
         self.pb.d_price = {c: latest[c] for c in latest if latest.get(c) and latest[c] > 0}
