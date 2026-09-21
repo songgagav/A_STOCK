@@ -162,7 +162,7 @@ def _ic_compute(df, factor_name: str, k: int) -> dict:
         if factor is None:
             return {"ok": False, "error": f"未知因子: {factor_name}"}
         raw = factor["build_wide"](pct, k)
-        fwd = pct.shift(-1).rolling(5).apply(
+        fwd = pct.shift(-1).rolling(5).apply(  # lookahead-ok: fwd=未来收益标签(评估用), 不作为决策输入
             lambda x: np.prod(1 + x) - 1, raw=True)
         ic_series = []
         for d in raw.index:

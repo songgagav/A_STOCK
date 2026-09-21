@@ -407,7 +407,7 @@ def _compute_fwd_returns(panel: pd.DataFrame) -> pd.DataFrame:
     bars["r1"] = 1.0 + bars["change_pct"].fillna(0) / 100.0
     g = bars.groupby("symbol", sort=False)["r1"]
     cump = g.cumprod()
-    fwd5 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-5) / cump - 1.0
+    fwd5 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-5) / cump - 1.0  # lookahead-ok: 未来 5 日收益标签(IC 评估用), 非特征
     bars["fwd5"] = np.where(np.isfinite(fwd5), fwd5, np.nan)
 
     result = bars[bars["d"].isin(pd.to_datetime(list(days)))].copy()

@@ -1013,8 +1013,8 @@ def score_series_hist(end: Optional[str] = None, days: int = 90) -> dict:
     bars = bars.assign(r1=r1)
     g = bars.groupby("symbol", sort=False)["r1"]
     cump = g.cumprod()
-    fwd1 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-1) / cump - 1.0
-    fwd5 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-5) / cump - 1.0
+    fwd1 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-1) / cump - 1.0  # lookahead-ok: 未来 1 日收益标签(IC 评估用), 非特征
+    fwd5 = g.cumprod().groupby(bars["symbol"], sort=False).shift(-5) / cump - 1.0  # lookahead-ok: 未来 5 日收益标签(IC 评估用), 非特征
     bars["fwd1"] = np.where(np.isfinite(fwd1), fwd1, np.nan)
     bars["fwd5"] = np.where(np.isfinite(fwd5), fwd5, np.nan)
 

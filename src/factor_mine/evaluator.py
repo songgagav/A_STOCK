@@ -271,7 +271,7 @@ def evaluate(frame: pd.DataFrame, factor: str, fwd: str = "fwd5",
         q_series = [round(float(qmean.get(i, np.nan)), 5) if pd.notna(qmean.get(i)) else None for i in range(5)]
         spread_q = float(qmean.get(4, np.nan) - qmean.get(0, np.nan)) if len(qmean) >= 5 else None
         monotone = bool(len(qmean) == 5 and all(
-            qmean.iloc[i] <= qmean.iloc[i + 1] + 1e-9 for i in range(4)))
+            qmean.iloc[i] <= qmean.iloc[i + 1] + 1e-9 for i in range(4)))  # lookahead-ok: 分位数单调性校验(静态区间 range(4)), 与时序无关
     else:
         q_series = [None] * 5
         spread_q = None

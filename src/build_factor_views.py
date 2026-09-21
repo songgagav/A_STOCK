@@ -612,7 +612,7 @@ def _compute_ic_latest(db, scores: pd.DataFrame | None = None) -> pd.DataFrame:
     if ret is None or ret.empty:
         return pd.DataFrame(columns=cols)
     ret = ret.sort_values(["symbol", "date"])
-    ret["nxt_close"] = ret.groupby("symbol")["close"].shift(-1)
+    ret["nxt_close"] = ret.groupby("symbol")["close"].shift(-1)  # lookahead-ok: 造**未来收益标签**(nxt_close)用于评估, 不是特征; 严禁并入特征矩阵
     ret["fwd_1d"] = (ret["nxt_close"] / ret["close"] - 1.0)
     ret["fwd_1d"] = np.where(
         (ret["close"] > 0) & (ret["nxt_close"] > 0), ret["fwd_1d"], np.nan)
