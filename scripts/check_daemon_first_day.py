@@ -173,6 +173,8 @@ def collect() -> dict:
                     "train_metrics_keys": sorted(tm.keys()) if isinstance(tm, dict) else None,
                     "actual_timesteps": (tm or {}).get("actual_timesteps") if isinstance(tm, dict) else None,
                     "post_train_ok": (pt or {}).get("ok") if isinstance(pt, dict) else None,
+                    "post_new": (pt or {}).get("new") if isinstance(pt, dict) else None,
+                    "post_delta": (pt or {}).get("delta_new_minus_old") if isinstance(pt, dict) else None,
                     "val_new": (pt or {}).get("val_new") if isinstance(pt, dict) else None})
     out["drl_artifacts"] = drl
 
@@ -211,7 +213,9 @@ def verdict(d: dict, phase: str) -> list:
         add("daemon_state.last_health_day 已推进到今天",
             st.get("last_health_day") == str(TODAY),
             f"last_health_day={st.get('last_health_day')}（08:30 窗口内应写为 {TODAY}）")
-    if phase in ("intraday", "close"):
+    if phase == "intraday":
+        # 仅盘中要求引擎在跑。收盘阶段引擎会按计划自停(15:03), 那时 running_day 为 None
+        # **本来就是正确行为** —— 初版在 close 也要求它, 于是收盘必然误报 FAIL。
         add("daemon_state.running_day == 今天（盘中引擎已启动）",
             st.get("running_day") == str(TODAY), f"running_day={st.get('running_day')}")
     if phase == "close":
@@ -270,9 +274,13 @@ def verdict(d: dict, phase: str) -> list:
             "; ".join(f"{a['where']}: {a.get('train_metrics_n')} 键 "
                       f"actual_timesteps={a.get('actual_timesteps')}"
                       for a in exist) or "两处 train_meta 均无 train_metrics")
-        withpt = [a for a in exist if a.get("post_train_ok") is not None]
-        add("post_train_validation 已落盘（含 val_new）", bool(withpt),
-            "; ".join(f"{a['where']}: ok={a.get('post_train_ok')} val_new={a.get('val_new')}"
+        # 字段名不是字面的 `val_new`: 实测 2026-09-21 的 train_meta 里是
+        # `new` / `old` / `delta_new_minus_old`(学习后验证的新旧对比)。
+        # 初版只找 val_new, 于是护栏明明在(14 键)却误报 FAIL。
+        withpt = [a for a in exist if a.get("post_train_ok") is not None or a.get("post_new") is not None]
+        add("post_train_validation 已落盘（含 new / delta_new_minus_old）", bool(withpt),
+            "; ".join(f"{a['where']}: ok={a.get('post_train_ok')} "
+                      f"new={a.get('post_new')} delta={a.get('post_delta')}"
                       for a in exist) or "两处 train_meta 均无 post_train_validation")
     return v
 
