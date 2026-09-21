@@ -1,0 +1,72 @@
+feat(roadmap-17): 模拟盘接入拆单闸门 + 降级驱动量采集 (2039 passed)
+
+本批次两件事, 外加用户要的三个后续结论(拆vs不拆差异 / _to_used 口径 / 是否接实盘)。
+
+== ⑰ 模拟盘接入拆单闸门 + 对照留痕(不接实盘) ==
+
+**成本恒等(解析结论)**: 虚拟盘成交成本是 PaperBook 未收到 avg_daily_volume 时走的
+常量分支 = 滑点万5+冲击万2 = 7bps/单边, **与订单大小无关**。故
+Σ_i r·n_i = r·Σ n_i = r·n ⇒ 拆 N 档与一次性**成本完全相同**(实测 1万/100万/1亿
+三档, delta 恒为 0)。差异不在成本, 而在: 各档成交价变动(价格风险)、单 tick
+吃单量被压(冲击幅度无数据可标定)、成交时点分散。
+
+**两次自建冲击模型都被算术否掉(过程留档)**:
+ (a) slippage_model.market_impact_rate 的临时项 0.5·p·vol 乘上名义额后对**订单规模
+     是二次的** ⇒ 拆 N 档把总成本按 1/N 缩水(实测一笔 10 万元: 一次性 1902 元 /
+     拆 10 档 190 元), 模型自带"拆单更便宜"的结论, 拿它做对照是循环论证;
+ (b) 换自建线性冲击 k·p: k 为常数时得到同一个二次形状; 要让结论正确(拆单不改变
+     总冲击)则费率必须与规模无关 —— 那正是现行常量口径。
+ **数学事实: 线性冲击模型无法回答"拆单省不省"** —— 要么恒等, 要么二次。真实冲击
+ 是次线性的(√p 量级), 但本仓无成交数据可标定该指数。
+
+**于是只做两件能算清的事**:
+ (i) 参与率闸门 —— 单 tick 下单量上限 ADV×participation_cap(0.10), 超出**推迟到
+     后续 tick, 从不取消**(引擎每 15 秒一轮); 不改变成本、不改变当日可达成交量、
+     不改变选股与权重;
+ (ii) 对照留痕 —— data/exec_split_compare.jsonl(append-only, 走 #6 哈希链)。
+ 接线点 realtime_engine._rebalance() 买入侧(ADV 每轮批量取一次, 取不到即不拆)。
+
+**实测: 当前规模下闸门从不触发** —— 真实 ADV 下即便把单笔放大到 5000 万元,
+参与率也只有 0.48%~7.28%, 全部低于 10% 上限; 而虚拟盘真实单笔约 1 万元 ⇒ 参与率
+0.0001%~0.0015%, 距上限 6868~104186 倍。
+
+**接实盘决断: 不接**。收益 0(不触发); 成本真实(跨 tick 未成量状态机+断电恢复+
+券商部分成交回报语义, 而 TRADE_BROKER 恒为 paper、easytrader 未接入); 风险是新增
+一条改变下单时序的路径。**触发条件写死**: 单笔名义额 > ADV×1% 成为常态(≈100万元/单,
+需资金规模增约 100 倍)时再评估。
+
+**`_to_used` 口径评估: 可比**。拆与不拆累加的是同一批成交额(累加在每次实际成交后、
+按实际成交量算), Σ mv_i = mv, 预算消耗完全相同; 本次实现**刻意未改 _to_used 任何
+一行**(限速只改 qty, 之后走原累加语句)。顺带登记一条既有不对称(与本批次无关):
+买入按含成本名义额计入预算、卖出按不含成本 —— 量级 0.07%(对 20% 日换手预算约
+0.35% 相对差异), 可忽略但登记为 P1-TOUSED-ASYMMETRY(deferred)。
+
+== P2-DEGRADE-INPUTS: 采集拒单率/滑点分布 ==
+
+新增 src/degrade_inputs.py, 从**已有账本**算三个量, **只采集不判定**:
+ · 拒单率 —— data/order_audit.jsonl 的 action(reject + pending_approval 都算被拦,
+   分开列出);
+ · 滑点分布 —— 成交的 impact_bps + exec_risk_bps(按日/分位);
+ · 参与率 —— 单笔名义额 / ADV(复用 market_stats 的真实 ADV)。
+已接进 run_daily 的 degrade_inputs 步骤; **显式不参与任何拦截**
+(report()['wired_into_state_machine'] is False, 有测试锁住)。
+
+**实测现状(两件必须说清的事)**:
+ ① **虚拟盘至今没有真实成交数据** —— data/state.json.trades_history 为空、
+    data/order_audit.jsonl 不存在 ⇒ "采集拒单率/滑点分布"**采不到东西**:
+    不是代码没写, 是没有原料。函数在无样本时返回 n=0 并写明原因, **不给一张空表
+    让人误读成"无异常"**。
+ ② **滑点的实测分布在原理上当前就不存在** —— 生产撮合走常量分支(PaperBook 未收到
+    avg_daily_volume/volatility), 逐笔 impact_bps 不产生。模块里写明"**不得把常量
+    7bps 当作实测分布引用**"并有测试锁住该措辞。
+
+仍未做: 进 health_state 需要一个"拒单率多高算降级"的阈值, 而本仓纪律是「阈值须基于
+下游表现」。故先累积分布(MIN_DAYS_FOR_CALIBRATION=10 天, 占位初值), 再按分位数标定。
+
+== 其它 ==
+· 探针: _tools/probe_split.py(成本恒等表+闸门表, 纯计算), _tools/probe_throttle.py
+  (真实 ADV + 闸门实跑, 需 h5i 解释器) —— 验收表述引用了它们, 故随仓库保留。
+· 文档: docs/exec-split-decision.md(三问全答: 实测差异 / 记账口径 / 接实盘决断)
+· 登记: ops/acceptance_status.json 新增 ROADMAP-7-SPLIT、P1-TOUSED-ASYMMETRY;
+  P2-DEGRADE-INPUTS 由 open 更新为 partial(采集已落地、判定仍缺)
+· 测试: tests/test_exec_gate.py(75 例)、tests/test_degrade_inputs.py(38 例)

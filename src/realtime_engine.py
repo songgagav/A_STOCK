@@ -857,6 +857,22 @@ class RealtimeEngine:
         if not gate_open:
             log(f"调仓间隔未到(距上次{self._last_rebal_day} {gap_days}天<{rebal_iv}), 本轮仅止损/风控")
 
+        # [路线图 ⑰] 拆单闸门所需的 ADV: 每轮调仓**批量取一次**(带缓存),
+        # 取不到就是空字典 => 全部不拆(保持既有一次性下单行为, 不因缺数据停手)。
+        try:
+            import exec_gate as _EG0
+            if _EG0.enabled():
+                _need = [t["canon"] for t in self.targets] + list(self.pb.positions.keys())
+                self._adv = _EG0.fetch_adv(_need, day=self.pb.trade_date)
+                if self._adv:
+                    log(f"拆单闸门: 已取 {len(self._adv)} 只标的 ADV (cap="
+                        f"{float(PAPER.get('participation_cap') or 0) * 100:.2f}%)")
+            else:
+                self._adv = {}
+        except Exception as _e:  # noqa: BLE001
+            self._adv = {}
+            log(f"拆单闸门 ADV 取数异常(本轮不拆): {type(_e).__name__}: {_e}")
+
         # 1) 卖出目标组合外的持仓 (可卖部分; 跌停/停牌跳过)
         min_hold = int(PAPER.get("min_hold_days", 0) or 0)
         if gate_open:
@@ -1094,6 +1110,28 @@ class RealtimeEngine:
                     except Exception as _ce:  # noqa: BLE001
                         # 判定异常**不阻断交易**(否则一个 bug 就让系统静默停手), 但响亮报出
                         log(f"下单前合规判定异常(不阻断, 需排查): {type(_ce).__name__}: {_ce}")
+                    # [路线图 ⑰] 拆单闸门: 把本次下单量限到 ADV×cap 以内。
+                    # 只**推迟**超出部分(后续 tick 继续), 从不取消; 成本口径不变
+                    # (常量 7bps/单边与订单大小无关, 见 micro_cost 的解析证明),
+                    # 故 _to_used 的记账在"拆/不拆"下可比。
+                    try:
+                        import exec_gate as _EG
+                        _th = _EG.throttle(canon, qty, pr,
+                                           adv=(self._adv or {}).get(canon))
+                        if _th.get("capped"):
+                            _EG.record(canon=canon, side="buy", wanted=qty,
+                                       throttled=_th, price=pr,
+                                       day=self.pb.trade_date,
+                                       adv=(self._adv or {}).get(canon))
+                            log(f"拆单限速({canon}) 本次 {qty}->{_th['qty']}股 "
+                                f"(推迟 {_th['deferred']}股 至后续 tick; "
+                                f"参与率{( _th.get('participation') or 0) * 100:.4f}%)")
+                            qty = int(_th["qty"])
+                            mv = qty * pr * exec_ratio
+                    except Exception as _ee:  # noqa: BLE001
+                        log(f"拆单闸门异常(不阻断, 按原量下单): {type(_ee).__name__}: {_ee}")
+                    if qty < 100:
+                        continue
                     self.pb.buy(canon, qty, pr)
                     self._to_used += mv
                     log(f"买入({canon}) {qty}股 @{pr:.3f} 名义额{mv:.0f}")

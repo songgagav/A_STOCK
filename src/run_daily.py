@@ -702,6 +702,17 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["factor_hypotheses"] = {"ok": False, "error": str(e)[:200]}
 
+        # 2.8) [P2-DEGRADE-INPUTS] 降级驱动量**采集**(拒单率/滑点分布/参与率)。
+        #  只采集不判定: 进 health_state 需要一个"拒单率多高算降级"的阈值, 而本仓
+        #  纪律是「阈值须基于下游表现」。故每日把分布算出来落盘, 累积后再标定。
+        #  **不参与任何拦截** —— 这一点由 degrade_inputs.report() 的
+        #  wired_into_state_machine=False 显式声明, 并有测试锁住。
+        try:
+            import degrade_inputs as _DI
+            report["steps"]["degrade_inputs"] = _DI.report()
+        except Exception as e:
+            report["steps"]["degrade_inputs"] = {"ok": False, "error": str(e)[:200]}
+
         try:
             from pre_drl_brief import run_pre_drl_brief
             report["steps"]["pre_drl_brief"] = run_pre_drl_brief(day, day_dir)
