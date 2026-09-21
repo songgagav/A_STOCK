@@ -104,6 +104,40 @@ def main() -> int:
         json.dump(new, f, ensure_ascii=False, indent=2)
     print(f"  [已写入] {fp}")
 
+    # ---- 同步 live_state.json ----
+    # **为什么必须同步**: `dashboard.py` **优先读 live_state.json**(仅当它缺失才回退 state.json)。
+    # 而 live_state.json 由**盘中引擎**每 tick 覆写 —— 引擎停后它就冻结在最后一 tick。
+    # 不同步的话, 重置完 state.json 后 localhost:8000 **仍显示旧持仓与旧净值**, 直到次日 08:30。
+    # 同样走**最小差异**: 只改 capital / positions, 其余键(day/mode/in_session/data_ts/ops/
+    # midday/live_source…)一律保留 —— 尤其 **data_ts 必须保留**(它记录"引擎最后一次 tick 的时刻",
+    # 改成现在等于伪造数据时点)。
+    lv_fp = os.path.join(config.DATA_DIR, "live_state.json")
+    if os.path.isfile(lv_fp):
+        with open(lv_fp, encoding="utf-8-sig") as f:
+            lv = json.load(f)
+        lv_new = dict(lv)
+        cap = dict(lv.get("capital") or {})
+        cap_keys = {
+            "init_capital": init, "equity": init, "cash": init,
+            "market_value": 0.0, "positions_value": 0.0,
+            "realized": 0.0, "unrealized": 0.0, "fees_paid": 0.0,
+            "buy_fees": 0.0, "sell_fees": 0.0, "attributed_pnl": 0.0,
+            "total_pnl": 0.0, "total_pnl_pct": 0.0,
+            "open_positions": 0, "cash_ratio": 1.0,
+        }
+        for k, v in cap_keys.items():
+            if k in cap:
+                cap[k] = v
+        lv_new["capital"] = cap
+        lv_new["positions"] = []
+        with open(lv_fp, "w", encoding="utf-8") as f:
+            json.dump(lv_new, f, ensure_ascii=False, indent=2)
+        print(f"  [已写入] {lv_fp}")
+        print(f"    capital: equity={cap.get('equity')} cash={cap.get('cash')} "
+              f"open_positions={cap.get('open_positions')}   positions={len(lv_new['positions'])} 只")
+        print(f"    保留: day={lv_new.get('day')} mode={lv_new.get('mode')} "
+              f"data_ts={lv_new.get('data_ts')}（**刻意不动** —— 它是引擎最后一次 tick 的真实时刻）")
+
     # ---- 回读校验: 用引擎自己的 restore 路径 ----
     with open(fp, encoding="utf-8-sig") as f:
         back = json.load(f)
