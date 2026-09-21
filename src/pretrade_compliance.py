@@ -270,10 +270,41 @@ def approved_orders(path: str | None = None) -> list:
 
 def _main(argv=None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(description="每单合规 + 高危识别 + 订单审计")
+    ap = argparse.ArgumentParser(description="每单合规 + 高危识别 + 订单审计 + 高危单审批")
     ap.add_argument("--show", type=int, metavar="N", help="显示最近 N 条订单审计")
     ap.add_argument("--selftest", action="store_true", help="对样例单跑一遍三段式裁决")
+    ap.add_argument("--pending", action="store_true", help="列出待批高危单")
+    ap.add_argument("--approve", metavar="ID", help="批准某高危单(引擎下一 tick 可放行)")
+    ap.add_argument("--reject", metavar="ID", help="驳回某高危单")
+    ap.add_argument("--actor", default="human", help="操作者标记(留痕用)")
+    ap.add_argument("--reason", default="", help="批准/驳回原因(留痕用)")
     args = ap.parse_args(argv)
+
+    if args.approve or args.reject:
+        oid = args.approve or args.reject
+        r = decide(oid, approve=bool(args.approve), actor=args.actor,
+                   reason=args.reason)
+        if not r.get("ok"):
+            print(f"失败: {r.get('error')}")
+            return 1
+        it = r["item"]
+        print(f"{'已批准' if args.approve else '已驳回'}: {oid} "
+              f"({(it.get('order') or {}).get('symbol')} {(it.get('order') or {}).get('side')} "
+              f"{(it.get('order') or {}).get('qty')}) by {args.actor}")
+        return 0
+
+    if args.pending:
+        items = [it for it in (_read_pending(None).get("orders") or [])
+                 if it.get("status") == "pending"]
+        if not items:
+            print("(无待批单)")
+            return 0
+        for it in items:
+            o = it.get("order") or {}
+            print(f"{it['id']}  {it['ts']}  {o.get('symbol')} {o.get('side')} "
+                  f"qty={o.get('qty')} @{o.get('price')}  原因: {'; '.join(it.get('reasons') or [])}")
+        print(f"\n共 {len(items)} 笔待批 —— 批准: --approve <ID> --actor <你>; 驳回: --reject <ID>")
+        return 0
 
     if args.show:
         fp = audit_path()
