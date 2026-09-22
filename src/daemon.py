@@ -260,6 +260,9 @@ _OBS_DIR = os.path.normpath(os.path.join(_BASE, "..", "obs-stack"))
 _OBS_ENABLED = os.environ.get("ASTOCK_OBS_STACK", "1").strip().lower() not in ("0", "false", "no")
 _OBS_ALERT_HOOK = os.path.join(_BASE, "ops", "alert_hook.py")
 
+#: 死手开关上次判定(档位 + 时刻)。用于"只在变化时记日志 + 30 分钟心跳"。
+_DEADMAN_LAST: dict = {}
+
 
 def _norm_path(p: str) -> str:
     """把命令行里的路径统一成小写 + 正斜杠, 便于**按整段路径**比较而非子串比较。"""
@@ -409,6 +412,44 @@ def _probe_stockdb_port(timeout: float = 1.5) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"listening": False, "endpoint": f"{host}:{port}",
                 "error": f"{type(e).__name__}: {e}"}
+
+
+def _check_deadman() -> None:
+    """独立求值死手开关, 并把结论写进**守护日志**(离线可读)。
+
+    为什么要有这一段(而不是只靠 `health_state.gather()`):
+      · `gather()` 是**发布者**在采集, 而发布者就是本守护自己, 且只在
+        5 分钟看护块里跑 —— 用一个"由被监控者自己执行、还要等 5 分钟"的判据
+        去发现"被监控者已经不在了", 原理上不成立;
+      · 日志是**离线可读**的: 即使告警链(Prometheus → Alertmanager → hook)
+        整条都死了, 事后翻 `daemon.log` 仍能看到"那一刻某组件已经 N 小时没 tick"。
+      2026-09-22 实测正是"监测者与被监测者一起消失"(机器 16:08 重启),
+      别的机制都没留下任何痕迹。
+
+    **只在档位变化时记一条, 每 30 分钟补一条心跳** —— 每分钟记一次会把
+    日志淹掉, 而"淹没的真告警"与"没有告警"等价。
+    """
+    global _DEADMAN_LAST
+    try:
+        import deadman_switch as _DMS
+        v = _DMS.verdict()
+    except Exception as e:  # noqa: BLE001
+        # 判不出来就说判不出来, 不静默当健康
+        lvl, reasons = "UNKNOWN", [f"死手开关无法求值: {type(e).__name__}: {e}"]
+        v = {}
+    else:
+        lvl = str(v.get("level"))
+        reasons = [str(x) for x in (v.get("reasons") or [])]
+    now_ts = time.time()
+    changed = lvl != _DEADMAN_LAST.get("level")
+    due = (now_ts - float(_DEADMAN_LAST.get("at") or 0)) >= 1800
+    if changed or due:
+        # 心跳也记: 否则"没消息"与"没在查"无法区分(本仓反复踩的那条)
+        kinds = {i.get("component"): i.get("status") for i in (v.get("items") or [])}
+        _log(f"死手开关 level={lvl} {'(档位变化) ' if changed else '(30 分钟心跳) '}"
+             f"items={kinds}"
+             + (f" | {'; '.join(reasons)[:200]}" if reasons else ""))
+    _DEADMAN_LAST = {"level": lvl, "at": now_ts}
 
 
 def _ensure_stockdb() -> None:
@@ -680,6 +721,16 @@ def run_loop():
             _ensure_dashboard()
             _ensure_obs_stack()
             _publish_health_state()
+        # 死手开关判定: **放在看护块之外**, 每个自然分钟都问一次。
+        #
+        # [2026-09-22] `health_state.gather()` 里也会采集 `verdict()`, 但那是
+        # **发布者**在做 —— 而发布者就是本守护自己, 且只在本分支里跑。
+        # 用一个"由被监控者自己执行、还要等 5 分钟"的判据去发现
+        # "被监控者已经不在了", 是原理上不成立的: 它恰恰在最需要它的时刻不执行。
+        # 故这里独立地问一次, 并把结论**同时写进守护日志** ——
+        # 日志是**离线可读**的: 即使告警链整条都死了, 事后翻日志仍能看到
+        # "那一刻引擎已经 4 小时没 tick 了"。
+        _check_deadman()
 
         # 非交易日(周末/节假日): 不启动盘中引擎, 不跑收盘选股.
         # 仅在维护窗口(15:05~22:00)每天跑一次 maint 维护管道 = 数据拉取+模型训练.

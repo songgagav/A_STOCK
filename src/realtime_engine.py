@@ -595,6 +595,26 @@ class RealtimeEngine:
     def run_tick(self):
         self.tick += 1
         now = datetime.now()
+        # [2026-09-22 修] Dead-Man's Switch: tick 落在**主循环的每一轮**, 而不是调仓那一刻。
+        #
+        # 原先这一 beat 在 `_rebalance_if_due()` 里、且位于"调仓间隔已到"之后 ——
+        # 而调仓间隔是**3 天**(实测日志: `调仓间隔未到(距上次 0 天<3), 本轮仅止损/风控`),
+        # 于是绝大多数交易日**一次都不会 beat**。注册表给 realtime_engine 的标称周期是
+        # 60s(阈值 180s), 所以盘中判定永远是 OVERDUE —— 一个**永久假阳性**。
+        #
+        # 这正是死手开关设计上要防的:`beat()` 的语义是"**我还活着**"(liveness),
+        # 不是"我做了一笔调仓"(business event)。把两者混在一起, 就会得到
+        # "引擎好好地跑着却天天报失联" —— 而**永久假阳性比没有告警更糟**:
+        # 它会训练人忽略这条告警, 于是真失联时也没人看。
+        #
+        # 放在这里还有一个好处: 早于 `push_only_in_session and not session` 的提前返回,
+        # 所以即使是非交易时段空转, 也能证明主循环仍在转。
+        try:
+            import deadman_switch as _DMS
+            _DMS.beat("realtime_engine",
+                      note=f"tick {self.tick} {self.pb.trade_date} {now:%H:%M:%S}")
+        except Exception:  # noqa: BLE001
+            pass
         session = self.in_session(now)
         tgt_codes = [t["canon"] for t in self.targets]
         all_codes = list(dict.fromkeys(tgt_codes + list(self.pb.positions.keys())))
@@ -832,14 +852,10 @@ class RealtimeEngine:
         if TRADE_BROKER != "paper":
             log(f"止损: 实盘通道(easytrader)未接入, 拒绝下单 TRADE_BROKER={TRADE_BROKER}")
             return 0
-        # [P0 清单第6项] Dead-Man's Switch: 每次调仓留一次 tick。
-        # 注册表把 realtime_engine 标为 trading_hours_only, 故收盘后不再 tick
-        # 不会被判失联(判定会用 trading_calendar 确认"此刻本就不该有 tick")。
-        try:
-            import deadman_switch as _DMS
-            _DMS.beat("realtime_engine", note=f"rebalance {self.pb.trade_date}")
-        except Exception:  # noqa: BLE001
-            pass
+        # [2026-09-22 移出] Dead-Man's Switch 的 beat 已移到 `run_tick()` 开头。
+        # 留这段注释是为了说明**为什么不能放回这里**: 这里位于"调仓间隔已到"之后,
+        # 而间隔是 3 天, 于是绝大多数交易日一次都不 beat ⇒ 盘中判定永久 OVERDUE。
+        # beat 的语义是 liveness("我还活着"), 不是 business event("我调仓了")。
         total_target_mv = INIT_CAPITAL * MAX_POS_RATIO
         n = max(len(self.targets), 1)
         band = total_target_mv / n            # 等权参考(缺省回退/日志)

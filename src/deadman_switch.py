@@ -50,13 +50,30 @@ TIMEOUT_MULT = 3.0
 
 #: 缺省注册表: 组件名 -> 标称周期(秒) + 说明。
 #: **周期写的是"这个任务应该多久留一次 tick"**, 不是"它跑多久"。
+#:
+#: [2026-09-22 收紧注册口径] **只登记真有东西在 beat 的组件。**
+#: 原先有 4 项, 实测只有 2 项在生产里被喂过 tick:
+#:   · `obs_stack`(period 300s) —— **全仓无任何 beat 调用点**, 账本里只有
+#:     2026-09-22 01:30:34 一条一次性打底(来自 `--flush-percent`), 之后再没动过
+#:     ⇒ 判定永久 `OVERDUE`(实测 "已 69600s 无 tick > 阈值 900s");
+#:   · `run_daily`(period 86400s) —— 同样**无 beat 调用点**, 同一条打底记录。
+#: 这不是"它们真的失联了", 而是**它们从来没被接上**。
+#:
+#: 为什么必须移除而不是留着: 死手开关一旦接线进健康快照与告警
+#: (`astock_deadman_overdue > 0` ⇒ `DeadmanOverdue` critical), 这两项会让
+#: 它**永久常亮** —— 而**永久假阳性比没有告警更糟**: 它训练人忽略这条告警,
+#: 于是真失联时也没人看。真要监控它们, 应先给它们接上 `beat()`, 再接回注册表。
+#:
+#: 观测栈的"缺谁拉起谁"由 `daemon._ensure_obs_stack()` 每 5 分钟巡检负责
+#: (2026-09-22 已修好其组件识别, 实测能正确发现并拉起 9101 上死掉的
+#: metrics_server) —— **职责不重叠**: 死手开关管"主循环还活着吗",
+#: 观测栈巡检管"某个组件在不在"。
 DEFAULT_REGISTRY: dict[str, dict] = {
-    "run_daily": {
-        "period_s": 86400.0,      # 每个交易日的日更闭环
-        "desc": "日更主链路(选股/回测/复盘)",
-    },
+    # 注: `run_daily` 与 `obs_stack` 于 2026-09-22 移出。若将来给它们接上
+    # `deadman_switch.beat(...)`, 再把条目加回来(见本段上方说明)。
     "daemon": {
-        # 守护主循环**每分钟**留一次 tick(见 daemon.py 的 DEADMAN_EVERY_S),
+        # 守护主循环**每分钟**留一次 tick(见 daemon.py 的 DEADMAN_EVERY_S)
+        # —— 实测: `daemon.py:661` 的 `_DMS.beat("daemon", ...)`。
         # 故标称周期 = 60s -> 阈值 180s。也就是说: 守护一旦停摆超过 3 分钟
         # 就会被判失联 —— 这比"某个文件不刷新了"要硬得多, 因为"没有 tick"
         # 本身即是证据, 不需要任何人去观测它。
@@ -64,13 +81,13 @@ DEFAULT_REGISTRY: dict[str, dict] = {
         "desc": "守护进程主循环(每分钟 tick)",
     },
     "realtime_engine": {
-        "period_s": 60.0,         # 盘中 tick 之外的"我还活着"声明
-        "desc": "盘中引擎(收盘后应静默, 见 tolerated_offhours)",
+        # 实测: `realtime_engine.py:run_tick()` 每一轮 beat 一次。
+        # [2026-09-22 修] 此前 beat 在 `_rebalance_if_due()` 里、且在"调仓间隔已到"
+        # 之后, 而间隔是 3 天 ⇒ 绝大多数交易日一次都不 beat ⇒ 永久假阳性。
+        # beat 的语义是"我还活着", 不是"我调仓了", 故已移到主循环每轮。
+        "period_s": 60.0,
+        "desc": "盘中引擎主循环(每 tick beat, 收盘后应静默)",
         "trading_hours_only": True,
-    },
-    "obs_stack": {
-        "period_s": 300.0,
-        "desc": "观测栈(Prometheus/Alertmanager/AlertHook/Metrics)",
     },
 }
 

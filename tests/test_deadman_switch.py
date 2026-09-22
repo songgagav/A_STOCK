@@ -256,8 +256,51 @@ class TestVerdict:
 
 class TestRegistry:
     def test_defaults_present(self):
+        """注册表**只留真有东西在 beat 的组件**。
+
+        2026-09-22 收紧: 原先还有 `run_daily`(86400s) 与 `obs_stack`(300s),
+        但**全仓没有任何 beat 调用点** —— 账本里各只有 2026-09-22 01:30:34 一条
+        一次性打底(来自 `--flush-percent`), 之后永远不动。
+        接线进告警后它们会让 `DeadmanOverdue` **永久常亮**(实测
+        `obs_stack: 已 69600s 无 tick`), 而**永久假阳性比没有告警更糟**:
+        它训练人忽略这条告警, 真失联时也没人看。
+
+        观测栈的"缺谁拉起谁"由 `daemon._ensure_obs_stack()` 每 5 分钟巡检负责 ——
+        职责不重叠: 死手开关管"主循环还活着吗", 巡检管"某个组件在不在"。
+        """
         reg = D.load_registry()
-        assert {"run_daily", "daemon", "realtime_engine", "obs_stack"} <= set(reg)
+        assert {"daemon", "realtime_engine"} <= set(reg)
+        assert "obs_stack" not in reg, "obs_stack 无 beat 调用点, 会永久假阳性"
+        assert "run_daily" not in reg, "run_daily 无 beat 调用点, 会永久假阳性"
+
+    def test_every_registered_component_actually_beats(self):
+        """**核心不变量**: 注册表里的每个组件, 仓内都必须真有 `beat()` 调用点。
+
+        这是本次缺陷的通用形式 —— "登记了但没人喂 tick"。它无法靠读注册表发现
+        (表本身合法、period 合理、desc 齐备), 只能靠**去代码里找有没有人在 beat**。
+        """
+        import re
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = ""
+        for dp, dns, fns in os.walk(os.path.join(repo, "src")):
+            dns[:] = [d for d in dns if d != "__pycache__"]
+            for fn in fns:
+                if fn.endswith(".py"):
+                    src += open(os.path.join(dp, fn), encoding="utf-8").read()
+        # 也扫 scripts/ 与 ops/: 将来可能由它们 beat
+        for sub in ("scripts", "ops"):
+            d = os.path.join(repo, sub)
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if fn.endswith(".py"):
+                    src += open(os.path.join(d, fn), encoding="utf-8").read()
+        for name in D.DEFAULT_REGISTRY:
+            pat = re.compile(r"""beat\(\s*["']%s["']""" % re.escape(name))
+            assert pat.search(src), (
+                f"注册表登记了 {name!r}, 但全仓找不到 beat(\"{name}\") 调用点 ⇒ "
+                "它永远不会被喂 tick ⇒ 判定永久 OVERDUE(假阳性)。"
+                "要么接上 beat(), 要么从注册表移除。")
 
     def test_every_entry_has_period_and_desc(self):
         for name, spec in D.DEFAULT_REGISTRY.items():
