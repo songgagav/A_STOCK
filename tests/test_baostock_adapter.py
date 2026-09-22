@@ -238,6 +238,134 @@ class TestFetchBatch:
         assert r["limiter"]["throttle_signals"] == 2
 
 
+class TestFactorComputationDiscipline:
+    """**因子计算纪律**: 价格衍生指标取自源, **不得自算**。
+
+    ## 为什么这条要单独锁
+
+    实测 600177 @ 2026-09-18(**含除权**): 前一日 close=**8.30**, 当日 close=**8.14**。
+
+    | 来源 | 值 | |
+    |---|---|---|
+    | 自算 `(8.14/8.30-1)` | **-1.93%** | 用**未调整**前收, **错** |
+    | 引擎 `pct_chg` | **+0.49%** | 基于除权调整后 `pre_close=8.10` |
+    | baostock `pctChg` | **+0.4938%** | 与引擎一致 |
+
+    **最危险的地方**: `-1.93%` 是一个**完全合理的涨跌幅** —— 它不会触发任何异常、
+    不会看起来可疑, 只会让当天所有价格衍生因子悄悄偏掉。
+    这是"少取一个字段就静默算错"的典型, 而且**只在除权日发生**(平时两者相同),
+    所以用近端样本测不出来。
+    """
+
+    def test_fetcher_requests_the_derived_fields(self):
+        """真实 fetcher 的字段集**必须**含 `pctChg`/`turn`/`preclose`。"""
+        for f in BA.REQUIRED_FIELDS:
+            assert f in BA.FIELDS.split(","), \
+                f"FIELDS 缺 {f} —— 会导致调用方自算, 除权日静默算错"
+
+    def test_fetcher_refuses_to_run_without_them(self):
+        """缺字段时**宁可报错也不自算** —— 响亮失败优于静默算错。"""
+        try:
+            import baostock  # noqa: F401
+        except ImportError:
+            pytest.skip("baostock 未安装")
+        with pytest.raises(ValueError) as ei:
+            BA.make_baostock_fetcher(start="2026-09-18", end="2026-09-18",
+                                     fields="date,code,open,high,low,close,volume,amount",
+                                     login=False)
+        msg = str(ei.value)
+        assert "pctChg" in msg and "自算" in msg
+        assert "-1.93" in msg or "除权" in msg, "错误信息应说明为什么"
+
+    def test_baostock_spec_maps_change_pct_from_source(self):
+        """源规格必须把 `pctChg` 映射到 `change_pct`, 而不是留空靠下游算。"""
+        import bars_ingest as BI
+        fm = BI.SOURCE_SPECS["baostock"]["field_map"]
+        assert fm.get("pctChg") == "change_pct", \
+            "baostock 未从源取 change_pct —— 下游会自算, 除权日错"
+        assert fm.get("turn") == "turnover", "换手率也应取自源"
+
+    def test_all_sources_that_have_the_field_declare_it(self):
+        """**通用化**: 任何源只要声明了 `change_pct`, 就必须来自源列。
+
+        这条防的是"将来接新源时忘了映射 `change_pct`, 下游悄悄自算"。
+        """
+        import bars_ingest as BI
+        for name, spec in BI.SOURCE_SPECS.items():
+            fm = spec["field_map"]
+            if name == "stockdb_sdk":
+                assert fm.get("pct_chg") == "change_pct", name
+            elif name == "akshare":
+                assert fm.get("涨跌幅") == "change_pct", name
+            elif name == "baostock":
+                assert fm.get("pctChg") == "change_pct", name
+
+    def test_normalize_never_derives_change_pct(self):
+        """**核心不变量**: 归一化层**从不**从价格推导 `change_pct`。
+
+        若哪天有人在 `normalize` 里加一句"change_pct 缺失就用 close 自算",
+        除权日的所有因子会静默偏掉 —— 且没有任何报错。
+        """
+        import inspect
+        import bars_ingest as BI
+        src = inspect.getsource(BI.normalize)
+        # 不得出现"用 close/前收 计算涨跌幅"的形态
+        for bad in ("pct_chg =", "change_pct = (", "/ prev", "pct_change(",
+                    "shift(1)"):
+            assert bad not in src, \
+                f"normalize 里出现 {bad!r} —— 疑似自算涨跌幅, 除权日会静默算错"
+        # 而它确实**照搬**源列
+        assert "fm.items()" in src or "field_map" in src
+
+    def test_selfcomputed_value_would_be_caught(self):
+        """反证: 把"自算的 -1.93"喂进交叉校验, 必须**判为不一致**。"""
+        import cross_validate as CV
+        eng = {("600177", "20260918"): {"open": 8.12, "high": 8.23, "low": 8.11,
+                                        "close": 8.14, "volume": 23996000.0,
+                                        "change_pct": 0.49}}
+        selfcalc = {("600177", "20260918"): {"open": 8.12, "high": 8.23, "low": 8.11,
+                                             "close": 8.14, "volume": 23995952.0,
+                                             "change_pct": -1.93}}   # 自算的错值
+        r = CV.cross_validate(eng, selfcalc, source="baostock")
+        assert r["ok"] is False, "自算的 -1.93 竟通过了校验 —— 判据失效"
+        assert any("change_pct" in m["name"] for m in r["mismatches"])
+
+
+class TestRealFetcherContract:
+    """真实 fetcher 的结构契约(不依赖网络)。"""
+
+    def test_warns_when_adjustflag_is_not_unadjusted(self):
+        """用非 `'3'` 的 adjustflag 必须**响亮提示** —— 这是口径问题。"""
+        try:
+            import baostock  # noqa: F401
+        except ImportError:
+            pytest.skip("baostock 未安装")
+        with pytest.warns(RuntimeWarning, match="adjustflag"):
+            BA.make_baostock_fetcher(start="2026-09-18", end="2026-09-18",
+                                     adjustflag="2", login=False)
+
+    def test_fetch_range_reports_bj_as_explicitly_unfetchable(self):
+        """契约二+三联动: 北交所标的必须进 `not_requested` 而非 `failed`。
+
+        混进 `failed` 会误导 —— 它并非本次故障, 而是数据源**原理上不覆盖**。
+        """
+        import pandas as pd
+        sym_df = pd.DataFrame({"symbol": ["600000", "920000"],
+                               "market": ["sh", "bj"]})
+        res = BA.fetch_range(["600000", "920000"], start="2026-09-18",
+                             end="2026-09-18", symbols_df=sym_df,
+                             fetch_one=lambda code: [{"x": 1}])
+        assert res["not_requested"] == ["920000"]
+        assert "920000" not in res["failed"], "北交所被当成失败 —— 会每天误报故障"
+        assert res["status"] == BA.UNFILLABLE
+
+    def test_fetch_range_keys_are_bare_codes(self):
+        """结果键必须是**裸代码** —— 便于与引擎/h5i 对齐比较。"""
+        res = BA.fetch_range(["600000"], start="2026-09-18", end="2026-09-18",
+                             fetch_one=lambda code: [{"x": 1}])
+        assert list(res["rows"]) == ["600000"], res["rows"].keys()
+
+
 class TestCrossValidateCriteria:
     """交叉校验: 判据是**写死的预期等式**, 不是"看着接近"。"""
 

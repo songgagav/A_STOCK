@@ -286,4 +286,61 @@ AData / Baostock 需先: ① 安装并确认可用; ② 单独验证复权口径
 `baostock` 已登记进 `SOURCE_SPECS`(`volume_mult=1.0`, `symbol_strip_prefix=True`),
 并有 `TestEveryRegisteredSourceSatisfiesTheContract` 对**每个已登记源**自动验契约。
 
+---
+
+## 9. ⚠️ 因子计算纪律: 价格衍生指标**取自源, 不得自算**(强制)
+
+### 为什么这是一条**纪律**而不是一个建议
+
+实测 600177 @ 2026-09-18(**含除权**): 前一日 close = **8.30**, 当日 close = **8.14**。
+
+| 来源 | 值 | |
+|---|---|---|
+| **自算** `(8.14/8.30-1)` | **−1.93%** | 用**未调整**前收 ⇒ **错** |
+| **引擎** `pct_chg` | **+0.49%** | 基于除权调整后 `pre_close = 8.10` |
+| **baostock** `pctChg` | **+0.4938%** | 与引擎一致 |
+
+**最危险之处**: `−1.93%` 是一个**完全合理的涨跌幅** —— 不触发异常、不看起来可疑,
+只会让当天所有价格衍生因子悄悄偏掉。而且**只在除权日发生**(平时两者相同),
+**用近端样本测不出来**。
+
+### 强制手段(三层, 已全部落地)
+
+1. **请求层**: `baostock_adapter.REQUIRED_FIELDS = (pctChg, turn, preclose)`;
+   字段集缺任何一个 ⇒ `make_baostock_fetcher` **直接 `ValueError`** 并说明原因
+   (宁可响亮失败, 也不自算)。
+2. **映射层**: 每个源的 `field_map` 必须把源的涨跌幅列映射到 `change_pct`
+   (baostock `pctChg` / akshare `涨跌幅` / 引擎 `pct_chg`);
+   且 `normalize` 内**禁止**出现任何价格推导(`pct_change(` / `shift(1)` / `pct_chg =`),
+   由 `test_normalize_never_derives_change_pct` 静态扫描锁住。
+3. **校验层**: `cross_validate` 逐值比对 `change_pct`;
+   `test_selfcomputed_value_would_be_caught` 反证 —— 把自算的 −1.93 喂进去
+   **必须被判为不一致**(判据真的有效, 而不是形同虚设)。
+
+### 推广
+
+这条纪律**不限于涨跌幅**: 换手率(`turn`)、复权因子、任何"可由价格推导"的量,
+都应**取自源**。理由一致 —— 只有源知道**除权/停牌/复牌**这些事件,
+而"从价格反推"永远缺这部分信息。
+
+---
+
+## 10. 北交所 339 只: 补数路径待定(独立议题)
+
+`symbols.parquet` 里 `market='bj'` 共 **339 只**(代码段 `920xxx`, 实测)。
+
+| 事实 | 依据 |
+|---|---|
+| Baostock **不覆盖**北交所 | `query_stock_basic('bj.430047')` 无数据; `query_history_k_data_plus('bj.920000', ...)` 返回 **`error_code=10004011 股票代码未标识sh或sz`** |
+| AkShare 是否覆盖 | **未验证** |
+| 引擎是否覆盖 | 部分 —— h5i 09-22 全市场 5481 行里含 339 只 `920xxx`(即引擎**有**北交所数据) |
+
+⇒ **不需要为北交所换主源**: 引擎已覆盖。Baostock 作为**补数/校验**源时,
+北交所是它**原理上的缺口** —— 已由 `classify_targets` / `fetch_range` 显式报为
+`unfetchable`/`not_requested`(**不得**混进 `failed`, 否则每天误报故障)。
+
+**待决策**: 北交所若真需要 Baostock 之外的补数源, 走 AkShare(需先验证覆盖)
+还是 ops 口径(`h5i_ingest`/`h5i_rebuild`)。已登记为独立议题。
+
+
 

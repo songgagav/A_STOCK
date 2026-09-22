@@ -46,6 +46,173 @@ RECOVER_AFTER_OKS = 20
 APPENDED, PARTIAL, UNFILLABLE, FAILED = (
     "appended", "partial", "unfillable_gap", "failed")
 
+# ---------------------------------------------------------------------------
+# 真实 fetcher
+# ---------------------------------------------------------------------------
+
+#: 请求字段集。**必须包含价格衍生字段**, 理由见 `REQUIRED_FIELDS`。
+FIELDS = ("date,code,open,high,low,close,preclose,volume,amount,"
+          "adjustflag,turn,tradestatus,pctChg")
+
+#: **因子计算纪律**: 价格衍生指标一律**取自源**, 不得自算。
+#:
+#: 实测依据(600177 @ 2026-09-18, 含除权): 前一日 close=**8.30**, 当日 close=**8.14**。
+#:   · 自算 `(8.14/8.30-1)` = **-1.93%**  ← 用未调整前收, **错**
+#:   · 引擎 `pct_chg`        = **+0.49%**  ← 基于除权调整后 pre_close=8.10
+#:   · baostock `pctChg`     = **+0.4938%** ← 与引擎一致
+#: ⇒ 少取一个字段就会**静默算错**, 且错得"看起来很正常"(-1.93% 是个合理涨跌幅)。
+#: 故 `pctChg` / `turn` / `preclose` 属于**必需字段**, 缺了宁可报错也不自算。
+REQUIRED_FIELDS = ("pctChg", "turn", "preclose")
+
+
+def make_baostock_fetcher(*, start: str, end: str, adjustflag: str = "3",
+                          fields: str = FIELDS, login=True):
+    """构造**真实** fetcher: `fetch(bscode) -> DataFrame`。
+
+    设计要点(每条都有实测依据):
+      1. **一次请求取整个区间**, 不在日期上再循环。逐只已经够慢, 再按天循环会让
+         请求数乘上区间天数(2 天 => 10424 次而非 5212 次)。
+      2. **`adjustflag='3'` 不复权** —— 除权日实测: flag=3 与引擎 OHLC 逐值一致 3/3,
+         而 flag=2(前复权) 仅 2/3(历史价被复权缩放)。
+      3. **请求 `pctChg`/`turn`/`preclose`** —— 见 `REQUIRED_FIELDS` 的纪律说明。
+      4. 返回**原始列名的 DataFrame**(`code/date/open/.../pctChg/turn`),
+         交给 `bars_ingest.normalize(..., "baostock")` 做映射 —— 换算与映射**只有一处**。
+
+    `login=False` 供已登录的场景复用会话(避免每批重复登录)。
+    """
+    if adjustflag != "3":
+        # 不阻断(允许显式实验), 但**必须响亮提示** —— 这是口径问题, 不是风格问题
+        import warnings
+        warnings.warn(
+            f"baostock adjustflag={adjustflag!r} 与引擎口径不一致: 本仓对齐的是 '3' 不复权。"
+            f"除权日会有差异(实测 flag=2 前复权在同一除权日与引擎 2/3 不一致)。",
+            RuntimeWarning, stacklevel=2)
+
+    import baostock as bs
+    import pandas as pd
+
+    missing = [f for f in REQUIRED_FIELDS if f not in fields.split(",")]
+    if missing:
+        raise ValueError(
+            f"请求字段缺少 {missing} —— 这些是**必需**的: "
+            f"价格衍生指标(涨跌幅/换手率)必须取自源, 自算会在除权日静默算错"
+            f"(实测 600177 @ 2026-09-18: 自算 -1.93% vs 正确 +0.49%)")
+
+    state = {"logged_in": False}
+
+    def _login():
+        if state["logged_in"]:
+            return
+        r = bs.login()
+        if str(getattr(r, "error_code", "1")) != "0":
+            raise ConnectionError(f"baostock 登录失败: {r.error_msg}")
+        state["logged_in"] = True
+
+    if login:
+        _login()
+
+    def fetch(bscode: str):
+        _login()
+        rs = bs.query_history_k_data_plus(
+            str(bscode), fields, start_date=start, end_date=end,
+            frequency="d", adjustflag=adjustflag)
+        code = str(getattr(rs, "error_code", "1"))
+        if code != "0":
+            # 把源错误**原样抛出**, 让 fetch_batch 用 looks_throttled 判定是否限流
+            raise RuntimeError(f"baostock error_code={code} msg={getattr(rs, 'error_msg', '')}")
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+        if not rows:
+            return pd.DataFrame(columns=fields.split(","))
+        return pd.DataFrame(rows, columns=rs.fields)
+
+    def close():
+        if state["logged_in"]:
+            try:
+                bs.logout()
+            except Exception:  # noqa: BLE001
+                pass
+            state["logged_in"] = False
+
+    fetch.close = close
+    return fetch
+
+
+def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
+                limiter: RateLimiter | None = None, adjustflag: str = "3",
+                fetch_one=None, fetcher=None) -> dict:
+    """**定向补数**入口: 按 symbol 列表取指定区间, 返回契约三的归类结果。
+
+    `symbols` 为 h5i 裸代码列表(如 `["600000","000001"]`)。
+    `symbols_df` 给定时用它区分市场并**显式报出北交所不可得**;
+    不给则按前缀推断(可能把 `920xxx` 误判 —— 但那已被 `to_baostock_code` 处理)。
+
+    `fetcher` / `fetch_one` 可注入: 前者是 `make_baostock_fetcher(...)` 的产物,
+    后者是"裸代码 -> DataFrame"的简版。**测试用注入版, 生产用真实版。**
+
+    返回 `classify_outcome(...)` 的结果 + `rows` / `failed` / `limiter`。
+    """
+    syms = [str(s) for s in symbols]
+    # 契约二: 用 symbols.parquet 区分市场; 北交所显式不可得
+    unfetchable: dict = {}
+    if symbols_df is not None:
+        cls = classify_targets(symbols_df)
+        bj = set(cls["by_market"].get("bj", []))
+        if bj:
+            hit = [s for s in syms if s in bj]
+            if hit:
+                unfetchable["bj"] = {
+                    "symbols": hit, "count": len(hit),
+                    "reason": ("Baostock 对北交所(`bj.*`)返回空 —— 实测 "
+                               "`query_stock_basic('bj.430047')` 无数据; 覆盖仅沪深"),
+                    "action": "走 h5i_ingest/h5i_rebuild 运维口径, 或改用其它源",
+                }
+        todo = [s for s in syms if s not in bj]
+    else:
+        todo = list(syms)
+
+    market_of = {}
+    if symbols_df is not None and "market" in getattr(symbols_df, "columns", []):
+        market_of = {str(a): str(b) for a, b in
+                     zip(symbols_df["symbol"], symbols_df["market"])}
+
+    if fetch_one is None:
+        if fetcher is None:
+            fetcher = make_baostock_fetcher(start=start, end=end, adjustflag=adjustflag)
+        f = fetcher
+
+        def fetch_one(sym):
+            return f(to_baostock_code(sym, market_of.get(sym)))
+    else:
+        f = None
+
+    lim = limiter or RateLimiter()
+    got = fetch_batch([to_baostock_code(s, market_of.get(s)) for s in todo],
+                      fetch_one, limiter=lim)
+    # 把结果键从 baostock 代码折回裸代码, 便于与引擎/ h5i 对齐
+    rows = {}
+    for k, v in got["rows"].items():
+        bare = k.split(".")[-1] if "." in k else k
+        rows[bare] = v
+    failed = {}
+    for k, v in got["failed"].items():
+        bare = k.split(".")[-1] if "." in k else k
+        failed[bare] = v
+
+    out = classify_outcome(requested=len(syms), got=len(rows), unfetchable=unfetchable)
+    out.update({"rows": rows, "failed": failed, "limiter": got["limiter"],
+                "interval_ms": got["interval_ms"],
+                "start": start, "end": end, "adjustflag": adjustflag})
+    # 北交所那些"没去请求"的标的, 计入 failed 会误导 —— 单列
+    out["not_requested"] = sorted(unfetchable.get("bj", {}).get("symbols", []))
+    if f is not None and hasattr(f, "close"):
+        try:
+            f.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
 
 class RateLimiter:
     """契约一: 限流策略。
@@ -268,11 +435,14 @@ def classify_outcome(*, requested: int, got: int, unfetchable: dict | None = Non
 def _main(argv=None) -> int:
     import argparse
     import json
-    ap = argparse.ArgumentParser(description="Baostock 适配器契约: 标的分类与限流参数")
+    ap = argparse.ArgumentParser(description="Baostock 适配器: 真实 fetcher / 契约自检")
     ap.add_argument("--targets", action="store_true", help="用 symbols.parquet 分类标的")
     ap.add_argument("--limiter", action="store_true", help="打印限流参数")
-    args = ap.parse_args(argv)
-    if args.limiter:
+    ap.add_argument("--fields", action="store_true", help="打印请求字段集(含纪律说明)")
+    ap.add_argument("--probe", nargs="*", metavar="SYMBOL",
+                    help="真实拉取若干标的(默认取少量样本)并打印首行")
+    arg = ap.parse_args(argv)
+    if arg.limiter:
         print(json.dumps({"default_interval_ms": DEFAULT_INTERVAL_MS,
                           "backoff_interval_ms": BACKOFF_INTERVAL_MS,
                           "backoff_after_fails": BACKOFF_AFTER_FAILS,
@@ -280,7 +450,15 @@ def _main(argv=None) -> int:
                           "throttle_hints": list(_THROTTLE_HINTS)},
                          ensure_ascii=False, indent=2))
         return 0
-    if args.targets:
+    if arg.fields:
+        print(json.dumps({"fields": FIELDS.split(","),
+                          "required": sorted(REQUIRED_FIELDS),
+                          "discipline": ("价格衍生指标**取自源**, 不得自算 —— "
+                                         "除权日自算 change_pct 会得到 -1.93% 而正确答案是 "
+                                         "+0.49%(实测 600177 @ 2026-09-18)")},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if arg.targets:
         import os
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -294,7 +472,24 @@ def _main(argv=None) -> int:
                                           for k, v in cls["unfetchable"].items()}},
                          ensure_ascii=False, indent=2))
         return 0
-    print("契约: 限流 / 标的分类 / 缺口分类。用 --targets 或 --limiter。")
+    if arg.probe is not None:
+        syms = arg.probe or ["600177", "600000", "000001"]
+        f = make_baostock_fetcher(start="2026-09-17", end="2026-09-22")
+        try:
+            for s in syms:
+                try:
+                    df = f(to_baostock_code(s))
+                except Exception as e:  # noqa: BLE001
+                    print(f"  {s}: EXC {type(e).__name__}: {e}")
+                    continue
+                print(f"  {s}: {len(df)} 行  cols={list(df.columns)}")
+                if len(df):
+                    print("     ", df.iloc[-1].to_dict())
+                time.sleep(DEFAULT_INTERVAL_MS / 1000.0)
+        finally:
+            f.close()
+        return 0
+    print("Baostock 适配器。用 --targets / --limiter / --fields / --probe。")
     return 0
 
 
