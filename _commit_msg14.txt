@@ -1,0 +1,78 @@
+docs(discipline): 澄清 push_state 归属 DISC-2 + skip 不等于通过 (2291 passed)
+
+按用户要求澄清 `check_push_state` 的具体作用与归属。**结论由实验给出, 不由我断言。**
+
+## ① 澄清: 它查什么(实验确认)
+
+用户问: 它是「检查未推送的提交」(有用) 还是「检查未提交的更改」(与 git status 重复)?
+
+**答: 前者。** 在临时仓里造三种状态实测:
+
+| 状态 | `check_push_state` | `git status` |
+|---|---|---|
+| 已推送 | `ahead=0` | clean |
+| **有未提交更改(2 项)** | **`ahead=0`(不报)** | 看得到 2 项 |
+| **已提交未推送** | **`ahead=1` + 提交列表** | **看不到** |
+
+⇒ 它查「**已提交但未推送**」, **不查工作区** ⇒ **与 `git status` 互补, 不重复**。
+⇒ 返回里也**没有任何** working-tree 字段(实测 keys =
+`repo/remote/branch/ahead/behind/ahead_commits/error`)。
+
+## ② 归属: 纳入 DISC-2(用户建议, 采纳)
+
+理由: 这正是 DISC-2 的形态 —— **「已推送」与「未推送」不可区分**, 而本会话真的踩到了:
+
+    我 commit 了 **35 次**, 而 `git status` **一直是干净的**。
+    于是「看起来一切已保存」, 实际**一次都没推** —— 直到用户问才发现。
+
+**并据此拆分为独立模块**: `_tools/push_state.py`(原先放在 `safe_write.py` 里)。
+`safe_write` 是 DISC-4(生成代码前先 `ast.parse`), 塞一个 git 检查会让职责糊掉 ——
+下一个人不会去"代码生成校验"的工具里找 git 检查。**一个模块一个职责。**
+`safe_write.py` 现在**指向**新位置(并在 CLI 里提示), 有测试锁住不得回迁。
+
+## ③ DISC-2 补充实例: skip 不等于 通过(用户要求, 并列「假信心测试」)
+
+已写入 `docs/disciplines.md` DISC-2 的事实依据表(现共 **6 个实例**), 并单列说明:
+
+- pytest 默认报告里 **`skipped` 与 `passed` 都是绿的** ——
+  一个"因环境缺依赖而从不执行"的用例, 在概览上与"执行且通过"**看起来一样**;
+- 判据: **任何带 `pytest.skip` 的用例, 都必须有人能回答"它在什么条件下会真跑"**;
+  若答案是"永远不会", 那它不是测试, 是**装饰**;
+- 本仓对策: 关键路径的真实数据用例必须走**生产同款加载路径**,
+  并在核实结果时**专门看 skip 数**。
+
+**本会话的实例**: `test_real_data_matches_engine` 原本 `from stock_sdk import rd`,
+而该模块在 `stockdb/pybao` 下需 `sys.path` ⇒ 在 venv310 下**静默 skip**,
+却计入"通过"。已改用 `engine_bars_sync.load_rd()`, 现在 **3/3 真跑**(实测)。
+
+## ④ 确认 `TestRealDataWritePath` 三例已入回归(用户要求)
+
+| 环境 | 结果 |
+|---|---|
+| `.venv310`(有 baostock + 引擎) | **3 passed**(真跑) |
+| `.venv314`(无 baostock) | 3 skipped, **带明确原因**`No module named 'baostock'` |
+
+三例: `test_real_data_survives_the_whole_write_path` /
+`test_real_normalized_frame_satisfies_every_contract` / `test_real_data_matches_engine`。
+
+## 守卫
+
+`tests/test_push_state.py`(11 例, 临时仓实测):
+- 脏工作区**必须不报**(否则与 git status 重复 —— 用户明确问过这点);
+- 已提交未推送**必须报** `ahead=N` + 提交列表;
+- 推送后回到 0;
+- **无法判定时报错而非静默 ahead=0**(含 "无法判定不等于已推" 的措辞);
+- 非仓库目录报错(**并在测试里先断言该目录真的不在任何 git 仓内** ——
+  首版用 `tmp_path` 落在本仓内, git 向上找到真仓而假红);
+- 职责边界: `safe_write` 不得再带 `check_push_state`, 且两个模块都要声明各自纪律。
+
+## 我自己在写本批时的两次失误(留档)
+
+1. **又栽在中文半角引号上**(本会话第六次) —— 被 `ast.parse` 拦住(正是 DISC-4 的价值);
+2. **测试里"改文件但内容不变"导致空提交** —— `git add` 后无内容变化 ⇒ 无新提交 ⇒
+   `ahead` 停在 0 而测试假红。**这类"测试自身的状态没造出来"很容易被误读成
+   "被测代码有问题"**, 故在断言前先断言前置状态(新写法已加)。
+
+## 测试
+
+**2291 passed / 31 skipped / 0 failed**。`ops/acceptance_status.json` 116 -> 117。

@@ -83,54 +83,11 @@ def write_python(path: str, source: str, *, allow_overwrite: bool = True,
     return path
 
 
-def check_push_state(repo: str, *, remote: str = "origin",
-                     branch: str = "main") -> dict:
-    """检查**本地领先远端多少提交** —— 供"该推了"的提醒。
-
-    存在的理由: 本会话出现过"提交了 35 次却一次没推"的情况 ——
-    `git status` 只显示未提交的文件, **不会告诉你"ahead 35"**。
-    这条把它变成一个可查询的数字。
-    """
-    import re
-    import subprocess
-
-    def _run(args):
-        return subprocess.run(args, cwd=repo, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=60)
-
-    out = {"repo": repo, "remote": remote, "branch": branch,
-           "ahead": None, "behind": None, "ahead_commits": [], "error": None}
-    r = _run(["git", "rev-list", "--left-right", "--count",
-              f"{remote}/{branch}...{branch}"])
-    if r.returncode != 0:
-        out["error"] = (r.stderr or r.stdout or "").strip()[:200]
-        return out
-    m = re.match(r"\s*(\d+)\s+(\d+)", r.stdout or "")
-    if m:
-        out["behind"], out["ahead"] = int(m.group(1)), int(m.group(2))
-    if out["ahead"]:
-        r2 = _run(["git", "log", "--oneline", "-n", str(min(out["ahead"], 20)),
-                   f"{remote}/{branch}..{branch}"])
-        out["ahead_commits"] = [l for l in (r2.stdout or "").splitlines() if l.strip()]
-    return out
-
-
 def _main(argv=None) -> int:
     import argparse
-    import json
-    ap = argparse.ArgumentParser(description="DISC-4 工具: 校验语法 / 检查推送状态")
+    ap = argparse.ArgumentParser(description="DISC-4 工具: 生成 .py 前先校验语法")
     ap.add_argument("files", nargs="*", help="待校验的 .py 文件")
-    ap.add_argument("--push-state", metavar="REPO", help="检查某仓领先远端多少提交")
-    ap.add_argument("--branch", default="main")
     args = ap.parse_args(argv)
-
-    if args.push_state:
-        st = check_push_state(args.push_state, branch=args.branch)
-        print(json.dumps(st, ensure_ascii=False, indent=2))
-        if st.get("ahead"):
-            print(f"\n⚠️ 本地领先 {st['remote']}/{st['branch']} "
-                  f"**{st['ahead']} 个提交** —— 该推了。")
-        return 0
 
     bad = 0
     for fp in args.files:
@@ -144,7 +101,8 @@ def _main(argv=None) -> int:
             bad += 1
             print(f"  FAIL {fp}: {e}")
     if not args.files:
-        print("DISC-4 工具。用法: safe_write.py <file.py>... | --push-state <REPO>")
+        print("DISC-4 工具。用法: safe_write.py <file.py>...")
+        print("(检查『已提交但未推送』请用 _tools/push_state.py —— 那是 DISC-2)")
     return 1 if bad else 0
 
 
