@@ -111,12 +111,22 @@ SOURCE_SPECS: dict[str, dict] = {
     # 注意: 源规格 **不做复权换算** —— 复权由适配器在取数时用 adjustflag 选定,
     # 因为复权是**取数语义**而非单位换算(换算会掩盖口径不一致)。
     "baostock": _spec(
+        # **用全字段集**: `preclose` / `pctChg` / `turn` 必须取, 否则会丢语义。
+        # 实测(600177 除权日 09-18): baostock 的 `preclose=8.1000`(除权调整后)与
+        # `pctChg=0.493800` 与引擎的 pre_close=8.10 / pct_chg=+0.4938 **完全一致**;
+        # `turn` 是换手率(0.5328 对引擎 turnover=0.53)。
+        # 若**不取** `pctChg` 而用 (close/前一日close-1) 自算, 在除权日会得到
+        # **-1.93%**(错) —— 因为那用的是未调整的前收 8.30。这正是"少取一个字段就
+        # 静默算错"的实例。
         {"code": "symbol", "date": "date", "open": "open", "high": "high",
-         "low": "low", "close": "close", "volume": "volume", "amount": "amount"},
+         "low": "low", "close": "close", "volume": "volume", "amount": "amount",
+         "pctChg": "change_pct", "turn": "turnover"},
         symbol_key="code", symbol_strip_prefix=True, date_format="%Y-%m-%d",
         volume_mult=1.0, amount_mult=1.0,
         note="Baostock; volume 单位=**股**(实测比值 1.0000, 勿 ×100); "
-             "取数须用 adjustflag='3' 对齐本仓不复权口径; "
+             "取数须用 adjustflag='3' 对齐本仓不复权口径"
+             "(除权日实测: flag=3 与引擎 OHLC 逐值一致 3/3, flag=2 前复权 2/3 不一致); "
+             "**须取 `pctChg`/`turn` 字段** —— 自算涨跌幅在除权日会错; "
              "**北交所(bj.)无数据**, 覆盖仅沪深; 符号为 `sh.600000` 形式(自动剥离前缀)"),
 }
 
