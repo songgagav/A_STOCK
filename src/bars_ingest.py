@@ -42,15 +42,38 @@ DEFAULT_MIN_ROWS_PER_DAY = 1000
 
 
 def _spec(field_map: dict, *, symbol_key: str = "code",
-          symbol_zfill: int = 6, date_format: str = "%Y%m%d",
+          symbol_zfill: int = 6, symbol_strip_prefix: bool = False,
+          date_format: str = "%Y%m%d",
           volume_mult: float = 1.0, amount_mult: float = 1.0,
           min_rows_per_day: int = DEFAULT_MIN_ROWS_PER_DAY,
           note: str = "") -> dict:
-    """构造一份源规格(**声明式**)。"""
+    """构造一份源规格(**声明式**)。
+
+    `symbol_strip_prefix`: 源用 `sh.600000` 这类**带交易所前缀**的代码时置 True ——
+    归一化要产出 h5i 的**裸 6 位**代码(`600000`)。实测踩到: 不剥离时
+    `sh.600000` 被原样写入 symbol 列, 虽然 zfill(6) 不会截断它, 但**下游按裸代码匹配
+    全部失败**(静默 —— 数据看着正常, 只是永远匹配不上)。
+    """
     return {"field_map": dict(field_map), "symbol_key": symbol_key,
-            "symbol_zfill": int(symbol_zfill), "date_format": date_format,
+            "symbol_zfill": int(symbol_zfill),
+            "symbol_strip_prefix": bool(symbol_strip_prefix),
+            "date_format": date_format,
             "volume_mult": float(volume_mult), "amount_mult": float(amount_mult),
             "min_rows_per_day": int(min_rows_per_day), "note": note}
+
+
+def _to_h5i_symbol(s: "pd.Series", spec: dict) -> "pd.Series":
+    """源代码 -> h5i 裸 6 位代码。**只在此处做符号规范化**, 避免各源各写一份。"""
+    import pandas as pd
+    x = s.astype(str).str.strip()
+    if spec.get("symbol_strip_prefix"):
+        # `sh.600000` / `SZ.000001` -> `600000` / `000001`
+        # **不用行内 `(?i)`**: pandas 的 `str.replace` 会警告
+        # "Flags not at the start of the expression but at position 1", 且未来会报错。
+        # 改用 `case=False`(并由 pandas 自己加 flag 到正确位置)。
+        x = x.str.replace(r"^(sh|sz|bj)\.", "", regex=True, case=False)
+    z = spec.get("symbol_zfill") or 0
+    return x.str.zfill(z) if z else x
 
 
 #: 源名 -> 源规格。**未登记的源一律拒绝**(见 `normalize`)。
@@ -76,6 +99,25 @@ SOURCE_SPECS: dict[str, dict] = {
         volume_mult=100.0, amount_mult=1.0,
         note="AkShare 东财接口; **成交量单位是手, 必须 ×100 转股**(实测比值 100.0001); "
              "复权口径须由调用方用 adjust 参数确认(不复权 vs 前复权)"),
+
+    # Baostock。**2026-09-22 对引擎逐个实测(8 只 × 3 日)**:
+    #   · OHLC **逐值一致**;
+    #   · **volume 比值 = 1.0000** ⇒ 单位是**股**, 与引擎同口径, **不需要 ×100**
+    #     (这点与 akshare 相反 —— 两者混用而不按源声明换算, 会得到差 100 倍的量);
+    #   · amount 1:1(元)。
+    # 复权: baostock 的 `adjustflag` 是 **1=后复权 / 2=前复权 / 3=不复权**
+    # (实测验证: flag=1 的浦发 close≈121, flag=2/3 为 9.06/9.04 —— 后复权价被大幅放大)。
+    # **本仓对齐口径是 `3`(不复权)**: 引擎 09-18 浦发 close=9.07, 与 baostock flag=3 一致。
+    # 注意: 源规格 **不做复权换算** —— 复权由适配器在取数时用 adjustflag 选定,
+    # 因为复权是**取数语义**而非单位换算(换算会掩盖口径不一致)。
+    "baostock": _spec(
+        {"code": "symbol", "date": "date", "open": "open", "high": "high",
+         "low": "low", "close": "close", "volume": "volume", "amount": "amount"},
+        symbol_key="code", symbol_strip_prefix=True, date_format="%Y-%m-%d",
+        volume_mult=1.0, amount_mult=1.0,
+        note="Baostock; volume 单位=**股**(实测比值 1.0000, 勿 ×100); "
+             "取数须用 adjustflag='3' 对齐本仓不复权口径; "
+             "**北交所(bj.)无数据**, 覆盖仅沪深; 符号为 `sh.600000` 形式(自动剥离前缀)"),
 }
 
 
@@ -140,7 +182,7 @@ def normalize(df, source: str, *, min_rows_per_day: int | None = None):
                         if c not in ("symbol", "date")))
     if _already:
         norm_src = work.copy()
-        norm_src["symbol"] = work["symbol"].astype(str).str.zfill(spec["symbol_zfill"])
+        norm_src["symbol"] = _to_h5i_symbol(work["symbol"], spec)
         norm_src["date"] = pd.to_datetime(work["date"], errors="coerce")
         mult = {"volume": spec["volume_mult"], "amount": spec["amount_mult"]}
         for c in H5I_COLS:
@@ -175,7 +217,7 @@ def normalize(df, source: str, *, min_rows_per_day: int | None = None):
     if sym_key is None:
         raise ValueError(f"源 {source!r} 的规格缺 symbol 来源 —— 无法归一化")
     out = pd.DataFrame({
-        "symbol": work[sym_key].astype(str).str.zfill(spec["symbol_zfill"]),
+        "symbol": _to_h5i_symbol(work[sym_key], spec),
         "date": pd.to_datetime(work[date_key].astype(str),
                                format=spec["date_format"], errors="coerce"),
     })

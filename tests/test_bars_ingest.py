@@ -206,7 +206,7 @@ class TestSourceRegistryIsExplicit:
         assert "复权口径" in msg, "错误信息要告诉人该怎么登记, 而不只是拒绝"
 
     def test_known_sources_present(self):
-        assert set(BI.known_sources()) == {"stockdb_sdk", "akshare"}
+        assert set(BI.known_sources()) == {"stockdb_sdk", "akshare", "baostock"}
 
     def test_akshare_volume_multiplier_is_declared(self):
         """akshare 的成交量单位是**手** ⇒ 规格里必须显式 ×100。
@@ -393,6 +393,78 @@ class TestNormalizeIsIdempotent:
         out, meta = BI.normalize(_SAMPLE, "stockdb_sdk", min_rows_per_day=0)
         assert len(out) > 0
         assert meta.get("input") != "already_normalized", "原始记录被误判为已归一化"
+
+
+class TestEveryRegisteredSourceSatisfiesTheContract:
+    """**对每个已登记源**都验一遍契约 —— 新源自动被覆盖, 不必逐个补用例。
+
+    这条比"为 akshare 写一条、为 baostock 再写一条"更有价值: 前者在**新增源时
+    会自动开始检查它**, 后者需要人记得补。
+    """
+
+    @staticmethod
+    def _one_row_for(source: str) -> list[dict]:
+        """按源的字段名造一行。**故意用各源的真实列名**, 以覆盖 field_map。"""
+        if source == "stockdb_sdk":
+            return [{"code": "600000", "date": "20260922", "open": 9.03, "high": 9.07,
+                     "low": 8.97, "close": 9.04, "volume": 53266728, "amount": 480795737,
+                     "pct_chg": 0.33, "turnover": 0.16}]
+        if source == "akshare":
+            return [{"股票代码": "600000", "日期": "2026-09-22", "开盘": 9.03,
+                     "最高": 9.07, "最低": 8.97, "收盘": 9.04, "成交量": 532667,
+                     "成交额": 480795737, "涨跌幅": 0.33, "换手率": 0.16}]
+        if source == "baostock":
+            return [{"code": "sh.600000", "date": "2026-09-22", "open": "9.03",
+                     "high": "9.07", "low": "8.97", "close": "9.04",
+                     "volume": "53266728", "amount": "480795737"}]
+        raise AssertionError(f"新增了源 {source!r} 但没在这里给样例 —— 请补上")
+
+    @pytest.mark.parametrize("source", sorted(BI.SOURCE_SPECS))
+    def test_normalizes_to_the_h5i_contract(self, source):
+        raw = self._one_row_for(source)
+        out, meta = BI.normalize(raw, source, min_rows_per_day=0)
+        assert list(out.columns) == _H5I_COLS, f"{source}: 列不符契约"
+        for c in ("open", "high", "low", "close", "volume", "amount"):
+            assert out[c].dtype == "float64", f"{source}: {c} 落成了 {out[c].dtype}"
+        assert meta["source"] == source and meta["rows"] == 1
+
+    @pytest.mark.parametrize("source", sorted(BI.SOURCE_SPECS))
+    def test_symbol_is_bare_6_digits(self, source):
+        """**所有源的符号都必须归一到裸 6 位** —— 否则下游按代码匹配会静默失败。
+
+        实测踩到: baostock 的 `sh.600000` 若不剥前缀会被原样写入, 数据看着正常,
+        只是**永远匹配不上**任何按裸代码查的东西。这种"静默不匹配"最难查。
+        """
+        raw = self._one_row_for(source)
+        out, _ = BI.normalize(raw, source, min_rows_per_day=0)
+        sym = str(out.iloc[0]["symbol"])
+        assert sym == "600000", f"{source}: 符号归一化后是 {sym!r}, 应为 '600000'"
+        assert "sh." not in sym and "sz." not in sym and "." not in sym
+
+    def test_volume_units_differ_by_source_and_are_declared(self):
+        """**单位必须按源声明** —— akshare 是手(×100), baostock/引擎是股(×1)。
+
+        三者混用而不换算, 会得到**差 100 倍**的量, 且没有任何报错 ——
+        正是"数据看起来正常但差 100 倍"那类潜伏错误。
+        """
+        assert BI.SOURCE_SPECS["akshare"]["volume_mult"] == 100.0
+        assert BI.SOURCE_SPECS["baostock"]["volume_mult"] == 1.0
+        assert BI.SOURCE_SPECS["stockdb_sdk"]["volume_mult"] == 1.0
+        # 同一只票、同一天: 引擎/baostock 给 **53266728 股**;
+        # akshare 给 **532667 手**(手是整数单位, 会截掉那 28 股)⇒ ×100 = 53266700 股。
+        ak, _ = BI.normalize(self._one_row_for("akshare"), "akshare", min_rows_per_day=0)
+        bs_, _ = BI.normalize(self._one_row_for("baostock"), "baostock", min_rows_per_day=0)
+        assert float(bs_.iloc[0]["volume"]) == 53266728.0
+        assert float(ak.iloc[0]["volume"]) == 53266700.0
+        # 两源换算后应落在同一量级; 允许"手"的取整损失(≤100 股)
+        assert abs(float(ak.iloc[0]["volume"]) - float(bs_.iloc[0]["volume"])) < 100.0, \
+            "两源换算后差了不止一个取整量级 —— 单位声明可能错了"
+        # 反证: 若 akshare 忘了 ×100, 会差 100 倍 —— 断言它确实被乘过
+        assert float(ak.iloc[0]["volume"]) > 1_000_000, "akshare 的 ×100 没生效"
+
+    def test_baostock_declares_prefix_stripping(self):
+        assert BI.SOURCE_SPECS["baostock"]["symbol_strip_prefix"] is True
+        assert BI.SOURCE_SPECS["stockdb_sdk"]["symbol_strip_prefix"] is False
 
 
 class TestRoutingContract:
