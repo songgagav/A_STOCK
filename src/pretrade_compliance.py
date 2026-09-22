@@ -415,6 +415,16 @@ def gate(order: dict, ctx: dict, actor: str = "engine", path: str | None = None,
             return {"decision": "pending_approval",
                     "reasons": [f["detail"] for f in rk["flags"]], "id": it["id"],
                     "deduped": bool(it.get("deduped"))}
+        # ---- 正常放行: **必须留痕** ----
+        # 这是本模块 docstring 承诺过的四类裁决之一("正常：照常执行(留痕)"),
+        # 而实现里此前**独独漏了这一条** —— 而它恰恰是占比最大的那类。
+        # 后果(2026-09-22 实测): 当天 3 笔买入全部走这条路径, `data/order_audit.jsonl`
+        # **从未被创建**, 于是"订单级细粒度流水"对最常见的成功单是完全空白的;
+        # 排查时无法回答"今天到底下过哪些单、什么量、什么价"。
+        # 这条与"判定异常不阻断交易"的纪律不冲突: 放行照旧放行, 只是**说出来**。
+        audit({"action": "execute", "symbol": (order or {}).get("symbol"), "side": side,
+               "qty": (order or {}).get("qty"), "price": (order or {}).get("price"),
+               "reasons": [], "actor": actor}, path=audit_fp, now=now)
         return {"decision": "execute", "reasons": []}
     except Exception as e:  # noqa: BLE001
         return {"decision": "execute", "reasons": [], "error": f"{type(e).__name__}: {e}"}

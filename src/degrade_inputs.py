@@ -72,6 +72,26 @@ def _day_of(rec: dict) -> str:
     return ts[:10] if len(ts) >= 10 else "unknown"
 
 
+def _load_default_trades(state_path: str | None = None) -> list[dict]:
+    """从虚拟盘台账(`data/state.json`)读成交记录。读不到返回空列表(不抛)。
+
+    成交在 `trades_history` 里按日分组(`{day: [trade, ...]}`); 这里把日期展开到
+    每条记录上, 使下游可以按日分桶(**滑点/参与率的分布是日频性质, 不展开就
+    没有"天数"可言**)。
+    """
+    rows: list[dict] = []
+    try:
+        fp = state_path or os.path.join(_repo_root(), "data", "state.json")
+        with open(fp, encoding="utf-8-sig") as f:
+            st = json.load(f)
+        for day, items in (st.get("trades_history") or {}).items():
+            for t in items or []:
+                rows.append({**t, "day": day})
+    except Exception:  # noqa: BLE001
+        return []
+    return rows
+
+
 # --------------------------------------------------------------------------
 # 1) 拒单率
 # --------------------------------------------------------------------------
@@ -135,26 +155,24 @@ def rejection_stats(path: str | None = None) -> dict:
 # --------------------------------------------------------------------------
 # 2) 滑点分布
 # --------------------------------------------------------------------------
-def slippage_stats(trades: list | None = None, *, path: str | None = None) -> dict:
+def slippage_stats(trades: list | None = None, *, path: str | None = None,
+                   use_default_source: bool = True) -> dict:
     """按日/按分位统计实测滑点。
 
     口径: 只统计**真实产生了滑点分解**的成交(`impact_bps` 或 `exec_risk_bps`
     存在者)。当前生产撮合走常量分支(不传 ADV/波动率), 故这些字段**不产生** ——
     此时如实返回退化样本与原因, **不把常量 7bps 当成实测分布**。
+
+    `use_default_source=False` 时**完全不读环境**(只统计传入的 `trades`) ——
+    这是给测试用的隔离开关: 否则"生产今天有没有成交"会悄悄变成测试断言的一部分
+    (本仓就有两个用例因此在虚拟盘开始成交后失效: 它们断言"无成交", 而当天真的
+    成交了 3 笔)。
     """
     rows = list(trades or [])
     source = "caller"
-    if not rows:
+    if not rows and use_default_source:
         source = "data/state.json.trades_history"
-        try:
-            fp = path or os.path.join(_repo_root(), "data", "state.json")
-            with open(fp, encoding="utf-8-sig") as f:
-                st = json.load(f)
-            for day, items in (st.get("trades_history") or {}).items():
-                for t in items or []:
-                    rows.append({**t, "day": day})
-        except Exception:  # noqa: BLE001
-            rows = []
+        rows = _load_default_trades(path)
     vals, by_day = [], {}
     n_trades = len(rows)
     for t in rows:
@@ -208,19 +226,15 @@ def slippage_stats(trades: list | None = None, *, path: str | None = None) -> di
 # --------------------------------------------------------------------------
 # 3) 参与率分布
 # --------------------------------------------------------------------------
-def participation_stats(trades: list | None = None, *, adv: dict | None = None) -> dict:
-    """单笔名义额 / ADV 的分布。拆单判定的唯一输入。"""
+def participation_stats(trades: list | None = None, *, adv: dict | None = None,
+                        use_default_source: bool = True) -> dict:
+    """单笔名义额 / ADV 的分布。拆单判定的唯一输入。
+
+    `use_default_source=False` 时完全不读环境(见 `slippage_stats` 的说明)。
+    """
     rows = list(trades or [])
-    if not rows:
-        try:
-            fp = os.path.join(_repo_root(), "data", "state.json")
-            with open(fp, encoding="utf-8-sig") as f:
-                st = json.load(f)
-            for day, items in (st.get("trades_history") or {}).items():
-                for t in items or []:
-                    rows.append({**t, "day": day})
-        except Exception:  # noqa: BLE001
-            rows = []
+    if not rows and use_default_source:
+        rows = _load_default_trades()
     out = {"n_trades": len(rows), "n_with_adv": 0, "participation_p50": None,
            "participation_p95": None, "max_notional": None,
            "note": "", "cap_reference": None}
@@ -264,13 +278,14 @@ def participation_stats(trades: list | None = None, *, adv: dict | None = None) 
 # 4) 汇总
 # --------------------------------------------------------------------------
 def report(*, audit: str | None = None, compute_adv: bool = False,
-           sample_canons=None) -> dict:
+           sample_canons=None, use_default_source: bool = True) -> dict:
     """一次算齐三个量, 供日更/面板消费。**只采集, 不判定**。
 
     compute_adv=True 时会去取真实 ADV(需要 h5i; 仅当有成交件时才值得跑)。
+    use_default_source=False 用于测试隔离(不读生产台账)。
     """
     rej = rejection_stats(audit)
-    slp = slippage_stats()
+    slp = slippage_stats(use_default_source=use_default_source)
     adv_map = None
     if compute_adv and sample_canons:
         try:
@@ -279,7 +294,7 @@ def report(*, audit: str | None = None, compute_adv: bool = False,
                        (market_stats.stats_for(sample_canons) or {}).items()}
         except Exception:  # noqa: BLE001
             adv_map = None
-    par = participation_stats(adv=adv_map)
+    par = participation_stats(adv=adv_map, use_default_source=use_default_source)
     ready = bool(rej.get("calibration_ready") and slp.get("calibration_ready"))
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

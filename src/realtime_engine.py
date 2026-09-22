@@ -736,6 +736,29 @@ class RealtimeEngine:
         neg = ("SELL" in s) or ("卖出" in s) or ("减仓" in s) or ("观望" in s) or ("中性" in s)
         return not neg
 
+    def _pb_equity(self):
+        """当前账户权益(元)。**优先现算**, 取不到返回 None(清单该项自然 skip)。
+
+        为什么需要这个方法: `PaperBook` **没有 `equity` 属性** —— 它只存 cash 与
+        positions, 权益要 `cash + market_value()`。此前引擎用
+        `getattr(self.pb, "equity", None)` 取, 结果**恒为 None**, 使交易前清单的
+        "单笔仓位上限"与"组合回撤"两项永远只能记 skip(2026-09-22 实测确认)。
+        取不到时返回 None 而不是 0: 0 会被清单读成"权益为零", 那与"不知道"是
+        两回事(0 会让所有仓位占比变成 inf)。
+        """
+        try:
+            snap = self.pb.snapshot()
+            eq = snap.get("equity")
+            if eq is not None and float(eq) > 0:
+                return float(eq)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            eq = float(self.pb.cash) + float(self.pb.market_value())
+            return eq if eq > 0 else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _compute_gate(self, equity_now: float) -> dict:
         """IC 门控 + 单日亏损防御 (2026-09-07).
 
@@ -1097,7 +1120,12 @@ class RealtimeEngine:
                             {"symbol": canon, "side": "buy", "qty": qty, "price": pr},
                             {"tradable": tb,
                              "position_qty": (self.pb.positions.get(canon) or {}).get("qty"),
-                             "equity": getattr(self.pb, "equity", None),
+                             # equity: **PaperBook 没有这个属性**(它只存 cash 与 positions,
+                             # 权益要现算)。此前写的 getattr(self.pb, "equity", None) 恒为
+                             # None —— 于是"单笔仓位上限"与"组合回撤"两项检查的输入永远
+                             # 是空的, 只能记 skip。改成用 snapshot() 现算(它内部就是
+                             # cash + market_value())。
+                             "equity": self._pb_equity(),
                              "cash": getattr(self.pb, "cash", None),
                              "regime": (self._gate or {}).get("regime"),
                              "freeze_new_buys": (self._gate or {}).get("freeze_new_buys"),

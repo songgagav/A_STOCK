@@ -758,9 +758,36 @@
       "level": "P1",
       "title": "_to_used 换手预算的买卖口径不对称: 买入按含成本名义额计入, 卖出按不含成本名义额计入",
       "status": "deferred",
-      "detail": "**现状(逐行核对)**: `realtime_engine._rebalance()` 里\n· 买入: `mv = qty * pr * exec_ratio`(exec_ratio = 1 + slippage + impact_cost), `self._to_used += mv`;\n· 卖出: `mv = qty * pr`(不含成本), `self._to_used += mv`。\n即同样一笔名义额, 买入比卖出多消耗约 7bps 的换手预算。\n\n**影响评估**: 量级 0.07%; 对 20% 的日换手预算约 0.35% 相对差异 —— **可忽略**。\n\n**为什么搁置**: 修它等于改换手预算口径, 而该口径直接支撑『降频/降摩擦』那一整套既有行为(调仓间隔、小单门槛、换手上限), 收益(0.35%)与扰动面不成比例。\n\n**登记的理由**: 避免将来有人把这个不对称当成拆单批次引入的问题 —— 本批次**刻意未改 `_to_used` 任何一行**(限速只改 qty, 之后走原累加语句)。",
+      "detail": "**现状(逐行核对)**: `realtime_engine._rebalance()` 里\n· 买入: `mv = qty * pr * exec_ratio`(exec_ratio = 1 + slippage + impact_cost), `self._to_used += mv`;\n· 卖出: `mv = qty * pr`(不含成本), `self._to_used += mv`。\n即同样一笔名义额, 买入比卖出多消耗约 7bps 的换手预算。\n\n**影响评估**: 量级 0.07%; 对 20% 的日换手预算约 **0.35% 相对差异** —— **可忽略**。\n\n**【2026-09-22 用户决定: 登记 deferred, 不修】** 修它等于改换手预算口径, 而该口径直接支撑『降频/降摩擦』那一整套既有行为(调仓间隔、小单门槛、换手上限), 0.35% 的收益与扰动面不成比例。\n\n**登记理由**: 避免将来有人把这个不对称当成拆单批次(ROADMAP-7-SPLIT)引入的问题 —— 本批次**刻意未改 `_to_used` 任何一行**(限速只改 qty, 之后走原累加语句)。",
       "evidence": "src/realtime_engine.py 卖出/买入两处 `_to_used += mv` 的 mv 表达式；docs/exec-split-decision.md 第三节第 3 点",
-      "next": "不修(影响 0.35% 相对差异, 扰动面大); 若将来统一口径, 应在同一次改动里同时调整 max_turnover_pct 的取值, 否则等价于静默放宽/收紧换手预算。"
+      "next": "不修(用户 2026-09-22 决定, 0.35% 相对差异可忽略)。若将来统一口径, 必须在同一次改动里同时调整 `max_turnover_pct` 的取值, 否则等价于静默放宽/收紧换手预算。"
+    },
+    {
+      "id": "P0-AUDIT-GAP",
+      "level": "P0",
+      "title": "订单审计对**正常放行的单**从不写盘 => `data/order_audit.jsonl` 从未被创建(已修)",
+      "status": "fixed",
+      "detail": "**【2026-09-22 盘后诊断发现并修复 —— 当天实盘暴露】**\n\n**现象**: 2026-09-22 虚拟盘成交 3 笔买入(日志有 `买入(...)` 三行), 但 `data/order_audit.jsonl` **完全不存在** —— 订单级细粒度流水对最常见的成功单是一片空白, 排查时无法回答『今天到底下过哪些单、什么量、什么价』。\n\n**根因(实测定位)**: `pretrade_compliance.gate()` 有四类裁决, 其中三类写了审计(合规不过→reject; 卖出→execute; 买入高危→pending_approval), 而**第四类『买入全部通过→execute』在 `return` 之前没有调用 `audit()`**。第四类恰恰是占比最大的那类。模块 docstring 里明确承诺过『正常：照常执行(留痕)』—— 实现与承诺不一致。\n\n**修复**: 在正常放行路径补上 `audit({\"action\": \"execute\", ...})`。与『判定异常不阻断交易』的纪律不冲突: 放行照旧放行, 只是**说出来**。`gates=False`(清单整体关闭)时同样留痕 —— 放行必须留痕, 与清单开关无关。\n\n**验证**: 手工复现真实那笔买入(`301520.SZ` 100股@72.08) —— 修复前审计文件不产生, 修复后产生并带哈希链(`seq`/`prev`/`hash`)。测试覆盖四类裁决各自都写审计(见 tests/test_pretrade_gate_all_paths.py)。\n\n**同类风险(一并检查过)**: `audit()` 函数本身**正常**(手工调用可写出带链文件), 所以这不是『写失败被吞掉』, 而是『根本没被调用』—— 两者的排查路径完全不同, 记在这里以免下次误判。",
+      "evidence": "src/pretrade_compliance.py::gate 正常放行分支新增 audit(); 复现脚本 _tools/verify_audit_fix.py(修复前后对照); tests/test_pretrade_gate_all_paths.py(四类裁决全覆盖)",
+      "next": "无。**但需注意**: 修复只对**今后**生效 —— 2026-09-22 及之前的订单流水**无法补回**(当时就没写)。该日如需对账, 只能用 `logs/live_engine.log` 的 `买入(...)` 行 + `data/state.json` 的 `trades_history` 重建。"
+    },
+    {
+      "id": "P1-PBEQUITY-ATTR",
+      "level": "P1",
+      "title": "`PaperBook` 没有 `equity` 属性 => 引擎传的权益恒为 None, 交易前清单两项检查永远 skip(已修)",
+      "status": "fixed",
+      "detail": "**【2026-09-22 盘后诊断发现并修复】**\n\n**现象**: `realtime_engine` 组装交易前清单的 ctx 时写的是 `\"equity\": getattr(self.pb, \"equity\", None)`。实测 `hasattr(PaperBook(...), \"equity\") is False` —— `PaperBook` 只存 `cash` 与 `positions`, 权益要 `cash + market_value()`(即 `snapshot()['equity']`)。于是该字段**恒为 None**。\n\n**后果**: 交易前清单的『单笔仓位上限』与『组合回撤』两项的输入永远是空的, 只能记为 `skip` —— 也就是说这两项**从未真正生效过**(其余三项: IC门控/数据新鲜度/单日亏损 分别依赖 regime/data_lag_days/day_start_equity, 不受影响)。这正是本仓反复强调的那类失效: **检查存在、日志显示『跳过』、看起来一切正常**。\n\n**修复**: 新增 `realtime_engine._pb_equity()`: 优先 `snapshot()['equity']`, 取不到回退 `cash + market_value()`, 都取不到返回 **None 而不是 0** —— 0 会被清单读成『权益为零』, 使所有仓位占比变成 inf 而误判。\n\n**验证**: 修复后 900 股@10 元的单在 10 万权益下被正确算出 9.00%(超过 8% 上限的判定真的生效了); 配合 IC 门控=risk 时该单被 `reject` 且理由是清单项。测试断言 `hasattr(PaperBook(...), \"equity\") is False` 以防有人『顺手』加一个语义不同的同名属性而悄悄改变清单行为。",
+      "evidence": "src/realtime_engine.py::_pb_equity + gate 调用点; 复现脚本 _tools/diag_audit.py(修复前 getattr 恒 None 的实证); tests/test_pretrade_gate_all_paths.py",
+      "next": "无。"
+    },
+    {
+      "id": "P0-DATASRC-STOCKDB",
+      "level": "P0",
+      "title": "厂商引擎 stockdb.exe 未运行(端口 7899 无监听) => 盘中引擎 11:31 静默停摆, 数据落后 2 个交易日",
+      "status": "open",
+      "detail": "**【2026-09-22 盘后诊断 —— 当日链路的直接断裂点】**\n\n**实测事实**:\n· `Get-NetTCPConnection -LocalPort 7899` **无监听**; `Get-Process stockdb` **不存在** ⇒ 厂商引擎(生产主路径的硬依赖, 见 P1-ENGINEDEP)不在运行;\n· h5i `daily_bars` 最新 = **2026-09-18**(落后 2026-09-21/09-22 两个交易日);\n· `data/health/state.json` 记录 `engine_error = 取数服务失败(127.0.0.1:7899) ref=000001: TimeoutError: Connect timeout`、`probe_error_kind = unreachable`、`freshness_ok = False`;\n· `logs/live_engine.log` 最后一行 = **11:31:01**(故障前每日正常跑到 15:03 自动停止); `logs/engine.pid = 36336` 而该进程**已不存在**;\n· 当天成交量停在 3 笔(09:30:21 建仓), 之后引擎再未成交。\n\n**净影响**: 当日 11:31 之后整个下午没有行情、没有撮合、没有止损保护。而 09:30 那 3 笔买入**仍执行了** —— 当时日志显示『实时源告警: 仅候选池缺价 10/10 只』, 即在行情已不完整的情况下建了仓。\n\n**为什么守护没有救回来(两个独立原因)**:\n① **今天 08:30 没有守护**: `logs/daemon.log` 显示守护进程是 **16:09:07 才启动**的(之前不在运行), 所以 11:31 无人看护、无人拉起;\n② **即使守护在, 也不该拉起** —— 数据源本身死了, 重启引擎只会得到一台对着陈旧数据下单的引擎。这一点**现行实现是对的**; 真正缺的是『数据源死了要响亮告警并停手』, 而不是反复重启。\n\n**这是外部依赖故障, 不是代码缺陷** —— 代码侧已把它如实报成 DEGRADED 并带明确的 unreachable 归因(不是静默)。修法是运维动作: 双击启动 stockdb.exe(厂商说明是双击启动的常驻服务), 或改由服务托管。",
+      "evidence": "Get-NetTCPConnection 7899 无监听; Get-Process stockdb 不存在; h5i MAX(date)=2026-09-18; data/health/state.json 的 engine_error/freshness_ok; logs/live_engine.log 末行 11:31:01; logs/engine.pid=36336 对应进程不存在; logs/daemon.log『2026-09-22 16:09:07 守护进程启动』; 登记簿 P1-ENGINEDEP",
+      "next": "① 运维启动 stockdb.exe 并确认 7899 有监听; ② 确认后补 09-21/09-22 的行情(engine_bars_sync); ③ 考虑把该常驻服务改为服务托管(与 daemon 一致), 避免『双击才启动』这一人为依赖 —— 属独立改动, 需用户确认。"
     }
   ]
 }

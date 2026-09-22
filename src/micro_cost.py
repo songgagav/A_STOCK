@@ -104,16 +104,21 @@ def participation_cap_qty(*, adv: float | None, participation_cap: float,
     return int(max(qty, 0))
 
 
-def observed_cost_table(trades: list | None = None) -> dict:
+def observed_cost_table(trades: list | None = None, *,
+                        use_default_source: bool = True) -> dict:
     """把实测成交整理成"名义额 -> 单边成本率"表, 供将来回归真实规模弹性。
 
-    `trades` 为 None 时读本仓的虚拟盘台账。**当前为空**(无成交数据),
-    函数如实返回 `n=0` 与原因 —— 这是本模块在拿到数据之前唯一诚实的答案,
-    也是"拆单到底省不省"这个问题目前**无法用本仓数据回答**的证据。
+    `trades=None` 且 `use_default_source=True` 时读本仓虚拟盘台账; 否则只统计传入者
+    (**给测试用的隔离开关** —— 否则"生产今天有没有成交"会变成测试断言的一部分,
+    本仓已有两个用例因此失效)。
+
+    当前生产成交**不含** `impact_bps`(撮合走常量分支, 见模块 docstring), 故
+    `buckets` 必为空、`regression_ready=False` —— 这是本模块在拿到"带滑点分解的
+    成交"之前唯一诚实的答案: **拆单能不能省冲击成本, 用本仓现在的数据回答不了**。
     """
     rows = list(trades or [])
     source = "caller"
-    if not trades:
+    if not trades and use_default_source:
         source = "data/state.json.trades_history"
         try:
             import json
@@ -127,6 +132,8 @@ def observed_cost_table(trades: list | None = None) -> dict:
                     rows.append({**t, "day": day})
         except Exception:  # noqa: BLE001
             rows = []
+    elif not trades:
+        source = "isolated(none)"
     out = {"n": len(rows), "source": source, "buckets": [],
            "note": "", "regression_ready": False}
     if not rows:

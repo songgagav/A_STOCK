@@ -138,8 +138,19 @@ class TestSlippageStats:
 
 class TestParticipationStats:
     def test_no_samples(self):
-        p = DI.participation_stats(trades=[])
-        assert p["n_with_adv"] == 0 and "无样本" in p["note"]
+        """**隔离开关**: 不读生产台账时给出"无样本"。
+
+        原用例断言"虚拟盘无成交", 那让生产状态成了断言的一部分 ——
+        2026-09-22 虚拟盘成交 3 笔后它就失效了。现用 `use_default_source=False` 隔离。
+        """
+        p = DI.participation_stats(use_default_source=False)
+        assert p["n_trades"] == 0 and p["n_with_adv"] == 0
+        assert "无样本" in p["note"]
+
+    def test_no_adv_with_trades_gives_distinct_reason(self):
+        p = DI.participation_stats(trades=[{"price": 10.0, "qty": 100}],
+                                   adv=None, use_default_source=False)
+        assert p["n_with_adv"] == 0 and "未提供 ADV" in p["note"]
 
     def test_pairs_trade_with_adv(self):
         trades = [{"canon": "600000.SH", "price": 10.0, "qty": 10_000}]

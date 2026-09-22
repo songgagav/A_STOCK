@@ -94,11 +94,28 @@ class TestParticipationCapQty:
 
 
 class TestObservedCostTable:
-    def test_empty_when_no_trades(self):
-        ct = M.observed_cost_table()
+    def test_isolated_source_is_empty(self):
+        """**隔离开关**: `use_default_source=False` 时完全不读生产台账。
+
+        原用例断言的是"生产无成交"(n==0), 那等于把"虚拟盘今天有没有成交"变成测试
+        断言的一部分 —— 2026-09-22 虚拟盘真的成交 3 笔后它就失效了。
+        现改为断言**隔离行为**本身, 与生产状态解耦。
+        """
+        ct = M.observed_cost_table(use_default_source=False)
         assert ct["n"] == 0
         assert ct["regression_ready"] is False
+        assert ct["source"] == "isolated(none)"
         assert "无法标定" in ct["note"]
+
+    def test_production_trades_without_decomposition_yield_no_buckets(self):
+        """**回归锁**: 生产成交不含 impact_bps(常量分支) => 分桶必为空。
+
+        这条比"n==0"更有意义: 即使虚拟盘开始成交, 只要撮合仍走常量分支, 就没有
+        可用于回归规模弹性的数据 —— 而"拆单省不省冲击成本"正是靠它回答的。
+        """
+        ct = M.observed_cost_table()
+        assert ct["buckets"] == []
+        assert ct["regression_ready"] is False
 
     def test_with_synthetic_trades(self):
         trades = [{"price": 10.0, "qty": 1000, "impact_bps": 7},
@@ -110,7 +127,8 @@ class TestObservedCostTable:
         assert len(ct["buckets"]) >= 3
 
     def test_ignores_rows_without_impact(self):
-        ct = M.observed_cost_table([{"price": 10.0, "qty": 100}])
+        ct = M.observed_cost_table([{"price": 10.0, "qty": 100}],
+                                   use_default_source=False)
         assert ct["buckets"] == []
 
 
