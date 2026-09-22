@@ -338,6 +338,73 @@ def save_state(st: dict):
         raise
 
 
+def _push_state_meta() -> dict:
+    """把「已提交但未推送」的提交数记进回执(**开发纪律, 只记不告警**)。
+
+    见 `daily_summary.json` 的 `push_state` 字段。**任何异常都不得冒泡** ——
+    它是开发纪律的检查, 与交易管道无关; 一个 git 调用卡住不该影响收盘选股。
+
+    判据与 `_tools/push_state.py` **同源**; 此处不 import 它, 因为 `_tools` 不是包,
+    且不想给生产导入面添加开发期目录。两处都只看 `rev-list --left-right --count`
+    的同一个数字, 逻辑极短, 重复的风险低于引入开发期依赖的风险。
+    """
+    try:
+        import re as _re
+        import subprocess as _sp
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = _sp.run(["git", "rev-list", "--left-right", "--count",
+                     "origin/main...main"],
+                    cwd=repo, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=20)
+        if r.returncode != 0:
+            return {"error": "git 不可用或远端分支缺失",
+                    "detail": ((r.stderr or r.stdout or "").strip()[:160])}
+        m = _re.match(r"\s*(\d+)\s+(\d+)", r.stdout or "")
+        if not m:
+            return {"error": f"无法解析 rev-list 输出: {(r.stdout or '')[:80]!r}"}
+        return {"ahead": int(m.group(2)), "behind": int(m.group(1)),
+                "note": ("开发纪律(非运行时纪律): ahead>0 = 有已提交但未推送的工作。"
+                         "**只记日志, 不告警** —— 大重构期间 ahead>0 属正常, "
+                         "强提醒会变成噪声(TableStale24h 330 次 firing 的教训)。")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+#: 「连续 N 天未推送」的阈值(用户建议的更强保障)。
+#: 为什么是**连续**而不是单日: 大重构期间单日 ahead>0 完全正常, 只有**持续**未推
+#: 才说明真的漏了 —— 这与 `datasource_gate` 的"同一原因连续失败才停手"同一思路。
+PUSH_STALE_DAYS = 3
+
+
+def _push_state_streak(day: str, ahead: int) -> dict:
+    """维护"连续多少天有未推送提交"的计数(落 `data/push_state_streak.json`)。
+
+    **只为在日志里升级措辞, 刻意不接告警** —— 理由同上(开发纪律 ≠ 运行时纪律)。
+    """
+    import json as _json
+    fp = os.path.join(DATA_DIR, "push_state_streak.json")
+    st = {"day": None, "streak": 0}
+    try:
+        if os.path.exists(fp):
+            with open(fp, encoding="utf-8-sig") as f:
+                st = _json.load(f) or st
+    except Exception:  # noqa: BLE001
+        st = {"day": None, "streak": 0}
+    if st.get("day") == day:
+        return {"streak": int(st.get("streak") or 0), "unchanged": True}
+    streak = (int(st.get("streak") or 0) + 1) if ahead > 0 else 0
+    try:
+        tmp = fp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump({"day": day, "streak": streak, "ahead": int(ahead)}, f,
+                       ensure_ascii=False, indent=2)
+        os.replace(tmp, fp)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"streak": streak, "unchanged": False,
+            "stale": streak >= PUSH_STALE_DAYS, "threshold": PUSH_STALE_DAYS}
+
+
 def run_daily(day: str = None, download_prices: bool = True, mode: str = "full") -> dict:
     """日频收盘 / 维护 管道.
 
@@ -921,6 +988,34 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         out_path = os.path.join(DAILY_DIR, day_dir, "daily_summary.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+        # [2026-09-22 DISC-2 实例: 开发纪律[已提交 vs 已推送]] 记入回执, **只记日志**。
+        #
+        # 为什么在这里: 本会话踩到过"commit 了 35 次却一次没推" —— 而 `git status`
+        # 只显示未提交文件, **不告诉你 ahead N**, 于是"看起来一切已保存"。
+        #
+        # **刻意不做强提醒/不推告警**: 它是**开发纪律**(提交/推送规范), 不是运行时纪律
+        # (数据源健康/告警链)。大重构期间 ahead>0 完全正常, 强提醒会变成噪声 ——
+        # 那正是 `TableStale24h` 330 次 firing 的教训(长期无人处理的告警等于没有告警)。
+        # 故: 写进回执可随时查, 但不打扰。
+        #
+        # 放在**回执落盘之后**: git 子进程即便卡住, 也不会拖慢回执本身。
+        try:
+            _ps = _push_state_meta()
+            # 「连续 N 天」只在拿到 ahead 时才算 —— 取不到状态时不得推进计数
+            # (否则一个 git 故障会被记成"连续未推")。
+            if "ahead" in _ps:
+                _ps.update(_push_state_streak(day_dir, _ps["ahead"]))
+            report["push_state"] = _ps
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+            if _ps.get("ahead"):
+                _msg = f"{_ps['ahead']} 个提交未推送 (仅记录, 不告警)"
+                if _ps.get("stale"):
+                    _msg += f" —— **已连续 {_ps['streak']} 天**, 建议尽快推"
+                print(f"[run_daily] [push_state] {_msg}")
+        except Exception as e:  # noqa: BLE001
+            # 开发纪律的检查**绝不能**影响运行时管道
+            report["push_state"] = {"error": f"{type(e).__name__}: {e}"}
         # ===== ArcticDB daily_summary 持久化 (供 SPC/退化检测查询) =====
         try:
             from arctic_store import get_store

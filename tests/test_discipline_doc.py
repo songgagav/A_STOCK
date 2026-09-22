@@ -126,8 +126,50 @@ class TestDisc1MechanismsActuallyExist:
     def test_disc4_points_at_the_implementation(self):
         """DISC-4 必须点名它的实现, 而不只是描述原则。"""
         src = open(_DOC, encoding="utf-8").read()
-        assert "_tools/safe_write.py" in src, "DISC-4 未点名实现"
+        assert "_tools/safe_write.py" in src, "DISC-4 未点名生成端实现"
         assert "write_python" in src, "DISC-4 未点名辅助函数"
+
+    def test_disc4_has_a_fixer_not_only_a_validator(self):
+        """DISC-4 必须**同时有修复端** —— 这是本会话追加的教训。
+
+        校验端只能说"错了"; 而报错行常不是肇事行, 于是仍是低效的手工循环。
+        修复端把它变成一条命令。
+        """
+        src = open(_DOC, encoding="utf-8").read()
+        assert "_tools/fix_cjk_quotes.py" in src, "DISC-4 未点名修复端"
+        assert "fix_cjk_quotes" in src
+        p = os.path.join(_REPO, "_tools", "fix_cjk_quotes.py")
+        assert os.path.isfile(p), f"缺修复端实现: {p}"
+
+    def test_fixer_fixes_real_cases_and_leaves_correct_code_alone(self):
+        """修复端**实测**: 能修真实历史样本, 且**不碰**本就正确的代码。"""
+        import importlib.util
+        p = os.path.join(_REPO, "_tools", "fix_cjk_quotes.py")
+        spec = importlib.util.spec_from_file_location("fxq", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # 真实历史样本(本会话第 1 次与第 8 次踩到的形态)
+        for bad, want in (
+            ('assert x, "未声明"不告警""', "未声明「不告警」"),
+            ('x = "与"某个 bug 怎么修的"不同"', "与「某个 bug 怎么修的」不同"),
+        ):
+            new, n, ok = mod.fix_text(bad)
+            assert ok, f"修复后仍未通过: {new!r}"
+            assert n == 1, f"应恰好修 1 处, 实为 {n}"
+            assert want in new, new
+            # 修完后, 每个字符串字面量**内部**都不该再有半角引号。
+            # 注意判据要精确: "紧贴中文"太宽 —— 合法的**界定符**同样紧贴中文
+            # (如 `"未声明…"`), 故必须按字面量拆分后再看内部(首版在此假红)。
+            import ast as _ast
+            for node in _ast.walk(_ast.parse(new)):
+                if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+                    inner_q = '"' in node.value
+                    assert not inner_q, \
+                        f"字面量内部仍有半角引号: {node.value!r} (源码 {new!r})"
+        # **不得碰**本就正确的代码
+        good = 'x = "中文「这样」就对了"\n'
+        new, n, ok = mod.fix_text(good)
+        assert ok and n == 0 and new == good, "修复端改动了本就正确的代码"
 
     def test_disc4_implementation_exists_and_refuses_bad_syntax(self):
         """实现必须真实存在, 且**语法不过时拒绝落盘**。"""

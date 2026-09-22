@@ -157,6 +157,62 @@ class TestItFailsLoudlyNotSilently:
         assert "该推了" in w and "cX" in w, w
 
 
+class TestPreconditionsMustBeAsserted:
+    """DISC-2 形态③: **测试自身的状态必须先被断言**。
+
+    ## 这条守的是我自己犯过的错
+
+    我写"已提交但未推送"的用例时忘了改文件内容 ⇒ `git add` 后无内容变化 ⇒
+    **空提交 ⇒ 根本没产生提交** ⇒ `ahead` 停在 0 而断言 `== 1` 失败。
+    它看起来像"被测代码不报未推送", 实际是**我压根没造出那个状态**。
+
+    这与「假信心测试」同源(都让测试看起来正常), 但形态不同:
+      · 假信心测试 = 断言太弱, **永远通过**;
+      · 本形态     = 测试跑了、断言也"对"了, 但**在验证一个错误的场景**。
+
+    **通用对策: 在断言"结果"之前, 先断言"场景已成立"。**
+    """
+
+    def test_unpushed_scenario_is_actually_established(self, sandbox):
+        """造"已提交未推送"时, 先证明**真的产生了新提交**。"""
+        before = _git(sandbox, "rev-parse", "HEAD").stdout.strip()
+        with open(os.path.join(sandbox, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("changed")            # **必须先改内容**, 否则是空提交
+        _git(sandbox, "add", "-A")
+        _git(sandbox, "commit", "-q", "-m", "c-pre")
+        after = _git(sandbox, "rev-parse", "HEAD").stdout.strip()
+        # 先断言场景成立, 再断言被测行为
+        assert after != before, "前置条件未成立: 没有产生新提交(疑空提交)"
+        assert _git(sandbox, "status", "--porcelain").stdout.strip() == "", \
+            "前置条件未成立: 工作区不干净, 说明提交没成功"
+        assert PS.check_push_state(sandbox)["ahead"] == 1
+
+    def test_dirty_scenario_is_actually_established(self, sandbox):
+        """造"工作区脏"时, 先证明 git 真的看得见改动。"""
+        with open(os.path.join(sandbox, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("dirty")
+        porcelain = _git(sandbox, "status", "--porcelain").stdout.strip()
+        assert porcelain, "前置条件未成立: 没有造出脏工作区"
+        assert any("a.txt" in l for l in porcelain.splitlines())
+        # 场景成立后, 才断言"它不报"
+        assert PS.check_push_state(sandbox)["ahead"] == 0
+
+    def test_non_repo_scenario_is_actually_outside_any_repo(self):
+        """造"非仓库目录"时, 先证明该目录**真的不在任何 git 仓内**。
+
+        首版用 pytest 的 `tmp_path` —— 它落在本仓内, 而 git 会**向上查找**仓库根,
+        于是找到真仓并正常返回, 用例假红(看起来像"被测代码不报错")。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="notarepo2_") as td:
+            r = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace")
+            assert r.returncode != 0, \
+                f"前置条件未成立: 该目录在 git 仓内({r.stdout.strip()})"
+            assert PS.check_push_state(td)["error"]
+
+
 class TestResponsibilitySplit:
     """职责边界: 两个工具各管一件事, 不得互相混入。"""
 
@@ -188,3 +244,69 @@ class TestResponsibilitySplit:
         # 归属: 已提交/已推送 属 DISC-2; DISC-4 那节应说明它不在此处
         d4 = doc[doc.find("## DISC-4"):]
         assert "push_state" in d4, "DISC-4 应指明 push_state 不在本纪律(职责边界)"
+
+    def test_discipline_doc_documents_all_three_test_failure_modes(self):
+        """DISC-2 必须列出三种"测试看起来正常"的形态(用户要求并列)。
+
+        ① 假信心测试(断言太弱) ② skip 被读成通过 ③ **前置状态没造出来**。
+        第③种最隐蔽: 测试跑了、断言也"对"了, 却在**验证一个错误的场景**。
+        """
+        doc = open(os.path.join(_REPO, "docs", "disciplines.md"),
+                   encoding="utf-8").read()
+        for token in ("假信心测试", "skip", "前置状态没造出来"):
+            assert token in doc, f"DISC-2 缺形态: {token}"
+        assert "先断言" in doc and "场景已成立" in doc, \
+            "DISC-2 应给出形态③的通用对策(先断言场景已成立)"
+
+
+class TestRunDailyLogsWithoutAlerting:
+    """`push_state` 接入 daily 回执: **只记日志, 不告警**(用户决策)。"""
+
+    def test_helper_returns_the_number_and_says_it_is_dev_discipline(self):
+        import importlib.util
+        # run_daily 依赖较重, 用源码检查 + 独立函数测试
+        p = os.path.join(_REPO, "src", "run_daily.py")
+        src = open(p, encoding="utf-8").read()
+        assert "_push_state_meta" in src and "_push_state_streak" in src
+        assert "只记日志" in src or "只记录" in src, "未声明「不告警」"
+        assert "开发纪律" in src, "未声明它是开发纪律而非运行时纪律"
+
+    def test_it_never_raises_into_the_pipeline(self):
+        """开发纪律的检查**绝不能**影响运行时管道。
+
+        源码层面锁: 调用处包在 try/except 里, 且异常只写进 report 不抛出。
+        """
+        src = open(os.path.join(_REPO, "src", "run_daily.py"),
+                   encoding="utf-8").read()
+        i = src.find("report[\"push_state\"] = _ps")
+        assert i > 0, "未找到接入点"
+        blk = src[max(0, i - 700):i + 700]
+        assert "try:" in blk and "except Exception" in blk, \
+            "push_state 接入未包 try/except —— 一个 git 故障会打断收盘管道"
+        # helper 自身也必须吞异常
+        j = src.find("def _push_state_meta")
+        hblk = src[j:j + 1800]
+        assert "except Exception" in hblk, "helper 未吞异常"
+
+    def test_streak_needs_consecutive_days_not_one(self):
+        """用户要求: **连续 N 天**才算"该推了", 单日 ahead>0 不该升级措辞。
+
+        理由同 `datasource_gate`: 偶发一天是正常(大重构), 持续才是真漏。
+        """
+        src = open(os.path.join(_REPO, "src", "run_daily.py"),
+                   encoding="utf-8").read()
+        assert "PUSH_STALE_DAYS" in src
+        assert "连续" in src, "未体现「连续 N 天」"
+
+    def test_no_alert_rule_was_added_for_push_state(self):
+        """**刻意不接告警** —— 它是开发纪律, 加了会变成噪声。
+
+        实测依据: `TableStale24h` 因长期无人处理而 firing 330 次 ⇒
+        长期无人处理的告警等于没有告警。故这里断言告警规则里**没有** push 相关项。
+        """
+        rules = open(os.path.join(_REPO, "ops", "alert_rules.yml"),
+                     encoding="utf-8").read()
+        low = rules.lower()
+        for bad in ("push_state", "pushstate", "unpushed"):
+            assert bad not in low, \
+                f"告警规则里出现了 {bad} —— 用户明确要求只记日志不告警"
