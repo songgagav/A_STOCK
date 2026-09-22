@@ -207,6 +207,26 @@ def classify_engine(probe: dict | None, *, today_lag_hint: int | None = None) ->
     if not p.get("ok"):
         return {"ok": False, "kind": "unreachable",
                 "detail": f"引擎不可达/无数据: {str(p.get('error') or '未知')[:160]}"}
+    # [2026-09-22 P0] **日历强度必须先于落后天数被检查**。
+    #
+    # 为什么顺序不能反: `expected_day` 由 `trading_calendar` 的三层回退链给出。
+    # 当它降级到「daily_bars 交叉」层时, "最后一个已收盘交易日"会退化成
+    # "最后一个有数据的日子" —— 于是 `engine_day` 与 `expected_day` **同时**停在
+    # 同一天, **落后恒为 0**, 报告上是一个漂亮的 0, 而「供应商未发布」这个哨兵
+    # **已经失效了**。这与引擎把"无数据"说成"非交易日"是同一族错误的镜像:
+    # **这里是把"日历降级"说成"刚好追平"。**
+    #
+    # 故: 非官方日历时一律判 `freshness_undeterminable`(**不可判定 != 健康**),
+    # 并把来源带进 detail 供人排查 —— 与本模块既有的
+    # "缺字段 = 无信息, 不据此拒单" 同一条纪律。
+    strength = fresh.get("calendar_strength")
+    if strength is not None and strength != "official":
+        return {"ok": False, "kind": "freshness_undeterminable",
+                "detail": (f"交易日历判据已降级为 {strength!r}"
+                           f"(source={fresh.get('calendar_source')!r}) —— "
+                           f"该层日历**停在数据停的地方**, 用它算出的落后天数恒偏小, "
+                           f"故不可判定; 需先修日历缓存(data/trade_calendar.json 的 "
+                           f"`days` 键)")}
     if lag is None:
         return {"ok": False, "kind": "freshness_undeterminable",
                 "detail": "引擎可连但无法判定数据新鲜度(缺 freshness) —— "

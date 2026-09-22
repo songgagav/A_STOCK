@@ -1,14 +1,48 @@
 groups:
   - name: astock_db_stale
     rules:
-      - alert: TableStale24h
-        expr: (time() - astock_db_lastday_ts) / 86400 > 1 and astock_db_lastday_ts > 0
-        for: 30m
+      # [2026-09-22 重做] 原规则是**单一 24h 阈值打所有表**, 这是设计错误:
+      #   · `financials` 是**季度**表 —— 实测最后一日 2026-06-30(84.9 天前),
+      #     而那是**财报的正常节奏**, 永远超 24h ⇒ **永久假阳性**;
+      #   · `daily_bars` 是每日表, 24h 又**太松**(一次漏更不会在一天内暴露)。
+      #   实测后果: 该规则自 09-08 起 **firing 330 次**, 长期无人处理 ——
+      #   而**长期无人处理的告警等于没有告警**(它训练人忽略这个频道),
+      #   与 obs_stack 那条常亮 OVERDUE 同源。
+      # 判据改为**按更新节奏分档**: 日报类 5 天(留出周末+一个容错交易日),
+      # 季报类 120 天(一个季度 + 缓冲)。阈值来自"该表**本该**多久更新一次",
+      # 而不是一刀切 —— 与本仓 METHOD-1(判据须基于下游真实语义)一致。
+      - alert: TableStaleDaily
+        # 日报类表(每交易日应更新)
+        expr: >-
+          (time() - astock_db_lastday_ts) / 86400 > 5
+          and astock_db_lastday_ts > 0
+          and astock_db_lastday_ts{table=~"daily_bars|valuation|valuation_snapshot|margin_daily|money_flow_estimate|northbound_money"}
+        for: 1h
         labels:
           severity: warning
         annotations:
-          summary: "表 {{ $labels.table }} 最后更新已超过24小时"
-          description: "astock_db_lastday_ts={{ $value | humanizeTimestamp }} 距今超过 24h, 请检查数据窗口任务"
+          summary: "日报类表 {{ $labels.table }} 已超过 5 天未更新"
+          description: >-
+            astock_db_lastday_ts 距今超过 5 天(留出周末与一个容错交易日)。
+            查 data/datasource_health.jsonl 的 db_update 连续失败原因,
+            以及 data/health/state.json 的 observed.datasource。
+            实测 2026-09-22: valuation/valuation_snapshot/money_flow_estimate
+            停在 09-08(14.9 天), 属上游数据源问题, 见 docs/stockdb-source-status.md。
+
+      - alert: TableStaleQuarterly
+        # 季报类表(财报节奏) —— **刻意与日报类分开**: 用 24h 判它必然永久误报
+        expr: >-
+          (time() - astock_db_lastday_ts) / 86400 > 120
+          and astock_db_lastday_ts > 0
+          and astock_db_lastday_ts{table=~"financials"}
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "季报类表 {{ $labels.table }} 已超过 120 天未更新"
+          description: >-
+            financials 为季度表, 正常节奏约 90 天一期; 超过 120 天说明
+            **连续两个报告期未入库**, 需查同步链路(不是"今天没拉到")。
 
   # 融合口径降级告警 (2026-09-19)
   #   背景: fusion 覆盖跌破 MIN_COVERAGE(0.80) 时会回退 f_ml; 而 f_ml 曾因数据湖

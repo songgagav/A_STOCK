@@ -534,9 +534,15 @@ def _ensure_obs_stack() -> None:
         if "prom" not in run:
             prom_exe = os.path.join(_OBS_DIR, "prom", "prometheus-2.53.2.windows-amd64", "prometheus.exe")
             if os.path.exists(prom_exe):
+                # [2026-09-22] 加 `--web.enable-lifecycle`: 没有它, `POST /-/reload`
+                # 返回 **403**, 于是**改完告警规则只能重启 Prometheus 才生效** ——
+                # 而"改了规则却没生效"没有任何症状(实测: 规则文件 mtime 20:09,
+                # Prometheus 启于 16:14, 规则 API 里还是旧的 1 条, 而所有人都以为改好了)。
+                # 开了它, 改规则后可 `curl -X POST localhost:9090/-/reload` 立即生效。
                 _start_obs_component("prometheus",
                                      [prom_exe, "--config.file=prometheus.yml",
-                                      "--storage.tsdb.path=prom/data"],
+                                      "--storage.tsdb.path=prom/data",
+                                      "--web.enable-lifecycle"],
                                      cwd=_OBS_DIR)
         if "grafana" not in run:
             g_home = os.path.join(_OBS_DIR, "grafana", "grafana-v11.1.0")

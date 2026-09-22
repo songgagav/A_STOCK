@@ -30,6 +30,55 @@ CAL_FILE = os.path.join(DATA_DIR, "trade_calendar.json")
 CACHE_MAX_AGE_DAYS = 30
 
 
+def calendar_provenance() -> dict:
+    """**日历判据的来源与强度** —— 供哨兵区分"权威日历"与"降级回退"。
+
+    [2026-09-22] 为什么必须把这层暴露出来:
+      `is_trading_day` / `latest_calendar_day` 有一条**三层回退链**:
+        ① 官方 AKShare 日历(`days`, 含**未来**日期) —— 权威
+        ② 无缓存时用 `daily_bars` 交叉 —— **它停在数据停的地方**(鸡生蛋)
+        ③ 再不行 weekday<5 —— 完全不知道节假日
+      而所有调用方此前只看到**一个布尔/一个日期**, **看不出用的是哪一层**。
+      后果: 当日历降级到 ② 时, "最后一个已收盘交易日"会退化成"最后一个有数据的日子",
+      于是 `engine_day` 与 `expected_day` **同时**停在同一天 ⇒ 落后恒为 0 ⇒
+      「供应商未发布」这个哨兵**静默失效**, 而报告上一切正常。
+
+      这与本仓反复出现的「看起来是事实 vs 其实是缺失」是同一族: 引擎把"无数据"说成
+      "非交易日", 而这里是把"日历降级"说成"刚好追平"。
+
+    返回 {source, strength, updated, n, future_days, fallback_ok}:
+      · strength: "official"      —— 官方日历(AKShare `tool_trade_date_hist_sina`), 含未来日期
+                  "data_derived"  —— 由 daily_bars 派生, **停在数据停处**
+                  "weekday_only"  —— 只知周末, 不知节假日
+
+    **强度判据为什么不能只看文件里的 `source` 字段**(实测踩到的坑):
+      该文件有**两个写入方**(见 `_PRESERVE_KEYS` 上方说明), 而导出脚本覆写时把
+      **文件级** `source` 写成了 `h5i:daily_bars.trading_days ...` —— 那是 `trading_days`
+      键的来源, 不是 `days` 键的来源。于是按 `source` 判会把**官方日历误判成降级**
+      (实测: 首版就这么判错了, 会把闸门永久卡在 `freshness_undeterminable`)。
+      可靠的不变量是: **数据派生的日历不可能包含未来交易日**。
+      实测 `days` 含 66 个今天之后的日期(到 20261231) ⇒ 它必然是官方日历。
+    """
+    cache = _load_cache()
+    if not cache.get("ok"):
+        return {"source": None, "strength": "weekday_only", "updated": None,
+                "n": 0, "future_days": 0, "fallback_ok": False}
+    days = set(cache.get("days") or ())
+    today8 = datetime.now().strftime("%Y%m%d")
+    future = sum(1 for d in days if str(d) > today8)
+    src = str(cache.get("source") or "cache")
+    weak = ("daily_bars" in src.lower()) or ("h5i:" in src.lower())
+    if future > 0:
+        # 含未来交易日 ⇒ 只能来自官方日历(数据派生绝无可能)
+        strength = "official"
+    elif weak:
+        strength = "data_derived"
+    else:
+        strength = "official"
+    return {"source": src, "strength": strength, "updated": cache.get("updated"),
+            "n": len(days), "future_days": future, "fallback_ok": True}
+
+
 def _empty_set():
     return {"ok": False, "days": set(), "updated": None, "source": None}
 

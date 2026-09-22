@@ -155,15 +155,28 @@ def engine_available(rd=None, refs=REF_SYMBOLS) -> dict:
     return out
 
 
-def engine_trading_days(refs=REF_SYMBOLS, rd=None) -> list:
-    """从引擎自身的**参考股票全历史**导出权威交易日列表（并集）。
+def engine_covered_days(refs=REF_SYMBOLS, rd=None) -> list:
+    """引擎**数据覆盖**的日期列表(参考股票全历史并集) —— **这不是交易日历**。
 
-    为什么不靠本地 `trade_calendar.json`: 它是**从数据派生的**, 数据停在哪它就停在哪
-    —— 实测 2026-09-19 生成的那份 `last=2026-09-08`, 恰好等于我们最后有数据的日子,
-    故它无法告诉我们 09-09..09-18 里哪些是交易日（鸡生蛋）。
-    而活跃股票的全历史日期**就是**权威交易日集合; 取若干只并集可规避单只停牌缺口。
+    [2026-09-22 P0 改名] 原名 `engine_trading_days`, 这个名字本身就是缺陷的一部分:
+    它诱导调用方把它当**日历**用, 而它实为「引擎有哪些天的数据」。
+    两者在引擎数据正常时**恰好相等**, 一旦引擎缺数据就分道扬镳 ——
+    于是「我没有那天的数据」被表述成「那天不是交易日」。
 
-    这同时消除了 `fetch_day` 的一处固有歧义: 有了权威交易日, "已知是交易日却取回 0 行"
+    实测(2026-09-22, 引擎数据停在 09-18):
+      trading_days: [20260915..20260918]
+      non_trading : [20260919, 20260920, 20260921, 20260922]
+    而本仓官方日历说 09-21/09-22 **是**交易日(周一/周二, 无法定假日)。
+    数据补齐后同一调用立刻恢复正常 —— **证实它就是"覆盖", 不是"日历"**。
+
+    **正确用法**:
+      · 「实际进度」= 本函数返回的末日 ⇒ 与 `expected_day` 比, 得出落后天数;
+      · 「应该到哪天」= **官方日历**(`trading_calendar.latest_calendar_day`),
+        **绝不可**取自本函数, 否则"引擎没数据"会被误判成"不是交易日"。
+
+    为什么本函数仍从引擎取(而不是直接用官方日历): 见下方原注释 ——
+    活跃股票的全历史日期**就是**它实际拥有数据的日子, 这正是"实际进度"的定义。
+    它同时消除了 `fetch_day` 的一处固有歧义: 有了覆盖集, "已知该有数据却取回 0 行"
     才能被判为**硬错误**, 而周末/节假日可以名正言顺地跳过。
     """
     if rd is None:
@@ -174,15 +187,24 @@ def engine_trading_days(refs=REF_SYMBOLS, rd=None) -> list:
             rows = list(rd.vals("日k", s, "*"))
         except Exception as e:  # noqa: BLE001
             raise EngineUnavailable(
-                f"取交易日历失败({ENGINE_ENDPOINT}) ref={s}: {type(e).__name__}: {e}") from e
+                f"取引擎数据覆盖失败({ENGINE_ENDPOINT}) ref={s}: {type(e).__name__}: {e}") from e
         for r in rows:
             d = str(r.get("date") or "")
             if len(d) == 8 and d.isdigit():
                 days.add(d)
     if not days:
         raise EngineUnavailable(
-            f"参考股票全历史为空({refs}) —— 引擎在线但无数据, 拒绝据此推断交易日")
+            f"参考股票全历史为空({refs}) —— 引擎在线但无数据, 拒绝据此推断任何日期集")
     return sorted(days)
+
+
+def engine_trading_days(refs=REF_SYMBOLS, rd=None) -> list:
+    """**已弃用别名** —— 请用 `engine_covered_days`。
+
+    保留仅为兼容既有调用点/外部脚本。名字具有误导性: 它返回的是引擎**数据覆盖**
+    的日期集, 不是交易日历(见 `engine_covered_days` 的说明)。
+    """
+    return engine_covered_days(refs=refs, rd=rd)
 
 
 def fetch_day(day: str, prefixes=PREFIXES, rd=None):
@@ -353,10 +375,22 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
 
     正确判据: 引擎至少应覆盖**今天之前的最后一个交易日**。
     （今天若已收盘, 引擎通常会覆盖今天, 那也满足 >= 该下界。）
+
+    [2026-09-22 P0 修] **同时输出日历判据的来源与强度**(`calendar_source` /
+    `calendar_strength`)。为什么必须暴露这层:
+      `latest_calendar_day` 走**三层回退**(官方日历 -> daily_bars 交叉 -> weekday)。
+      当它降级到「daily_bars 交叉」时, "最后一个已收盘交易日"会退化成
+      "最后一个有数据的日子" —— 于是 `engine_day` 与 `expected_day` **同时**停在
+      同一天, **落后恒为 0** ⇒ 「供应商未发布」这个哨兵**静默失效**,
+      而报告上只有一个漂亮的 0。
+      这与引擎把"无数据"说成"非交易日"是同一族错误的镜像:
+      **这里是把"日历降级"说成"刚好追平"。**
+      故本报文附带强度, 由 `datasource_gate` 据此把弱日历判为**不可判定**而非健康。
     """
     import datetime as _dt
     out = {"ok": False, "engine_day": str(engine_day) if engine_day else None,
-           "expected_day": None, "lag_trading_days": None, "today": None, "error": None}
+           "expected_day": None, "lag_trading_days": None, "today": None, "error": None,
+           "calendar_source": None, "calendar_strength": None}
     today = today or _dt.date.today()
     if isinstance(today, str):
         today = _dt.date.fromisoformat(today.replace("/", "-"))
@@ -364,6 +398,9 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
 
     try:
         import trading_calendar as TC
+        prov = TC.calendar_provenance()
+        out["calendar_source"] = prov.get("source")
+        out["calendar_strength"] = prov.get("strength")
         expected = TC.latest_calendar_day(today - _dt.timedelta(days=1))
     except Exception as e:  # noqa: BLE001
         out["error"] = f"交易日历不可用: {type(e).__name__}: {e}"
@@ -387,6 +424,15 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
             pass
         return out
     out["ok"] = True
+    # [2026-09-22 修] **追平时必须显式给出 0, 不能留 None**。
+    # 原实现只在"落后"分支赋值 `lag_trading_days`, 追平时该键保持初始的 None ——
+    # 而 `None` 在消费方(`datasource_gate.classify_engine`)的语义是
+    # "**无法判定**新鲜度", 于是它退到 `today_lag_hint` 兜底; 兜底也没有时,
+    # 一次**完全正常**的探针会被判成 `freshness_undeterminable`(不可判定 != 健康)。
+    # 实测: 引擎已追平 09-22 却仍报 `ok:false, kind:freshness_undeterminable`。
+    # "追平"是**有结论**的(结论就是 0 天), 与"判不出来"必须分开 —— 这与本仓
+    # "缺字段 = 无信息, 不据此拒单" 同源: 有结论就别报成没结论。
+    out["lag_trading_days"] = 0
     return out
 
 
@@ -428,7 +474,7 @@ def main() -> int:
         lo = args.from_.replace("/", "-")
         hi = args.to.replace("/", "-")
         try:
-            all_td = engine_trading_days()
+            all_td = engine_covered_days()
         except EngineUnavailable as e:
             print(json.dumps({"ok": False, "errors": [str(e)]}, ensure_ascii=False, indent=2))
             return 1
@@ -446,8 +492,39 @@ def main() -> int:
         return 2
 
     if args.trading_days:
-        print(json.dumps({"trading_days": days, "non_trading": non_trading},
-                         ensure_ascii=False, indent=2))
+        # [2026-09-22 P0] **键名必须说实话**。
+        # 原先输出 `trading_days` / `non_trading`, 读者很自然地把它读成
+        # 「这些天是交易日 / 那些天不是交易日」—— 而它实为
+        # 「引擎**有数据**的日子 / **没数据**的日子」。实测 2026-09-22 引擎缺数据时,
+        # 该输出把 09-21/09-22 列进 `non_trading`, 一个真实故障被读成"最近在放假"。
+        # 现同时给出**官方日历口径**, 让"没数据"与"非交易日"一目了然。
+        try:
+            import trading_calendar as _TC
+            prov = _TC.calendar_provenance()
+            cal_days = _TC._calendar_days() or set()
+            cand2 = _calendar_days(args.from_.replace("/", "-"),
+                                   args.to.replace("/", "-")) if (args.from_ and args.to) else []
+            official_in_range = [d for d in cand2 if d in cal_days]
+            strength = prov.get("strength")
+        except Exception as e:  # noqa: BLE001
+            official_in_range, strength = [], f"不可用: {type(e).__name__}"
+        missing = [d for d in official_in_range if d not in set(days)]
+        print(json.dumps({
+            # 说实话的名字
+            "engine_days_with_data": days,
+            "engine_days_without_data": non_trading,
+            # 官方日历口径(判"该不该有数据"的唯一依据)
+            "official_trading_days_in_range": official_in_range,
+            "official_calendar_strength": strength,
+            # 关键衍生量: 官方说是交易日、引擎却没有数据
+            "missing_data_on_trading_days": missing,
+            "note": ("`engine_days_without_data` 含**周末**与**引擎缺数据**两类, "
+                     "不可读作『非交易日』; 判『该不该有数据』请看 "
+                     "official_trading_days_in_range, 差值见 missing_data_on_trading_days"),
+            # 兼容旧键(有误导性, 保留以免破坏既有调用方)
+            "trading_days": days,
+            "non_trading": non_trading,
+        }, ensure_ascii=False, indent=2))
         return 0
 
     print(f"[计划] 交易日 {len(days)} 天: {days}")

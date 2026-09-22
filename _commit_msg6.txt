@@ -1,0 +1,105 @@
+fix(sentinel): 根治日历判据 + 告警按节奏分档 + 三库决策登记 (2168 passed)
+
+按用户对本批次的定性与优先级执行。用户指出 ②(引擎日历)是当前最严重的设计缺陷,
+并把 ⑤(TableStale24h 已 firing 330 次)定性为"永久假阳性的另一种形态"。
+
+## ② P1-ENGINE-CALENDAR-ROOT(按用户定性, 含 P0 级哨兵修复)
+
+用户原话: 「expected_day 不能取引擎的日期集, 否则『引擎没数据』会被误判为
+『不是交易日』」——**核实后发现哨兵侧本已取本仓日历**, 真正的 P0 在**更深一层**。
+
+### ① 命名不再冒充日历
+`engine_trading_days()` -> **`engine_covered_days()`**(旧名保留为**已标注弃用**的别名)。
+名字本身是缺陷的一部分: 它诱导调用方把「引擎数据覆盖」当**日历**用。
+docstring 写明: 「实际进度」= 本函数; 「应该到哪天」= **官方日历**, 绝不可取自本函数。
+
+### ② CLI 键名说实话
+原 `trading_days` / `non_trading` 会被读成「这些天是交易日/那些天不是」, 而实测它把
+引擎缺的 09-21/09-22 列进 `non_trading` —— **一个真实故障被读成「最近在放假」**。
+现输出 `engine_days_with_data` / `official_trading_days_in_range` /
+**`missing_data_on_trading_days`**(官方说是交易日、引擎却没数据), 旧键保留兼容并附说明。
+
+### ③ 日历强度可见 + 降级必须判为「不可判定」(本条真正的 P0)
+`expected_day` 由**三层回退链**给出: 官方 AKShare 日历 -> `daily_bars` 派生 -> 仅周末。
+**降级到中间层时**,「最后一个已收盘交易日」退化成「最后一个有数据的日子」,
+于是 `engine_day` 与 `expected_day` **同时**停住 ⇒ **落后恒为 0** ⇒ 哨兵静默失效,
+而报告上是个漂亮的 0。
+**这是引擎那个错误的镜像: 引擎把「无数据」说成「非交易日」, 这里是
+「把日历降级说成刚好追平」。**
+
+新增 `trading_calendar.calendar_provenance()`(`official`/`data_derived`/`weekday_only`),
+`freshness()` 带上它, `classify_engine()` **在查落后天数之前先查日历强度** ——
+非 official 一律 `freshness_undeterminable`(**不可判定 != 健康**)。
+
+### ④ 强度判据踩过的坑(留档)
+首版按文件级 `source` 判 ⇒ 把**官方日历误判成降级**, 会把闸门**永久卡死**。
+原因: 该文件有**两个写入方**, 导出脚本覆写时把文件级 `source` 写成了
+`h5i:daily_bars.trading_days` —— 那是 `trading_days` 键的来源, **不是 `days` 键的**。
+可靠不变量: **数据派生的日历不可能含未来交易日**。实测 `days` 含 **66 个**未来日期
+(到 20261231) ⇒ 必然是官方日历。已据此改判, 实测 strength=`official`。
+
+### ⑤ 顺带修掉一个真 bug
+`freshness()` 只在「落后」分支赋 `lag_trading_days`, **追平时留 `None`**;
+而 `None` 在 `classify_engine` 的语义是「判不出来」⇒ 一次**完全正常**的探针被判
+`freshness_undeterminable`。实测引擎已追平 09-22 却仍报 `ok:false`。
+「追平」是**有结论**的(结论就是 0 天), 与「判不出来」必须分开。
+
+实测: 追平 -> `{ok:true, lag:0}`; 模拟 `data_derived` -> `{ok:false,
+kind:freshness_undeterminable}` 并给出降级来源。新增 13 例守卫。
+
+## ⑤ P1-TABLE-STALE-THRESHOLD-PER-RHYTHM(处置 330 次 firing)
+
+**根因是设计错误, 不是数据问题**: 原规则用**单一 24h 阈值**打所有表, 而各表节奏不同。
+实测最后一日:
+
+| 表 | 最后一日 | 年龄 | 真实节奏 |
+|---|---|---|---|
+| daily_bars / northbound_money | 09-22 | **0.9 天** | 每交易日(健康) |
+| margin_daily | 09-18 | 4.9 天 | 每交易日 |
+| valuation / valuation_snapshot / money_flow_estimate | 09-08 | **14.9 天** | 每交易日(真停更) |
+| financials | 06-30 | **84.9 天** | **每季度** |
+
+`financials` 是**季度表**, 用 24h 判它**必然永久超阈** —— 这就是 330 次的主因;
+而 `daily_bars` 用 24h 又**太松**。
+
+处置(**按节奏分档, 不是静音**): `TableStaleDaily`(6 张日报表, >5 天) +
+`TableStaleQuarterly`(financials, >120 天); 删除 `TableStale24h`。
+**不改为 silenced**: 静音会连**真停更**一起盖住 —— 而 valuation 那 14.9 天是真的停了。
+
+**顺带根治「改了规则不生效」**: 实测 `POST /-/reload` 返回 **403**
+(未开 `--web.enable-lifecycle`), 而规则**只在启动时读一次** ⇒ 改规则必须重启才生效,
+且**没有任何症状**。已在 `_ensure_obs_stack()` 拉起参数加上该 flag,
+实测重启后 `/-/reload` 返回 **200**。规则 14 条已生效, `TableStaleDaily` state=pending,
+`TableStaleQuarterly` 正确静默(84.9 < 120)。
+
+## ⑤ 三库: DECISION accepted(记录为已知状态)
+
+按用户决定不补, 新建 `docs/stockdb-source-status.md` 记录:
+三库状态 / 为何不补(收益 0, 代价是引擎停机) / `data/LOCK` 影响面(只影响写者) /
+**厂商是否停更的判断框架** / **akshare 备选主源的口径验证结果**。
+
+## ⑤ 换手影响已记入 SUPERSEDED.json
+
+`turnover_impact`: 4 只换手(增 600064/601900/603883/688002, 掉 601333/600908/603055/601838);
+**归因 = 数据截面变化**(同一代码/同一 weights, 唯一变量是 h5i 多了 2 天), 不是因子变化;
+3 笔持仓与新旧 top10 的关系; **不调仓**的三重理由(T+1 锁定 / 调仓间隔 3 天未到 /
+「不在榜上」不是卖出信号); 以及风险提示(不要用新数据回溯性改写已有止损线)。
+
+## akshare 口径验证(用户要求)
+
+抽样 60 只在市标的对比重叠日 09-18: OHLC/pct **15/16 逐值一致**;
+`volume` 比值 **mean=100.0001**(手->股, ×100); `amount` **16/16 为 1:1**;
+缺口日 09-21/09-22 **32/32 可取**。
+
+那 1 例(600177 `pct_chg` +0.49 vs −1.93)**已定性为复权口径差异, 非数据错误**:
+引擎自洽(`8.14/8.10−1 = +0.4938%` ✓, 其 pre_close 为除权调整后), akshare 不复权用 8.30。
+**独立复核未完成** —— akshare 限流(约 80 次请求后 ConnectionError), 未能取 `qfq` 对比。
+已如实登记为"假设有强证据、待复核"。
+
+## 登记与测试
+
+ops/acceptance_status.json 102 -> **106**: P1-ENGINE-CALENDAR-ROOT(fixed) /
+P1-TABLE-STALE-THRESHOLD-PER-RHYTHM(fixed) / DECISION-STOCKDB-THREE-STORES(accepted) /
+LESSON-N-QUERIES-ASK-IF-KEYS-REPEAT(accepted, 用户要求固化)。
+
+测试 **2168 passed / 26 skipped / 0 failed**(新增 13 哨兵守卫 + 2 告警分档守卫)。

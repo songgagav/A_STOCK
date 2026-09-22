@@ -92,6 +92,47 @@ class TestSingleSourceOfTruthForAlertRules:
                 assert (r.get("labels") or {}).get("severity"), f"{r.get('alert')} 缺 severity"
 
     @_needs_yaml
+    def test_no_single_threshold_for_all_tables(self):
+        """**告警阈值必须按更新节奏分档**, 不能一刀切。
+
+        2026-09-22 实测: 原规则 `TableStale24h` 用**单一 24h 阈值**打所有表, 而
+        `financials` 是**季度**表(最后一日 2026-06-30, 84.9 天前) —— 它**必然永久超阈**,
+        于是该规则自 09-08 起 **firing 330 次**, 长期无人处理。
+        **长期无人处理的告警等于没有告警**: 它训练人忽略这个频道 ——
+        与 obs_stack 那条常亮 OVERDUE 同源。
+
+        真实节奏: 日报类(每交易日) vs 季报类(约 90 天)。故必须分开。
+        """
+        import yaml
+        fp = os.path.join(_REPO, "ops", "alert_rules.yml")
+        d = yaml.safe_load(open(fp, encoding="utf-8"))
+        names = {r["alert"] for g in d["groups"] for r in g["rules"]}
+        assert "TableStale24h" not in names, \
+            "TableStale24h 回来了 —— 用 24h 判季度表必然永久误报"
+        assert "TableStaleDaily" in names, "缺日报类阈值"
+        assert "TableStaleQuarterly" in names, "缺季报类阈值"
+        # 两条的阈值必须不同(否则等于没分档)
+        exprs = {r["alert"]: str(r["expr"]) for g in d["groups"] for r in g["rules"]}
+        for a in ("TableStaleDaily", "TableStaleQuarterly"):
+            assert "> 5" in exprs[a] or "> 120" in exprs[a], f"{a} 阈值可疑: {exprs[a][:80]}"
+        assert "> 5" in exprs["TableStaleDaily"], "日报类阈值应为 5 天"
+        assert "> 120" in exprs["TableStaleQuarterly"], "季报类阈值应为 120 天"
+
+    @_needs_yaml
+    def test_every_rule_has_severity_and_description(self):
+        """告警必须可行动: 有 severity, 且 description 说得清**去哪儿查**。"""
+        import yaml
+        fp = os.path.join(_REPO, "ops", "alert_rules.yml")
+        d = yaml.safe_load(open(fp, encoding="utf-8"))
+        for g in d["groups"]:
+            for r in g["rules"]:
+                name = r["alert"]
+                assert (r.get("labels") or {}).get("severity"), f"{name} 缺 severity"
+                ann = r.get("annotations") or {}
+                assert ann.get("summary"), f"{name} 缺 summary"
+                assert ann.get("description"), f"{name} 缺 description"
+
+    @_needs_yaml
     def test_deadman_and_datasource_rules_exist(self):
         """2026-09-22 这批规则的**存在性**必须锁住。
 
