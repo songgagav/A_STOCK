@@ -1,0 +1,54 @@
+feat(ops): stockdb.exe 改为服务托管, 与 daemon 一起起停 (2084 passed)
+
+用户要求: "将这个 exe 改为服务托管与 daemon 一起"。
+
+== 为什么需要 ==
+stockdb.exe 是生产摄入主路径的硬依赖(SDK 直连 127.0.0.1:7899), 但此前只能
+**人工双击启动**。2026-09-22 它没跑 ⇒ 11:31 起盘中引擎静默停摆、下午无行情
+无撮合, 而下游症状与"今天是节假日"**无法区分**。daemon 由 NSSM 托管、
+stockdb 靠人记得双击 —— 两者可靠性差一个量级。
+
+== 交付 ==
+· ops/install_stockdb_service.ps1 (新): NSSM 注册 AStockStockdb。
+  AppDirectory=E:\A_stockDB(**必须**: stockdb.conf 的 work_dir/pidfile 都是相对
+  路径, 换目录就读不到库)、SERVICE_AUTO_START、AppExit Restart、
+  AppThrottle=180000(崩溃风暴保护: 1 小时内重启超 20 次则放弃并置停止 ——
+  不设它 flapping 会掩盖真故障)、stdout/stderr 落 logs/stockdb_service.*.log。
+  沿用 daemon 脚本的 NSSM 信任纪律(校验 SHA256 + 显式 -IAcceptUnsignedNssm)。
+
+· ops/service_control.ps1 (改): 引擎一并纳管, 保证**启动顺序**(先引擎后守护)
+  与**停止顺序**(先守护后引擎); status 同屏报出两个服务与 7899 监听状态。
+  **不建立 SCM 静态依赖** —— daemon 启动时主动探活引擎(探不到 exit 4),
+  静态依赖会让 SCM"等待"依赖项而 daemon 又断言它必须已就绪 ⇒ 启动死锁。
+
+· src/daemon.py (改): 新增**运行期巡检** _ensure_stockdb()。这是当天事故真正
+  的缺口: 启动闸门早就挡得住, 但没有任何东西在运行期发现引擎掉了。巡检只报告
+  不拉起(与 _check_flow 同纪律, 理由更强: 引擎掉线通常是 leveldb 坏了或更新器
+  没跑, 重启只得到一台能连上但取不到数的引擎 —— P1-ENGINEDEP 的原话)。
+  机器重启后的自动拉起由 SCM 负责, 那才是"该自动"的一半。降噪: 结论变化或
+  每 5 分钟才记一次。
+
+== 实测证据(不是"配了就假设生效") ==
+· 服务形态下真能取数: engine_bars_sync --probe -> ok=true, rows=6475,
+  day=20260918(端口开着 ≠ SDK 能取数, 故必须用真探针验证);
+· **自愈实测**: 强杀 stockdb 进程 -> **6 秒内** NSSM 自动拉起, pid 20520 -> 23724
+  (pid 确实更换, 不是"已死 pid 未变"那类假 PASS);
+· 巡检实测: 在监听时静默、模拟掉线时 CRITICAL + 人工处置指引;
+· 两服务均 Running/Automatic; service_control.ps1 -Action status/start 均 exit 0。
+
+== 踩到并修掉的两个坑 ==
+① .ps1 缺 UTF-8 BOM ⇒ PowerShell 按 GBK 解析, 中文注释乱码破坏引号配对, 报错
+   落在完全无关的行上(**正是本仓已登记的 P2-PS1BOM**; 既有测试
+   test_interp_parity_helpers.py::TestPowerShellScriptEncoding 已覆盖 ops/,
+   会替我看住 —— 编辑工具会抹掉 BOM, 这次又踩了一次);
+② 中文全角冒号紧跟变量名($StockdbService: 状态=)被当成 PowerShell drive 引用
+   ⇒ InvalidVariableReferenceWithDrive, 故中文标签里的变量一律写 ${var}。
+另: NSSM 控制台型服务从 StartPending 到 RUNNING 实测约 18 秒, 而端口在转
+   RUNNING **之前**就已监听 —— 就绪判定必须**同时**等"服务 Running"与"端口在听",
+   只等其一都会误判(这个瞬态一度让状态显示为 Paused)。
+
+== 登记 ==
+P0-DATASRC-STOCKDB: open -> partial(服务托管完成; 剩余为数据新鲜度本身 ——
+引擎 day=20260918 落后最后已收盘交易日 20260921 一个交易日, 补数需跑更新器)。
+
+测试: +tests/test_stockdb_patrol.py(13 例, 含"巡检绝不重启引擎"与接线存在性)

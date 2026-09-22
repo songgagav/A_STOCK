@@ -1,6 +1,7 @@
 ﻿<#
 .SYNOPSIS
   启动/停止/查询 AStockDaemon 服务，并清理探测遗留的垃圾服务（需**管理员**）。
+  [2026-09-22] 同时托管**行情引擎** AStockStockdb（stockdb.exe），两者一起起停。
 
 .BACKGROUND 为什么不直接用 `nssm start`
   上一次提权安装时**卡在 `nssm start`** 上：服务已注册（注册表参数全部正确、路径 Test-Path=True），
@@ -9,16 +10,34 @@
   `nssm start` 的语义是"启动并等待服务进入 RUNNING"，应用没起来时它会一直等。
   故此处改用 `sc.exe start`（立即返回）+ **轮询**判定，把"等待"变成可观测、可超时的检查。
 
+.BACKGROUND 为什么要和 stockdb 一起管（P0-DATASRC-STOCKDB）
+  stockdb.exe 是生产摄入主路径的硬依赖，但此前只能**人工双击启动**。
+  2026-09-22 它没跑 ⇒ 11:31 起盘中引擎静默停摆、下午无行情无撮合，而下游症状
+  与"今天是节假日"**无法区分**。daemon 由 NSSM 托管、stockdb 靠人记得双击，
+  两者可靠性差一个量级 —— 故并入同一控制面，并保证**启动顺序**（先引擎后守护）:
+  daemon 启动时会主动探活 stockdb，探不到就 exit 4 拒绝启动；
+  先起 stockdb 才能让这条闸门通过，而不是让守护带着错误码反复重启。
+
+  注: 两者**不建立 SCM 静态依赖**。静态依赖会让 SCM"等待"依赖项，而 daemon 又
+  断言依赖项必须已就绪 —— 叠加起来是启动死锁。顺序由本脚本保证。
+
 .用法（管理员）
-  pwsh -File ops\service_control.ps1 -Action start
-  pwsh -File ops\service_control.ps1 -Action stop
+  pwsh -File ops\service_control.ps1 -Action start      # 先 stockdb 后 daemon
+  pwsh -File ops\service_control.ps1 -Action stop       # 先 daemon 后 stockdb
   pwsh -File ops\service_control.ps1 -Action status
+  pwsh -File ops\service_control.ps1 -Action start -SkipStockdb   # 只管 daemon
 #>
 [CmdletBinding()]
 param(
   [ValidateSet('start', 'stop', 'status', 'restart', 'heal', 'diag')]
   [string]$Action = 'status',
   [string]$ServiceName = 'AStockDaemon',
+  # 行情引擎服务名（由 ops/install_stockdb_service.ps1 注册）
+  [string]$StockdbService = 'AStockStockdb',
+  # 只管 daemon、不碰行情引擎（调试或引擎单独维护时用）
+  [switch]$SkipStockdb,
+  # 引擎端点：start 时轮询它就绪（与 daemon 的启动闸门同一端口）
+  [int]$EnginePort = 7899,
   [string[]]$StrayServices = @('__probe_svc__'),
   [string]$DiagDump = '',
   [int]$TimeoutSec = 90
@@ -40,6 +59,61 @@ function DaemonProcs() {
       $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
       $cl -and ($cl -match 'daemon\.py')
     })
+}
+
+# ---- 行情引擎（stockdb.exe）辅助：**必须定义在用到它的分支之前** ----
+# PowerShell 的函数**不提升**（脚本按行执行），而 `status` 分支在文件前部就 exit 了。
+# 实测把函数留在文件后部时, `status` 会报 `EngineListening is not recognized`
+# —— 于是"引擎不在监听"这一行永远显示为空, 恰好把本功能想暴露的故障又藏了回去。
+function EngineListening([int]$port) {
+  return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+}
+
+function EnsureStockdbRunning() {
+  if ($SkipStockdb) { Step '[行情引擎] 已指定 -SkipStockdb，不管理'; return $true }
+  if (-not (Get-Service -Name $StockdbService -ErrorAction SilentlyContinue)) {
+    Step "[行情引擎] 服务 $StockdbService 不存在 —— 请先跑 ops\install_stockdb_service.ps1"
+    Step '            （本次继续启动 daemon；daemon 自身的引擎闸门会判定是否放行）'
+    return $false
+  }
+  $st = (Get-Service -Name $StockdbService).Status
+  if ($st -ne 'Running') {
+    Step "[行情引擎] $StockdbService 状态=$st -> sc.exe start（立即返回，稍后轮询）"
+    & sc.exe start $StockdbService | Out-Null
+  } else {
+    Step "[行情引擎] $StockdbService 已在运行"
+  }
+  # 判定必须**同时**满足"服务 Running"与"端口在监听"。
+  # 实测(NSSM + 控制台型应用): 服务先经 StartPending, 约 **18 秒**才转 RUNNING,
+  # 而端口在转 RUNNING **之前**就已监听 —— 只等端口会在服务仍 StartPending 时
+  # 就宣布就绪; 只等服务状态又会在端口还没起时就往下走。两者都要。
+  $t = 0
+  while ($t -lt 90) {
+    $s2 = (Get-Service -Name $StockdbService).Status
+    $listen = EngineListening -port $EnginePort
+    if ($s2 -eq 'Running' -and $listen) {
+      Step "  [OK] 服务 Running 且 $EnginePort 已监听（+${t}s）"
+      return $true
+    }
+    Start-Sleep -Seconds 2; $t += 2
+  }
+  $sFinal = (Get-Service -Name $StockdbService).Status
+  Step "  [FAIL] +${t}s 未就绪: 服务状态=$sFinal $EnginePort 监听=$(EngineListening -port $EnginePort)"
+  Step '         查 logs\stockdb_service.err.log 与 E:\A_stockDB\log.txt'
+  return $false
+}
+
+function StopStockdbService() {
+  if ($SkipStockdb) { return }
+  if (-not (Get-Service -Name $StockdbService -ErrorAction SilentlyContinue)) { return }
+  Step "[行情引擎] 停止 $StockdbService"
+  & sc.exe stop $StockdbService | Out-Null
+  $t = 0
+  while ($t -lt $TimeoutSec) {
+    Start-Sleep -Seconds 2; $t += 2
+    if ((Get-Service -Name $StockdbService).Status -eq 'Stopped') { break }
+  }
+  Step "  停止后状态: $((Get-Service -Name $StockdbService).Status)"
 }
 
 Step "================ Action=$Action Service=$ServiceName ================"
@@ -68,6 +142,18 @@ Step "当前状态: $($svc.Status)"
 
 if ($Action -eq 'status') {
   Step "daemon 进程: $((DaemonProcs).Id -join ', ')"
+  # 行情引擎同屏报出 —— 它是本控制面托管的第二个服务。只看 daemon 会漏掉
+  # 2026-09-22 那类故障: daemon 一切正常, 引擎却不在监听。
+  if (Get-Service -Name $StockdbService -ErrorAction SilentlyContinue) {
+    $sg = Get-Service -Name $StockdbService
+    $listening = EngineListening -port $EnginePort
+    Step "行情引擎 ${StockdbService}: 状态=$($sg.Status) StartType=$($sg.StartType) ${EnginePort} 监听=$listening"
+    if ($sg.Status -ne 'Running' -or -not $listening) {
+      Step '  [WARN] 引擎不在监听 => 摄入为 0 行, 且症状与"今天没数据"无法区分 (P0-DATASRC-STOCKDB)'
+    }
+  } else {
+    Step "行情引擎 ${StockdbService}: 服务不存在（未托管）—— 跑 ops\install_stockdb_service.ps1 注册"
+  }
   exit 0
 }
 
@@ -148,8 +234,12 @@ if ($Action -eq 'diag') {
   exit 0
 }
 
+# ---- 行情引擎（stockdb.exe）启停：**先引擎后守护** ----
+# （辅助函数 EngineListening / EnsureStockdbRunning / StopStockdbService 已提到
+#   文件前部定义 —— PowerShell 函数不提升, 而 status 分支在前部就 exit 了。）
+
 if ($Action -eq 'stop') {
-  Step '停止服务'
+  Step '停止服务（顺序: 先 daemon 后行情引擎）'
   & sc.exe stop $ServiceName | Out-Null
   $t = 0
   while ($t -lt $TimeoutSec) {
@@ -158,11 +248,12 @@ if ($Action -eq 'stop') {
   }
   Step "停止后状态: $((Get-Service -Name $ServiceName).Status)"
   Step "残留 daemon 进程: $((DaemonProcs).Id -join ', ')"
+  StopStockdbService
   exit 0
 }
 
 if ($Action -eq 'restart') {
-  Step '重启: 先停'
+  Step '重启: 先停（顺序: 先 daemon 后行情引擎）'
   & sc.exe stop $ServiceName | Out-Null
   $t = 0
   while ($t -lt $TimeoutSec) {
@@ -170,6 +261,10 @@ if ($Action -eq 'restart') {
     if ((Get-Service -Name $ServiceName).Status -eq 'Stopped') { break }
   }
   Step "  停止后状态: $((Get-Service -Name $ServiceName).Status)"
+  if (-not $SkipStockdb) {
+    StopStockdbService
+    EnsureStockdbRunning | Out-Null
+  }
 }
 
 # ---- 自愈验证: 杀掉 daemon 进程, 看 NSSM 是否按 AppExit=Restart 自动拉起 ----
@@ -203,6 +298,13 @@ if ($Action -eq 'heal') {
 }
 
 Step '启动服务（sc.exe start，立即返回）'
+# 顺序: **先行情引擎, 后守护**。daemon 启动时会探活 stockdb, 探不到就 exit 4
+# 拒绝启动（ops/start_daemon.ps1 的引擎闸门）—— 先起引擎才能让那条闸门通过,
+# 而不是让守护带着错误码反复重启。
+$engineOk = EnsureStockdbRunning
+if (-not $engineOk) {
+  Step '[WARN] 行情引擎未就绪 —— daemon 很可能因引擎闸门而拒绝启动（exit 4）'
+}
 & sc.exe start $ServiceName | Out-Null
 $t = 0; $final = $null
 while ($t -lt $TimeoutSec) {
@@ -216,6 +318,15 @@ while ($t -lt $TimeoutSec) {
 $svc = Get-Service -Name $ServiceName
 $procs = DaemonProcs
 Step "最终状态: $($svc.Status)   StartType=$($svc.StartType)   daemon 进程=$($procs.Id -join ', ')"
+# 行情引擎一并报出 —— 它是本控制面托管的第二个服务, 状态必须同屏可见
+if (-not $SkipStockdb -and (Get-Service -Name $StockdbService -ErrorAction SilentlyContinue)) {
+  $sg = Get-Service -Name $StockdbService
+  $listening = EngineListening -port $EnginePort
+  Step "行情引擎: $StockdbService 状态=$($sg.Status)  $EnginePort 监听=$listening"
+  if ($sg.Status -ne 'Running' -or -not $listening) {
+    Step '  [WARN] 行情引擎未就绪 —— 摄入将是 0 行, 且症状与"今天没数据"无法区分'
+  }
+}
 
 $q = (& sc.exe queryex $ServiceName 2>&1 | Out-String)
 Step ("sc queryex: " + (($q.Trim() -replace "`r?`n", ' | ')))

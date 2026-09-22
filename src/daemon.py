@@ -90,6 +90,9 @@ _state = {
 #: 不落盘: 守护重启后重新判定一次即可, 无需跨进程记忆。
 _FLOW_LAST: dict = {}
 
+#: 行情引擎(stockdb.exe)运行期巡检的上次结论 —— 同样只在变化/每 5 分钟记日志。
+_STOCKDB_LAST: dict = {}
+
 
 def _write_state():
     try:
@@ -351,6 +354,74 @@ def _check_flow() -> None:
         _FLOW_LAST.update(level=lvl, ts=now)
 
 
+def _probe_stockdb_port(timeout: float = 1.5) -> dict:
+    """**廉价**探活: 行情引擎端点是否在监听(纯 TCP connect, 不发协议请求)。
+
+    为什么不用 `engine_bars_sync --probe`: 那个探针要查参考股全历史, 实测 **1.71s**
+    （见 `_publish_health_state` 的注释）。启动闸门付得起这个代价, 但**运行期每 5 分钟
+    一次的巡检付不起** —— 守护主循环还要看护引擎与观测栈。
+
+    「端口开着」不等于「SDK 能取数」（P1-ENGINEDEP: 引擎在跑但库打不开时, 摄入照样
+    返回 0 行, 与『今天没数据』无法区分）。故这里只作为**快速失联判据**:
+    端口都不在, 一定是死的; 端口在, 再由下游探针/健康快照去确认能不能取数。
+    这个分工是有意的 —— 廉价信号抓"确定死了", 昂贵信号抓"活着但无用"。
+    """
+    import socket
+    try:
+        from config import PAPER as _P  # noqa: F401  仅为确认 config 可导入
+    except Exception:  # noqa: BLE001
+        pass
+    host, port = "127.0.0.1", 7899
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return {"listening": True, "endpoint": f"{host}:{port}", "error": None}
+    except Exception as e:  # noqa: BLE001
+        return {"listening": False, "endpoint": f"{host}:{port}",
+                "error": f"{type(e).__name__}: {e}"}
+
+
+def _ensure_stockdb() -> None:
+    """行情引擎(stockdb.exe)**运行期**巡检: 掉了就响亮报警。
+
+    为什么必须有这一段（2026-09-22 的真实事故, 见登记册 P0-DATASRC-STOCKDB）:
+    `ops/start_daemon.ps1` 早就有启动闸门（探不到引擎就 exit 4 拒绝启动）——
+    也就是说**启动时**是挡得住的。但当天的问题是:
+      ① 守护 16:09 才启动（上午根本没人看护）;
+      ② 更根本的是 —— **没有任何东西在运行期发现引擎掉了**。11:31 引擎失联后,
+         守护如果活着, 也只会继续看护一个注定拿不到数据的引擎, 直到收盘才发现
+         "今天没有新数据", 而这与"今天是节假日"**无法区分**。
+    启动闸门管不住运行期, 这一段补的就是那个缺口。
+
+    **只报告, 不擅自拉起** —— 与 `_check_flow` 同一条纪律, 理由更强:
+    引擎掉线通常意味着它的 leveldb 坏了或更新器没跑, 重启只会得到一台
+    能连上但取不到数的引擎（P1-ENGINEDEP 的原话: 症状与"今天没数据"无法区分）。
+    处置应转人工。而**机器重启后的自动拉起**由 SCM 负责（AStockStockdb 是
+    `SERVICE_AUTO_START` + `AppExit Restart`）—— 那才是"该自动"的那一半。
+
+    不刷屏: 结论变化时记一条, 持续期间每 5 分钟复述一次（与本循环的看护节奏一致）。
+    """
+    try:
+        r = _probe_stockdb_port()
+    except Exception as e:  # noqa: BLE001
+        _log(f"行情引擎巡检异常(不影响主循环): {type(e).__name__}: {e}")
+        return
+    listening = bool(r.get("listening"))
+    lvl = "OK" if listening else "CRITICAL"
+    now = time.time()
+    if lvl == "OK":
+        if _STOCKDB_LAST.get("level") not in (None, "OK"):
+            _log(f"行情引擎已恢复监听({r.get('endpoint')}) —— 数据摄入链路可用")
+        _STOCKDB_LAST.update(level="OK", ts=now)
+        return
+    if lvl != _STOCKDB_LAST.get("level") or (now - float(_STOCKDB_LAST.get("ts") or 0)) >= 300:
+        _log(f"[{lvl}] 行情引擎 {r.get('endpoint')} **不在监听** ({r.get('error')})")
+        _log(f"       后果: 盘中引擎取不到数会静默停摆, 且症状与『今天没数据』无法区分。")
+        _log(f"       处置(转人工, 不自动重启): 检查服务 AStockStockdb "
+             f"(`Get-Service AStockStockdb`); 若已停止, 查 {LOG_DIR}\\stockdb_service.err.log "
+             f"与 E:\\A_stockDB\\log.txt (常见: leveldb Corruption / 更新器未跑)。")
+        _STOCKDB_LAST.update(level=lvl, ts=now)
+
+
 def _publish_health_state() -> None:
     """发布运行态健康快照（路线图 #2 的**发布者**, 单一出口）。
 
@@ -574,6 +645,7 @@ def run_loop():
         dash_tick += 1
         if dash_tick >= 20:
             dash_tick = 0
+            _ensure_stockdb()          # [P0-DATASRC-STOCKDB] 行情引擎运行期巡检
             _ensure_dashboard()
             _ensure_obs_stack()
             _publish_health_state()
