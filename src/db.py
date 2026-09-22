@@ -99,8 +99,43 @@ def _h5i_store():
 # [m4 性能] h5i daily_bars 整窗预热缓存 (供 selector 等对全池逐 symbol 批量读取加速).
 # 仅当 StockDB.prefetch_daily_bars 显式预热后, get_bars 命中同窗口时走内存切片;
 # 未预热/窗口不符仍走逐条 SQL (语义/数值完全一致, 本缓存只做加速不做改写).
-_H5I_BULK_SLOT: dict = {"key": None, "frame": None, "window_days": 0}
+_H5I_BULK_SLOT: dict = {"key": None, "frame": None, "groups": None, "window_days": 0}
 _H5I_BULK_BACK_DAYS = 400  # 覆盖 >=200 交易日的自然日缓冲
+
+# [2026-09-22 性能] "最新一期"类单行查询的进程内记忆化。
+#
+# 为什么需要: `get_valuation` 与 `_h5i_fin` 都是**每只一条 SQL**, 而 selector 对
+# 全池(实测 filtered=2809)逐只调用 ⇒ 5000+ 次单行查询。实测单品耗时:
+#   get_valuation 0.254s/只 => 全池 11.9 分钟;  get_financials 0.046s/只 => 2.1 分钟.
+# 这是**日常管道里最大的一笔固定开销**, 且它是纯粹的 N 次重复查询 —— 每只只要
+# "最新一期"一行, 同一进程内重复问同一个 symbol 必然得到同一答案。
+#
+# 为什么安全: 只缓存 `as_of is None`(即"当前最新")的结果。指定 `as_of` 的历史查询
+# **不缓存** —— 那才是会因窗口不同而变的东西。数据在本进程生命周期内不会变
+# (跑批期间没有并发写入), 故记忆化不引入陈旧读数。
+# 与 `_H5I_BULK_SLOT` 同一立场: **只做加速, 不改语义**; 失败一律退回原 SQL 路径。
+_H5I_LATEST_CACHE: dict = {}
+
+#: `prefetch_latest_snapshots()` 的落点: {"valuation"|"financials": {symbol: Series}}。
+#: 与 `_H5I_BULK_SLOT` 同一立场: 只做加速, 未预热/键缺失时**退回原逐条 SQL**。
+_LATEST_SNAP: dict = {"valuation": {}, "financials": {}}
+
+#: no-lookahead 开关: 一旦置位, `prefetch_latest_snapshots()` 拒绝填充、
+#: `_get_valuation_uncached`/`_h5i_fin_uncached` 也不命中快照。
+#: 给历史回测(`selector._select_hist`)用 —— 那类上下文**必须**只看到 as-of 数据。
+_LATEST_SNAP_FROZEN: dict = {"on": False}
+
+
+def _latest_cached(table: str, canon: str, loader):
+    """按 (table, symbol) 记忆化"最新一期"; loader 抛错/返回空**不缓存**(留给下次重试)。"""
+    key = (table, canon)
+    hit = _H5I_LATEST_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = loader()
+    if val:
+        _H5I_LATEST_CACHE[key] = val
+    return val
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +565,70 @@ class StockDB:
         return {k: v for k, v in fin.items() if v is not None}
 
     # ---------- 批量预热 (m4 性能) ----------
+    def prefetch_latest_snapshots(self) -> bool:
+        """预热 valuation / financials 的**全市场最新一期**到进程级字典。
+
+        ⚠️ **只可用于"当前最新"口径的调用方, 绝不可用于 no-lookahead 历史回测。**
+        快照装的是**每个 symbol 的最新一行**, 若历史回测命中它, 就会把"今天的最新财报/
+        估值"喂给"过去某天的选股" —— 那是前视偏差, 属本仓最忌讳的一类错误
+        (见 `_select_hist` 的 no-lookahead 契约)。故本函数**只允许在 hist 上下文之外**
+        调用(见 `_LATEST_SNAP_FROZEN`), 且 `_h5i_fin_uncached` 只在 `as_of is None` 时命中。
+        目前 `selector._select_hist` 走的是独立的 `get_financials_asof(canon, hist_day)`,
+        不读本快照 —— 这层防护是为了**将来有人改动时不至于静默引入前视**。
+
+        [2026-09-22 性能] 为什么必须整表一次取:
+          `get_valuation` 与 `_h5i_fin` 都是"每只一条 SQL 取最新一期"。selector 对
+          全池(filtered=2809)逐只调用 ⇒ **2809 次扫描**。实测每次约 200ms —— 而瓶颈
+          **不是 CAST、也不是排序**(实测双 CAST / 单 CAST / 不 CAST 都是 ~200ms),
+          而是**扫过整张表本身**; `valuation` 有 **1540 万行**, 一次查询就要走一遍。
+          2809 × 200ms ≈ **9.4 分钟**, 是日常管道里最大的一笔固定开销。
+
+          一次性取全市场最新一期只要 **10.7s / 5812 只**(row_number 窗口函数,
+          单次扫描), 即约 **50× 改善**。
+
+        为什么不按 symbol 记忆化(我先试过, 无效): pool 里 2809 个 canon
+        **互不相同**, 每个 symbol 只被问一次 ⇒ 任何按 symbol 的缓存都必然全部未命中。
+        缓存对"重复问同一个键"有效, 而这里的访问模式是"每个键只问一次" ——
+        这正说明**该改的是查询形态(逐条 -> 批量), 不是加缓存**。
+
+        语义: 与逐条 `ORDER BY ts DESC LIMIT 1` 结果一致(窗口函数 rn=1 即最新一期)。
+        失败返回 False, 调用方退回逐条 SQL 路径。
+        """
+        if not _h5i_enabled():
+            return False
+        if _LATEST_SNAP_FROZEN.get("on"):
+            # hist/no-lookahead 上下文里**拒绝**预热, 免得把最新一期喂给历史回测
+            return False
+        try:
+            s = _h5i_store()
+        except Exception:  # noqa: BLE001
+            return False
+        if s is None:
+            return False
+
+        def _bulk(table: str, cols: str) -> dict:
+            q = (f"SELECT symbol, CAST(ts AS DATE) AS d, {cols} FROM ("
+                 f"  SELECT symbol, ts, {cols},"
+                 f"         row_number() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn"
+                 f"  FROM {table}"
+                 f") WHERE rn = 1")
+            df = s._db.sql(q).to_pandas()
+            if df is None or df.empty:
+                return {}
+            return {str(r["symbol"]): r for _, r in df.iterrows()}
+
+        try:
+            _LATEST_SNAP["valuation"] = _bulk(
+                "valuation", "pe_ttm, pb, ps_ttm, market_cap")
+            _LATEST_SNAP["financials"] = _bulk(
+                "financials", "roe, roe_diluted, eps, np_yoy, gross_margin, "
+                              "net_margin, ocf_ps, debt_ratio")
+        except Exception:  # noqa: BLE001
+            _LATEST_SNAP["valuation"] = {}
+            _LATEST_SNAP["financials"] = {}
+            return False
+        return bool(_LATEST_SNAP["valuation"] or _LATEST_SNAP["financials"])
+
     def prefetch_daily_bars(self, as_of=None, n: int = 200) -> bool:
         """预热 h5i daily_bars 到进程级内存窗 (selector 全池逐 symbol 读取加速).
 
@@ -565,7 +664,23 @@ class StockDB:
             ).to_pandas()
             if df is None or df.empty:
                 return False
-            _H5I_BULK_SLOT.update({"key": key, "frame": df, "window_days": _H5I_BULK_BACK_DAYS})
+            # [2026-09-22 性能修] 建**按 symbol 的索引**, 供 get_bars 做 O(1) 取子表。
+            #
+            # 原实现: `get_bars` 命中缓存后执行 `g[g["symbol"] == sym]` —— 对**整窗
+            # 151 万行**做全列布尔扫描。selector 逐只调用 2809 次 ⇒ 约 42 亿次比较,
+            # **纯 CPU 烧**(实测该轮选股累积 CPU 3980s ≈ 66 分钟当量, 而原始那轮只需
+            # 4 分钟)。它是 CPU-bound 而非 I/O-bound, 所以"加大缓存"没用。
+            #
+            # 改法: 预热时按 symbol 一次性分组, 之后 get_bars 只做字典查表 + tail(n)。
+            # **零语义变更**: 子表内容、排序、列都走同一条后续路径, `set_index`/`loc`
+            # 与布尔筛选结果逐行等价(已由 test_db_prefetch_index 逐值比对锁住)。
+            try:
+                df = df.sort_values("d")
+                groups = {sym: sub for sym, sub in df.groupby("symbol", sort=False)}
+            except Exception:  # noqa: BLE001
+                groups = None   # 分组失败就退回原布尔扫描路径, 不改变行为
+            _H5I_BULK_SLOT.update({"key": key, "frame": df, "groups": groups,
+                                   "window_days": _H5I_BULK_BACK_DAYS})
             return True
         except Exception:
             return False
@@ -584,8 +699,17 @@ class StockDB:
                 if int(n) <= 230 and _H5I_BULK_SLOT["frame"] is not None:
                     key = str(as_of)[:10] if as_of is not None else "latest"
                     if _H5I_BULK_SLOT["key"] == key:
-                        g = _H5I_BULK_SLOT["frame"]
-                        sub = g[g["symbol"] == _canon_to_db(canon)]
+                        # [2026-09-22 性能修] 走 symbol 索引 O(1) 取子表。
+                        # 原实现是 `g[g["symbol"] == sym]` —— 对整窗 151 万行做全列
+                        # 布尔扫描, selector 逐只调 2809 次 ⇒ 约 42 亿次比较, 纯 CPU 烧。
+                        # 索引缺失(分组失败)时**退回原路径**, 行为不变。
+                        _groups = _H5I_BULK_SLOT.get("groups")
+                        _sym = _canon_to_db(canon)
+                        if _groups is not None:
+                            sub = _groups.get(_sym)
+                        else:
+                            g = _H5I_BULK_SLOT["frame"]
+                            sub = g[g["symbol"] == _sym]
                         if sub is not None and not sub.empty:
                             df = sub.sort_values("d").tail(int(n)).rename(columns={"d": "date"})
                             keep = [c for c in ("date", "open", "high", "low", "close",
@@ -753,8 +877,41 @@ class StockDB:
     def _h5i_fin(self, canon: str, as_of=None) -> dict:
         """h5i.financials 最新一期(可截至 as_of). 列: ts, roe, roe_diluted, eps,
         np_yoy, gross_margin, net_margin, ocf_ps, debt_ratio, ..."""
+        # [2026-09-22 性能] **只在 as_of is None 时**记忆化。
+        # 指定 as_of 是历史窗口查询, 结果随窗口变 —— 缓存它会产生陈旧读数。
+        if as_of is None:
+            return _latest_cached("financials", canon,
+                                  lambda: self._h5i_fin_uncached(canon, None))
+        return self._h5i_fin_uncached(canon, as_of)
+
+    def _h5i_fin_uncached(self, canon: str, as_of=None) -> dict:
         s = _h5i_store()
         sym = _canon_to_db(canon)
+        # 批量快照命中(仅 as_of is None) -> 免去一次全表扫描
+        if as_of is None:
+            _snap = ({} if _LATEST_SNAP_FROZEN.get("on")
+                     else (_LATEST_SNAP.get("financials") or {}))
+            r = _snap.get(sym) if _snap else None
+            if r is not None:
+                import math as _m
+
+                def _num(v):
+                    try:
+                        f = float(v)
+                        return f if not _m.isnan(f) else None
+                    except Exception:  # noqa: BLE001
+                        return None
+                out = {"report_date": (str(r["d"])[:10] if r.get("d") is not None else None),
+                       "roe": _num(r.get("roe")), "roe_avg": _num(r.get("roe_diluted")),
+                       "eps": _num(r.get("eps")), "profit_yoy": _num(r.get("np_yoy")),
+                       "gross_margin": _num(r.get("gross_margin")),
+                       "net_margin": _num(r.get("net_margin")),
+                       "operate_cf": _num(r.get("ocf_ps"))}
+                # **刻意不含 debt_ratio**: 逐条路径同样不注入(见其后的注释 ——
+                # "duck 原实现 liability_ratio 恒 None, 为迁移前后行为逐位一致暂不注入")。
+                # 快照路径若擅自多给一个字段, 就会改变 governance_score 的输入 ——
+                # 那属于"加速顺手改了语义", 是本仓明令禁止的。
+                return {k: v for k, v in out.items() if v is not None}
         cond = f"symbol='{sym}'"
         if as_of is not None:
             cond += f" AND ts <= TIMESTAMP '{as_of}'"
@@ -787,6 +944,22 @@ class StockDB:
         return {k: v for k, v in fin.items() if v is not None}
 
     def get_valuation(self, canon: str) -> dict:
+        # [2026-09-22 性能] 记忆化"最新一期"(实测 0.254s/只 => 全池 11.9 分钟)。
+        # 只缓存最新口径; 本函数没有 as_of 形参, 故整体可缓存。
+        return _latest_cached("valuation", canon, lambda: self._get_valuation_uncached(canon))
+
+    def _get_valuation_uncached(self, canon: str) -> dict:
+        # 批量快照命中 -> 免去一次全表扫描(实测 ~200ms/只)
+        _snap = ({} if _LATEST_SNAP_FROZEN.get("on")
+                 else (_LATEST_SNAP.get("valuation") or {}))
+        if _snap:
+            r = _snap.get(_canon_to_db(canon))
+            if r is not None:
+                def _f(v):
+                    return None if v is None or (hasattr(v, "isna") and bool(pd.isna(v))) else v
+                return {"trade_date": (str(r["d"])[:10] if r.get("d") is not None else None),
+                        "pe_ttm": _f(r.get("pe_ttm")), "pb": _f(r.get("pb")),
+                        "ps_ttm": _f(r.get("ps_ttm")), "market_cap": _f(r.get("market_cap"))}
         if _h5i_enabled():
             try:
                 s = _h5i_store()

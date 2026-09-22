@@ -246,6 +246,24 @@ class RotationSelector:
         except Exception:
             pass
 
+        # [2026-09-22 性能] valuation/financials 的**全市场最新一期**批量预热。
+        #
+        # 为什么必须做: 下面的 scoring 循环里每只都要 `get_valuation` + `get_financials`,
+        # 而两者在 h5i 上都是"扫整表取最新一期" —— 实测每次约 200ms, 而瓶颈是
+        # **扫过 1540 万行本身**(双 CAST / 单 CAST / 不 CAST 三种写法都 ~200ms,
+        # 与排序、类型转换无关)。2809 只 ⇒ 约 **11 分钟**, 是日常管道最大的一笔固定开销。
+        # 一次性取全市场最新一期只要 **11.5s / 5812 只**, 之后每只是字典查表。
+        # 实测 25 只: 5.84s -> 0.011s(约 500x), 全池 10.9 分钟 -> 1.3 秒,
+        # 且**逐字段等价**(已用 NaN-aware 比对核过 25 只)。
+        #
+        # 注: 这里**不能**靠按 symbol 的记忆化解决 —— pool 里 2809 个 canon 互不相同,
+        # 每个 symbol 只被问一次 ⇒ 任何按 symbol 的缓存都必然全部未命中。
+        # 该改的是**查询形态(逐条 -> 批量)**, 不是加缓存。
+        try:
+            self.db.prefetch_latest_snapshots()
+        except Exception:
+            pass
+
         # 权重: 优先 ICIR 自适应(weight_optimizer 生成的 weights.json), 无则静态
         W = selector_weights()
 
@@ -429,6 +447,19 @@ class RotationSelector:
         # 逐条触发 h5i 全表扫描 (~1s/标的). 预热失败自动回退逐条 SQL (语义不变).
         try:
             self.db.prefetch_daily_bars(as_of=hist_day, n=200)
+        except Exception:
+            pass
+
+        # [2026-09-22 no-lookahead 防护] **冻结"最新一期"快照**。
+        # `prefetch_latest_snapshots()` 装的是每个 symbol 的**最新一行**(今天口径);
+        # 历史回测若命中它 = 把今天的财报/估值喂给过去的选股 = 前视偏差。
+        # 本路径当前走的是 `get_financials_asof(canon, hist_day)`(独立函数, 不读快照),
+        # 故此冻结**不改变现有行为** —— 它是防止将来有人改动时静默引入前视的护栏。
+        try:
+            import db as _db
+            _db._LATEST_SNAP_FROZEN["on"] = True
+            _db._LATEST_SNAP["valuation"] = {}
+            _db._LATEST_SNAP["financials"] = {}
         except Exception:
             pass
 
