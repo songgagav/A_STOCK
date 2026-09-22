@@ -40,10 +40,19 @@ def test_default_config():
 
 
 def test_cli_help():
+    # **必须显式 encoding**。中文 Windows 下 `text=True` 走 GBK 解码, 而
+    # `drl_train.py --help` 的描述里有中文(0xae 等字节 GBK 解不开)。错发生在
+    # subprocess 的**读取线程**里, `subprocess.run` 不抛, 而是静默返回 `stdout=None`,
+    # 于是断言报成 "argument of type 'NoneType' is not a container" ——
+    # 看起来像测试写坏了, 实际是**被测程序的 help 根本没被读到**。
+    # 2026-09-22 实测: 该用例在修复前一直是红的, 且原因一直被误读为断言写法问题。
     result = subprocess.run(
         [sys.executable, os.path.join(_BASE, "src", "drl_train.py"), "--help"],
-        capture_output=True, text=True, cwd=_BASE,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=_BASE,
     )
+    assert result.stdout is not None, (
+        f"--help 的 stdout 为 None(解码失败); stderr={result.stderr!r}")
     assert "--cvar_alpha" in result.stdout, "CLI --cvar_alpha 未在 help 中"
     assert "--cvar_coef" in result.stdout, "CLI --cvar_coef 未在 help 中"
     print("3. CLI --cvar_alpha / --cvar_coef: OK")

@@ -60,7 +60,12 @@ _SVC_STATE = {"1": "STOPPED", "2": "START_PENDING", "3": "STOP_PENDING", "4": "R
 
 def _sc_query(name=SERVICE):
     try:
-        o = subprocess.run(["sc.exe", "queryex", name], capture_output=True, text=True,
+        # 显式 utf-8: 这三处的父进程都是**中文 Windows**(生产解释器同样 cp936 默认),
+        # `sc.exe`/PowerShell 在中文系统上会输出中文消息。不加的话轻则乱码,
+        # 重则读取线程抛 UnicodeDecodeError 而 `subprocess.run` **静默返回 stdout=None**,
+        # 紧接着 `o.splitlines()` 报 AttributeError —— 报出来的错和真实原因无关。
+        o = subprocess.run(["sc.exe", "queryex", name], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
                            timeout=20).stdout
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -85,8 +90,9 @@ def _daemon_procs():
             ["powershell.exe", "-NoProfile", "-Command",
              "Get-Process python -ErrorAction SilentlyContinue | "
              "ForEach-Object { $_.Id }"],
-            capture_output=True, text=True, timeout=25).stdout
-        ids = [int(x) for x in ps.split() if x.strip().isdigit()]
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=25).stdout
+        ids = [int(x) for x in (ps or "").split() if x.strip().isdigit()]
     except Exception:  # noqa: BLE001
         return None
     if not ids:
@@ -96,8 +102,9 @@ def _daemon_procs():
             ["powershell.exe", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*daemon.py*' } | "
              "ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)\" }"],
-            capture_output=True, text=True, timeout=30).stdout
-        rows = [l.strip() for l in out.splitlines() if "|" in l]
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30).stdout
+        rows = [l.strip() for l in (out or "").splitlines() if "|" in l]
         return rows
     except Exception:  # noqa: BLE001
         return None

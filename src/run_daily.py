@@ -15,6 +15,18 @@ from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
 
 
+class _IngestSkipped(Exception):
+    """内部信号: 数据源健康门禁判定 HALT, 本次跳过某一步摄入。
+
+    为什么用异常而不是 if/else 层层缩进: 摄入步骤是一长串独立的 try/except,
+    逐个加 if 会把缩进推深好几层且容易漏; 用异常能保证**一个地方判定,
+    所有摄入步骤一致生效**。代价是必须显式捕获它, 否则会被下面的
+    `except Exception` 记成"error"而掩盖真实原因(这正是本仓最忌讳的
+    归因错误) —— 故每个摄入步骤都先 `except _IngestSkipped: pass`。
+    """
+    pass
+
+
 def self_closed_loop(day: str, day_dir: str, db) -> dict:
     """D->B 反馈闭环: 当日信号 IC 回算(幂等写 ic_history.csv) + ICIR 驱动因子权重刷新.
 
@@ -354,8 +366,67 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         except Exception as e:
             report["steps"]["premarket_healthcheck"] = {"ok": False, "error": str(e)[:200]}
 
-        # 1) 收盘后第一步: 增量补录数据库全表头数据 (断点续传, 已存在自动跳过)
+        # 0.5) [2026-09-22 数据源健康门禁] **在摄入之前**判定数据源是否可信。
+        #  为什么放在这里: 2026-09-22 的故障链是"引擎没跑 → 引擎静默停摆 → 直到
+        #  收盘才发现今天没有新数据", 而症状与"今天是节假日"无法区分。启动闸门
+        #  管启动那一刻、daemon 巡检管端口在不在, **都不管"服务活着但数据没进来"**。
+        #
+        #  停手范围(刻意区分): **只跳过摄入与依赖数据的下游动作(选股/因子视图/
+        #  回测/训练)**; **保留选股/持仓归档**(自选股/持仓归档照常) —— 与
+        #  kill_switch『只停新开仓, 绝不停离场』同一条纪律, 否则当天连持仓账都
+        #  不更新, 运维就失去了判断"账户现在什么样"的依据。
+        #
+        #  门禁自身异常 => allow=True(不阻断)并按本仓纪律响亮记录。
+        ds_allow = True
         try:
+            import datasource_gate as _DG
+            # 引擎**当场**探一次。为什么不能只看 `_prev`:
+            # `_prev` 是**上一轮**的产物, 它答的是"上次那会儿引擎好不好", 不是"现在"。
+            # 而这里位于摄入**之前** —— 此刻当天的 engine_bars_sync 还没跑, 没有产物可看;
+            # 若不探, 引擎"服务活着但数据没进来"这一整类失效**在本次判定里根本不存在**
+            # (2026-09-22 实测: 只传 sync_step/db_update_step 时 items 里连
+            #  `stockdb_engine` 都不出现 —— 检查项静默消失, 比检查失败更危险)。
+            # 探针失败(含超时/解码问题)**不阻断**: probe_engine 一律返回 ok=False 带原因,
+            # 逐次计入"连续失败", 连续 3 次才 HALT。
+            _pr = _DG.probe_engine()
+            _eng_probe = _pr.get("probe") if _pr.get("ok") else {
+                "ok": False, "error": _pr.get("error") or "探针失败"}
+            # 上一轮的 engine_bars_sync / db_update 产物(若存在)一并喂进去 ——
+            # 这样"连续失败"能在**本次摄入之前**就生效, 而不是等本次失败之后。
+            _prev = {}
+            try:
+                import glob as _glob
+                _dirs = sorted(_glob.glob(os.path.join(DAILY_DIR, "[0-9]" * 8)))
+                _dirs = [d for d in _dirs if os.path.basename(d) < day.replace("-", "")]
+                if _dirs:
+                    with open(os.path.join(_dirs[-1], "daily_summary.json"),
+                              encoding="utf-8-sig") as _f:
+                        _prev = (json.load(_f).get("steps") or {})
+            except Exception:  # noqa: BLE001
+                _prev = {}
+            _ds = _DG.check_and_record(engine_probe=_eng_probe,
+                                       sync_step=_prev.get("engine_bars_sync"),
+                                       db_update_step=_prev.get("db_update"))
+            report["steps"]["datasource_gate"] = _ds
+            ds_allow = bool(_ds.get("allow", True))
+            if not ds_allow:
+                print(f"[run_daily] 数据源健康门禁 HALT: {'; '.join(_ds.get('reasons') or [])}")
+                print("[run_daily] => 跳过摄入与选股; **持仓归档照常**(停手不停离场)")
+        except Exception as _e:  # noqa: BLE001
+            report["steps"]["datasource_gate"] = {"ok": False, "error": str(_e)[:200]}
+
+        # 1) 收盘后第一步: 增量补录数据库全表头数据 (断点续传, 已存在自动跳过)
+        #    门禁 HALT 时**整段跳过** —— 不产出任何可能污染台账的产物。
+        #    (不用异常做控制流: 那会让下面的 except 把它记成"error", 掩盖真实原因。)
+        def _skip_ingest(step: str) -> dict:
+            return {"ok": False, "skipped": "datasource_gate_halt",
+                    "note": (f"数据源健康门禁判定 HALT, 跳过 {step} 摄入 —— "
+                             f"不产出可能污染台账的产物; 持仓归档照常")}
+
+        try:
+            if not ds_allow:
+                report["steps"]["db_update"] = _skip_ingest("db_update")
+                raise _IngestSkipped()
             from update_db import update_all
             upd = update_all(day=datetime.strptime(day, "%Y-%m-%d").date(),
                              only=["daily_bars", "valuation_snapshot",
@@ -378,6 +449,8 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                     "daily_bars 路径已由 free_stockdb_sync 兜底"
                 ),
             }
+        except _IngestSkipped:
+            pass                       # 已如实记入 report, 不再覆盖成 generic error
         except Exception as e:
             report["steps"]["db_update"] = {"ok": False, "error": str(e)[:200]}
 
@@ -387,6 +460,9 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         #        "两个源"若无记录, 就会变成无人察觉的口径漂移。
         _eng = None
         try:
+            if not ds_allow:
+                report["steps"]["engine_bars_sync"] = _skip_ingest("engine_bars_sync")
+                raise _IngestSkipped()
             from engine_bars_sync import sync_to_latest
             _eng = sync_to_latest(apply=True)
             report["steps"]["engine_bars_sync"] = {
@@ -402,10 +478,16 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                 "errors": _eng.get("errors"),
                 "note": "厂商引擎 SDK 直连(stockdb.exe @127.0.0.1:7899) 主源",
             }
+        except _IngestSkipped:
+            pass
         except Exception as e:  # noqa: BLE001
             report["steps"]["engine_bars_sync"] = {"ok": False, "error": str(e)[:300]}
 
-        if isinstance(_eng, dict) and _eng.get("ok"):
+        if not ds_allow:
+            # 门禁 HALT: 镜像回退路径同样跳过 —— 数据源不可信时,
+            # "换个源再抓一遍"只会把不可信数据从另一条路灌进台账。
+            report["steps"]["free_stockdb_sync"] = _skip_ingest("free_stockdb_sync")
+        elif isinstance(_eng, dict) and _eng.get("ok"):
             # 主源成功: 不再跑镜像 —— 它已冻结, 跑它只会 scanned=0 白等约 1 分钟。
             report["steps"]["free_stockdb_sync"] = {
                 "ok": True, "skipped": True,
@@ -572,7 +654,18 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # 1) 选股 (交易日: 生成次日目标池 = 盘前决策产物).
         #    非交易日(maint): 跳过选股/市场情绪/连续回放, 因为无新交易数据.
         sel = None
-        if mode == "full":
+        if mode == "full" and not ds_allow:
+            # [数据源健康门禁] HALT 时不选股 —— 用不可信数据选出的池会污染台账,
+            # 且次日消费方无从区分"这是正常选出的池"还是"这是带病选出的池"。
+            # **持仓归档照常**(见下方 paper/book 段) —— 停手不停离场。
+            report["steps"]["select"] = {
+                "skip": True, "skipped": "datasource_gate_halt",
+                "reason": "数据源健康门禁判定 HALT, 跳过选股(避免带病产物污染台账)"}
+            report["steps"]["market_sentiment"] = {"ok": False, "skip": True,
+                                                   "reason": "数据源门禁 HALT 跳过"}
+            report["steps"]["continuous_replay"] = {"ok": False, "skip": True,
+                                                    "reason": "数据源门禁 HALT 跳过"}
+        elif mode == "full":
             selector = RotationSelector(db, n=MAX_STOCKS)
             sel = selector.select()
             sel["date"] = day

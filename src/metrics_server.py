@@ -209,6 +209,44 @@ def _refresh_drl_degrade() -> None:
         _g_drl_env_ok.set(0)
 
 
+_g_ds_allow = Gauge("astock_datasource_allow",
+                    "数据源健康门禁: 1=允许摄入 0=应停止摄入")
+_g_ds_level = Gauge("astock_datasource_level",
+                    "数据源健康门禁档位 (0=OK 1=DEGRADED 2=HALT 3=UNKNOWN)")
+_g_ds_read_ok = Gauge("astock_datasource_read_ok",
+                      "数据源门禁结论可读性 (0=读失败 => 告警源已失效)")
+
+
+def _refresh_datasource() -> None:
+    """暴露数据源健康门禁的结论 (2026-09-22 批次)。
+
+    为什么要有指标而不是只在面板显示: 告警链(Prometheus -> Alertmanager -> alert_hook)
+    是**夜里唯一会叫的人**。门禁的价值是"数据源死了要响亮停手", 若它只在面板上可见,
+    收盘后/夜间就没人知道 —— 而那正是故障通常发生的时候。
+
+    读的是**健康快照**(发布者已算好), 不在这里重跑判定: 面板与指标服务每 3 秒轮询,
+    重跑引擎探针(实测 1.71s)会拖垮它们。
+    """
+    try:
+        import health_state as _HS
+        pub = _HS.read_published()
+    except Exception as e:  # noqa: BLE001
+        _g_ds_read_ok.set(0)          # 显式暴露"读失败", 不留健康假象
+        print("datasource read err:", str(e)[:160], flush=True)
+        return
+    ds = ((pub or {}).get("observed") or {}).get("datasource") or {}
+    lvl = ds.get("level")
+    if lvl is None:
+        # 快照里没有该字段: 可能是旧版本发布的快照 —— 记为"不可读", 不记为健康
+        _g_ds_read_ok.set(0)
+        _g_ds_level.set(3)
+        _g_ds_allow.set(1)
+        return
+    _g_ds_read_ok.set(1)
+    _g_ds_level.set({"OK": 0, "DEGRADED": 1, "HALT": 2, "UNKNOWN": 3}.get(str(lvl), 3))
+    _g_ds_allow.set(0 if lvl == "HALT" else 1)
+
+
 def _refresh() -> None:
     try:
         stats = db_stats.collect_once()
@@ -233,6 +271,11 @@ def _refresh() -> None:
         _refresh_drl_degrade()
     except Exception as e:  # noqa: BLE001
         print("drl degrade refresh err:", str(e)[:200], flush=True)
+    # 同理独立: 数据源门禁指标失败不得连带影响上面两项
+    try:
+        _refresh_datasource()
+    except Exception as e:  # noqa: BLE001
+        print("datasource refresh err:", str(e)[:200], flush=True)
 
 
 def main() -> None:

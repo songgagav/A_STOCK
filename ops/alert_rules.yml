@@ -112,3 +112,35 @@ groups:
             astock_drl_degrade_read_ok=0: metrics_server 无法读取 DRL 降级状态
             (data/drl/current_model.json 指针与 data/drl_degrade_events.jsonl 账本),
             astock_drl_* 各指标可能停留在过期值, DrlHalted 因此可能漏报。
+
+      - alert: DataSourceHalt
+        # [2026-09-22] 数据源健康门禁判定 HALT: 连续 FAILS_TO_HALT 轮同一原因失败
+        # (厂商引擎不可达 / 数据落后超硬阈值 / db_update 全表失败 / 同步假成功)。
+        # 为什么是 critical: 2026-09-22 的真实故障链是"引擎没跑 -> 引擎静默停摆 ->
+        # 直到收盘才发现今天没有新数据", 而症状与"今天是节假日"无法区分。
+        # 门禁已跳过摄入与选股, 但**必须有人知道**, 否则它只是一次静默停手。
+        expr: astock_datasource_allow == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "数据源健康门禁 HALT (已停止摄入与选股)"
+          description: >-
+            astock_datasource_level=2: 数据源连续失败达阈值, run_daily 已跳过摄入与
+            选股(持仓归档照常)。查 data/datasource_health.jsonl 看连续失败原因,
+            以及 data/health/state.json 的 observed.datasource.reasons。
+            常见: 服务 AStockStockdb 停止 / 厂商未发布 / db_update 表级全失败。
+
+      - alert: DataSourceGateUnreadable
+        # 与 FusionHealthUnreadable / DrlDegradeStatusUnreadable 同理: 读数失败会
+        # 让 astock_datasource_* 停留在过期值, 使 DataSourceHalt 漏报 ——
+        # 告警源自身失效必须显式暴露。
+        expr: astock_datasource_read_ok == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据源门禁结论不可读 (告警源已失效)"
+          description: >-
+            metrics_server 读不到 data/health/state.json 的 observed.datasource
+            (快照缺失或为旧版本) => DataSourceHalt 可能漏报。

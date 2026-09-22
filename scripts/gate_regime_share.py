@@ -40,9 +40,11 @@ def main() -> None:
         t0 = time.time()
         cp = subprocess.run([PY, os.path.join(_BASE, "src", "backtest_with_gate.py"),
                              "--start", day, "--end", end, "--output", tmp],
-                            capture_output=True, text=True, timeout=900)
+                            capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=900)
         if cp.returncode != 0 or not os.path.exists(tmp):
-            print(f"{day:<12} 失败: {cp.stderr[-160:]}")
+            # `or ""`: 解码失败时 stderr 会是 None, 直接切片会把真实失败报成 TypeError
+            print(f"{day:<12} 失败: {(cp.stderr or '')[-160:]}")
             continue
         d = json.load(open(tmp, encoding="utf-8"))
         per = d.get("per_day") or []

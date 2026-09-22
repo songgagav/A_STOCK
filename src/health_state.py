@@ -149,10 +149,26 @@ def assemble(snap: dict) -> dict:
     elif flevel == "WARN":
         reasons.append(f"数据流动无法判定(#4 看门狗): {flow.get('reason')}")
 
+    # [2026-09-22 数据源健康门禁] 只消费**结论**, 不在这里重跑判定 ——
+    # 判定要读 run_daily 产物与引擎探针, 属采集层(`datasource_gate.evaluate`)的职责。
+    # 这里只负责把它的 HALT 抬成 HALTED: "数据源连续失败到该停手" 与"策略停摆/数据停流"
+    # 同属**系统实际已停止工作**, 该进同一个档位。
+    ds = snap.get("datasource") or {}
+    ds_level = ds.get("level")
+    if ds_level == "HALT":
+        reasons.append(
+            "数据源健康门禁判定 HALT(连续失败达阈值, 应停止摄入与依赖数据的下游动作): "
+            + "; ".join(ds.get("reasons") or [])[:220])
+    elif ds_level == "DEGRADED":
+        for r in (ds.get("reasons") or [])[:3]:
+            reasons.append(f"数据源健康: {r}")
+    elif ds_level == "UNKNOWN":
+        reasons.append("数据源健康门禁未生效(没有任何数据源被判定 —— 不等于健康)")
+
     # HALTED 语义 = **系统实际上已停止工作**: 策略停摆(L3) 或 盘中数据停流(引擎死了/死锁/
     # 行情源冻住)。这两种情况下账户既不会正确估值、也不会正确执行, 故同为 HALTED;
     # 归因文本各自保留, 由消费方区分该去查策略还是查引擎。
-    halted = bool(l3) or flevel == "CRITICAL"
+    halted = bool(l3) or flevel == "CRITICAL" or ds_level == "HALT"
     state = "HALTED" if halted else ("DEGRADED" if reasons else "NORMAL")
     return {"state": state, "reasons": reasons}
 
@@ -169,6 +185,27 @@ def gather() -> dict:
     root = _repo_root()
     snap: dict = {"tick_ms": None, "freshness_ok": None,
                   "live_source": None, "l3_today": 0}
+
+    # 0) [2026-09-22 数据源健康门禁] 采集其结论(只读本地账本与最近一次日更产物,
+    #    不重跑引擎探针 —— 探针在下面第 2 步已经跑了)。失败不影响下面的采集。
+    try:
+        import sys as _sys
+        import datetime as _dt
+        _sys.path.insert(0, os.path.join(root, "src"))
+        import datasource_gate as _DG
+        _sync = _dbu = None
+        _p = os.path.join(root, "data", "daily",
+                          _dt.datetime.now().strftime("%Y%m%d"),
+                          "daily_summary.json")
+        if os.path.isfile(_p):
+            with open(_p, encoding="utf-8-sig") as _f:
+                _steps = (json.load(_f).get("steps") or {})
+            _sync = _steps.get("engine_bars_sync")
+            _dbu = _steps.get("db_update")
+        snap["datasource"] = _DG.evaluate(sync_step=_sync, db_update_step=_dbu)
+    except Exception as _e:  # noqa: BLE001
+        snap["datasource"] = {"level": "UNKNOWN",
+                              "reasons": [f"门禁采集异常: {type(_e).__name__}: {_e}"]}
 
     # 1) tick_ms / live_source —— 来自 live_state.json（引擎每 tick 写）
     lv_fp = os.path.join(root, "data", "live_state.json")

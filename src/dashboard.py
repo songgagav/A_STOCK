@@ -2451,9 +2451,13 @@ def start_incremental_sync(only: list[str] | None = None,
 # 在 incremental 出错时也带上子进程的 stderr
 def _safe_subprocess_run(code: str, cwd: str, timeout: int = 300):
     try:
+        # `errors="replace"`: 已显式 utf-8, 但子进程若在中文 Windows 上以 GBK
+        # 写 stderr, 严格模式会在读取线程里抛 —— `subprocess.run` **不抛**,
+        # 而是静默返回 `stdout=None`, 调用方再 `(x.stdout or "")` 就把"解码失败"
+        # 伪装成"子进程什么都没说"。replace 至少保住能解出来的部分。
         return subprocess.run([sys.executable, "-c", code],
                                 cwd=cwd, capture_output=True, text=True,
-                                timeout=timeout, encoding="utf-8")
+                                timeout=timeout, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired as e:
         # TimeoutExpired 没有 stdout/stderr 属性 (是 CalledProcessError 子类)
         class _FakeResult: pass
@@ -2523,7 +2527,7 @@ def start_manual_sync_table(table: str, day: str | None = None) -> dict:
     try:
         proc = subprocess.run([sys.executable, "-c", code],
                                 cwd=_BASE, capture_output=True, text=True,
-                                timeout=300, encoding="utf-8")
+                                timeout=300, encoding="utf-8", errors="replace")
         out["finished_at"] = _now()
         if proc.stderr:
             out["subprocess_stderr"] = proc.stderr[:500]
@@ -2535,7 +2539,8 @@ def start_manual_sync_table(table: str, day: str | None = None) -> dict:
                     [sys.executable, "-c",
                      "import sys; sys.path.insert(0, r'" + _BASE.replace('\\', '/') + "'); "
                      "import update_db; print('|'.join(sorted([n for n in dir(update_db) if n.startswith('sync_')])))"],
-                    cwd=_BASE, capture_output=True, text=True, timeout=10)
+                    cwd=_BASE, capture_output=True, text=True, timeout=10,
+                    encoding="utf-8", errors="replace")
                 avail = [n[len("sync_"):] for n in (avail_proc.stdout or "").split("|") if n]
             except Exception:
                 avail = []

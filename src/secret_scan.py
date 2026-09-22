@@ -124,7 +124,12 @@ def scan_text(text: str, filename: str = "<text>") -> list:
 
 def tracked_files(repo: str) -> list:
     try:
-        p = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True, text=True, timeout=60)
+        # `encoding` 必须显式给: 中文 Windows 的 `locale.getpreferredencoding()` 是
+        # cp936, 而 `git ls-files` 输出的是 UTF-8 文件名。乱码不会抛异常 ——
+        # GBK 大多能"解成功", 只是解出**看似正常但完全错误**的字串, 于是本仓
+        # 含中文的路径会被当成另外一些路径去扫, 而扫描结果看起来一切正常。
+        p = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=60)
         return [x for x in (p.stdout or "").splitlines() if x.strip()]
     except Exception:  # noqa: BLE001
         return []

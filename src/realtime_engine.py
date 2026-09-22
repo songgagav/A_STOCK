@@ -706,11 +706,21 @@ class RealtimeEngine:
 
     # ---------- 可交易性判定 (A股: 涨停不能买 / 跌停不能卖 / 停牌跳过) ----------
     def _tradable(self, canon: str):
-        """返回 (action_allowed, reason). 复用 feed.quotes(在get_latest时已刷新)."""
+        """返回 (action_allowed, reason). 复用 feed.quotes(在get_latest时已刷新).
+
+        停牌三态(2026-09-22 审计后改): `suspended` 为 True/False/None,
+        其中 **None = 无法判定**(成交量字段缺失)。语义:
+          · True   -> 停牌, 不可交易(唯一确定要拦的)
+          · False  -> 成交量>0, 确认在交易
+          · None   -> **未知**: 不据此拦单(缺信息不该停手, 本仓既有纪律),
+                      但也不冒充"已确认可交易" —— 需要拦时靠**交易所停牌名单**
+                      把它升级为 True(见 `paper_book.get_latest` 的三态推导)。
+        此前把 None 也当 False, 于是"停牌不可买"在生产主路径**恒放行**。
+        """
         q = self.feed.quotes.get(canon)
         if q is None:
             return True, ""                    # 无行情 -> 交由价格>0兜底
-        if q.get("suspended"):
+        if q.get("suspended") is True:
             return False, "停牌"
         px = q.get("price", 0)
         if px <= 0:
@@ -1116,6 +1126,14 @@ class RealtimeEngine:
                             _lag = (self.sel or {}).get("data_lag_days")
                         except Exception:  # noqa: BLE001
                             _lag = None
+                        _dd_pct = None
+                        try:
+                            # 组合回撤就在**同一函数的局部变量** risk 里
+                            # (self.pb.apply_risk_controls() 的返回值), 此前没传进闸门 ——
+                            # 于是清单的"组合回撤"项永远 skip。见 2026-09-22 审计。
+                            _dd_pct = (risk or {}).get("drawdown_pct")
+                        except Exception:  # noqa: BLE001
+                            _dd_pct = None
                         _g = _PC.gate(
                             {"symbol": canon, "side": "buy", "qty": qty, "price": pr},
                             {"tradable": tb,
@@ -1123,10 +1141,23 @@ class RealtimeEngine:
                              # equity: **PaperBook 没有这个属性**(它只存 cash 与 positions,
                              # 权益要现算)。此前写的 getattr(self.pb, "equity", None) 恒为
                              # None —— 于是"单笔仓位上限"与"组合回撤"两项检查的输入永远
-                             # 是空的, 只能记 skip。改成用 snapshot() 现算(它内部就是
-                             # cash + market_value())。
+                             # 是空的, 只能记 skip。改成用 snapshot() 现算。
                              "equity": self._pb_equity(),
                              "cash": getattr(self.pb, "cash", None),
+                             # [2026-09-22 审计] 下面三个键此前**都没传**, 后果严重:
+                             #  · max_pos  —— 不传 => classify_risk 的"单笔超一个等权槽位"
+                             #    高危判定**永不触发** => 巨量单**不进人工审批**。
+                             #    实测: 一笔 999,000 元(权益的 9.8 倍)的买单 high_risk=False。
+                             #    这是本仓红线(高危单转人工)的直接失效, 故补上。
+                             #    PAPER 里没有 max_pos 键, 用 MAX_STOCKS(它就是仓位槽数)。
+                             "max_pos": MAX_STOCKS,
+                             #  · min_cash —— 不传 => 订单级"买入后现金须 >= 底线"永不触发。
+                             #    引擎另有同规则兜底(缩档), 故不是资金风险, 而是**留痕缺失**:
+                             #    审计里看不到这类拦截。
+                             "min_cash": INIT_CAPITAL * (1 - MAX_POS_RATIO),
+                             #  · drawdown_pct —— 不传 => 清单"组合回撤"项永远 skip。
+                             "drawdown_pct": _dd_pct,
+                             "peak_equity": getattr(self.pb, "peak_equity", None),
                              "regime": (self._gate or {}).get("regime"),
                              "freeze_new_buys": (self._gate or {}).get("freeze_new_buys"),
                              "data_lag_days": _lag,

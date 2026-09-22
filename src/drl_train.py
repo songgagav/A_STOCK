@@ -1046,7 +1046,15 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     try:
         import drl_precheck as _PC
         _pre = _PC.evaluate(n_dates=len(rets), net_values=_PC.load_net_values(day_dir))
-        _PC.record(day_dir, _pre)
+        # **必须传全路径**。2026-09-22 实测踩到: 这里原先传的是裸 `day_dir`(即 "20260922"),
+        # 而 `_PC.record` 内部 `os.makedirs(day_dir)` 会按**当前工作目录**解析相对路径。
+        # 结果是 `precheck.json` 落到 `<repo_root>/20260922/precheck.json`, 而
+        # `data/drl/20260922/` 里 model.zip / train_meta.json / target_plan.json 一应俱全,
+        # **只有检查结论那一份不在** —— 事后想回答"当天学习前检查了什么、结论是什么"
+        # 会直接找不到证据, 而所有调用点看起来都"成功返回了路径"。
+        # 同文件下面 heartbeat_dir / out_dir 都用了 `os.path.join(DATA_DIR, "drl", day_dir)`,
+        # 只有这一处漏了 —— 不是设计, 是遗漏。
+        _PC.record(os.path.join(DATA_DIR, "drl", day_dir), _pre)
         if not _pre.get("ok"):
             _reason = "学习前检查未通过: " + "; ".join(
                 str(i.get("detail")) for i in (_pre.get("issues") or []))

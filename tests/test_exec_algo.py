@@ -907,7 +907,12 @@ def test_import_graph_does_not_pull_heavy_modules():
         "print(int('paper_book' in sys.modules), int('config' in sys.modules),"
         " int('slippage_model' in sys.modules))".format(src_dir)
     )
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+    # 显式 utf-8: 子进程一旦 import 失败, traceback 里会带中文路径/消息, 而中文
+    # Windows 默认 cp936 解码 —— 要么乱码, 要么在读取线程里抛而 `stdout=None`,
+    # 于是下面 `proc.stdout.split()` 报成 AttributeError, **把"import 失败"这个
+    # 真正的原因盖掉**。这正是 P2-PS1BOM 那类"报错报到不相干的行上"的翻版。
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=180)
     assert proc.returncode == 0, proc.stderr
     has_paper_book, has_config, has_slippage = proc.stdout.split()
     assert has_paper_book == "0", "import exec_algo 不应拉起 paper_book"

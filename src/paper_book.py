@@ -744,6 +744,24 @@ class PriceFeed:
         """引擎每 tick 注入当前持仓, _fetch_spot 据此构建 watchlist."""
         self.positions = positions or {}
 
+    def _suspended_set(self) -> set:
+        """交易所停牌名单(当日), 返回 canon 集合。**取不到返回空集合**。
+
+        为什么要它(2026-09-22 审计): 生产主源(新浪)不返回成交量, 于是
+        "停牌不可买"这条规则**没有任何可用输入**。A 股其实有**独立可得**的权威判据
+        (停牌名单); 本方法就是接入点。
+
+        **现状(如实)**: 本仓当前**没有实现**停牌名单的取数
+        (无 `quality_exclusions.suspended_codes`, h5i 也没有当日停牌标记) ——
+        故它现在恒返回空集合, 三态里的 None(未知)保持不变。
+        这不是"接上了但没用", 而是**这个判据尚无数据源**, 故在此写明,
+        免得后人以为停牌已被覆盖。要真正启用需要一条停牌名单数据源。
+
+        取数失败一律返回空集合: 拿不到名单时保持 None(不据此拦单),
+        与"缺信息不该停手"的既有纪律一致。
+        """
+        return set()
+
     def _fetch_spot(self, fetch_all: bool = False) -> dict:
         """拉取实时行情快照, 返回 {canon: price_dict}.
 
@@ -1048,16 +1066,33 @@ class PriceFeed:
             snap = self._fetch_spot_with_timeout()
             if snap:
                 self._snap = {c: q["price"] for c, q in snap.items()}
-                # 停牌推断: 交易日盘中成交量恒为0 -> 停牌 (兜底价不参与此判定)
+                # 停牌推断(三态, 2026-09-22 审计后改):
+                #   True  = 确认停牌(有成交量字段且 <=0)
+                #   False = 确认在交易(成交量 > 0)
+                #   **None = 无法判定**(成交量字段缺失: 新浪源没有该字段, 恒为 -1)
+                # 此前把"无法判定"也标成 False(=非停牌), 于是 `_tradable` 的
+                # "停牌不可买"在生产主路径**恒不生效** —— 实测 `_fetch_sina_spot`
+                # 硬编码 `volume: -1, suspended: False`(源码注释写明是"为跳过错判")。
+                # 三态化之后: 交易所的停牌名单(独立可得)可以判 True, 而"没有量数据"
+                # 如实记为 None(未知), 不再冒充"已确认可交易"。
                 for c, q in snap.items():
                     if q.get("fallback"):
-                        # DuckDB 兜底: 没有成交量信息, 默认为非停牌
-                        q["suspended"] = False
-                    elif q.get("volume", 0) is None or q.get("volume", 0) < 0:
-                        # 成交量数据缺失 (-1 或 None): 默认非停牌
-                        q["suspended"] = False
+                        # 兜底价: 没有成交量信息 -> 未知
+                        q["suspended"] = None
+                    elif q.get("volume") is None or q.get("volume") < 0:
+                        # 成交量数据缺失(-1 或 None): **未知**, 不是"非停牌"
+                        q["suspended"] = None
                     else:
                         q["suspended"] = (q["volume"] <= 0)
+                # 交易所停牌名单是**独立可得**的权威判据, 有则覆盖上面的推断
+                try:
+                    _halt = self._suspended_set()
+                    if _halt:
+                        for c, q in snap.items():
+                            if c in _halt:
+                                q["suspended"] = True
+                except Exception:  # noqa: BLE001
+                    pass    # 取不到名单不影响撮合(只是保持三态里的 None/推断值)
                 self.quotes = snap
                 self._ts = now
                 self._total_fetch += 1

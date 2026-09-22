@@ -295,9 +295,23 @@ def run_regime_batch(days, scenarios=None, *, stop_on_error: bool = False,
             # 相对基准场景收益变差的交易日占比 —— "压力场景下这套信号还成立吗"
             "degraded_days": sum(1 for x in deltas if x < 0),
         }
-    return {"ok": bool(per_day) and not errs, "days": list(days),
+    # **成败判据必须看"有没有跑出数"**, 不能只看"函数有没有抛异常"。
+    # 2026-09-22 首次接进 run_daily 时踩到: 5 天 × 2 场景**全部 ok=false、
+    # 收益全是 null**(各日回测都没产出统计), 而这里仍返回 ok=true ——
+    # 于是 daily_summary 里 `regime_scenarios: ok=true`, 一个**什么都没算出来的
+    # 步骤被记成成功**。这正是本仓最忌讳的那类假成功。
+    n_stat = sum(s.get("n_ok") or 0 for s in summary.values())
+    n_expected = len(names) * len(per_day)
+    ok = bool(per_day) and not errs and n_stat > 0
+    return {"ok": ok, "days": list(days),
             "per_day": per_day, "summary": summary, "scenarios": names,
-            "errors": errs}
+            "errors": errs,
+            # 让调用方一眼看出"跑了几格、成了几格", 不必去翻 summary
+            "n_cells": n_expected, "n_cells_with_stats": n_stat,
+            "partial": bool(ok and n_stat < n_expected),
+            "note": ("" if ok else
+                     f"所有 {n_expected} 个 (日, 场景) 组合都没产出统计 "
+                     f"=> 判失败(而不是'没问题')")}
 
 
 def _make_weights(targets: list[dict], mode: str = "equal") -> list[float]:

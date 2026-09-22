@@ -121,9 +121,15 @@ def _run_once(stage: str, args: list[str], day: str | None = None) -> dict:
     if day:
         cmd += ["--day", day]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1500)
+        # 子进程是本仓自己的 Python 脚本, 输出含中文(进度/告警/异常)。
+        # 不显式给 encoding 时会按 cp936 解 —— 要么解成乱码, 要么在读取线程里
+        # 抛 UnicodeDecodeError 而 `subprocess.run` **不抛、静默返回 stdout=None**,
+        # 于是 `out` 变成空串, 事后从 stage 记录里**再也看不到子进程说过什么**。
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=1500)
         return {"ok": r.returncode == 0, "stage": stage, "day": day,
-                "out": (r.stdout or "")[-2000:], "err": (r.stderr or "")[-300:]}
+                "out": (r.stdout or "")[-2000:], "err": (r.stderr or "")[-300:],
+                "decode_ok": r.stdout is not None}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "stage": stage, "day": day, "err": str(e)[:200]}
 
