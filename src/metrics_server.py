@@ -216,6 +216,45 @@ _g_ds_level = Gauge("astock_datasource_level",
 _g_ds_read_ok = Gauge("astock_datasource_read_ok",
                       "数据源门禁结论可读性 (0=读失败 => 告警源已失效)")
 
+# [2026-09-22 死手开关接线] 该模块此前**只被喂 tick、从不被求值**
+# (全仓检索 `deadman_switch.verdict` 零命中), 于是本仓唯一一个
+# "失联本身即是证据"的机制恰恰是唯一没接线的那个。
+# 当天实测: daemon 消失 4.6 小时(机器 16:08 重启), 全系统零告警。
+_g_dm_overdue = Gauge("astock_deadman_overdue",
+                      "死手开关: 是否有组件超过 3× 周期没有 tick (1=有)")
+_g_dm_unknown = Gauge("astock_deadman_unknown",
+                      "死手开关: 账本为空/已失效 (1=这套监控从未生效)")
+_g_dm_read_ok = Gauge("astock_deadman_read_ok",
+                      "死手开关结论可读性 (0=读失败 => 告警源已失效)")
+
+
+def _refresh_deadman() -> None:
+    """暴露死手开关的结论 (2026-09-22 批次)。
+
+    与 `_refresh_datasource` 同一条理由: 告警链是夜里唯一会叫的人。
+    而这一项尤其重要 —— 其它监控(心跳/看门狗/健康快照)都要求**监测者自己还活着**,
+    只有它判的是"本该出现的 tick 没出现", 失联本身即是证据。当天正是
+    "监测者与被监测者一起消失"的情形, 别的机制覆盖不到。
+    """
+    try:
+        import health_state as _HS
+        pub = _HS.read_published()
+    except Exception as e:  # noqa: BLE001
+        _g_dm_read_ok.set(0)
+        print("deadman read err:", str(e)[:160], flush=True)
+        return
+    dm = ((pub or {}).get("observed") or {}).get("deadman")
+    if not isinstance(dm, dict) or not dm.get("level"):
+        # 快照里没有该字段: 旧版本快照。记"不可读", **不记健康**
+        _g_dm_read_ok.set(0)
+        _g_dm_overdue.set(0)
+        _g_dm_unknown.set(0)
+        return
+    _g_dm_read_ok.set(1)
+    lvl = str(dm.get("level"))
+    _g_dm_overdue.set(1 if lvl == "OVERDUE" else 0)
+    _g_dm_unknown.set(1 if lvl == "UNKNOWN" else 0)
+
 
 def _refresh_datasource() -> None:
     """暴露数据源健康门禁的结论 (2026-09-22 批次)。
@@ -276,6 +315,11 @@ def _refresh() -> None:
         _refresh_datasource()
     except Exception as e:  # noqa: BLE001
         print("datasource refresh err:", str(e)[:200], flush=True)
+    # 同理独立: 死手开关指标失败不得连带影响上面三项
+    try:
+        _refresh_deadman()
+    except Exception as e:  # noqa: BLE001
+        print("deadman refresh err:", str(e)[:200], flush=True)
 
 
 def main() -> None:

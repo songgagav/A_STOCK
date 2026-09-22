@@ -165,6 +165,28 @@ def assemble(snap: dict) -> dict:
     elif ds_level == "UNKNOWN":
         reasons.append("数据源健康门禁未生效(没有任何数据源被判定 —— 不等于健康)")
 
+    # [2026-09-22 死手开关接线] 消费 `deadman_switch.verdict()` 的结论。
+    # 为什么它必须在这里被消费: 其它监控(心跳/看门狗/健康快照)都要求**监测者自己还活着**,
+    # 而它判的是"本该出现的 tick 没出现" —— **失联本身即是证据**。本案(daemon 消失 4.6 小时
+    # 而全系统零告警)正是其它监控原理上覆盖不到的情形, 因为监测者与被监测者一起没了。
+    #
+    # OVERDUE  => DEGRADED(有组件停摆。不用 HALTED: 单组件停摆不等于系统已停止工作)
+    # UNKNOWN  => DEGRADED(**账本为空 = 这套监控从未生效, 不是健康**)。
+    #             这一档刻意不写成 NORMAL: "没有告警"与"没有在监控"必须可区分。
+    dm = snap.get("deadman") or {}
+    dm_level = dm.get("level")
+    if dm_level == "OVERDUE":
+        reasons.append("死手开关 OVERDUE(组件超过 3× 周期没有 tick): "
+                       + "; ".join(str(x) for x in (dm.get("reasons") or []))[:220])
+    elif dm_level == "UNKNOWN":
+        reasons.append("死手开关 UNKNOWN(账本为空, 这套监控从未生效 —— 不等于健康)")
+    elif "deadman" in snap and not dm:
+        # **区分"没这一项"与"有这一项但取不到"**: 前者是向后兼容(老快照/纯函数调用
+        # 本就不带这个键, 不该因此被判 DEGRADED), 后者是采集层异常, 必须说出来。
+        # 判据取 `"deadman" in snap` 而非 `dm is None` —— 因为 `gather()` 采集失败时
+        # 恰恰就是把 `snap["deadman"] = None` 写进去, 两者必须分开。
+        reasons.append("死手开关结论取不到(采集层异常) —— 不等于健康")
+
     # HALTED 语义 = **系统实际上已停止工作**: 策略停摆(L3) 或 盘中数据停流(引擎死了/死锁/
     # 行情源冻住)。这两种情况下账户既不会正确估值、也不会正确执行, 故同为 HALTED;
     # 归因文本各自保留, 由消费方区分该去查策略还是查引擎。
@@ -267,6 +289,28 @@ def gather() -> dict:
     except Exception as e:  # noqa: BLE001
         snap["flow"] = None
         snap["flow_error"] = f"{type(e).__name__}: {e}"
+
+    # 5) 死手开关 —— **失联本身即是证据**
+    #    [2026-09-22 修] 这个模块此前**只被喂 tick、从不被求值**: 全仓检索
+    #    `deadman_switch.verdict` / `_DMS.verdict` 零命中, 唯一生产调用点是
+    #    daemon 的 `beat()`。于是本仓唯一一个"不需要监测者自己活着"的机制 ——
+    #    其它监控(心跳/看门狗/健康快照)都要求监测者还在跑, 而它判的是
+    #    "本该出现的 tick 没出现" —— **恰恰是唯一没接线的那个**。
+    #    当天实测: daemon 从 12:25 起消失 4.6 小时(机器 16:08 重启), 全系统零告警;
+    #    我手工跑一次 `verdict()` 立刻得到 OVERDUE(obs_stack 已 66866s 无 tick)。
+    #    判据完全正确, 就是没人去问。
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(root, "src"))
+        import deadman_switch as DMS
+        dv = DMS.verdict()
+        snap["deadman"] = {"level": dv.get("level"),
+                           "overdue": [i.get("component") for i in dv.get("overdue") or []],
+                           "unknown": [i.get("component") for i in dv.get("unknown") or []],
+                           "reasons": dv.get("reasons") or []}
+    except Exception as e:  # noqa: BLE001
+        snap["deadman"] = None
+        snap["deadman_error"] = f"{type(e).__name__}: {e}"
 
     return {"observed": snap, **assemble(snap)}
 

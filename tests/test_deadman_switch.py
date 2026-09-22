@@ -206,6 +206,53 @@ class TestVerdict:
         led = _write_ledger(tmp_path, [{"component": "alpha", "at": T0.strftime(D._TS_FMT)}])
         json.dumps(D.verdict(T0, registry=_reg(), ledger=led), ensure_ascii=False)
 
+    def test_intraday_component_absent_today_is_overdue_not_silent(self, tmp_path):
+        """**盘后回看时, "今天盘中一次都没出现" 不能被读成 "收盘后应静默"**。
+
+        2026-09-22 实测: `realtime_engine` 实际 12:29:35 就停了(下午整段没跑),
+        而盘后跑判定时它显示 SILENT_EXPECTED「非交易时段, 本项不该有 tick」——
+        判据没错, 但它答的是"**现在**该不该有", 不是"**今天该跑的时候跑了吗**"。
+        只看"现在是不是交易时段"的判定, 在盘后回看时永远看不出盘中停摆。
+
+        此处: 今天是交易日, 盘后问, 最后一条 tick 是**昨天**的
+        => 今天盘中从未出现 => OVERDUE。
+        """
+        led = _write_ledger(tmp_path, [
+            {"component": "eng", "at": (T0 - timedelta(days=1)).strftime(D._TS_FMT)}])
+        after = T0.replace(hour=20, minute=0)
+        v = D.verdict(after, registry={"eng": {"period_s": 60.0, "trading_hours_only": True}},
+                      ledger=led)
+        assert v["items"][0]["status"] == D.OVERDUE
+        assert "从未出现" in v["items"][0]["detail"]
+
+    def test_intraday_component_ticked_today_then_stopped_is_not_flagged(self, tmp_path):
+        """**刻意不覆盖的情况**(留档, 免得后人以为它管这个)。
+
+        引擎今天盘中出现过、但**早于收盘就停了**(今天正是这种: 最后 tick 11:31,
+        实际 12:29 停)。这一档**不报 OVERDUE** —— 因为盘后无法区分"正常收盘静默"
+        与"半路死掉", 想靠时间点比较糊过去, 结果会是**每天收盘都误报**。
+        真正要覆盖它得靠"盘中周期心跳 + 收盘时的当日覆盖度断言", 属另一件事。
+        """
+        led = _write_ledger(tmp_path, [{"component": "eng", "at": T0.strftime(D._TS_FMT)}])
+        after = T0.replace(hour=20, minute=0)
+        v = D.verdict(after, registry={"eng": {"period_s": 60.0, "trading_hours_only": True}},
+                      ledger=led)
+        assert v["items"][0]["status"] == D.SILENT
+
+    def test_weekend_is_still_silent_after_the_fix(self, tmp_path):
+        """**回归护栏**: 上面那个修复的首版把每个周末都报成了 OVERDUE。
+
+        周末的最后一条 tick 天然早于"今天 09:30", 不加"今天本来就是交易日"这道
+        判断就会满屏误报。此例与 `test_weekend_is_silent` 同义, 但把**为什么**
+        写在这里 —— 它是被那次改动打破后补上的。
+        """
+        sat = datetime(2026, 9, 26, 10, 0, 0)
+        led = _write_ledger(tmp_path, [
+            {"component": "eng", "at": datetime(2026, 9, 25, 14, 0).strftime(D._TS_FMT)}])
+        v = D.verdict(sat, registry={"eng": {"period_s": 60.0, "trading_hours_only": True}},
+                      ledger=led)
+        assert v["items"][0]["status"] == D.SILENT
+
 
 class TestRegistry:
     def test_defaults_present(self):

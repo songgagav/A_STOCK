@@ -688,6 +688,40 @@ def run_loop():
                     # 这是 pid 监护**原理上抓不到**的一类: 主循环卡住/行情源冻住时,
                     # 进程一切正常, 盘面却静静冻住, 直到收盘才发现整天没动。
                     _check_flow()
+            elif _state["running_day"] != day_str and _state["engine_pid"]:
+                # [2026-09-22 修] **自愈不能依赖内存态 `running_day`**。
+                # 上面那个 elif 把崩溃自愈 gate 在"本进程记得今天起过引擎"上, 而
+                # `running_day` 只在 `_start_engine()` 里被赋值 —— **daemon 自己一重启,
+                # 这个记忆就没了**, 自愈分支永不进入, 且因为 `_log` 就在被跳过的分支里,
+                # **连一句日志都不会产生**。
+                # 当天实测: 机器 16:08:42 重启, daemon 16:09:07 起(恢复的 running_day=null),
+                # 引擎最后一次写 12:29:35 ⇒ 12:29:35~16:08 这段 daemon 活着、引擎已死,
+                # **零次自愈尝试、零条日志**, 只能靠比对 mtime 考古才发现。
+                # 而那恰恰是最需要自愈的场景: 守护自己刚重启过。
+                #
+                # 修法: 用**可观测事实**(现在是不是该有引擎)替代**易失的内存记忆**。
+                # `engine_pid` 仍在 state 里(持久化过), 就直接问它活不活。
+                #
+                # [2026-09-22 二次修 —— 首版自己踩的坑, 留档] 首版**漏了时间闸门**,
+                # 于是收盘后每次循环都 `_start_engine`: 引擎起来一看已过 15:05, 自己
+                # 立刻退出(`已收盘或非交易日, 引擎自动停止`), 30 秒后守护又拉一次 ——
+                # **重启风暴**, 实测 20:12~20:14 每 30 秒一个 pid(18956/8020/11608/19396)。
+                # 这正是 `_proc_alive` docstring 里点名要避免的那种事。
+                # 教训: 加一条自愈路径时, 必须把**原路径的所有前置条件**都复制过来 ——
+                # 时间闸门不是装饰, 它和存活判断同等重要。
+                if cur_time >= dtime(15, 3):
+                    # 已过收盘窗口: 引擎本就该停, 不是故障。清掉会话记忆即可, 不重启。
+                    _state["running_day"] = None
+                    _state["engine_done"] = True
+                    _write_state()
+                elif not _proc_alive(_state["engine_pid"]):
+                    _log(f"引擎不在运行(pid={_state['engine_pid']}, "
+                         f"running_day={_state['running_day']!r}) —— 自愈拉起")
+                    _start_engine(today)
+                else:
+                    # 进程确实活着, 只是本进程不记得 —— 把记忆补上, 免得下一轮又走这里
+                    _state["running_day"] = _state.get("running_day") or day_str
+                    _write_state()
             _sync_sub_logs()
         else:
             _sync_sub_logs()

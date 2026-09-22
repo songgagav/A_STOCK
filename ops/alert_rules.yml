@@ -144,3 +144,54 @@ groups:
           description: >-
             metrics_server 读不到 data/health/state.json 的 observed.datasource
             (快照缺失或为旧版本) => DataSourceHalt 可能漏报。
+
+      - alert: DeadmanOverdue
+        # [2026-09-22] 死手开关 OVERDUE: 有组件超过 3× 周期没有 tick。
+        # 为什么这条特别重要: 其它所有监控(心跳/看门狗/健康快照)都要求
+        # **监测者自己还活着**, 只有它判的是"本该出现的 tick 没出现" ——
+        # 失联本身即是证据。而它此前**只被喂 tick、从不被求值**
+        # (全仓检索 deadman_switch.verdict 零命中), 于是本仓唯一一个
+        # 不依赖监测者存活的机制, 恰恰是唯一没接线的那个。
+        # 当天实测: daemon 从 12:25 起消失 4.6 小时(机器 16:08 重启), 全系统零告警;
+        # 手工跑一次 verdict() 立刻得到 OVERDUE(obs_stack 已 66866s 无 tick)。
+        expr: astock_deadman_overdue > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "死手开关 OVERDUE (有组件已停摆)"
+          description: >-
+            data/health/state.json 的 observed.deadman.overdue 非空: 有注册组件的
+            tick 超过 3× 标称周期没出现。查 data/deadman_ticks.jsonl 按 component
+            分组看最后 tick 时间, 对照 data/deadman_registry.json 的 period_s。
+            注意: 这可能意味着**监测者与被监测者一起消失**(2026-09-22 即如此),
+            故同时确认 daemon 自身是否在跑。
+
+      - alert: DeadmanNeverArmed
+        # 账本为空 = 这套监控**从未生效**。刻意单独一条而不是并进上面那条:
+        # "没有告警"与"没有在监控"必须可区分 —— 这正是该模块自己的立场
+        # (verdict 的 UNKNOWN 档不取 OK)。
+        expr: astock_deadman_unknown > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "死手开关从未生效 (账本为空, 不等于健康)"
+          description: >-
+            astock_deadman_unknown > 0: data/deadman_ticks.jsonl 为空或没有任何
+            组件的 tick, 死手开关处于 UNKNOWN —— 它不会发现任何失联。
+            修复: 确认 daemon/realtime_engine 在调用 deadman_switch.beat(),
+            必要时用 `python src/deadman_switch.py --flush-percent 1` 打底。
+
+      - alert: DeadmanUnreadable
+        # 告警源自身失效: 读不到 observed.deadman 时上面两条都会哑掉
+        # (与 DataSourceGateUnreadable 同一纪律)。
+        expr: astock_deadman_read_ok == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "死手开关结论不可读 (告警源已失效)"
+          description: >-
+            metrics_server 读不到 data/health/state.json 的 observed.deadman
+            (快照缺失或为旧版本) => DeadmanOverdue / DeadmanNeverArmed 可能漏报。

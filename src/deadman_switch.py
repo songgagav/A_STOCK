@@ -263,10 +263,37 @@ def verdict(now=None, *, registry: dict | None = None, ledger: str | None = None
         item["last_at"] = rec.get("at") or rec.get("ts")
         item["age_s"] = round(age, 1)
         if (spec or {}).get("trading_hours_only") and not _in_trading_hours(now):
-            item["status"] = SILENT
-            item["detail"] = (f"非交易时段(最后 tick {item['last_at']}), "
-                              f"本项不该有 tick")
-            silent.append(item)
+            # [2026-09-22 修] 这一档原本无条件判"不该有 tick", 于是**掩盖了一种失效**:
+            # 盘中该跑却没跑。当天实测 `realtime_engine` 12:29:35 就停了(下午整段没跑),
+            # 我 20:04 跑判定时它显示 SILENT_EXPECTED「非交易时段, 本项不该有 tick」——
+            # 判据没错, 但它答的是"**现在**该不该有", 而我想问"**今天下午该跑的时候跑了吗**"。
+            # 只看"现在是不是交易时段"的判定, 在**盘后回看**时永远看不出盘中停摆。
+            #
+            # 补上历史视角(只覆盖一种情况, 刻意不做大): 若最后一条 tick **早于今日
+            # 交易时段起点**, 说明它今天盘中**一次都没出现** —— 那不是"收盘后应静默",
+            # 是"该跑的时候没跑"。
+            #
+            # **刻意不覆盖的情况**: 引擎今天盘中出现过、但**早于收盘就停了**(今天正是
+            # 这种: 最后 tick 11:31, 实际 12:29 停)。那种"半路死掉"需要的是**盘中周期
+            # 心跳 + 收盘时的当日覆盖度断言**, 属另一件事, 不能靠这个时间点比较糊过去
+            # —— 否则每天收盘后都会把正常关机的引擎误报成 OVERDUE。
+            _sess_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            # **必须先确认"今天本来就是交易日"**: 非交易日(周末/节假日)的最后一条 tick
+            # 天然早于"今天 09:30", 不加这道判断就会把每个周末都报成 OVERDUE。
+            # (首版正是这么写的, 被 `test_weekend_is_silent` 立刻抓住 —— 一条用例
+            # 抵得上一次盘后误报。)
+            _today_trades = _in_trading_hours(now.replace(hour=10, minute=30))
+            if _today_trades and ts < _sess_start <= now.replace(microsecond=0):
+                item["status"] = OVERDUE
+                item["detail"] = (f"今日盘中**从未出现 tick**(最后 tick {item['last_at']} "
+                                  f"早于今日交易时段起点 {_sess_start:%H:%M}) —— "
+                                  f"这与『收盘后应静默』是两回事")
+                overdue.append(item)
+            else:
+                item["status"] = SILENT
+                item["detail"] = (f"非交易时段(最后 tick {item['last_at']}), "
+                                  f"本项不该有 tick")
+                silent.append(item)
         elif age > limit_s:
             item["status"] = OVERDUE
             item["detail"] = (f"已 {age:.0f}s 无 tick > 阈值 {limit_s:.0f}s "
