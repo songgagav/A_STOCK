@@ -261,6 +261,32 @@ _OBS_ENABLED = os.environ.get("ASTOCK_OBS_STACK", "1").strip().lower() not in ("
 _OBS_ALERT_HOOK = os.path.join(_BASE, "ops", "alert_hook.py")
 
 
+def _norm_path(p: str) -> str:
+    """把命令行里的路径统一成小写 + 正斜杠, 便于**按整段路径**比较而非子串比较。"""
+    return str(p or "").replace("\\", "/").lower()
+
+
+def _cmd_has_script(cmdline: list, script_rel: str) -> bool:
+    """命令行的**某个 argv 项**是否**就是**本仓的这个脚本(而非"某处包含这几个字")。
+
+    为什么必须按 argv 逐项比: 2026-09-22 实测, `_obs_procs()` 把三类**完全无关**的
+    进程认成了观测栈组件 ——
+      · 一个 `node.exe`(DSH 会话本体, 命令行里含本仓路径);
+      · `powershell.exe -Command ...`(命令行里含被执行的脚本正文);
+      · 我自己临时的 `python -c "..."` 诊断脚本(正文里提到了 metrics_server)。
+    它们都因为"命令行里出现了这几个字"而命中, 于是 `metrics in run` 恒为真 ⇒
+    **`_ensure_obs_stack()` 永远不会发现 9101 的 metrics_server 已经死了**,
+    而真实进程早已不存在。这与 2026-09-21 那次 `ivms320-redis-server` 是同一条通病:
+    **子串匹配无法区分"同名/提及"与"就是它"**。上次只补了"要求出现本仓目录",
+    这次要补的是"**要求它出现在 argv 的脚本位置上**"。
+    """
+    want = _norm_path(os.path.join(_BASE, script_rel))
+    for tok in cmdline or []:
+        if _norm_path(tok) == want:
+            return True
+    return False
+
+
 def _obs_procs() -> dict:
     """按进程名/命令行识别观测栈各组件 pid.
 
@@ -270,22 +296,28 @@ def _obs_procs() -> dict:
     ⇒ celery 连不上 127.0.0.1:6379, 每约 55 分钟起一次又退出(日志表现为 celery 反复"已拉起")。
     这与"诊断脚本匹配到自己"是同一类通病: **子串匹配无法区分'同名'与'同一个'**。
 
-    修正: 原生组件要求命令行里出现**观测栈目录**; 脚本组件要求出现**本仓目录**。
+    [2026-09-22 二次修] 上次只加到"要求命令行出现本仓目录", **不够**: 任何**提到**
+    本仓路径的进程都会命中(本次实测: node.exe 的 DSH 会话、powershell -Command、
+    以及我自己的 `python -c` 诊断脚本)。后果是 `metrics` 恒判为"在跑", 而 9101 上
+    的 metrics_server 实际早已不存在 ⇒ **看护永不拉起它**, 告警链(夜里唯一会叫的人)
+    静默断掉。故脚本类组件改为**按 argv 逐项精确比对脚本路径**(见 `_cmd_has_script`),
+    并要求解释器确实是 python; 原生组件仍按"进程名 + 观测栈目录"判(它们的 exe 名是
+    唯一的, 不存在"被提及"的问题)。
     """
     try:
         import psutil
     except Exception:
         return {}
     obs = _OBS_DIR.lower()
-    repo = _BASE.lower()
     out: dict[str, int] = {}
     for p in psutil.process_iter(["name", "cmdline"]):
         try:
             nm = (p.info.get("name") or "").lower()
-            cl = " ".join(p.info.get("cmdline") or [])
-            cll = cl.lower()
+            cl = p.info.get("cmdline") or []
+            cll = " ".join(cl).lower()
         except Exception:
             continue
+        is_py = nm.startswith("python") or nm.startswith("pythonw")
         if ("redis-server" in nm or "redis-server" in cll) and obs in cll:
             out.setdefault("redis", p.pid)
         elif "alertmanager" in nm and obs in cll:
@@ -294,15 +326,14 @@ def _obs_procs() -> dict:
             out.setdefault("prom", p.pid)
         elif "grafana-server" in nm and obs in cll:
             out.setdefault("grafana", p.pid)
-        elif "metrics_server" in cll and repo in cll:
+        elif is_py and _cmd_has_script(cl, os.path.join("src", "metrics_server.py")):
             out.setdefault("metrics", p.pid)
-        elif "alert_hook" in cll and repo in cll:
+        elif is_py and _cmd_has_script(cl, os.path.join("ops", "alert_hook.py")):
             out.setdefault("hook", p.pid)
-        elif "flower" in cll and "celery" in cll and "worker" not in cll and (
-                repo in cll or "src.tasks_db" in cll):
+        elif is_py and "-m" in cl and "celery" in cll and "flower" in cll \
+                and "worker" not in cll:
             out.setdefault("flower", p.pid)
-        elif "celery" in cll and "tasks_db" in cll and (
-                repo in cll or "src.tasks_db" in cll):
+        elif is_py and "-m" in cl and "celery" in cll and "worker" in cll:
             out.setdefault("celery", p.pid)
     return out
 

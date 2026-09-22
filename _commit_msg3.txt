@@ -1,0 +1,71 @@
+fix(ops): 告警规则指向单一事实源 + 观测栈组件识别去子串匹配 (2150 passed)
+
+用户让我「检查今天模拟盘状态」。核对发现 `data/state.json` 与 `data/live_state.json`
+的 mtime **双双停在 12:29:35**, 而当时已 20:00 —— **7.5 小时没有撮合、没有风控**。
+`LastBootUpTime = 2026-09-22 16:08:42`(计划外重启), NSSM 开机已正确拉起服务,
+所以"它怎么会停"有答案。顺这条线查下去, 挖出三个**静默失效**。
+
+## 一、观测栈组件识别靠子串匹配 ⇒ 看护永不拉起真组件 (P1)
+
+手工杀掉 9101 的 `metrics_server` 想看 daemon 会不会自愈, 结果 5 分钟后仍未拉起,
+但 `_obs_procs()` 报 `metrics` 在跑。根因是纯子串匹配
+(`"metrics_server" in cll and repo in cll`), 实测三类无关进程全部命中:
+- `node.exe`(DSH 会话本体, 命令行含本仓路径)
+- `powershell.exe -Command ...`(命令行含被执行的脚本正文)
+- 我自己临时的 `python -c` 诊断脚本(正文里提到了 metrics_server)
+
+于是 `metrics in run` **恒为真** ⇒ 真组件死了永不拉起。而 metrics_server 是告警链
+(Prometheus → Alertmanager → alert_hook)的**唯一数据源** ——
+**夜里唯一会叫的那个人, 哑了也没人知道。**
+
+这是同一条通病第三次出现(2026-09-21 是 `ivms320-redis-server` 被当成观测栈的 redis);
+当时只补了"要求命令行出现本仓目录", 不够 —— "提到路径" 与 "就是那个脚本" 是两件事。
+
+修法: 脚本类组件改为**按 argv 逐项精确比对脚本路径**并要求解释器确实是 python;
+原生组件(exe 名唯一)仍按"进程名 + 观测栈目录"判。
+
+生产实测: 修复后 `metrics` 正确缺席; 重启 daemon 后看护立刻生效 ——
+`20:35:16 [daemon] 观测栈 metrics 未运行, 已拉起 pid=20352`, 9101 随即恢复 200。
+
+## 二、Prometheus 读的是陈旧副本, 8 天里所有规则改动全是空的 (P0)
+
+接好死手开关告警后查规则 API, 只看到 **1 条**。追下去发现:
+
+- Prometheus 实际读 `obs-stack/alert_rules.yml` —— 一份 **443 字节、只有 1 条规则、
+  最后修改于 2026-09-14** 的**陈旧副本**;
+- 因为 `obs-stack/prometheus.yml` 写的是相对路径 `- "alert_rules.yml"`,
+  按 Prometheus 的 cwd(`obs-stack/`)解析, 于是永远读那份旧副本;
+- 仓内真正的 `ops/alert_rules.yml`(13 条)**从未被读过**。
+
+**后果**: 融合健康 3 条 / DRL 降级 9 条 / 数据源门禁 2 条 / 死手开关 3 条 ——
+**全部不存在于 Prometheus**, 因此永远不会告警。不是"要 reload", 是**读错了文件**。
+本仓反复出现的『看起来做了 vs 实际生效』, 这次踩在**告警链自己身上**:
+**不会响的告警与没有告警, 外表完全一样。**
+
+修法: `prometheus.yml` 的 `rule_files` 改为**仓内那份的绝对路径**
+(相对路径会随启动者 cwd 漂移, 而漂移的告警配置没有任何症状)。
+
+生产实测: 规则组 1 → 3, 规则 1 → 13; `DeadmanOverdue` 实测 state=**pending**
+(即告警链真的在求值, 不再是一条死规则)。
+
+## 三、守卫: 让"规则没被读到"不可能再静默发生
+
+新增 `tests/test_alert_rules_single_source.py`:
+1. **仓内只允许一份 `alert_rules.yml`**(陈旧副本是本次事故的直接成因);
+2. 那份必须合法且含已知**组名**(锁能力域而非条数, 条数每次加规则都变是噪声);
+3. 死手开关 3 条 + 数据源门禁 2 条的**存在性**;
+4. 若本机有 `obs-stack/prometheus.yml`, 其 `rule_files` **必须指向仓内那份的绝对路径**,
+   且**禁止相对路径**。
+
+用 `find_spec` 而非 `importorskip`: 模块级 skip 会把整个文件跳掉(实测两解释器都变成
+"1 skipped"), 于是第 1 条**最关键的守卫**在没有 yaml 的解释器上等于不存在。
+实测 .venv314/.venv310 都没有 PyYAML, 故第 2~4 条常态 skip —— 已在注释里写明
+"改完规则请用生产解释器手工核一次", 并已核: 13 条 / 3 组 / 路径正确。
+
+## 登记
+
+ops/acceptance_status.json 96 → 98:
+- P1-OBS-PROC-SUBSTRING-MATCH (fixed)
+- P0-PROMETHEUS-NEVER-RELOADS-RULES (fixed)
+
+测试: 2150 passed / 15 skipped / 0 failed (原 2144; 新增 6)。

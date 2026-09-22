@@ -75,6 +75,110 @@ class TestEngineHealDoesNotDependOnVolatileMemory:
         assert "engine_done" in block, "过了收盘窗口应标记完成, 而不是继续拉引擎"
 
 
+class TestObsProcDetection:
+    """观测栈组件识别: **不能靠子串匹配**。
+
+    2026-09-22 实测 `_obs_procs()` 把三类完全无关的进程认成了组件:
+      · `node.exe`(DSH 会话本体, 命令行含本仓路径);
+      · `powershell.exe -Command ...`(命令行含被执行的脚本正文);
+      · 一个临时的 `python -c "..."` 诊断脚本(正文里提到了 metrics_server)。
+    后果: `metrics in run` 恒为真 ⇒ 9101 上的 metrics_server 死了**永远不会被拉起**,
+    而告警链(Prometheus -> Alertmanager -> alert_hook)是夜里唯一会叫的人。
+
+    这与 2026-09-21 的 `ivms320-redis-server` 是同一条通病: **子串匹配无法区分
+    "同名/提及" 与 "就是它"**。上次只补了"要求出现本仓目录", 不够。
+    """
+
+    def _fake(self, monkeypatch, procs):
+        import sys
+        import types
+        import daemon as D
+
+        class _P:
+            def __init__(self, pid, info):
+                self.pid = pid
+                self.info = info
+
+        fake = types.SimpleNamespace(
+            process_iter=lambda attrs=None: iter([_P(pid, i) for pid, i in procs]))
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        return D._obs_procs()
+
+    def test_a_mentioning_process_is_not_a_component(self, monkeypatch):
+        """**核心**: 命令行里"提到"脚本路径 ≠ 那就是本组件。"""
+        import os
+        import daemon as D
+        repo = D._BASE
+        procs = [
+            # 真组件: argv 里就是本仓脚本
+            (111, {"name": "python.exe",
+                   "cmdline": [r"C:\py\python.exe",
+                               os.path.join(repo, "src", "metrics_server.py"),
+                               "--port", "9101"]}),
+            # 假的: node 会话, 命令行只是**包含**本仓路径
+            (222, {"name": "node.exe",
+                   "cmdline": ["node.exe", os.path.join(repo, "src", "metrics_server.py")]}),
+            # 假的: powershell -Command 正文里提到
+            (333, {"name": "powershell.exe",
+                   "cmdline": ["powershell.exe", "-Command",
+                               "Get-Content " + os.path.join(repo, "src", "metrics_server.py")]}),
+        ]
+        got = self._fake(monkeypatch, procs)
+        assert got.get("metrics") == 111, f"应只认 python 真组件, 实得 {got}"
+
+    def test_missing_component_is_reported_missing(self, monkeypatch):
+        """**没有真组件时必须报"缺"** —— 否则看护永不拉起(今天就是这个后果)。"""
+        import os
+        import daemon as D
+        repo = D._BASE
+        procs = [
+            (222, {"name": "node.exe",
+                   "cmdline": ["node.exe", os.path.join(repo, "src", "metrics_server.py")]}),
+            (333, {"name": "powershell.exe",
+                   "cmdline": ["powershell.exe", "-Command", "echo metrics_server.py"]}),
+        ]
+        got = self._fake(monkeypatch, procs)
+        assert "metrics" not in got, f"无真组件却报存在 => 看护永不拉起: {got}"
+
+    def test_self_diagnostic_script_does_not_match(self, monkeypatch):
+        """诊断脚本(命令行正文里含组件名)**不得**把自己算成组件。
+
+        这在排查时最容易发生 —— 你一边跑诊断一边看判定, 诊断本身污染了判定。
+        """
+        import os
+        import daemon as D
+        repo = D._BASE
+        body = "import os; print(os.path.join(r'%s', 'src', 'metrics_server.py'))" % repo
+        procs = [(444, {"name": "python.exe", "cmdline": ["python.exe", "-c", body]})]
+        got = self._fake(monkeypatch, procs)
+        assert "metrics" not in got, f"诊断脚本污染了判定: {got}"
+
+    def test_real_shape_is_still_detected(self, monkeypatch):
+        """别把真组件也一起修掉了 —— 正常形态必须仍能识别。"""
+        import os
+        import daemon as D
+        repo = D._BASE
+        procs = [
+            (1, {"name": "python.exe", "cmdline": [
+                os.path.join(repo, ".venv310", "Scripts", "python.exe"),
+                os.path.join(repo, "src", "metrics_server.py"), "--port", "9101"]}),
+            (2, {"name": "python.exe", "cmdline": [
+                os.path.join(repo, ".venv310", "Scripts", "python.exe"),
+                os.path.join(repo, "ops", "alert_hook.py"), "--port", "9111"]}),
+            (3, {"name": "python.exe", "cmdline": [
+                os.path.join(repo, ".venv310", "Scripts", "python.exe"),
+                "-m", "celery", "-A", "src.tasks_db", "worker", "--pool=solo"]}),
+            (4, {"name": "python.exe", "cmdline": [
+                os.path.join(repo, ".venv310", "Scripts", "python.exe"),
+                "-m", "celery", "-A", "src.tasks_db", "flower", "--port=5555"]}),
+        ]
+        got = self._fake(monkeypatch, procs)
+        assert got.get("metrics") == 1
+        assert got.get("hook") == 2
+        assert got.get("celery") == 3
+        assert got.get("flower") == 4
+
+
 class TestDeadmanIsActuallyConsumed:
     """死手开关必须**被求值**, 而不只是被喂 tick。"""
 
