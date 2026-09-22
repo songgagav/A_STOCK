@@ -467,6 +467,111 @@ class TestEveryRegisteredSourceSatisfiesTheContract:
         assert BI.SOURCE_SPECS["stockdb_sdk"]["symbol_strip_prefix"] is False
 
 
+class TestRealDataWritePath:
+    """**真实数据**走完整写入路径(注入 `_append`, 不碰 h5i)。
+
+    ## 为什么单独锁这一条
+
+    已有 `test_append_is_injected_not_called_for_real` 用的是**合成行**;
+    而真实数据会带出合成行没有的形态 —— 全部 10 列、字符串型数值、`pctChg`/`turn`
+    等衍生字段、真实的 symbol 前缀。**真实数据 -> 归一化 -> 闸门 -> append**
+    这条路此前因"无可写对象"从未真跑, 是本批才首次走通的。
+
+    回归风险很具体: 若有人改了 `normalize` 的列处理或 `write_bars` 的分支,
+    合成行可能照样通过, 而真实数据会挂 —— 那时才发现就晚了。
+    """
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def bs_frames():
+        try:
+            import baostock_adapter as BA
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(f"baostock_adapter 不可用: {type(e).__name__}: {e}")
+        try:
+            f = BA.make_baostock_fetcher(start="2026-09-17", end="2026-09-22")
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(f"真实 fetcher 不可用: {type(e).__name__}: {e}")
+        out = {}
+        try:
+            for s in ("600000", "000001"):
+                try:
+                    out[s] = f(BA.to_baostock_code(s))
+                except Exception as e:  # noqa: BLE001
+                    pytest.skip(f"取数失败(疑限流/断网): {type(e).__name__}: {e}")
+        finally:
+            if hasattr(f, "close"):
+                f.close()
+        if not out:
+            pytest.skip("未取到任何真实数据")
+        return out
+
+    def test_real_data_survives_the_whole_write_path(self, bs_frames):
+        raw = pd.concat([d for d in bs_frames.values() if len(d)], ignore_index=True)
+        assert len(raw) > 0
+        captured = {}
+
+        def recorder(norm_df):
+            captured["df"] = norm_df.copy()
+            return {"ok": True, "appended": len(norm_df), "skipped_rows": 0}
+
+        out = BI.write_bars(raw, "baostock", dry_run=False, min_rows_per_day=0,
+                            h5i_max="2026-09-18", _append=recorder)
+        assert out["ok"] is True, f"真实数据被写入路径拒了: {out.get('error')}"
+        assert out["appended"] > 0
+        nd = captured.get("df")
+        assert nd is not None and not nd.empty, "归一化结果为空 —— 路径断了"
+
+    def test_real_normalized_frame_satisfies_every_contract(self, bs_frames):
+        """真实数据归一化后必须满足**每一条**契约(列/类型/符号/衍生字段)。"""
+        raw = pd.concat([d for d in bs_frames.values() if len(d)], ignore_index=True)
+        nd, meta = BI.normalize(raw, "baostock", min_rows_per_day=0)
+        assert list(nd.columns) == _H5I_COLS, "列顺序不符"
+        for c in ("open", "high", "low", "close", "volume", "amount"):
+            assert nd[c].dtype == "float64", f"{c} 是 {nd[c].dtype}, 应为 float64"
+        assert bool((nd["symbol"].str.len() == 6).all()), "symbol 未零填到 6 位"
+        assert not any("." in s for s in nd["symbol"]), "symbol 未剥离 sh./sz. 前缀"
+        assert nd["symbol"].is_unique
+        # **衍生字段必须来自源** —— 这是 DISC-1 在真实数据上的体现
+        assert nd["change_pct"].notna().all(), \
+            "change_pct 有缺失 —— 若改成自算就违反 DISC-1"
+        assert nd["turnover"].notna().all(), "turnover 缺失 —— 同样应取自源"
+        assert meta["rows"] == len(nd)
+
+    def test_real_data_matches_engine(self, bs_frames):
+        """真实数据归一化后与**引擎逐值一致**(含除权日)。"""
+        import cross_validate as CV
+        import engine_bars_sync as E
+        raw = pd.concat([d for d in bs_frames.values() if len(d)], ignore_index=True)
+        nd, _ = BI.normalize(raw, "baostock", min_rows_per_day=0)
+        eng, oth = {}, {}
+        for _, r in nd.iterrows():
+            d = pd.Timestamp(r["date"]).strftime("%Y%m%d")
+            oth[(str(r["symbol"]), d)] = {
+                "open": r["open"], "high": r["high"], "low": r["low"],
+                "close": r["close"], "volume": r["volume"], "amount": r["amount"],
+                "change_pct": r["change_pct"]}
+        # 引擎 SDK(`stock_sdk`)在 `stockdb/pybao` 下, 需由生产加载器把它加进
+        # `sys.path` —— 直接 `from stock_sdk import rd` 会 ModuleNotFoundError,
+        # 于是这条用例在**默认环境下静默 skip**(实测: venv310 下正是如此),
+        # 而 skip 看起来和"通过"一样。用 `E.load_rd()` 走与生产同一条加载路径。
+        try:
+            rd = E.load_rd()
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(f"引擎 SDK 不可用: {type(e).__name__}: {e}")
+        for (s, d) in list(oth):
+            try:
+                rows = list(rd.vals("日k", s, d))
+            except Exception:  # noqa: BLE001
+                rows = []
+            if rows:
+                eng[(s, d)] = rows[0]
+        assert eng, "引擎未返回任何可比对的日"
+        rep = CV.cross_validate(eng, oth, source="baostock")
+        assert rep["ok"] is True, f"真实数据与引擎不一致: {rep['mismatches']}"
+        assert rep["n_compared"] > 0
+
+
 class TestRoutingContract:
     """路由层契约: 调用方只该分支 `status`, 且缺口**不得**被当成功。"""
 

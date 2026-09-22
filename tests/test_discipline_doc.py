@@ -99,11 +99,67 @@ class TestDisc1MechanismsActuallyExist:
             assert hasattr(T.TestFactorComputationDiscipline, fn), \
                 f"纪律文件点名了 {fn}, 但它不存在 —— 文档在撒谎"
 
-    def test_placeholder_disciplines_are_marked_as_candidates(self):
-        """留位的纪律必须**标明是候选**, 不能看起来像已生效。"""
+    def test_disc2_disc3_disc4_are_formalized_with_mechanisms(self):
+        """DISC-2/3/4 已**正式固化**, 各自必须带"执行机制"。
+
+        它们原本是**标明为「候选」**的空位。用户要求正式固化 ——
+        固化即意味着: 不再只是想法, 而要能指出**在哪儿被执行**。
+        """
         src = open(_DOC, encoding="utf-8").read()
-        for n in ("DISC-2", "DISC-3"):
-            if n in src:
-                idx = src.find(n)
-                near = src[idx:idx + 120]
-                assert "候选" in near, f"{n} 未标明「候选」 —— 会被误读为已生效纪律"
+        for n in ("DISC-2", "DISC-3", "DISC-4"):
+            assert n in src, f"缺 {n}"
+            idx = src.find(f"## {n}")
+            assert idx >= 0, f"{n} 没有正式小节标题(可能仍留在候选区)"
+            body = src[idx:idx + 2500]
+            assert "执行机制" in body, f"{n} 缺「执行机制」—— 固化必须能指到执行处"
+            assert "候选" not in src[:idx].split("## ")[-1][:40], \
+                f"{n} 仍被标为候选, 但用户已要求正式固化"
+
+    def test_no_leftover_candidate_section(self):
+        """候选区若已清空, 不应留下"待登记的纪律"这个空标题。"""
+        src = open(_DOC, encoding="utf-8").read()
+        if "待登记的纪律" in src:
+            tail = src[src.find("待登记的纪律"):]
+            assert "候选" in tail, \
+                "留着「待登记的纪律」标题但里面没有候选 —— 空标题会误导"
+
+    def test_disc4_points_at_the_implementation(self):
+        """DISC-4 必须点名它的实现, 而不只是描述原则。"""
+        src = open(_DOC, encoding="utf-8").read()
+        assert "_tools/safe_write.py" in src, "DISC-4 未点名实现"
+        assert "write_python" in src, "DISC-4 未点名辅助函数"
+
+    def test_disc4_implementation_exists_and_refuses_bad_syntax(self):
+        """实现必须真实存在, 且**语法不过时拒绝落盘**。"""
+        import importlib.util
+        import tempfile
+        p = os.path.join(_REPO, "_tools", "safe_write.py")
+        assert os.path.isfile(p), f"缺实现: {p}"
+        spec = importlib.util.spec_from_file_location("safe_write", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # 坏语法必须抛, 且**不落盘**
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "bad.py")
+            bad = 'x = "中文"里嵌引号" 后面还有"\n'
+            with pytest.raises(mod.PythonSyntaxInvalid):
+                mod.write_python(target, bad)
+            assert not os.path.exists(target), \
+                "语法不过却落盘了 —— 会留下坏文件给别人导入"
+            # 好语法正常落盘
+            good = 'x = "中文「这样」就对了"\n'
+            mod.write_python(target, good)
+            assert os.path.isfile(target)
+
+    def test_safe_write_error_message_points_at_the_real_cause(self):
+        """报错必须提示"报错行常不是肇事行" —— 否则人会一直改错行。"""
+        import importlib.util
+        p = os.path.join(_REPO, "_tools", "safe_write.py")
+        spec = importlib.util.spec_from_file_location("safe_write2", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with pytest.raises(mod.PythonSyntaxInvalid) as ei:
+            mod.validate_python('a = 1\nb = "中文"嵌引号"\n')
+        msg = str(ei.value)
+        assert "不是肇事行" in msg, "报错未指向真因"
+        assert "「」" in msg, "报错未给出修法"
