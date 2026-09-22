@@ -244,23 +244,33 @@ def fetch_day(day: str, prefixes=PREFIXES, rd=None):
     for src in _FIELD_MAP:
         if src not in df.columns:
             df[src] = None
-    out = pd.DataFrame({
-        "symbol": df["code"].astype(str).str.zfill(6),
-        "date": pd.to_datetime(df["date"].astype(str), format="%Y%m%d", errors="coerce"),
-    })
-    for src, dst in _FIELD_MAP.items():
-        # 必须显式落成 float64: 引擎把 volume/amount 返回成 Python int, 而 h5i
-        # daily_bars 的这几列建表类型是 Float64 —— 直接透传会得到
-        # `schema mismatch: expected field volume Float64, got volume Int64`。
-        # 现有生产路径从 parquet 读出天然是 float64, 故这个坑**只有换源才会踩到**;
-        # 实测首次 --apply 即被 h5i 拒绝(appended=0, 未写入)。
-        out[dst] = pd.to_numeric(df[src], errors="coerce").astype("float64")
-    out = out.dropna(subset=["date"]).drop_duplicates("symbol", keep="last")
-    out = out[_H5I_COLS].sort_values("symbol").reset_index(drop=True)
+    # [2026-09-22 阶段一重构] 归一化交给**源无关**的 `bars_ingest.normalize`。
+    #
+    # 为什么必须抽出去: 这一步(字段映射/单位换算/类型落成/去重/残截面闸门)原先只存在于
+    # 本文件里, 于是每接一个新源都要重写一遍 —— 而其中任何一步写错都会**静默产生错数据**
+    # (单位差 100 倍、类型不符被拒、重复行)。抽到 `bars_ingest` 后, 新源只需在
+    # `SOURCE_SPECS` 里**声明**一份源规格。
+    #
+    # **行为等价**由 `tests/test_bars_ingest.py` 锁住: 同一批原始记录, 新旧两条路径
+    # 产出的 DataFrame 逐位比对(`assert_frame_equal(check_exact=True)`), 含
+    # symbol 零填充 / date 解析 / float64 落型 / `drop_duplicates("symbol", keep="last")`
+    # / 按 symbol 排序 / 列顺序 == `_H5I_COLS`。
+    import bars_ingest as _BI
+    # **残截面闸门留在本函数**, 故向 normalize 传 0 让它别做这一层判断。
+    #
+    # 为什么: 闸门的**失败语义属于各源适配器**, 不属于共享归一化层。
+    # 引擎路径的既有契约是抛 `EngineUnavailable`(调用方按"引擎不可用"处理),
+    # 而 `normalize` 是源无关的, 它只能抛 `ValueError`。
+    # 首版直接让 normalize 用引擎阈值校验, 结果异常类型从 `EngineUnavailable`
+    # 变成了 `ValueError` —— 一次性弄红两个既有用例
+    # (`TestLoudFailure::test_residual_cross_section_below_threshold_raises` 等)。
+    # 这正是"重构不得改 API"的实例: **行为等价的验收也含异常类型**。
+    out, _meta = _BI.normalize(df, "stockdb_sdk", min_rows_per_day=0)
 
-    meta["rows"] = int(len(out))
-    meta["symbols"] = int(out["symbol"].nunique())
+    meta["rows"] = int(_meta["rows"])
+    meta["symbols"] = int(_meta["symbols"])
     if meta["rows"] < MIN_ROWS_PER_DAY:
+        # 保留原有措辞与异常类型(既有测试与告警文本依赖它)
         raise EngineUnavailable(
             f"day={day8} 仅取回 {meta['rows']} 行 (< 阈值 {MIN_ROWS_PER_DAY}) "
             f"—— 残截面会静默污染下游, 拒绝写入 (prefix_counts={per})")

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""导出 A_stock_rotation 真实日线, 供 veighna_sim 模拟盘无依赖读取.
+r"""导出 A_stock_rotation 真实日线, 供 veighna_sim 模拟盘无依赖读取.
 
 为什么需要
   veighna_sim 的 paper 路径默认 `[data_source].provider="pseudo"`, 对任意符号返回

@@ -1,0 +1,82 @@
+feat(ingest)!: 阶段一 bars_ingest 源无关写入层 + 全仓语法守卫 (2224 passed)
+
+按用户批准的四项决策执行。用户要求: 阶段一开工(纯重构, 测试锁等价)、
+akshare 仅用于验证、Baostock 引入/AData 评估、缺口走运维口径;
+并把「先跑 ast.parse」固化成规范。
+
+## 阶段一: src/bars_ingest.py(源无关写入层)
+
+| 交付物 | 说明 |
+|---|---|
+| `SOURCE_SPECS` | **声明式**源规格(字段映射/符号列/日期格式/**单位换算**/残截面阈值); **未登记源一律拒绝** |
+| `normalize(df, source)` | 任意源 -> h5i 十列契约; **幂等** |
+| `write_bars(df, source)` | 归一化 -> 两道闸门 -> h5i; 返回 `unfillable_gap` |
+| `account_gap(days, h5i_max)` | 缺口分类 + 运维口径 action |
+| `fetch_and_ingest(...)` | 路由契约: `status ∈ {appended, unfillable_gap, failed}` |
+| `engine_bars_sync.fetch_day` | 改为**委托** `bars_ingest.normalize` |
+
+akshare 的 `volume` **×100**(手->股)以**声明**方式落在源规格里, 并有断言锁住。
+
+### 等价性验收(用户给定标准: 逐位一致)
+
+把重构**前**的归一化逻辑逐行抄录为 `_legacy_normalize` 作**基准**
+(刻意不 import 新代码 —— 否则基准会被一起改掉而失去意义), 与
+`bars_ingest.normalize` 用 `assert_frame_equal(check_exact=True, check_dtype=True)` 比对。
+**并用真实引擎数据(5481 行)再验一遍**, 且断言比对**非平凡**(行数 > 1000,
+且故意篡改一个值必须能让比对失败 —— 否则「两边都是空表」也会通过)。
+
+### 重构中实测踩到并修掉的三个问题(都有回归)
+
+1. **`normalize` 非幂等(最隐蔽)** —— 适配器 `fetch_day` **先归一化**再交出, 而
+   `field_map` 期望源列叫 `code`; 已归一化的表没有 `code` ⇒
+   `code -> None -> astype(str) -> "None"` ⇒ 只剩 1 行 ⇒ **归一化出 0 行**被闸门拒。
+   实测 `write_bars(fetch_day('20260922'), 'stockdb_sdk')` 报「仅 0 行」,
+   而 `fetch_day` 明明返回 **5481** 行。
+   ⇒ **只有测「适配器产物 -> write_bars」才能发现**; 只用原始记录的单测永远测不出。
+2. **异常类型被改** —— 首版让 `normalize` 用引擎阈值校验, 使 `fetch_day` 的异常从
+   `EngineUnavailable` 变成 `ValueError`, 弄红两个既有用例。
+   修法: **残截面闸门留在各源适配器**(失败语义属于适配器, 不属于共享归一化层)。
+   ⇒ **「行为等价」含异常类型** —— 这是「重构不得改 API」的具体形态。
+3. **`field_map` 方向搞反** —— 映射是 `{源列: 目标列}`, 首版写 `fm.get("date")`,
+   对 `stockdb_sdk` 恰好成立(其源列名就叫 `date`), 对 akshare 直接失败(源列名是 `日期`)。
+   这种「只在一个源上碰巧对」的写法正是本模块要消灭的耦合。
+
+### 两道闸门仍在(用户要求)
+
+· `data_quality_guard` 结构哨兵 —— 在 `h5i_sync.append_daily_bars` 里,
+  `write_bars` **刻意不重复实现**它(避免两处判据漂移), 有断言锁住;
+· **单调追加** —— 同在 append 路径, 有断言锁住。
+
+### 生产验证
+
+引擎探针 `ok:true, day:20260922, lag:0, calendar_strength:official`;
+`fetch_day` 5481 行, 列/类型/零填充全对;
+`write_bars(fetch_day(...))` -> `ok:True, meta.rows=5481, input=already_normalized`,
+且 09-22 被正确分类为 `unfillable_gap`(它已在水位上)并给出运维口径 action。
+
+## 全仓语法编译守卫(用户要求固化的规范)
+
+用户原话: 「在生成含大段中文的 Python 脚本时, 默认先跑 `ast.parse`……
+这与 METHOD-1 同源: **先做能立刻验证的事, 再等它在更晚的阶段失败**。」
+
+**做成测试而非只写进文档** —— 「规范」要靠人记得执行, 而本次会话**连续四次**都说明
+记不住(同一根因: 中文语境里手写半角引号把字符串字面量提前截断,
+而报错位置常在**不相干的下一行**)。
+
+`tests/test_python_syntax_guard.py` 覆盖**全仓每个 .py**。它立刻抓到两个真问题:
+
+1. `scripts/_tmp_fork_safe.py`(2026-09-18 一次性脚本, 未跟踪)**语法错误**
+   (docstring 用 `*/` 收尾) —— 顺带查出 `scripts/` 堆积 **25 个**未清理的
+   `_tmp_*.py`, 已整体**归档**(非删除, 遵「不删除证据」纪律)到
+   `data/_quarantine/tmp_scripts_20260922/`;
+2. `export_astock_bars.py` / `export_trade_calendar.py` 的 `SyntaxWarning`:
+   docstring 里的 PowerShell 续行 `\` 被当 Python 转义 —— 已改 raw string。
+
+守卫自身防护(避免「看起来在查, 实际没查」): 断言扫到文件数 > 100(防空转)、
+**自证**用例(喂坏样例必须抓到)、临时脚本堆积上限 5(刻意**不**无条件豁免 ——
+豁免最差的文件会制造噪声, 而噪声会让守卫被忽略)。
+
+## 登记与测试
+
+ops/acceptance_status.json 108 -> **110**。
+测试 **2224 passed / 26 skipped / 0 failed**。

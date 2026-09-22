@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""导出交易日历供跨项目消费者（veighna_sim 模拟盘）无依赖读取.
+r"""导出交易日历供跨项目消费者（veighna_sim 模拟盘）无依赖读取.
 
 为什么需要这个脚本
   A_stock_rotation `realtime_engine._plan_is_formal` 判定"盘后正式 plan"的下界是

@@ -178,3 +178,62 @@ AData / Baostock 需先: ① 安装并确认可用; ② 单独验证复权口径
 3. **确认 AData / Baostock 是否值得引入** —— 二者都需要新装依赖,
    且 `Baostock` 无实时行情(对本仓盘中链路无用, 只对历史补数有用);
 4. **确认缺口回填走 `h5i_ingest`/`h5i_rebuild` 的运维口径**(它是手工动作, 不是路由动作)。
+
+---
+
+## 7. 实施进度
+
+### ✅ 阶段一已完成(2026-09-22)
+
+`src/bars_ingest.py` 已落地, **纯重构、行为等价**(等价性由测试锁住, 见下)。
+
+| 交付物 | 说明 |
+|---|---|
+| `SOURCE_SPECS` | **声明式**源规格: 字段映射 / 符号列 / 日期格式 / **单位换算** / 残截面阈值。**未登记的源一律拒绝** |
+| `normalize(df, source)` | 任意源 -> h5i 十列契约。**幂等**(原始记录与已归一化表都能吃) |
+| `write_bars(df, source)` | 统一写入: 归一化 -> 两道闸门 -> h5i; 返回 `unfillable_gap` |
+| `account_gap(days, h5i_max)` | 缺口分类: `appended_days` vs `unfillable_gap`(**带运维口径 action**) |
+| `fetch_and_ingest(date, source, fetcher)` | 路由层契约: `status ∈ {appended, unfillable_gap, failed}` |
+| `engine_bars_sync.fetch_day` | 已改为**委托** `bars_ingest.normalize`(残截面闸门仍留适配器, 见下) |
+
+**等价性验收(用户给定标准)**: `tests/test_bars_ingest.py` 把重构**前**的归一化逻辑
+逐行抄录为 `_legacy_normalize`(基准), 与 `bars_ingest.normalize` 对同一批数据比对,
+`assert_frame_equal(check_exact=True, check_dtype=True)` **逐位一致**;
+并用**真实引擎数据**(5481 行)再验一遍, 且断言比对**非平凡**(行数 > 1000,
+且故意篡改一个值必须能比对失败)。
+
+### 重构中实测踩到并修掉的三个问题(留档)
+
+1. **`normalize` 非幂等** —— 适配器(`fetch_day`)**先归一化**再交出,
+   而 `field_map` 期望源列叫 `code`; 已归一化的表里没有 `code`, 于是
+   `code -> None -> astype(str) -> "None"` -> 只剩 1 行 -> **归一化出 0 行**被闸门拒。
+   实测 `write_bars(fetch_day('20260922'), 'stockdb_sdk')` 报「仅 0 行」,
+   而 `fetch_day` 明明返回 **5481** 行。**只有测"适配器产物 -> write_bars"才能发现**,
+   只用原始记录的单测永远测不出来。已修(幂等入口)+ 加回归。
+2. **异常类型被改** —— 首版让 `normalize` 用引擎阈值校验, 使 `fetch_day` 的异常从
+   `EngineUnavailable` 变成 `ValueError`, 弄红两个既有用例。
+   修法: **残截面闸门留在各源适配器**(失败语义属于适配器, 不属于共享归一化层),
+   `normalize` 只做归一化。
+   ⇒ **"行为等价"含异常类型** —— 这是"重构不得改 API"的具体形态。
+3. **`field_map` 方向搞反** —— 映射是 `{源列: 目标列}`, 首版写成 `fm.get("date")`,
+   对 `stockdb_sdk` 恰好成立(其源列名就叫 `date`), 对 akshare 直接失败(源列名是 `日期`)。
+   这种"只在一个源上碰巧对"的写法正是本模块要消灭的耦合。
+
+### 顺带: 全仓语法编译守卫
+
+用户要求把「生成含大段中文的脚本时先跑 `ast.parse`」固化成规范。已做成
+`tests/test_python_syntax_guard.py`(**跑全仓每个 .py** 的编译检查), 而不是只写进文档 ——
+"规范"要靠人记得执行, 而本次会话**连续四次**都说明记不住。
+
+它立刻抓到两个真问题:
+- `scripts/_tmp_fork_safe.py`(2026-09-18 的一次性脚本, 未跟踪)**语法错误**
+  (docstring 用 `*/` 收尾) —— 顺带发现 `scripts/` 下堆积了 **25 个** 未清理的
+  `_tmp_*.py`, 已整体归档到 `data/_quarantine/tmp_scripts_20260922/`;
+- `export_astock_bars.py` / `export_trade_calendar.py` 的 `SyntaxWarning`:
+  docstring 里的 PowerShell 续行 `\` 被当成 Python 转义 —— 已改为 raw string。
+
+### ⏳ 阶段二 / 阶段三(待 akshare 限流恢复)
+
+阶段二: 接 akshare(唯一已验证备源)做**双源交叉校验**;
+阶段三: 评估 AData / 引入 Baostock。**未验证的源不进路由表。**
+
