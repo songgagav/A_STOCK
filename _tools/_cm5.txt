@@ -1,0 +1,21 @@
+test(pretrade): gate 四类裁决全路径回归 + 生产 data/ 隔离哨兵 (2071 passed)
+
+补 tests/test_pretrade_gate_all_paths.py(507 行 / 30 用例), 锁住 2026-09-22 事故的
+两处根因, 并对每个锁做了**变异测试**证明它真会咬人:
+
+· 删掉 gate() 正常放行前的 audit(...)(精确复现事故) -> 8 failed / 22 passed
+· _pb_equity() 改回 getattr(self.pb, "equity", None) -> 3 failed / 27 passed
+
+覆盖: 四类裁决各自写审计 / 审计字段契约与哈希链相接(不断言 hash 值) /
+清单接线(risk 与 freeze_new_buys=True 拦单, 卖出不受影响) / 判定异常不阻断
+且响亮留痕 / gates=False 只关清单不关留痕 / PaperBook 无 equity 属性这一事实 /
+_pb_equity 主路径+回退+返回 None 而非 0 / 引擎权益真能喂出仓位占比。
+
+生产 data/ 未被写入: 跑前跑后 data/order_audit.jsonl 均不存在、
+data/pending_orders.json md5 逐字节相同; autouse 哨兵 _production_data_untouched
+在用例误写生产时直接报错(而不是静默污染)。
+
+顺带纠正一处语义误记: regime 从来没有 freeze_new_buys 这个档位(那是个布尔字段名),
+故额外锁住"字面量 regime=freeze_new_buys 不拦单"这一反方向误读。
+
+全量 2071 passed / 15 skipped / 0 failed。
