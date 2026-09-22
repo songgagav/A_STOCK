@@ -235,3 +235,40 @@ groups:
           description: >-
             metrics_server 读不到 data/health/state.json 的 observed.deadman
             (快照缺失或为旧版本) => DeadmanOverdue / DeadmanNeverArmed 可能漏报。
+
+  - name: astock_scrape_health
+    rules:
+      - alert: MetricsTargetDown
+        # [2026-09-23 新增] 本文件此前**全部**规则都建立在"9101 还能被抓到"之上,
+        # 却没有一条规则检查这件事本身。2026-09-23 00:31 实测到了后果:
+        # 手工停掉 metrics_server 重启换代码时, 9101 停止被抓, 于是
+        # `astock_db_lastday_ts` 等序列消失, **00:32:51 alert_hook 记下三条
+        # `resolved`** —— 而那三张表(valuation / valuation_snapshot /
+        # money_flow_estimate)**一张都没有更新**。
+        #
+        # 为什么这比"某条规则写错"危险: 数据源死了以后系统发出的信号是**由红转绿**。
+        # Alertmanager 只会把"firing -> 消失"解释为 **resolved**, 于是下游(人/钉钉)
+        # 收到的唯一消息是"故障已恢复"。本仓铁律是"宁可响亮停手, 不可静默降级",
+        # 而这里连"停手"都没有 —— 是**假恢复**。
+        #
+        # 为什么 `for: 10m` 而不是 0: 上面那条实测是我**主动重启**造成的, 属正常运维
+        # (daemon 的 `_ensure_obs_stack()` 也会在约 19 分钟内自愈)。10 分钟把"主动重启"
+        # 与"真的死了"分开 —— 与 `FAILS_TO_HALT=3`(连续 N 次才停手)同一条纪律:
+        # 判据要扛得住单次抖动, 否则会训练人忽略这个频道。
+        #
+        # `up` 由 Prometheus 自己对每次抓取生成, **不经过 metrics_server** ——
+        # 这正是它能覆盖"被监控者已死"的原因: 它不需要 9101 还活着才能取到值。
+        expr: up{job="astock-db"} == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "metrics_server (9101) 已停止被抓取 —— 本文件其余告警**全部失效**"
+          description: >-
+            up{job="astock-db"} == 0: Prometheus 连续 10 分钟抓不到 127.0.0.1:9101。
+            后果**不是"少了一路指标", 而是本文件里每一条告警都同时失效**, 且已经
+            firing 的告警会被 Alertmanager 报成 resolved(看起来像故障恢复)。
+            处置: 查 9101 是否在听(`Get-NetTCPConnection -LocalPort 9101`)、
+            `python src/metrics_server.py --port 9101` 能否手工起来;
+            daemon 的 `_ensure_obs_stack()` 约 19 分钟会自愈, 若没自愈则查 daemon 是否还活着
+            (两者同时消失是本条也覆盖不到的情形 —— 那时看 logs/daemon.log)。

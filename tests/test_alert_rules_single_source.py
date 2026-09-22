@@ -147,6 +147,73 @@ class TestSingleSourceOfTruthForAlertRules:
                      "DataSourceHalt", "DataSourceGateUnreadable"):
             assert want in names, f"缺规则 {want}; 现有: {sorted(names)}"
 
+    @_needs_yaml
+    def test_scrape_target_is_itself_monitored(self):
+        """**告警链自己被抓取这件事, 必须也有告警。**
+
+        2026-09-23 00:31 实测到这条缺口(不是推演): 手工停掉 metrics_server 换代码时,
+        9101 停止被抓, `astock_db_lastday_ts` 等序列消失, 于是 00:32:51 alert_hook
+        记下三条 **`resolved`** —— 而那三张表(valuation / valuation_snapshot /
+        money_flow_estimate)一张都没更新。
+
+        为什么这比"某条规则写错"危险: 数据源死掉以后本系统发出的信号是**由红转绿**。
+        Alertmanager 把"firing -> 序列消失"解释为 resolved, 于是人收到的唯一一条
+        消息是"故障已恢复" —— 这正是本仓明令禁止的**假恢复**
+        (『宁可响亮停手, 不可静默降级』)。
+
+        判据用 `up` 而不是某个 `astock_*` 指标: `up` 由 Prometheus 自己生成,
+        **不经过 metrics_server** —— 否则就是"要求被监控者还活着才能报它死了"。
+        """
+        import yaml
+        fp = os.path.join(_REPO, "ops", "alert_rules.yml")
+        d = yaml.safe_load(open(fp, encoding="utf-8"))
+        rules = {r["alert"]: str(r["expr"]) for g in d["groups"] for r in g["rules"]}
+        assert "MetricsTargetDown" in rules, (
+            "缺 MetricsTargetDown —— 9101 死掉时, 本文件其余规则会**全部静默失效**, "
+            "且已 firing 的告警会被报成 resolved(假恢复)")
+        expr = " ".join(rules["MetricsTargetDown"].split())
+        assert expr.startswith("up{"), (
+            f"MetricsTargetDown 的判据必须是 `up{{...}}`(Prometheus 自产, 不依赖 9101), "
+            f"实际: {expr[:100]!r}")
+        assert "== 0" in expr, f"判据应判 up == 0, 实际: {expr[:100]!r}"
+        # 必须有 for: 否则主动重启(正常运维)也会叫 —— 与 FAILS_TO_HALT 同一条纪律
+        for g in d["groups"]:
+            for r in g["rules"]:
+                if r["alert"] == "MetricsTargetDown":
+                    assert r.get("for"), (
+                        "MetricsTargetDown 缺 `for:` —— 主动重启 metrics_server 是正常运维, "
+                        "无延迟会把它变成噪声告警(长期噪声等于没有告警)")
+
+    def test_no_alert_rules_copy_outside_the_repo(self):
+        """**仓外**也不允许留告警规则副本。不需要 yaml, 永远真跑。
+
+        为什么单列一条(上面那条走 `os.walk(_REPO)` 覆盖不到这里):
+        2026-09-22 的事故副本恰恰在**仓外**的 `obs-stack/alert_rules.yml`
+        (443 字节 / 1 条规则 / 最后改于 09-14), 于是"仓内只允许一份"那条守卫
+        **全程没管到它**。那份副本已于 2026-09-23 删除, 这条守卫防止它再长回来 ——
+        `obs-stack/` 正是 Prometheus 的 cwd, 规则文件放那里**一定会被读到**。
+        """
+        if not os.path.isdir(_OUTER):
+            pytest.skip("外层目录不存在")
+        strays = []
+        for dp, dns, fns in os.walk(_OUTER):
+            dns[:] = [d for d in dns if d not in ("__pycache__", ".git", "node_modules")]
+            # 仓内那份是**唯一合法**的; 其它 git checkout 副本(_merge_workspace)不算陷阱,
+            # 因为它们不在 Prometheus 的搜索路径上 —— 但 obs-stack 下必须是空的。
+            if os.path.abspath(dp).lower().startswith(os.path.abspath(_REPO).lower()):
+                continue
+            for fn in fns:
+                if fn != "alert_rules.yml":
+                    continue
+                full = os.path.join(dp, fn)
+                rel = os.path.relpath(full, _OUTER).replace("\\", "/")
+                if rel.startswith("_merge_workspace/"):
+                    continue
+                strays.append(rel)
+        assert not strays, (
+            f"仓外存在告警规则副本: {strays} —— obs-stack/ 是 Prometheus 的 cwd, "
+            "放那里的规则文件会被读到, 而**没有任何机制会告诉你读的是哪份**")
+
 
 class TestPrometheusActuallyReadsIt:
     """**核心**: Prometheus 必须指向仓内那一份, 而不是任何副本。"""

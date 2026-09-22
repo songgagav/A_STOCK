@@ -55,6 +55,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+# [2026-09-23] 本仓 pytest 必须用 `--basetemp=.pytest_tmp\<run>` 才能在 Windows 上
+# 正常跑(默认 basetemp 目录不可写), 故该目录**每轮都会生成**且含大量临时产物;
+# 不忽略它会让每次 `git status` 都多出一坨噪声。
+.pytest_tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage
