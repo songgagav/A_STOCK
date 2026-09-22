@@ -26,8 +26,14 @@ groups:
             astock_db_lastday_ts 距今超过 5 天(留出周末与一个容错交易日)。
             查 data/datasource_health.jsonl 的 db_update 连续失败原因,
             以及 data/health/state.json 的 observed.datasource。
-            实测 2026-09-22: valuation/valuation_snapshot/money_flow_estimate
-            停在 09-08(14.9 天), 属上游数据源问题, 见 docs/stockdb-source-status.md。
+
+            【已知状态 · 2026-09-22 登记】若告警表是 valuation / valuation_snapshot /
+            money_flow_estimate 这三张, 则为**已登记的已知状态, 不是新故障**:
+            它们停在 2026-09-08(14.9 天), 属上游数据源问题 ——
+            见 docs/stockdb-source-status.md 与登记 P0-DB-UPDATE-ALL-TABLES-FAIL。
+            处置: 该告警**保留为 warning**(不用 silence 盖掉) —— 因为它同时覆盖
+            真正需要人看的表(daily_bars 等); 收到时按上表判断是否属已知三张,
+            属则记录后关闭, 不属则按新故障处理。
 
       - alert: TableStaleQuarterly
         # 季报类表(财报节奏) —— **刻意与日报类分开**: 用 24h 判它必然永久误报

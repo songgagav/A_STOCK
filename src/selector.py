@@ -246,8 +246,15 @@ class RotationSelector:
         except Exception:
             pass
 
+        # [2026-09-22 巡检] 每轮选股**从零开始计量** —— 否则上一轮的计数会累加进来,
+        # 使"本轮被问了多少次"失真(而那个次数正是判据本身)。
+        try:
+            import access_probe as _AP
+            _AP.reset()
+        except Exception:  # noqa: BLE001
+            pass
+
         # [2026-09-22 性能] valuation/financials 的**全市场最新一期**批量预热。
-        #
         # 为什么必须做: 下面的 scoring 循环里每只都要 `get_valuation` + `get_financials`,
         # 而两者在 h5i 上都是"扫整表取最新一期" —— 实测每次约 200ms, 而瓶颈是
         # **扫过 1540 万行本身**(双 CAST / 单 CAST / 不 CAST 三种写法都 ~200ms,
@@ -406,6 +413,21 @@ class RotationSelector:
 
         basket_signal = float(np.mean([t["signal"] for t in top_n])) if top_n else 0.0
 
+        # [2026-09-22 巡检] 「N 次扫表」结论随选股结果一起返回。
+        # 为什么挂在这里: 选股是**唯一**会对全池逐只扫表的路径, 也是那条
+        # "全池 2809 只 × 200ms = 11 分钟"被发现的现场。把结论放进产物,
+        # 事后翻 selection.json 就能看到"这一轮各存取被问了多少次、键重不重复",
+        # 而不必等到它变成 25 分钟才察觉。
+        # **失败不抛**: 巡检绝不得拖垮选股(与留痕同一条纪律)。
+        _access = None
+        try:
+            import access_probe as _AP
+            _v = _AP.verdict()
+            _access = {"level": _v.get("level"), "reasons": _v.get("reasons") or [],
+                       "rows": _AP.snapshot()}
+        except Exception:  # noqa: BLE001
+            _access = None
+
         return {
             "date": None,   # 由调用方填
             "as_of": as_of,
@@ -417,6 +439,7 @@ class RotationSelector:
             # 全池信号快照: 保留"本轮算过分的所有标的"因分明细,
             # 用于事后 IC 衰减跟踪(对比后续收益), 而非仅存 TopN
             "pool_snapshot": scored,
+            "access_probe": _access,
         }
 
     # ---------- P4: 历史日 no-lookahead 选股 ----------

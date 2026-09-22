@@ -138,6 +138,33 @@ def _latest_cached(table: str, canon: str, loader):
     return val
 
 
+def _probed(fn_name: str):
+    """[2026-09-22 巡检] 给存取方法加计量, **零语义变更**(见 access_probe)。
+
+    为什么加在**方法层**而不是各处调用点: 调用点会随重构移动/新增, 而指标必须
+    跟着**能力**走 —— 我们要统计的是「这个存取被问了多少次、键重不重复」,
+    与谁在问无关。装饰器只包一层 `finally`, 返回值与异常原样透传。
+    """
+    def deco(fn):
+        def wrapper(self, *a, **kw):
+            import time as _t
+            import access_probe as _AP
+            t0 = _t.perf_counter()
+            try:
+                return fn(self, *a, **kw)
+            finally:
+                try:
+                    _AP.record(fn_name, a[0] if a else None,
+                               (_t.perf_counter() - t0) * 1000.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        wrapper.__name__ = getattr(fn, "__name__", fn_name)
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
+        wrapper.__wrapped__ = fn
+        return wrapper
+    return deco
+
+
 # ---------------------------------------------------------------------------
 # symbols parquet 进程内缓存槽
 #
@@ -686,6 +713,7 @@ class StockDB:
             return False
 
     # ---------- 单标的历史日线 (用 daily_bars: 纯6位, 最新交易日) ----------
+    @_probed("get_bars")
     def get_bars(self, canon: str, n: int = 200, as_of=None) -> pd.DataFrame:
         """返回单标的最近 n 根日线 (截至 as_of, 若指定), 列: date, open, high,
         low, close, volume, amount, change_pct; 按 date 升序。
@@ -826,6 +854,7 @@ class StockDB:
         return row[0] if row else None
 
     # ---------- 真实财务数据 (financials 表, 治理分输入) ----------
+    @_probed("get_financials")
     def get_financials(self, canon: str) -> dict:
         """返回某标的最新一期真实财务指标, 无数据返回 {}.
         """
@@ -943,6 +972,7 @@ class StockDB:
         # 负债率数据已就绪(debt_ratio), 后续因子重建时在 h5i 原生层启用.
         return {k: v for k, v in fin.items() if v is not None}
 
+    @_probed("get_valuation")
     def get_valuation(self, canon: str) -> dict:
         # [2026-09-22 性能] 记忆化"最新一期"(实测 0.254s/只 => 全池 11.9 分钟)。
         # 只缓存最新口径; 本函数没有 as_of 形参, 故整体可缓存。
