@@ -1,0 +1,79 @@
+docs(discipline): 纪律文件落地 + 补数完成(写入路径首次实测) (2276 passed)
+
+按用户清单执行。
+
+## ① 纪律文件 `docs/disciplines.md`(与 METHOD-1 并列)
+
+- **METHOD-1**(方法论): 边界/阈值必须由**下游表现**决定, 而非**分布范围** ——
+  **引用**其原处 `docs/drl-learning-verification.md` §📌, **不复制正文**
+  (两处副本必然漂移), 并说明其本仓落地形态(证据不足时只记录不判定,
+  显式标注 `threshold_applied: false`)。
+- **DISC-1**(数据/工程): 价格衍生指标**取自源, 不得自算** ——
+  含事实依据 / 为什么必须成为纪律 / 原则 / **三层强制执行机制** / 守卫清单 /
+  新源接入检查表。
+- 留了两个**标明为「候选」**的空位(DISC-2 检查项静默消失、DISC-3 加速层不得改语义)。
+
+## ② 纪律文件本身也有守卫(9 例)
+
+理由: 一份纪律如果只是**写着**而没有任何东西检查它, 就会腐烂成漂亮文字 ——
+与本仓反复出现的「看起来做了 vs 实际生效」同族。锁两件事:
+1. 文件存在、与 METHOD-1 并列、且**引用而非复制** METHOD-1;
+2. **DISC-1 声明的三层强制必须能在代码里点到名** —— 把「文档说有三层」变成
+   「测试证明有三层」; 且点名到的测试函数/常量必须真实存在。
+
+**该守卫立刻抓到一处真缺口**: 正文提到 volume_ratio 判据但没点名
+`EXPECTED_VOLUME_RATIO` 常量 —— 已补上(含「写死的等式 vs 看着接近」的说明,
+以及手->股**非精确 100 倍**(实测差 28 股)的注脚)。
+
+## ③ 三层强制逐条点名验证(用户要求逐项确认)
+
+`TestFactorComputationDiscipline` 6 例全绿:
+
+| 用户要求 | 用例 | 结果 |
+|---|---|---|
+| REQUIRED_FIELDS 缺则 ValueError | `test_fetcher_refuses_to_run_without_them` | 通过 |
+| 静态扫描禁止 pct_change/shift(1) | `test_normalize_never_derives_change_pct` | 通过 |
+| 反证: 自算 −1.93 必被判不一致 | `test_selfcomputed_value_would_be_caught` | 通过 |
+| 字段集必须含必需字段 | `test_fetcher_requests_the_derived_fields` | 通过 |
+| 映射必须来自源列 | `test_baostock_spec_maps_change_pct_from_source` | 通过 |
+| **通用化**: 新源自动被检查 | `test_all_sources_that_have_the_field_declare_it` | 通过 |
+
+- **除权日用例(600177 @ 2026-09-18)已入测试** —— 由上述 3 条 + `test_pct_mismatch_fails` 覆盖
+- **volume_ratio 反证生效** —— `test_volume_off_by_100x_fails_loudly` + `test_akshare_expects_100x`
+- **真实数据双源交叉校验** —— 24 组 OK, OHLC 24/24 一致, volume比值=1.0000
+
+## ④ 补数完成 + **写入路径首次实测**(此前从未真跑过)
+
+真实 Baostock 数据走完整条路径(归一化 -> 两道闸门 -> append):
+```
+取数: 6/6 只, 每只 4 行(09-17..09-22), 合并 24 行
+write_bars: ok=True  appended=6  error=None
+  列 == H5I_COLS: True; volume/amount dtype=float64; symbol 全 6 位: True
+  change_pct 非空 6/6; turnover 非空 6/6
+cross_validate: OK  比对 6 组  volume比值=1.0000(预期 1.0)  失败判据=[]
+```
+`_append` 注入为记录器 —— 真实记录"会被写入什么", 但**不动 h5i**。
+
+## ⑤ 实证「不可回填」
+
+对已在库的日期**真调** `h5i_sync.append_daily_bars`:
+```
+h5i 当前水位 = 2026-09-22
+[h5i_sync] 跳过回填日期 2026-09-22 (<= h5i 现有最大 2026-09-22), 不破坏 h5i 单调性
+真调 append -> ok=True  appended=0  skipped_rows=6  error=None
+```
+⇒ **一行都写不进**。这是「水位之前的缺口不能用 append 回填」的**实证**(不再是推断)。
+
+## 过程中的自我观察(值得记)
+
+本批我在**同一处栽了第五次**: 中文串里手写半角引号截断 Python 字面量。
+`ast.parse` 每次都在运行前拦住 —— 但拦住之后我仍是"手改一处、再跑、再报下一处"。
+
+元教训: **守卫能拦住错误, 但拦不住低效的修复循环**。
+最终改为"生成脚本时就先 `ast.parse` 校验、通过才落盘", 一次收敛。
+候选 DISC-4: 生成含大段中文的代码时, 先校验再落盘(而不是写完再修)。
+
+## 登记与测试
+
+ops/acceptance_status.json 114 -> **115**。
+测试 **2276 passed / 28 skipped / 0 failed**(新增 9 例纪律文件守卫)。
