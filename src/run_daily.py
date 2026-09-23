@@ -92,6 +92,98 @@ def self_closed_loop(day: str, day_dir: str, db) -> dict:
     return fb
 
 
+def portfolio_construction() -> dict:
+    """组合**建仓进度** —— 让"未建满"这件事进入回执 (2026-09-23 新增, 用户决策方案 B)。
+
+    ## 为什么必须有这一项
+
+    2026-09-23 实测: 虚拟盘收盘只有 **4/10** 个目标持仓, 现金占比 **68.98%**,
+    而**回执里没有任何字段**说这件事。`position_gap` 虽然报过同类问题
+    (09-22 目标 10 实配 3), 但它只在**盘前健康检查**里, 属另一份产物 ——
+    于是"组合长期半仓"这件事在每日回执这条主线上是**不可见的**。
+
+    本仓 DISC-2 的形态: 「没有这一项」与「这一项没问题」必须可区分。
+    一个 70% 空转现金的组合, 与一个满仓组合, 在回执上**长得一样** —— 那就会
+    被误读成"策略弱", 而实际是"建仓节奏被预算与间隔门夹住了"。
+
+    ## 为什么由回执侧算, 而不是让引擎写
+
+    引擎(`realtime_engine`)是**盘中进程**, 它在 15:03 就退出了; 而回执在 19:10 生成。
+    故这里读引擎留下的 `data/live_state.json`(它含 `positions` 与 `targets` 快照)
+    与当天的 `target_plan.json` —— 两边都是**已落盘的事实**, 不新增进程间耦合。
+
+    返回 `{}` 表示取不到数据(不臆造数字); 调用方据此记 `error`, 而不是记 0。
+    """
+    out: dict = {"ok": False}
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        lv_fp = os.path.join(root, "data", "live_state.json")
+        if not os.path.isfile(lv_fp):
+            out["error"] = f"缺少 {lv_fp}"
+            return out
+        with open(lv_fp, encoding="utf-8-sig") as f:
+            lv = json.load(f)
+        pos = lv.get("positions") or []
+        held = {str(p.get("canon")) for p in pos if isinstance(p, dict) and p.get("canon")}
+        # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据);
+        # live_state 里有 targets 快照。若没有, 再退回当天 target_plan.json。
+        tgt_list = lv.get("targets") or []
+        if tgt_list:
+            want = [str(t.get("canon")) for t in tgt_list
+                    if isinstance(t, dict) and t.get("canon")]
+            src = "live_state.targets"
+        else:
+            plan_fp = os.path.join(root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
+                                   "target_plan.json")
+            if not os.path.isfile(plan_fp):
+                out["error"] = "live_state 无 targets 且找不到当日 target_plan.json"
+                return out
+            with open(plan_fp, encoding="utf-8-sig") as f:
+                plan = json.load(f)
+            want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
+                    if isinstance(t, dict) and t.get("canon")]
+            src = "target_plan.top_n"
+
+        cap = lv.get("capital") or {}
+        equity = float(cap.get("equity") or 0) or 1.0
+        mv = float(cap.get("market_value") or 0)
+        held_in_target = [c for c in want if c in held]
+        pending = [c for c in want if c not in held]
+        # 预算与槽位: 直接取引擎同款配置, 不另立数字
+        to_pct = float(PAPER.get("max_turnover_pct", 0.20) or 0.20)
+        max_pos = len(want) or 1
+        slot = equity / max_pos
+        budget = equity * to_pct
+        # 建仓预计天数: 待买名义额 / 单日预算, 向上取整(仅作**量级提示**)。
+        # 资金来自"现有现金 + 离池持仓卖出后回笼", 故两者都算进来 ——
+        # 只按现金算会把天数说多(离池票卖掉后是可以再投的)。
+        need = len(pending) * slot
+        days = int(-(-need // budget)) if budget > 0 else None
+
+        extra = sorted(held - set(want))          # 在持仓但已不在目标池 -> 将卖出回笼
+        cash = float(cap.get("cash") or 0)
+        out.update({
+            "ok": True,
+            "source": src,
+            "target_count": len(want),
+            "current_count": len(held_in_target),
+            "extra_holdings": extra,              # 在持仓但已不在目标池
+            "pending_buys": len(pending),
+            "pending_list": pending[:10],
+            "daily_turnover_budget": to_pct,
+            "budget_amount": round(budget, 2),
+            "slot_amount": round(slot, 2),
+            "cash_available": round(cash, 2),
+            "estimated_days_to_complete": days,
+            "deployment_ratio": round(mv / equity, 4),
+            "cash_ratio": cap.get("cash_ratio"),
+            "reason": ("单日换手预算与调仓间隔共同约束" if pending else None),
+        })
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {str(e)[:180]}"
+    return out
+
+
 def update_market_sentiment(day: str) -> dict:
     """更新收盘市场情绪快照；指定日尚无数据时回退到数据库最近交易日。"""
     result = {"requested_day": day, "ok": False}
@@ -509,7 +601,17 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                                    "orderbook_snapshot", "block_trade"])
             # 提取 AKShare 统计 (网络/空数据诊断)
             ak_stats = upd.pop("__akshare_stats__", {})
-            tables_dict = {k: {"ok": v["ok"], "rows": v["rows"]} for k, v in upd.items()}
+            # [2026-09-23 修] **必须保留每张表的 error**。
+            # 原实现只投影 `{"ok", "rows"}`, 把 `error` 丢了 —— 而
+            # `update_all` 在 DuckDB 不可用时走的是**提前返回**分支: 12 张表
+            # 全都是 `{ok:False, rows:0, error:"DuckDB 已退役/不可用..."}`,
+            # 步骤级却没有 error。于是回执里真因**彻底消失**, 只剩一句与事实
+            # 相反的供应商自评(akshare_stats 说 ok/0 错误/0 空), 让人误以为
+            # 是"整条 akshare 链路没产出" —— 实际 akshare 根本没被调用。
+            # 归因信息丢在中间层, 是本次 12/12 全失败被误读的直接原因。
+            tables_dict = {k: {"ok": v["ok"], "rows": v["rows"],
+                               "error": (str(v.get("error") or "")[:200] or None)}
+                           for k, v in upd.items()}
             # ok 判定: 至少有任一表成功 OR AKShare 网络错误已知容错
             any_ok = any(v.get("ok") for v in upd.values())
             report["steps"]["db_update"] = {
@@ -988,6 +1090,16 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                                        "reason": "非交易日(maint), 无当日盘中状态"}
             report["summary"] = {"skip": True,
                                  "reason": "非交易日(maint) 跳过"}
+
+        # [2026-09-23 用户决策: 方案 B「分 2-3 天建仓, 但显式记录」]
+        # 建仓进度必须进回执 —— 否则"组合半仓"与"组合满仓"在回执上长得一样,
+        # 会被误读成策略弱, 而实际是建仓节奏被换手预算/调仓间隔夹住。
+        # 放在 paper 之后: 此刻 live_state.json 已是收盘态, 读到的是最终持仓。
+        try:
+            report["steps"]["portfolio_construction"] = portfolio_construction()
+        except Exception as _e:  # noqa: BLE001
+            report["steps"]["portfolio_construction"] = {
+                "ok": False, "error": f"{type(_e).__name__}: {str(_e)[:160]}"}
 
         # 先写当日回执，绩效归因会从 daily_summary.json 读取包括今天在内的权益。
         out_path = os.path.join(DAILY_DIR, day_dir, "daily_summary.json")

@@ -172,23 +172,47 @@ class TestEvaluate:
         assert r["halt_sources"] == []
 
     def test_consecutive_failures_reach_halt(self, tmp_path):
-        """账本里**真有 3 次**同因失败 => HALT(阈值是 3, 不是 2)。
+        """**核心源**连续 3 次同因失败 => HALT。
 
-        [2026-09-23 修] 本用例原先只造 **2** 条账本就断言 HALT —— 那是**把 bug
-        当规格写进了测试**: `evaluate` 曾无条件 `+1`(把"传进来的这次观测"算作
-        账本里还没有的第 N+1 次), 于是 2 条 +1 = 3 触发 HALT。
-        而生产里 `run_daily` 记完账之后, 守护进程**又读同一天的产物再判一次**,
-        那次 `+1` 就把**同一次失败数了两遍** ⇒ 实测: 账本 2 条却报 `[HALT×3]`
-        ⇒ 次日会跳过摄入与选股(**提前一天停手**)。
-        修正后语义: 只有显式声明 `unrecorded` 的源才 +1; 传进来的 step 默认视为已入账。
+        [2026-09-23 两次修正, 都值得记]
+        ① 本用例原先只造 **2** 条账本就断言 HALT —— 那是**把 bug 当规格**:
+          `evaluate` 曾无条件 `+1`, 于是 2 条 +1 = 3。而生产里 `run_daily` 记完账后
+          守护进程**又读同一天产物再判一次**, 那次 `+1` 把同一次失败数了两遍
+          ⇒ 实测账本 2 条却报 `[HALT×3]` ⇒ 次日跳过摄入与选股(**提前一天停手**)。
+        ② 本用例原本用 `db_update` 当被熔断的源 —— 用户指出这意味着
+          「用辅助表失败熔断整个交易管道」是**过度反应**。现 `db_update` 已归为辅助源
+          (见 `CRITICAL_SOURCES` 的完整论证), 故这里改用**真正核心**的引擎源。
         """
         led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(3)
+            {"source": G.SRC_ENGINE, "ok": False, "kind": "engine_unreachable"}
+            for _ in range(3)
+        ])
+        r = G.evaluate(engine_probe={"ok": False, "error": "不可达"}, ledger=led)
+        assert r["level"] == G.HALT and r["allow"] is False
+        assert r["halt_sources"] == [G.SRC_ENGINE]
+
+    def test_auxiliary_source_never_halts_even_after_many_failures(self, tmp_path):
+        """**辅助源失败再多也不熔断** —— 但必须仍然看得见(level=DEGRADED)。
+
+        用户 2026-09-23 的判断: 12 张 `db_update` 表**无一**被决策链路引用,
+        而它们失败源于已退役的 DuckDB 写入路径。用「辅助表坏了」熔断
+        「整个交易管道」与本仓禁止的静默降级**方向相反但同样错**: 静默降级是
+        「坏了不报」, 这是「不重要的事坏了导致重要的事停摆」。
+
+        同时断言**可见性不降级**: level 仍为 DEGRADED, 且 `auxiliary_failures`
+        里带着归因文本 —— 否则就从"过度反应"滑到另一个极端"坏了没人知道"。
+        """
+        led = _ledger(tmp_path, [
+            {"source": G.SRC_DB_UPDATE, "ok": False, "kind": "all_tables_failed"}
+            for _ in range(9)      # 远超 FAILS_TO_HALT=3
         ])
         r = G.evaluate(db_update_step={"ok": False, "tables": {
             "a": {"ok": False, "rows": 0}}}, ledger=led)
-        assert r["level"] == G.HALT and r["allow"] is False
-        assert r["halt_sources"] == ["db_update"]
+        assert r["allow"] is True and r["halt_sources"] == []
+        assert r["level"] == G.DEGRADED, "辅助源失败必须仍然可见"
+        assert G.SRC_DB_UPDATE in (r.get("auxiliary_failures") or {})
+        assert any("辅助源不停手" in x for x in r["reasons"])
+        assert r["items"][0]["is_critical"] is False
 
     def test_recorded_failure_is_not_counted_twice(self, tmp_path):
         """**核心回归**: 同一次失败被判两次, 不能变成两次计数。
@@ -199,20 +223,49 @@ class TestEvaluate:
         本仓对"静默停手"零容忍, 对"误停手"同样零容忍。
         """
         led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+            {"source": G.SRC_ENGINE, "ok": False, "kind": "engine_unreachable"}
+            for _ in range(2)
         ])
-        step = {"ok": False, "tables": {"a": {"ok": False, "rows": 0}}}
+        probe = {"ok": False, "error": "不可达"}
         # 已入账(默认): 2 条就是 2 条, 仍是 DEGRADED
-        r = G.evaluate(db_update_step=step, ledger=led)
+        r = G.evaluate(engine_probe=probe, ledger=led)
         assert r["level"] == G.DEGRADED and r["allow"] is True, r["reasons"]
         assert r["items"][0]["consecutive_failures"] == 2
         assert r["items"][0]["counted_as_unrecorded"] is False
         # 显式声明"这次还没入账"才会 +1 -> 3 => HALT(即"第 3 次真失败")
-        r2 = G.evaluate(db_update_step=step, ledger=led,
-                        unrecorded=(G.SRC_DB_UPDATE,))
+        r2 = G.evaluate(engine_probe=probe, ledger=led,
+                        unrecorded=(G.SRC_ENGINE,))
         assert r2["level"] == G.HALT and r2["allow"] is False
         assert r2["items"][0]["consecutive_failures"] == 3
         assert r2["items"][0]["counted_as_unrecorded"] is True
+
+    def test_db_update_retirement_is_not_a_failure(self):
+        """**DuckDB 已退役不应算作失败**(2026-09-23 真因)。
+
+        实测: `db_update` 12/12 全失败的真因是 `_connect_write_retry` 抛
+        `FileNotFoundError`(legacy DuckDB 已删除), **与 akshare/网络无关** ——
+        供应商自评甚至是 `network_errors=0, empty_count=0`(即 akshare 根本没被调用)。
+        把它算成连续失败, 会让门禁每 3 天误熔断一次整个交易管道。
+        """
+        tabs = ["daily_bars", "valuation_snapshot", "lhb", "events", "stock_news"]
+        retired = {
+            "ok": False,
+            "tables": {t: {"ok": False, "rows": 0,
+                           "error": "DuckDB 已退役/不可用, 表级写入降级跳过 "
+                                    "(daily_bars 由 free_stockdb_sync -> h5i 主写)"}
+                       for t in tabs},
+            "akshare_stats": {"last_status": "ok", "network_errors": 0, "empty_count": 0},
+        }
+        cls = G.classify_db_update(retired)
+        assert cls["ok"] is True and cls["observed_only"] is True
+        assert cls["kind"] == "legacy_duckdb_retired"
+        # 真故障(非退役)仍必须是失败, 否则就是拿"已知状态"当万能挡箭牌
+        real = {"ok": False,
+                "tables": {t: {"ok": False, "rows": 0, "error": "akshare 接口变更"} for t in tabs}}
+        c2 = G.classify_db_update(real)
+        assert c2["ok"] is False and c2["kind"] == "all_tables_failed"
+        # 且归因必须能从**表级 error** 取到(步骤级 error 在生产里是空的)
+        assert "akshare" in c2["detail"] or "表级原因" in c2["detail"]
 
     def test_run_daily_declares_only_the_probe_as_unrecorded(self):
         """`run_daily` 必须**声明**只有引擎探针未入账, 且必须用**常量**而非字面量。
@@ -280,14 +333,15 @@ class TestCheckAndRecord:
     def test_halt_is_recorded_with_level_kind(self, tmp_path):
         """HALT 时必须往账本写一条 `_gate` 记录(kind=HALT), 否则事后无法归因。
 
-        [2026-09-23 修] 本用例原先造 **2** 条账本 —— 那是把"无条件 +1"的 bug
-        当规格。阈值 `FAILS_TO_HALT=3` 指的是**3 次真实失败**, 故这里造 3 条。
+        [2026-09-23 两次修正] ① 原先造 2 条账本(把无条件 +1 的 bug 当规格) ->
+        改为 3 条; ② 原先用 `db_update` 当被熔断源 -> 改为核心源 `SRC_ENGINE`,
+        因为 `db_update` 已归为辅助源(不熔断)。
         """
         led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(3)
+            {"source": G.SRC_ENGINE, "ok": False, "kind": "engine_unreachable"}
+            for _ in range(3)
         ])
-        r = G.check_and_record(db_update_step={"ok": False, "tables": {
-            "a": {"ok": False, "rows": 0}}}, ledger=led)
+        r = G.check_and_record(engine_probe={"ok": False, "error": "不可达"}, ledger=led)
         assert r["allow"] is False
         assert any(x["source"] == "_gate" and x["kind"] == "HALT"
                    for x in G.read_ledger(led))
@@ -295,20 +349,36 @@ class TestCheckAndRecord:
     def test_declaring_unrecorded_lowers_the_halt_bar_by_one(self, tmp_path):
         """声明"本次未入账"应把 HALT 提前一步 —— 这正是 run_daily 起跑时的情形。
 
-        `run_daily` 在**摄入之前**判定, 此刻当天的 db_update 还没跑、账本里没有它;
-        它喂的 `db_update_step` 是**上一轮**的产物(已入账)。两种情形必须可区分,
-        否则要么提前停手(不声明), 要么漏掉预警(永远不 +1)。
+        `run_daily` 在**摄入之前**判定: 它当场新探的**引擎探针**账本里还没有,
+        而它喂的 `sync_step`/`db_update_step` 取自**上一轮**产物(已入账)。
+        两种情形必须可区分, 否则要么提前停手(不声明), 要么漏掉预警(永远不 +1)。
+
+        **测试自身的前置状态必须先被断言**(DISC-2 形态③): 上一版我在同一个账本上
+        连调两次 `check_and_record`, 而第一次**自己也会记账**, 于是第二次的条数是
+        3 还是 4 取决于记账细节 —— 断言就悬空了。这里改成**各用一个独立账本**,
+        并在动手前断言前置条数。
         """
-        led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+        probe = {"ok": False, "error": "不可达"}
+
+        # 情形 A: 账本已有 2 条, 本次观测**已入账** => 就是 2 条, 不熔断
+        led_a = _ledger(tmp_path, [
+            {"source": G.SRC_ENGINE, "ok": False, "kind": "engine_unreachable"}
+            for _ in range(2)
         ])
-        step = {"ok": False, "tables": {"a": {"ok": False, "rows": 0}}}
-        # 已入账 => 2 条就是 2 条
-        assert G.check_and_record(db_update_step=step, ledger=led)["allow"] is True
-        # 未入账 => 算作第 3 次 => HALT
-        r = G.check_and_record(db_update_step=step, ledger=led,
-                               unrecorded=(G.SRC_DB_UPDATE,))
-        assert r["allow"] is False and r["level"] == G.HALT
+        assert G.consecutive_failures(G.SRC_ENGINE, ledger=led_a)["n"] == 2, "前置状态没造出来"
+        ra = G.evaluate(engine_probe=probe, ledger=led_a)
+        assert ra["allow"] is True and ra["level"] == G.DEGRADED
+        assert ra["items"][0]["consecutive_failures"] == 2
+
+        # 情形 B: 同样的账本, 但显式声明**本次未入账** => 算第 3 次 => HALT
+        led_b = _ledger(tmp_path, [
+            {"source": G.SRC_ENGINE, "ok": False, "kind": "engine_unreachable"}
+            for _ in range(2)
+        ])
+        assert G.consecutive_failures(G.SRC_ENGINE, ledger=led_b)["n"] == 2, "前置状态没造出来"
+        rb = G.evaluate(engine_probe=probe, ledger=led_b, unrecorded=(G.SRC_ENGINE,))
+        assert rb["allow"] is False and rb["level"] == G.HALT
+        assert rb["items"][0]["consecutive_failures"] == 3
 
     def test_engine_exception_does_not_block(self, monkeypatch, tmp_path):
         """**纪律**: 门禁自身异常返回 allow=True（一个 bug 不能让系统静默停手）。"""

@@ -1212,9 +1212,60 @@ class RealtimeEngine:
                     log(f"买入({canon}) {qty}股 @{pr:.3f} 名义额{mv:.0f}")
 
         # 推进策略调仓日: 本窗口确有策略成交(卖出或买入)才锁定调仓间隔.
-        if gate_open and self._to_used > 0:
+        #
+        # [2026-09-23 修 —— 用户决策: 方案 B「分 2-3 天建仓, 但显式记录」]
+        # 原判据只有 `gate_open and self._to_used > 0` —— 即「**当天有过成交**」。
+        # 后果(2026-09-23 实测): 那天 09:30 花掉 20% 换手预算买进 2 个槽位后,
+        # 就把窗口推进到 09-26, 此后全天 **670 个 tick** 全部只走
+        # `调仓间隔未到, 本轮仅止损/风控`, **再未尝试补仓**。收盘时组合只有
+        # **4/10** 个目标持仓、现金占比 **68.98%**, 而账本里记的却是"调仓已完成"。
+        #
+        # 根因是判据选错了对象: 「有成交」不等于「建仓完成」。用一个**未完成的**
+        # 建仓去换 3 天静默期, 是把"本次调仓"记成"已办结"。
+        #
+        # 故补一个**完成度**条件: 组合尚未建到目标、且预算/价格仍允许继续买时,
+        # **不推进** —— 窗口保持打开, 让单日 20% 预算自然限制节奏。
+        # 这不是放松风控: 单日换手预算(`max_turnover_pct`)与其它闸门**一行未改**,
+        # 改的只是"窗口何时算办结"。副作用也符合用户认可的方案 B:
+        # 组合会分 2-3 天建满, 而不是锁死 3 天再动。
+        #
+        # 判据用 `_construction_incomplete()` 单独抽出, 便于测试与将来复核。
+        _incomplete = self._construction_incomplete()
+        if gate_open and self._to_used > 0 and not _incomplete:
             self._last_rebal_day = _today().isoformat()
             log(f"策略调仓日推进 -> {self._last_rebal_day} (下次窗口≥{rebal_iv}自然日后)")
+        elif gate_open and self._to_used > 0 and _incomplete:
+            log(f"调仓窗口**不推进**: 组合尚未建满({_incomplete}), "
+                f"保持窗口开放以便后续交易日继续补仓(单日换手预算仍生效)")
+
+    def _construction_incomplete(self) -> str | None:
+        """组合是否尚未建到目标? 返回**人可读的原因**, 已建满则返回 None。
+
+        为什么单独抽成方法: 它决定了"调仓窗口是否办结", 属**交易节奏**的关键判据,
+        必须有独立、可测、可复核的一处实现 —— 埋在 `_rebalance` 里的一段内联
+        布尔表达式无法被单独验证, 而 2026-09-23 的缺陷正出在这里。
+
+        判据保守: 只有在**明确知道**还有该买而未买的标的时才返回原因;
+        任何取不到数据的路径一律返回 None(视为已建满, 允许推进) ——
+        沿用本仓纪律「缺字段 = 无信息, 不据此拒单」: 不能因为算不出来就把窗口
+        无限期敞着, 那会让调仓间隔形同虚设。
+        """
+        try:
+            if not self.targets:
+                return None
+            held = set((self.pb.positions or {}).keys())
+            want = [t.get("canon") for t in self.targets if t.get("canon")]
+            missing = [c for c in want if c not in held]
+            if not missing:
+                return None
+            # 冷却中的不算"该买未买"(当日刻意不回补, 属风控而非建仓未完成)
+            cooled = missing and all(c in self._cooled for c in missing)
+            if cooled:
+                return None
+            return f"目标 {len(want)} 只, 持有 {len(held & set(want))} 只, 待买 {len(missing)} 只: {missing[:6]}"
+        except Exception as e:  # noqa: BLE001
+            log(f"建仓完成度判定异常(按已建满处理, 不阻断): {type(e).__name__}: {e}")
+            return None
 
     # ---------- 午间重选 (独立线程, 不阻塞盘中 tick) ----------
     def _midday_reselect(self):

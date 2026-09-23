@@ -83,6 +83,43 @@ SOURCES = (SRC_ENGINE, SRC_DB_UPDATE, SRC_VIEWS)
 #: 这正是本仓反复出现的"字符串魔法值"通病。
 UNRECORDED_AT_DAILY_START = (SRC_ENGINE,)
 
+#: **核心数据源** —— 死了才配 HALT(停止摄入与选股)。
+#:
+#: [2026-09-23 新增] 由用户提出的问题倒逼出来:
+#: 「12 张辅助表全失败, 是否应该熔断整个交易管道?」
+#:
+#: ## 为什么 `db_update` **不**在这份名单里
+#:
+#: 三条实测证据(2026-09-23):
+#:   1. `db_update` 的 12 张目标表**全部**经 DuckDB 写入, 而
+#:      `data/legacy_stockdb.duckdb` **已退役删除**(`_connect_write_retry` 直接抛
+#:      `FileNotFoundError`)。即: 它失败是**配置现实**, 不是数据源故障。
+#:   2. 这 12 张表**无一**被决策链路引用 —— 全仓检索 `selector` / `factor_*` /
+#:      `realtime_engine` / `paper_book` / `risk_*` / `pretrade_*` 对这些表名**零命中**
+#:      (唯一命中在 `explain.py`, 而且是局部变量 `"events"` 的字面巧合)。
+#:   3. 行情主链路走的是 **厂商引擎** `engine_bars_sync` -> h5i, 与 `db_update` 无关;
+#:      实测引擎已追平(`engine_day=20260922 = expected`, `lag=0`)。
+#:
+#: ## 由此得出的判据(用户建议, 采纳)
+#:
+#: 「辅助数据坏了」与「交易数据坏了」必须**后果不同**: 前者 WARNING, 后者 HALT。
+#: 用『辅助表失败』熔断『整个交易管道』是本末倒置 —— 它与本仓一贯禁止的
+#: **静默降级**方向相反, 属**过度反应**: 不重要的事坏了, 导致重要的事停摆。
+#:
+#: ## 这份名单当前**只含引擎**, 刻意不含 `db_update`
+#:
+#: `stockdb_engine` 在两个含义上都是核心:
+#:   · **是交易数据本身** —— 它的日线就是选股与撮合的输入;
+#:   · **不是退役路径** —— 它走厂商 SDK 直连, 与 DuckDB 无关, 失败就是真故障。
+#: 它落后超限 / 不可达时熔断是**正确**的(那时确实没有可信行情)。
+#:
+#: 而 `db_update` 的 12 张表**无一**被决策链路引用(见上), 且失败源于已退役的
+#: 写入路径 —— 它够不上核心。
+#:
+#: > **将来若把某张 `db_update` 表接进决策链路, 必须同时把它加到这里。**
+#: > 加表而不加这里, 就等于"它坏了系统也不停" —— 那才是真正的静默降级。
+CRITICAL_SOURCES: tuple = (SRC_ENGINE,)
+
 #: 判定档位
 OK, DEGRADED, HALT = "OK", "DEGRADED", "HALT"
 UNKNOWN = "UNKNOWN"
@@ -385,10 +422,28 @@ def classify_db_update(step: dict | None) -> dict:
             if isinstance(v, dict) and (v.get("rows") or 0) == 0]
     n = len(tables)
     if len(bad) == n:
-        err = str(s.get("error") or "").strip()
+        # [2026-09-23] **先从表级 error 归因**, 再退回步骤级。
+        # 为什么必须下钻到表级: `run_daily` 构造 `tables_dict` 时只留
+        # `{"ok","rows"}`, **把每张表的 `error` 丢掉了**; 而步骤级 error 在
+        # 这条路径上本来就是空的 —— 于是真因在回执里彻底消失, 只剩一句
+        # 与事实相反的供应商自评(`akshare_stats: ok/0 错误/0 空`)。
+        # 实测: 12/12 全失败的真因是 `DuckDB 已退役/不存在`, 与 akshare 无关。
+        errs = sorted({str(v.get("error") or "").strip()
+                       for v in tables.values()
+                       if isinstance(v, dict) and str(v.get("error") or "").strip()})
+        _eff = str(s.get("error") or "").strip() or (errs[0] if errs else "")
+        # 「DuckDB 已退役」不是数据源故障, 是**配置现实**: 写入路径已迁 h5i,
+        # 该文件被刻意删除。把它算成失败会让门禁每 3 天误熔断一次整个交易管道
+        # (2026-09-23 实测正是如此)。故降级为**只观察**: 保留可见性, 不参与计数。
+        if "已退役" in _eff or "legacy_stockdb" in _eff or "DuckDB 已退役" in _eff:
+            return {"ok": True, "kind": "legacy_duckdb_retired", "observed_only": True,
+                    "detail": (f"{n} 张表的写入路径走 DuckDB, 而 legacy DuckDB "
+                               f"**已退役删除**({_eff[:90]}) —— 属已知配置现实, "
+                               f"不参与连续失败计数; 行情主链路走 engine_bars_sync -> h5i")}
         return {"ok": False, "kind": "all_tables_failed",
                 "detail": (f"**{n}/{n} 张表全部失败**且 rows=0"
-                           + (f"; 步骤级未给原因" if not err else f"; error={err[:120]}")
+                           + (f"; 步骤级未给原因" if not s.get("error") else f"; error={str(s.get('error'))[:120]}")
+                           + (f"; 表级原因={_eff[:150]}" if _eff else "")
                            + f"; 供应商自评={json.dumps(s.get('akshare_stats'), ensure_ascii=False)[:100]}")}
     if bad:
         return {"ok": False, "kind": "partial_tables_failed",
@@ -439,6 +494,7 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
     now = now or datetime.now()
     items: list[dict] = []
     _unrec = {str(x) for x in (unrecorded or ())}
+    _CRIT = {str(x) for x in CRITICAL_SOURCES}
 
     def add(source: str, cls: dict):
         items.append({"source": source, "ok": bool(cls.get("ok")),
@@ -458,6 +514,10 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
     halt_sources: list[str] = []
     degraded: list[str] = []
     reasons: list[str] = []
+    #: [2026-09-23] 只观察(不参与 HALT 计数)的失败源 -> 归因文本。
+    #: 与 `degraded` 分开记: 两者都会让 level=DEGRADED(可见), 但**都**不熔断 ——
+    #: 若把辅助失败也计入 `halt_sources`, 就是用「辅助表坏了」停掉整个交易管道。
+    auxiliary: dict[str, str] = {}
     for it in items:
         src = str(it["source"])
         if it["ok"]:
@@ -474,6 +534,16 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
         it["consecutive_failures"] = n_now
         it["same_kind"] = same
         it["counted_as_unrecorded"] = src in _unrec
+        it["is_critical"] = src in _CRIT
+        # [2026-09-23] **核心/辅助分流**: 只有核心源连续失败到阈值才熔断。
+        # 辅助源(见 `CRITICAL_SOURCES` 的说明)仍如实记录、仍让 level=DEGRADED
+        # (可见性不降级), 但**不**停掉交易管道 —— 用「辅助表坏了」熔断
+        # 「整个交易管道」是过度反应, 与静默降级方向相反但同样错。
+        if not it["is_critical"]:
+            auxiliary[src] = it["detail"]
+            degraded.append(src)
+            reasons.append(f"{src}: [DEGRADED {n_now}/{FAILS_TO_HALT}, 辅助源不停手] {it['detail']}")
+            continue
         if n_now >= FAILS_TO_HALT and same:
             halt_sources.append(src)
             reasons.append(f"{src}: [HALT×{n_now}] {it['detail']}")
@@ -491,6 +561,8 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
         "items": items,
         "halt_sources": halt_sources,
         "degraded_sources": degraded,
+        "auxiliary_failures": auxiliary,
+        "critical_sources": sorted(_CRIT),
         "reasons": reasons,
         "checked_at": now.strftime(_TS_FMT),
         "thresholds": {"fails_to_halt": FAILS_TO_HALT,
