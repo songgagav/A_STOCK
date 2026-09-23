@@ -473,7 +473,12 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                 _prev = {}
             _ds = _DG.check_and_record(engine_probe=_eng_probe,
                                        sync_step=_prev.get("engine_bars_sync"),
-                                       db_update_step=_prev.get("db_update"))
+                                       db_update_step=_prev.get("db_update"),
+                                       # [2026-09-23 修] 诚实回答"哪些观测还没入账":
+                                       # 只有引擎探针是**当场新探**的; 上面两个 step 取自
+                                       # **上一轮**产物(basename < 当天), 早已被上一轮记进账本。
+                                       # 不声明 => 同一次失败被数两遍 => 提前一天 HALT。
+                                       unrecorded=_DG.UNRECORDED_AT_DAILY_START)
             report["steps"]["datasource_gate"] = _ds
             ds_allow = bool(_ds.get("allow", True))
             if not ds_allow:

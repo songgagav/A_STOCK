@@ -172,13 +172,66 @@ class TestEvaluate:
         assert r["halt_sources"] == []
 
     def test_consecutive_failures_reach_halt(self, tmp_path):
+        """账本里**真有 3 次**同因失败 => HALT(阈值是 3, 不是 2)。
+
+        [2026-09-23 修] 本用例原先只造 **2** 条账本就断言 HALT —— 那是**把 bug
+        当规格写进了测试**: `evaluate` 曾无条件 `+1`(把"传进来的这次观测"算作
+        账本里还没有的第 N+1 次), 于是 2 条 +1 = 3 触发 HALT。
+        而生产里 `run_daily` 记完账之后, 守护进程**又读同一天的产物再判一次**,
+        那次 `+1` 就把**同一次失败数了两遍** ⇒ 实测: 账本 2 条却报 `[HALT×3]`
+        ⇒ 次日会跳过摄入与选股(**提前一天停手**)。
+        修正后语义: 只有显式声明 `unrecorded` 的源才 +1; 传进来的 step 默认视为已入账。
+        """
         led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(3)
         ])
         r = G.evaluate(db_update_step={"ok": False, "tables": {
             "a": {"ok": False, "rows": 0}}}, ledger=led)
         assert r["level"] == G.HALT and r["allow"] is False
         assert r["halt_sources"] == ["db_update"]
+
+    def test_recorded_failure_is_not_counted_twice(self, tmp_path):
+        """**核心回归**: 同一次失败被判两次, 不能变成两次计数。
+
+        这是 2026-09-23 的真实事故形态 —— run_daily 19:10 记一次, 守护 19:15
+        读当天产物再判一次。若第二次又 +1, 系统就会**提前一天停手**:
+        账本 2 条 => 报 HALT×3 => 次日 `run_daily` 跳过摄入与选股。
+        本仓对"静默停手"零容忍, 对"误停手"同样零容忍。
+        """
+        led = _ledger(tmp_path, [
+            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+        ])
+        step = {"ok": False, "tables": {"a": {"ok": False, "rows": 0}}}
+        # 已入账(默认): 2 条就是 2 条, 仍是 DEGRADED
+        r = G.evaluate(db_update_step=step, ledger=led)
+        assert r["level"] == G.DEGRADED and r["allow"] is True, r["reasons"]
+        assert r["items"][0]["consecutive_failures"] == 2
+        assert r["items"][0]["counted_as_unrecorded"] is False
+        # 显式声明"这次还没入账"才会 +1 -> 3 => HALT(即"第 3 次真失败")
+        r2 = G.evaluate(db_update_step=step, ledger=led,
+                        unrecorded=(G.SRC_DB_UPDATE,))
+        assert r2["level"] == G.HALT and r2["allow"] is False
+        assert r2["items"][0]["consecutive_failures"] == 3
+        assert r2["items"][0]["counted_as_unrecorded"] is True
+
+    def test_run_daily_declares_only_the_probe_as_unrecorded(self):
+        """`run_daily` 必须**声明**只有引擎探针未入账, 且必须用**常量**而非字面量。
+
+        为什么断言到源码这一层: 这个参数答错**不会报错**, 只会让计数偏一位,
+        而偏一位的后果是提前停手。用字面量 `("stockdb_engine",)` 手写时源名写错
+        同样不报错 —— 故要求走 `UNRECORDED_AT_DAILY_START` 这个有名字的常量。
+        """
+        import io as _io
+        import os as _os
+        p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                          "src", "run_daily.py")
+        src = _io.open(p, encoding="utf-8").read()
+        assert "check_and_record(" in src
+        assert "unrecorded=_DG.UNRECORDED_AT_DAILY_START" in src, (
+            "run_daily 的 check_and_record 必须显式声明 unrecorded —— "
+            "不声明会让同一次失败被数两遍(2026-09-23 实测: 2 条账本报 HALT×3)")
+        assert G.UNRECORDED_AT_DAILY_START == (G.SRC_ENGINE,), (
+            "起跑时只有引擎探针是当场新探的; sync/db_update 来自上一轮产物(已入账)")
 
     def test_alternating_kinds_do_not_halt(self, tmp_path):
         """交替原因说明探测本身不稳定 —— 该修探测, 不该停数据。"""
@@ -225,14 +278,37 @@ class TestCheckAndRecord:
         assert r["level"] == G.DEGRADED
 
     def test_halt_is_recorded_with_level_kind(self, tmp_path):
+        """HALT 时必须往账本写一条 `_gate` 记录(kind=HALT), 否则事后无法归因。
+
+        [2026-09-23 修] 本用例原先造 **2** 条账本 —— 那是把"无条件 +1"的 bug
+        当规格。阈值 `FAILS_TO_HALT=3` 指的是**3 次真实失败**, 故这里造 3 条。
+        """
         led = _ledger(tmp_path, [
-            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(3)
         ])
         r = G.check_and_record(db_update_step={"ok": False, "tables": {
             "a": {"ok": False, "rows": 0}}}, ledger=led)
         assert r["allow"] is False
         assert any(x["source"] == "_gate" and x["kind"] == "HALT"
                    for x in G.read_ledger(led))
+
+    def test_declaring_unrecorded_lowers_the_halt_bar_by_one(self, tmp_path):
+        """声明"本次未入账"应把 HALT 提前一步 —— 这正是 run_daily 起跑时的情形。
+
+        `run_daily` 在**摄入之前**判定, 此刻当天的 db_update 还没跑、账本里没有它;
+        它喂的 `db_update_step` 是**上一轮**的产物(已入账)。两种情形必须可区分,
+        否则要么提前停手(不声明), 要么漏掉预警(永远不 +1)。
+        """
+        led = _ledger(tmp_path, [
+            {"source": "db_update", "ok": False, "kind": "all_tables_failed"} for _ in range(2)
+        ])
+        step = {"ok": False, "tables": {"a": {"ok": False, "rows": 0}}}
+        # 已入账 => 2 条就是 2 条
+        assert G.check_and_record(db_update_step=step, ledger=led)["allow"] is True
+        # 未入账 => 算作第 3 次 => HALT
+        r = G.check_and_record(db_update_step=step, ledger=led,
+                               unrecorded=(G.SRC_DB_UPDATE,))
+        assert r["allow"] is False and r["level"] == G.HALT
 
     def test_engine_exception_does_not_block(self, monkeypatch, tmp_path):
         """**纪律**: 门禁自身异常返回 allow=True（一个 bug 不能让系统静默停手）。"""

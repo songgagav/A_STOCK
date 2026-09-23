@@ -71,6 +71,18 @@ SRC_VIEWS = "factor_views"         # 因子视图物化
 
 SOURCES = (SRC_ENGINE, SRC_DB_UPDATE, SRC_VIEWS)
 
+#: `run_daily` 起跑时, **只有引擎探针**是当场新探的(账本里还没有)。
+#:
+#: 它喂进来的 `sync_step` / `db_update_step` 取自上**一轮**的 `daily_summary.json`
+#: (刻意按 `basename(d) < day` 过滤掉当天), 故那两项**早已被上一轮记进账本**,
+#: 不能算作"未入账观测" —— 否则同一次失败会被数两遍。
+#:
+#: 2026-09-23 实测后果: `db_update` 账本只有 2 条失败, 却报 `[HALT×3] allow=False`,
+#: 会导致次日跳过摄入与选股(提前一天停手)。取个**有名字的常量**而不是在调用处
+#: 手写 `("stockdb_engine",)`: 源名写错不会报错, 只会安静地把语义搞反 ——
+#: 这正是本仓反复出现的"字符串魔法值"通病。
+UNRECORDED_AT_DAILY_START = (SRC_ENGINE,)
+
 #: 判定档位
 OK, DEGRADED, HALT = "OK", "DEGRADED", "HALT"
 UNKNOWN = "UNKNOWN"
@@ -390,7 +402,7 @@ def classify_db_update(step: dict | None) -> dict:
 
 def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
              db_update_step: dict | None = None, ledger: str | None = None,
-             now=None) -> dict:
+             unrecorded: frozenset | set | tuple = (), now=None) -> dict:
     """综合判定。**纯读 + 纯算**, 不改任何状态(记录由调用方决定是否 `record`)。
 
     返回 {'allow', 'level', 'items', 'halt_sources', 'reasons', 'checked_at',
@@ -398,9 +410,35 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
 
     `allow=False` 表示**应当停止数据摄入与依赖数据的下游动作**;
     **不表示停止守护进程**（见模块 docstring 的设计取舍 1）。
+
+    ## `unrecorded` —— 这个参数的存在本身是一个 bug 的修复 (2026-09-23)
+
+    连续失败的判据是"账本里最近一段连续失败有多长"。而下面这句
+    `n_now = cf["n"] + 1` 假设**传进来的这次观测还没被记进账本**, 于是把它算作
+    第 N+1 次。这个假设在**同一个观测被算两次**时就错了:
+
+        run_daily 19:10 判一次 → `check_and_record` 把它记进账本
+        → 19:15 守护进程读**当天** `daily_summary.json` 再判一次
+        → `cf["n"]` 已经含它了, 却又 +1 ⇒ **同一次失败被数了两遍**
+
+    2026-09-23 实测到的后果(真事故): 账本里 `db_update` 只有 **2** 条失败,
+    而 `health_state` 报 **`[HALT×3]` ⇒ `allow=False`** ⇒ 次日(09-24)的
+    `run_daily` 会**跳过摄入与选股**。不是"差一个数字"的问题, 是**提前一天停手**。
+
+    故把那个隐含假设改成**显式入参**:
+      · `unrecorded` 里的源 = "这次观测刚拿到、账本里还没有" ⇒ 计 `cf["n"] + 1`;
+      · 其余源(默认全部) = "账本里已经有了" ⇒ 计 `cf["n"]`。
+    默认 `()` 即"全部已记录" —— 只读型调用方(`health_state` 读当天已落盘产物)
+    不必做任何事就得到正确语义。
+
+    **为什么用"已记录源名"的显式列表, 而不是一个 bool**: bool 只能表达
+    "全部未记录/全部已记录", 而真实调用是混合的 —— `run_daily` 的**引擎探针**
+    是当场新探的(未记录), 它喂的 **sync/db_update 步骤**却是**上一轮**的产物
+    (已记录)。用 bool 必然又要把其中一半算错。
     """
     now = now or datetime.now()
     items: list[dict] = []
+    _unrec = {str(x) for x in (unrecorded or ())}
 
     def add(source: str, cls: dict):
         items.append({"source": source, "ok": bool(cls.get("ok")),
@@ -429,11 +467,13 @@ def evaluate(*, engine_probe: dict | None = None, sync_step: dict | None = None,
             reasons.append(f"{src}: [观察] {it['detail']}")
             continue
         cf = consecutive_failures(src, ledger=ledger)
-        # **加上本次**这一次失败（账本里可能还没记）
-        n_now = cf["n"] + 1
+        # 账本里已有该源的失败次数; 若本次观测**尚未入账**, 才把它自己也算上。
+        # (2026-09-23 修: 原实现无条件 +1, 使"同日再判一次"把同一次失败数两遍 ⇒ 提前 HALT)
+        n_now = cf["n"] + (1 if src in _unrec else 0)
         same = cf["same_kind"] or not cf["kinds"]
         it["consecutive_failures"] = n_now
         it["same_kind"] = same
+        it["counted_as_unrecorded"] = src in _unrec
         if n_now >= FAILS_TO_HALT and same:
             halt_sources.append(src)
             reasons.append(f"{src}: [HALT×{n_now}] {it['detail']}")
@@ -487,12 +527,17 @@ def chain_health(ledger: str | None = None, *, tail: int = 200) -> dict:
 
 def check_and_record(*, engine_probe: dict | None = None, sync_step: dict | None = None,
                      db_update_step: dict | None = None, ledger: str | None = None,
-                     now=None) -> dict:
-    """判定 + 落账本（生产入口）。**判定异常返回 allow=True 并如实标注**。"""
+                     unrecorded: frozenset | set | tuple = (), now=None) -> dict:
+    """判定 + 落账本（生产入口）。**判定异常返回 allow=True 并如实标注**。
+
+    `unrecorded` 原样透传给 `evaluate` —— 见那里的完整说明。调用方必须诚实回答
+    "我这次给的观测, 账本里到底有没有": 答错的后果不是数字不好看, 而是**提前停手**。
+    """
     now = now or datetime.now()
     try:
         res = evaluate(engine_probe=engine_probe, sync_step=sync_step,
-                       db_update_step=db_update_step, ledger=ledger, now=now)
+                       db_update_step=db_update_step, ledger=ledger,
+                       unrecorded=unrecorded, now=now)
     except Exception as e:  # noqa: BLE001
         return {"allow": True, "level": UNKNOWN,
                 "reasons": [f"门禁自身异常(不阻断, 需排查): {type(e).__name__}: {e}"],
