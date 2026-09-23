@@ -44,11 +44,14 @@ class _EngineStub:
     """只带被测方法所需属性的最小桩。"""
 
     _construction_incomplete = RE.RealtimeEngine._construction_incomplete
+    _rebal_window_decision = RE.RealtimeEngine._rebal_window_decision
 
     def __init__(self, targets, held, cooled=()):
         self.targets = [{"canon": c} for c in targets]
         self.pb = type("PB", (), {"positions": {c: {} for c in held}})()
         self._cooled = set(cooled)
+        self._construction_stall = 0
+        self._construction_last_filled = -1
 
 
 class TestConstructionIncomplete:
@@ -99,6 +102,88 @@ class TestConstructionIncomplete:
     def test_empty_targets_does_not_block(self):
         s = _EngineStub(targets=[], held=["A"])
         assert s._construction_incomplete() is None
+
+
+class TestStallGuard:
+    """**防止窗口永远敞着** (用户 2026-09-23 要求)。
+
+    用户的原话: 「如果 `_construction_incomplete()` 因某只标的一直在冷却中而永远
+    返回 True, 系统会反复尝试买入、反复失败、永不锁 3 天。这比『提前锁 3 天』更危险。」
+
+    ## 实现与该设想有一处**刻意的差异**, 必须说明
+
+    用户举的场景是「待买**全部**在冷却中」—— 而那种情形 `_construction_incomplete()`
+    **已经返回 None**(冷却属风控, 不是建仓卡住), 所以从设计上就不会落入停滞分支。
+    **真正的停滞场景是**: 待买标的**可买却一直买不进**(被等权槽位上限 / 小单门槛 /
+    涨停 等挡住), 此时窗口会一直敞着。
+
+    ## 判据用"尝试次数"而非"日历天数" —— 这一点决定了保护是否真的有效
+
+    用户建议写的是「连续 N **天**未推进」。但 `self._last_rebal_day` 是**进程态**
+    (初始化为 None), 引擎每天 08:30 由守护重启 ⇒ 任何跨日计数器都会归零,
+    "5 天"保护永远攒不满 5 天(每天都是第 1 天), **形同虚设**。
+    故改为**进程内连续失败尝试数**, 与 `FAILS_TO_HALT`「连续 N 次」同一条思路。
+    """
+
+    def test_forced_advance_after_limit(self):
+        """连续 N 次"无进展"后必须强制推进(这是用户要的验收)。"""
+        s = _EngineStub(targets=["A", "B", "C"], held=["A"])
+        limit = RE.CONSTRUCTION_STALL_LIMIT
+        seen = []
+        for _ in range(limit + 3):
+            adv, why = s._rebal_window_decision(True, s._construction_incomplete(), 3)
+            seen.append(adv)
+        assert seen[0] is False, "第一次就推进 —— 保护会退化回原行为"
+        # 最后一次必然已强制推进(计数已超限)
+        assert seen[-1] is True, "达到停滞上限仍未强制推进 —— 窗口会永远敞着"
+        assert any(a is True for a in seen), seen
+        assert "强制推进" in why
+
+    def test_progress_resets_the_stall_counter(self):
+        """中途有进展必须把计数归零 —— 否则正常的分批建仓会被误判为停滞。
+
+        这一条是**保护本身的安全阀**: 方案 B 下组合要 2-3 天建满, 每天都在进展;
+        若计数不归零, 正常节奏也会被强制推进。
+        """
+        s = _EngineStub(targets=["A", "B", "C"], held=["A"])
+        for _ in range(3):
+            s._rebal_window_decision(True, s._construction_incomplete(), 3)
+        assert s._construction_stall > 0, "前置状态没造出来: 计数未累积"
+        s.pb.positions["B"] = {}          # 买进一只 = 有进展
+        adv, _ = s._rebal_window_decision(True, s._construction_incomplete(), 3)
+        assert s._construction_stall == 0, "有进展后计数未归零, 正常建仓会被误判停滞"
+        assert adv is False, "才建了一半就不该推进"
+
+    def test_all_cooled_is_not_a_stall(self):
+        """「待买全部在冷却中」**不是**停滞 ---- 直接按已办结处理。
+
+        用户设想的正是这个场景; 实现上它在 `_construction_incomplete()` 就已返回 None,
+        故 `advance=True` 且**不需要**等 N 次。这比"等 5 次再推"更干净:
+        冷却当天本来就不该回补, 窗口没必要为它开着。
+        """
+        s = _EngineStub(targets=["A", "B", "C"], held=["A"], cooled=("B", "C"))
+        assert s._construction_incomplete() is None
+        adv, why = s._rebal_window_decision(True, None, 3)
+        assert adv is True and "已建到目标" in why
+        assert s._construction_stall == 0, "这种情形不该消耗停滞计数"
+
+    def test_gate_closed_never_advances(self):
+        s = _EngineStub(targets=["A", "B"], held=["A"])
+        adv, why = s._rebal_window_decision(False, "x", 3)
+        assert adv is False and "间隔未到" in why
+
+    def test_fully_built_advances(self):
+        s = _EngineStub(targets=["A", "B"], held=["A", "B"])
+        adv, _ = s._rebal_window_decision(True, s._construction_incomplete(), 3)
+        assert adv is True
+
+    def test_limit_is_documented_and_reachable(self):
+        """上限必须是**可达的小整数**, 且理由写在源码里(不是魔法值)。"""
+        assert isinstance(RE.CONSTRUCTION_STALL_LIMIT, int)
+        assert 2 <= RE.CONSTRUCTION_STALL_LIMIT <= 20, RE.CONSTRUCTION_STALL_LIMIT
+        src = open(os.path.join(_SRC, "realtime_engine.py"), encoding="utf-8").read()
+        assert "CONSTRUCTION_STALL_LIMIT = 5" in src
+        assert "跨日计数" in src, "必须写明为何不用日历天数(否则后人会'顺手'改成天数)"
 
 
 class TestPortfolioConstructionReceipt:

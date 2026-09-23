@@ -312,6 +312,20 @@ _RUNG_SAME_DAY = ("drl_same_day", "selection_same_day")
 #: [2026-09-22] P0-FREEZE-0925 的"选股耗时预算"告警需要真实耗时, 此前只记档位与只数。
 _LT_T0 = 0.0
 
+#: [2026-09-23 用户要求] 建仓停滞保护: 连续多少次"尝试建仓但目标内持仓数无增长"
+#: 之后**强制推进**调仓窗口。
+#:
+#: 为什么需要它: 2026-09-23 起, 调仓窗口只在"已建到目标"时才推进。若某标的
+#: 长期无法买入(一直在冷却 / 一直被等权槽位或小单门槛挡), 窗口就会**永远敞着**,
+#: 每个窗口日都重新尝试一遍、永不锁定 —— 那比"提前锁 3 天"更危险:
+#: 前者是节奏慢, 后者是**没有节奏**。
+#:
+#: 取 5 的依据: 单日 20% 换手预算下建满 10 槽位约需 5 个交易日 ⇒ 给足一个完整
+#: 建仓周期的余量; 超过它就说明不是"节奏", 而是"卡住了"。
+#: 与 `datasource_gate.FAILS_TO_HALT=3` 同一条思路: 用**连续 N 次**而不是 N 天,
+#: 因为引擎每日 08:30 重启、任何跨日计数都会归零(见 __init__ 的说明)。
+CONSTRUCTION_STALL_LIMIT = 5
+
 
 def _trace_targets(day: str, sel_day: str, rung: str, n: int) -> None:
     """记录目标池的实际来源档位。**绝不抛异常**(选股主链路)。"""
@@ -533,6 +547,18 @@ class RealtimeEngine:
         # (8000) 再次压回, 形成 压回↔补权 自振荡, 每次循环都烧双边手续费.
         # 这些标的当日不再回补, 次日自动解冻.
         self._cooled = set()              # 当日禁止回补的 canon 集合
+
+        # ---- [2026-09-23 用户要求] 建仓停滞保护 ----
+        # 「防止永远不推进」: 若组合一直建不满(某标的一直冷却 / 一直被别的闸门挡),
+        # 窗口会永远敞着、反复尝试、永不锁定 3 天 —— 那比"提前锁 3 天"更危险。
+        #
+        # **判据刻意用"尝试次数"而不是"日历天数"**:
+        #   `_last_rebal_day` 是**进程态**(见上, 初始化为 None), 引擎每天 08:30 由守护
+        #   重启 ⇒ 任何跨日的计数器都会在重启时归零, 那种"5 天"保护实际上永远不会
+        #   攒满 5 天(每天都是第 1 天)。用**进程内连续失败尝试数**才真正可达。
+        #   本仓同类先例: `FAILS_TO_HALT` 也是"连续 N 次"而非"N 天"。
+        self._construction_stall = 0      # 连续"尝试建仓但持仓数无增长"的次数
+        self._construction_last_filled = -1   # 上次尝试时的"目标内持仓数"
 
     # ---------- 交易时段判定 (A股) ----------
     @staticmethod
@@ -1230,13 +1256,58 @@ class RealtimeEngine:
         # 组合会分 2-3 天建满, 而不是锁死 3 天再动。
         #
         # 判据用 `_construction_incomplete()` 单独抽出, 便于测试与将来复核。
+        # 推进决策整体交给 `_rebal_window_decision()` —— 同样是为了可单独验证:
+        # "窗口何时办结"是**交易节奏**的关键判据, 2026-09-23 的缺陷正出在这里。
         _incomplete = self._construction_incomplete()
-        if gate_open and self._to_used > 0 and not _incomplete:
+        _advance, _reason = self._rebal_window_decision(gate_open, _incomplete, rebal_iv)
+        if gate_open and self._to_used > 0 and _advance:
             self._last_rebal_day = _today().isoformat()
+            self._construction_stall = 0       # 推进即重置停滞计数
+            self._construction_last_filled = -1
             log(f"策略调仓日推进 -> {self._last_rebal_day} (下次窗口≥{rebal_iv}自然日后)")
-        elif gate_open and self._to_used > 0 and _incomplete:
-            log(f"调仓窗口**不推进**: 组合尚未建满({_incomplete}), "
-                f"保持窗口开放以便后续交易日继续补仓(单日换手预算仍生效)")
+        elif gate_open and self._to_used > 0 and not _advance:
+            log(f"调仓窗口**不推进**: {_reason} "
+                f"(停滞计数 {self._construction_stall}/{CONSTRUCTION_STALL_LIMIT})")
+
+    def _rebal_window_decision(self, gate_open: bool, incomplete: str | None,
+                               rebal_iv: int) -> tuple[bool, str]:
+        """本窗口**是否算办结**? 返回 `(是否推进, 人可读原因)`。
+
+        抽成独立方法的理由与 `_construction_incomplete` 相同: 它是交易节奏的关键
+        判据, 必须有独立、可测、可复核的一处实现。
+
+        三条判据(顺序即优先级):
+          1. 窗口没开(`not gate_open`) => 不推进(间隔未到, 由调用方另行记日志);
+          2. 建仓**未完成** => 不推进 —— 但停滞计数达 `CONSTRUCTION_STALL_LIMIT`
+             时**强制推进**, 防止窗口永远敞着(用户 2026-09-23 要求);
+          3. 其余(已建满 / 无目标池 / 取不到数据) => 推进。
+
+        **停滞计数的语义**: 只统计"有可买标的但目标内持仓数连续 N 次没增加"。
+        「待买全部在冷却中」不算未完成(`_construction_incomplete` 返回 None),
+        故不会落入这条 —— 冷却属风控, 不是建仓卡住。
+        """
+        if not gate_open:
+            return False, "调仓间隔未到"
+        if not incomplete:
+            return True, "组合已建到目标(或无可买标的)"
+        # --- 建仓未完成: 先看是否已停滞到该强制推进 ---
+        try:
+            _filled = len(set((self.pb.positions or {}).keys())
+                          & {t.get("canon") for t in (self.targets or [])})
+        except Exception:  # noqa: BLE001
+            _filled = -1
+        if _filled > self._construction_last_filled:
+            # 有进展 -> 计数归零(当天预算用完属正常节奏, 不是停滞)
+            self._construction_stall = 0
+            self._construction_last_filled = _filled
+        else:
+            self._construction_stall += 1
+        if self._construction_stall >= CONSTRUCTION_STALL_LIMIT:
+            log(f"建仓停滞 {self._construction_stall} 次无进展(仍 {incomplete}) "
+                f"-> **强制推进调仓窗口**(防止窗口永远敞着; 下个窗口≥{rebal_iv}自然日后)")
+            return True, (f"建仓停滞 {self._construction_stall} 次无进展, 强制推进"
+                          f"(否则窗口永远敞着)")
+        return False, f"组合尚未建满({incomplete}), 保持窗口开放以便后续继续补仓"
 
     def _construction_incomplete(self) -> str | None:
         """组合是否尚未建到目标? 返回**人可读的原因**, 已建满则返回 None。

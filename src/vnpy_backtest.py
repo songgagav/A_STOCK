@@ -227,6 +227,15 @@ def run_regime_scenarios(day: str, scenarios=None, **kwargs) -> dict:
             "final_balance": _stat(res, "end_balance") or _stat(res, "final_balance"),
             "regime": (res.get("regime") or {}),
             "fallback": bool(res.get("fallback")),
+            # [2026-09-23 修] 失败原因必须带上来 —— 这是本仓 DISC-2 ⑤
+            # 「归因在中间层丢失」的又一实例: `run_vnpy_backtest` **有** error,
+            # 而这里构造 row 时只挑了 7 个字段, 把 error 丢了。于是
+            # `run_regime_batch` 汇总出的 10 个组合**全是
+            # {ok:false, total_return_pct:null, ...}, 一个原因都看不到**
+            # (实测 2026-09-23 回执)。真因是"前向窗口未来数据不足", 却被
+            # 呈现成"所有组合都没产出统计" —— 排查方向被引向了场景参数与数据输入。
+            "error": (res or {}).get("error"),
+            "skip": bool((res or {}).get("skip")),
         }
         b = _stat(base_res, "total_return")
         r = _stat(res, "total_return")
@@ -734,6 +743,7 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
                       persist_arctic: bool = True,
                       weight_mode: str = "equal",
                       forward: bool = False,
+                      forward_days: int | None = None,
                       scenario: str | None = None) -> dict:
     """vnpy 回测. day 语义随 forward 变化:
 
@@ -741,7 +751,14 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
         目标池为 as-of day 的选股。注意: 评估期落在决策日之前, 存在前视
         (见 _load_bars_forward 上方注释), 仅用于回溯归因, 不可用于样本外评估。
     forward=True: day = **决策日**; 目标池为 PIT(数据 <= day) 的选股; 持有期
-        [day, day+lookback_days 个交易日], 全部在决策日之后 -> 无前视, 用于 OOS。
+        [day, day+forward_days 个交易日], 全部在决策日之后 -> 无前视, 用于 OOS。
+    forward_days: 前向**持有期**交易日数; None 时取 `PAPER.regime_forward_days`。
+        [2026-09-23 修] 此前持有期硬编码复用 `lookback_days`(默认 20), 造成一个
+        **无法满足的日期选取**: `run_daily` 取"最近 5 个交易日"做多场景评估,
+        而持有期要 20 个交易日 ⇒ 最近的这些决策日**之后只剩 1~5 个交易日**
+        ⇒ `forward_window_days` 对每个组合都返回 [] ⇒ 10/10 组合全部 `ok=false`。
+        持有期是"准备持有多久", 与"回看多少根日线算因子"是**两个不同的量**,
+        共用参数必然导致一边不合理(见 config.PAPER.regime_forward_days 的说明)。
     scenario: [路线图 #9] 成本/延迟场景(normal / stress); None 时按
         `PAPER.regime_scenario` -> 环境变量 REGIME_SCENARIO -> normal 解析。
         **默认 normal 的倍率全为 1、延迟 0, 与既有单场景结果逐位一致**;
@@ -764,11 +781,19 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
         _log(f"[regime:{_sc['name']}] 命中场景缓存, 复用本进程内已有结果")
         return _copy.deepcopy(_REGIME_CACHE[_ck])
 
+    # 前向持有期: 与 lookback 解耦(见 docstring 的 2026-09-23 说明)
+    if forward_days is None:
+        try:
+            forward_days = int(PAPER.get("regime_forward_days", 3) or 3)
+        except Exception:  # noqa: BLE001
+            forward_days = 3
+    forward_days = max(1, int(forward_days))
+
     # 前向模式先在昂贵的选股之前校验未来数据是否充足(fail fast, 且不依赖 vnpy)
-    if forward and not forward_window_days(day_dt, lookback_days):
+    if forward and not forward_window_days(day_dt, forward_days):
         return {"ok": False,
                 "error": f"前向窗口未来数据不足: 决策日 {day} 起需 "
-                         f"{lookback_days} 个交易日, 已达数据末端",
+                         f"{forward_days} 个交易日, 已达数据末端",
                 "rows": 0}
 
     from vnpy.trader.constant import Exchange
@@ -813,7 +838,9 @@ def run_vnpy_backtest(day: str, top_n: int = 10, lookback_days: int = 120,
 
     bar_map: dict[str, pd.DataFrame] = {}
     for s6 in symbol6_list:
-        df = (_load_bars_forward(s6, day_dt, lookback_days) if forward
+        # 前向模式取"决策日之后 forward_days 个交易日"(持有期),
+        # 非前向模式取"截至决策日的 lookback_days 根"(回看) —— 两者语义不同。
+        df = (_load_bars_forward(s6, day_dt, forward_days) if forward
               else _load_bars(s6, day_dt, lookback_days))
         if not df.empty:
             bar_map[s6] = df

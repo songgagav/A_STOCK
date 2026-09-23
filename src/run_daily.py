@@ -592,13 +592,15 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                 report["steps"]["db_update"] = _skip_ingest("db_update")
                 raise _IngestSkipped()
             from update_db import update_all
+            # [2026-09-23 用户决策] 已退役且**无替代写入路径**的表从调用清单里移除。
+            # 它们只能写 legacy DuckDB(已退役删除) ⇒ 每次必然全失败, 只产噪声不产数据,
+            # 且那条失败的错误信息会把排查者引向错误方向(见 docs/disciplines.md DISC-2 ⑤)。
+            # **不调用 ≠ 看不见**: 下面仍以 `retired_tables` 记进回执。
+            from config import DB_UPDATE_RETIRED_NO_PATH as _RETIRED
+            _only = ["daily_bars", "northbound_money", "margin_daily",
+                     "money_flow_estimate"]
             upd = update_all(day=datetime.strptime(day, "%Y-%m-%d").date(),
-                             only=["daily_bars", "valuation_snapshot",
-                                   "adj_factors", "northbound_money",
-                                   "margin_daily", "dzjy_daily",
-                                   "money_flow_estimate", "lhb",
-                                   "stock_news", "events",
-                                   "orderbook_snapshot", "block_trade"])
+                             only=_only)
             # 提取 AKShare 统计 (网络/空数据诊断)
             ak_stats = upd.pop("__akshare_stats__", {})
             # [2026-09-23 修] **必须保留每张表的 error**。
@@ -618,9 +620,20 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                 "ok": any_ok,
                 "tables": tables_dict,
                 "akshare_stats": ak_stats,
+                # [2026-09-23 用户决策] 退役表**不调用但仍可见**。
+                # 为什么必须留这一项: 只从 only 里删掉、不留痕的话, 回执上
+                # 「这些表不再更新」这件事就**彻底消失**了 —— 那是从"归因错误"
+                # 滑到"静默消失", 而后者正是本仓一直在修的形态。
+                "retired_tables": [
+                    {"name": t,
+                     "reason": "只能写 legacy DuckDB(已退役删除), 无替代写入路径",
+                     "action": "不再调用"}
+                    for t in _RETIRED],
+                "active_tables": _only,
                 "note": (
                     "AKShare 在非交易时段 / 网络受限 / 接口变更时返回空数据; "
-                    "daily_bars 路径已由 free_stockdb_sync 兜底"
+                    "daily_bars 路径已由 free_stockdb_sync 兜底。"
+                    f" 本次仅调用 {len(_only)} 张(退役表见 retired_tables)"
                 ),
             }
         except _IngestSkipped:
@@ -921,14 +934,32 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                 from vnpy_backtest import run_regime_batch
                 from h5i_bar_store import H5iBarStore
                 _all = list(H5iBarStore().trading_days())
-                # 只取"未来数据充足"的日子(forward 窗口需要 lookback 根之后的数据),
-                # 否则末尾几天必然报"未来数据不足" —— 那是日期选取问题, 不是策略问题。
                 _lb = 20
-                _cand = _all[-(_rdays + _lb):- 1] if len(_all) > _rdays + _lb else _all[:-1]
+                # [2026-09-23 修] 日期选取必须按**前向持有期**留足未来数据,
+                # 而不是按 lookback。
+                #
+                # 原实现留 `_lb`(=20) 个交易日: 它假定"前向窗口要 20 天"。而前向窗口
+                # 实际用的是持有期, 此前又硬编码复用 lookback ⇒ 恰好自洽地留对了。
+                # 但把持有期与 lookback 解耦(`regime_forward_days=3`)之后, 这里若
+                # 仍留 20 天就**过保守**: 最近的 20 天永远选不进来, 白丢数据。
+                # 故改为按持有期留, 并额外留 1 天余量(末端那天之后没有数据)。
+                #
+                # 为什么必须显式传 `forward_days`: 不传就走 PAPER 默认值, 而此处
+                # 用的是局部 `_lb` —— 两者若漂移, 就会出现"选取按 A 留、校验按 B 判"
+                # 的隐蔽不一致(正是 DISC-2 那类"检查项与实际口径不是同一个").
+                _fd = int(_P2.get("regime_forward_days", 3) or 3)
+                # 上方边界必须是 `-(_fd + 1)`: 决策日之后要有 `_fd` 个交易日,
+                # 故最后 `_fd + 1` 天(含末端那天本身)**都不能**当决策日。
+                # 我第一次写的 `_all[-(_rdays + _reserve):-1]` 只排除了末端**一天**,
+                # 于是 pick 里最后两天仍缺未来数据 —— 实测 5 个里坏 2 个, 与修复前
+                # 的"全坏"只差程度。教训: "留余量"要按**最坏的那个决策日**算,
+                # 不能凭"多切掉一点"的感觉。
+                _cand = (_all[:-(_fd + 1)] if len(_all) > _fd + 1 else [])
                 _pick = _cand[-_rdays:] if _cand else []
                 if _pick:
                     _rb = run_regime_batch(_pick, _scen, top_n=10, lookback_days=_lb,
-                                           forward=True, persist_arctic=False)
+                                           forward=True, forward_days=_fd,
+                                           persist_arctic=False)
                     _rb["days_used"] = _pick
                     report["steps"]["regime_scenarios"] = _rb
                 else:

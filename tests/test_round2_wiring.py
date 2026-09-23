@@ -59,13 +59,27 @@ class TestRunDailySteps:
 
     def test_regime_step_avoids_data_tail(self):
         """多场景回测必须避开数据末尾 —— 末尾几天必然报『未来数据不足』,
-        那是日期选取问题而不是策略问题, 会让该步骤天天假失败。"""
-        i = self._src_text.find('"regime_scenarios"')
-        assert i > 0
-        window = self._src_text[max(0, i - 2500):i + 800]
+        那是日期选取问题而不是策略问题, 会让该步骤天天假失败。
+
+        [2026-09-23 修] 本用例原先用一个**固定长度的字符窗口**
+        (`_src_text[i-2500:i+800]`) 去框这段代码。我在该步骤里补了注释说明
+        "持有期与 lookback 必须解耦"之后, 窗口被注释挤出边界 ⇒ 用例失败。
+        **那是用例的脆弱, 不是代码的错**: 判据不该依赖"附近有多少字"。
+        改为用**语句锚点**取范围: 从 `run_regime_batch(` 到该调用结束。
+        """
+        i = self._src_text.find("run_regime_batch(")
+        assert i > 0, "找不到 run_regime_batch 调用"
+        window = self._src_text[i:i + 700]
         assert "forward=True" in window, "多场景步骤未走前向窗口"
-        # 必须从末尾"退让"若干天再取窗口(见 _cand = _all[-(_rdays + _lb):-1])
-        assert "[:- 1]" in window or "[:-1]" in window, "未避开数据末尾"
+        # 前向持有期必须**显式**传入: 不传就走 PAPER 默认值, 而日期选取用的是
+        # 局部变量 —— 两者漂移就会出现"选取按 A 留、校验按 B 判"。
+        assert "forward_days=_fd" in window, "未显式传前向持有期"
+        # 日期选取必须按**持有期**退让, 且上界要排除 `_fd + 1` 天
+        # (只排除末端一天的话, pick 里最后几天仍缺未来数据 —— 2026-09-23 踩过)。
+        assert "-(_fd + 1)" in self._src_text, (
+            "决策日选取未按前向持有期退让: 应形如 `_all[:-(_fd + 1)]`")
+        assert "[:- 1]" not in window and "[:-1]" not in window, (
+            "仍在使用 `[:-1]`(只排除末端一天)—— 那不足以让最后几个决策日凑齐未来数据")
 
 
 class TestConfigSwitches:

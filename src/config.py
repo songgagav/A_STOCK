@@ -351,6 +351,16 @@ PAPER = {
     #   一致 —— 回看窗口短于门槛要求的天数, 该项必然全数 fail 而看起来像"没因子"。
     "portfolio_bt_days": 10,
     "vnpy_regime_days": 5,
+    # · regime_forward_days: 前向(无前视)多场景评估的**持有期**交易日数。
+    #   [2026-09-23 修] 此前该窗口硬编码复用 `lookback_days`(=20), 与
+    #   `vnpy_regime_days`(=5) 组合出一个**无法满足的日期选取**:
+    #   取"最近 5 个交易日"做决策日, 却要求每个决策日之后还有 20 个交易日
+    #   ⇒ 最近的决策日之后只剩 1~5 天 ⇒ **10/10 个 (日,场景) 组合全部失败**,
+    #   整项能力空转(且回执里只剩 null, 看不到原因)。
+    #   取值与 `rebalance_interval_days`(=3) 保持一致: 真实组合就是约每 3 个
+    #   自然日调仓一次, 故用 3 个交易日作持有期做成本敏感性, 与执行口径吻合;
+    #   同时它小到让"最近 5 个交易日"都能凑齐未来数据。
+    "regime_forward_days": 3,
     "hypothesis_days": 60,
     # ---- 拆单执行 (路线图 ⑰ 第二阶段: 模拟盘接入 + 对照留痕, 不接实盘) ----
     # 拆单的**唯一**正当理由是"单笔参与率超过流动性可吸收的上限", 不是"更便宜":
@@ -448,3 +458,37 @@ DB_UPDATE_TARGETS = {
     "restricted_releases":    (None,                  None,      "sync_restricted_releases"),
     "minute_bars":            ("trade_date",          "date",    "sync_minute_bars"),
 }
+
+# ---- 已退役且**无替代写入路径**的表 (2026-09-23) ----
+#
+# 用户决策(2026-09-23): 「退役表从 run_daily 的 only=[...] 里删掉, **但保留可见性**」。
+# 理由: ① 退役路径本来就不该被调用; ② 每次调用都要走一遍重试/降级(实测平白多花
+# 时间); ③ 它产出的错误信息会把排查者引向错误方向(见 docs/disciplines.md DISC-2 ⑤)。
+#
+# 判据 —— 哪些表属于"退役且无替代":
+#   · `daily_bars` / `northbound_money` / `margin_daily` / `money_flow_estimate` /
+#     `financials` / `valuation`(非本表) 在 h5i 里**有对应表**, 且各有自己的
+#     `*_sync` 写入路径(如 margin_sync / northbound_sync), 故**不列入**本集合
+#     —— 它们仍应被调用, 失败是真信号。
+#   · 下面这些在 h5i **无对应表**, 只能写 DuckDB(已退役删除) ⇒ 每次必然全失败。
+#     调用它们只产生噪声, 不产生数据。
+#
+# **保留可见性**: 它们不进 `only=[...]`, 但会以 `retired_tables` 出现在
+# `db_update` 步骤里 —— 不调用 **不等于** 从此看不见, 否则就从"归因错误"
+# 滑到"静默消失"。
+DB_UPDATE_RETIRED_NO_PATH = (
+    "valuation_snapshot",   # h5i 有同名表, 但写入路径不在本次 only 清单内, 见下注
+    "adj_factors",          # h5i 无对应表
+    "dzjy_daily",           # h5i 无对应表(大宗交易)
+    "lhb",                  # h5i 无对应表(龙虎榜)
+    "events",               # h5i 无对应表
+    "orderbook_snapshot",   # h5i 无对应表(盘口快照)
+    "block_trade",          # h5i 无对应表(大宗交易明细)
+    "stock_news",           # h5i 无对应表
+)
+
+#: 注: `valuation_snapshot` 在 h5i 里**确有**同名表(实测 12593 行 / 最新 2026-09-08),
+#: 但它的写入走的是别的路径(h5i_rebuild / migrate_misc_h5i), 不在 `update_all` 里;
+#: 故从 `only` 移除它**不会**停止它的更新, 只是不再让 DuckDB 那条必然失败的路来报它。
+#: 这一点刻意写下来: "h5i 有同名表"与"本函数能写它"是两件事, 混起来会把
+#: 一个必然失败当成一个真实数据源。
