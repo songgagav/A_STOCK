@@ -233,6 +233,90 @@ class TestSuspendedRowsAreDroppedNotFatal:
         assert info["normalize"]["rows"] == 1188, info
 
 
+class TestWritePathAgainstRealH5i:
+    """**真实写入路径**的守卫 —— 跑在**隔离临时库**上, 用**生产同款 schema**。
+
+    为什么必须这么测(而不是只做源码断言):
+    `_write_day` 的第一个版本自己 `pa.Table.from_pandas(frame)` —— 而归一化后的帧
+    **只有 `date`, 没有 `ts`**, h5i 的 schema 却是 `ts: timestamp[us] not null`。
+    那样会写出**一列 null ts**(或被 schema 拒), 而**源码断言看不出这个**。
+    实测确认: 必须先经 `h5i_sync._df_to_h5i_table` 生成 `ts`。
+    """
+
+    @pytest.fixture()
+    def temp_db(self):
+        h5i_db = pytest.importorskip("h5i_db", reason="只有生产解释器/venv310 有 h5i_db")
+        import tempfile
+        prod_fp = os.path.join(_REPO, "data", "h5i", "market.db")
+        td = tempfile.mkdtemp()
+        db = h5i_db.Database(os.path.join(td, "market.db"), create=True)
+        # 从生产库**只读**取 schema, 保证与生产结构逐字段一致
+        if os.path.exists(prod_fp):
+            prod = h5i_db.Database(prod_fp)
+            sch = prod.schema("daily_bars")
+            prod.close()
+        else:
+            import pyarrow as pa
+            sch = pa.schema([pa.field("ts", pa.timestamp("us")), ("symbol", pa.string())] +
+                            [(c, pa.float64) for c in
+                             ("open", "high", "low", "close", "volume", "amount",
+                              "change_pct", "turnover")])
+        db.create_table("daily_bars", sch, time_column="ts")
+        yield db
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _frame(self, n=1200, day="2026-09-23"):
+        import bars_ingest as BI
+        recs = []
+        for i in range(n):
+            px = 10.0 + i * 0.01
+            recs.append({"date": day, "code": "sh.6%05d" % i,
+                         "open": f"{px}", "high": f"{px*1.01}", "low": f"{px*0.99}",
+                         "close": f"{px}", "preclose": f"{px}", "volume": "100000",
+                         "amount": f"{px*100000}", "adjustflag": "3", "turn": "0.15",
+                         "tradestatus": "1", "pctChg": "0.0"})
+        frame, _meta = BI.normalize(recs, "baostock")
+        return frame
+
+    def test_ts_is_populated_and_not_null(self, temp_db):
+        """**核心**: 写进去的行必须有非空 `ts`, 且恰好是那一天。"""
+        frame = self._frame()
+        assert "ts" not in frame.columns, (
+            "前置: 归一化后的帧本就没有 ts —— 这正是必须先过 _df_to_h5i_table 的原因")
+        BF._write_day("2026-09-23", frame, db=temp_db)
+        df = temp_db.read("daily_bars")
+        assert df.num_rows == 1200
+        ts = df.column("ts").to_pylist()
+        assert not any(x is None for x in ts), "写出了 null ts —— schema 要求 not null"
+        assert sorted({str(x)[:10] for x in ts}) == ["2026-09-23"]
+
+    def test_rewrite_same_day_is_idempotent(self, temp_db):
+        """同一天重复写**不得翻倍** —— 补数可能被重跑, 幂等是它的基本要求。"""
+        frame = self._frame()
+        BF._write_day("2026-09-23", frame, db=temp_db)
+        n1 = temp_db.read("daily_bars").num_rows
+        BF._write_day("2026-09-23", frame, db=temp_db)
+        n2 = temp_db.read("daily_bars").num_rows
+        assert n1 == n2 == 1200, (n1, n2)
+
+    def test_replace_does_not_touch_other_days(self, temp_db):
+        """替换区间**只覆盖那一天** —— 相邻日期必须原样保留。
+
+        这条是"用 `write()` 会删全表"那个风险的正面验证: 先写相邻日, 再替换中间日,
+        相邻日必须还在。
+        """
+        BF._write_day("2026-09-22", self._frame(day="2026-09-22"), db=temp_db)
+        BF._write_day("2026-09-24", self._frame(day="2026-09-24"), db=temp_db)
+        before = sorted({str(x)[:10] for x in temp_db.read("daily_bars").column("ts").to_pylist()})
+        assert before == ["2026-09-22", "2026-09-24"], before
+        BF._write_day("2026-09-23", self._frame(day="2026-09-23"), db=temp_db)
+        after = sorted({str(x)[:10] for x in temp_db.read("daily_bars").column("ts").to_pylist()})
+        assert after == ["2026-09-22", "2026-09-23", "2026-09-24"], after
+
+
 class TestDryRunWritesNothing:
     def test_no_write_flag_means_no_db_call(self, monkeypatch):
         """`write=False` 时**绝不能**碰到数据库。"""

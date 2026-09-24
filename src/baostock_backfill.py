@@ -262,13 +262,22 @@ def _write_day(day: str, frame, *, db=None) -> dict:
     用 `plan_replace_range` 而不是 `append`: 见模块 docstring —— append 对水位之前的
     日期抛 `sort_order_violation`, 而缺口恰恰可能落在水位之前; `write()` 则是**整表替换**,
     用它等于把全市场历史删掉。
+
+    [2026-09-25 修] **必须复用 `h5i_sync._df_to_h5i_table`**, 不要自己
+    `pa.Table.from_pandas`。理由: 归一化后的帧只有 `date`, **没有 `ts`**,
+    而 h5i `daily_bars` 的 schema 是 `ts: timestamp[us] not null` ——
+    自己转会写出一列 **null ts**(或直接被 schema 拒绝)。
+    `_df_to_h5i_table` 已经把这套做全了: `ts` 由 `date` 规范化生成、
+    `symbol` 补零到 6 位、缺列补 **float64 NaN**(不是 None, 否则 pyarrow 会推断成
+    Null 类型与建表 Float64 冲突)、最后强制 cast `timestamp[us]`。
+    **这正是"所有源经同一条写入路径"的意义** —— 我差点又把这条路重写一遍。
     """
     import h5i_db
-    import pyarrow as pa
+    import h5i_sync
 
     if db is None:
         db = h5i_db.Database(os.path.join(os.path.dirname(_HERE), "data", "h5i", "market.db"))
-    tbl = pa.Table.from_pandas(frame, preserve_index=False)
+    tbl = h5i_sync._df_to_h5i_table(frame)
     # h5i 的 time_column 是 ts; 只替换这一天 [00:00, 次日 00:00) 的区间
     start = _us(day)
     end = _us((dt.date.fromisoformat(day) + dt.timedelta(days=1)).isoformat()) - 1
