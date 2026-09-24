@@ -216,17 +216,17 @@ class TestDisc2FormIndex:
     因为它会让人以为已经覆盖了, 实际指向的是过期的形态清单。
     """
 
-    _FORMS = ("①", "②", "③", "④", "⑤")
+    _FORMS = ("①", "②", "③", "④", "⑤", "⑥")
 
     def _src(self):
         return open(_DOC, encoding="utf-8").read()
 
     def test_index_section_exists_and_precedes_details(self):
         src = self._src()
-        i_idx = src.find("失效形态索引")
+        i_idx = src.find("### 失效形态索引")
         assert i_idx > 0, "缺「失效形态索引」小节"
-        i_detail = src.find("四种\"测试看起来正常\"的形态")
-        assert i_detail > 0, "缺详细章节"
+        i_detail = src.find("### 详细判据")
+        assert i_detail > 0, "缺详细章节(标题应以「### 详细判据」开头)"
         assert i_idx < i_detail, (
             "索引必须排在详细章节**之前** —— 它的用途就是"
             "让人先决定查哪个, 再往下读细节")
@@ -264,37 +264,43 @@ class TestDisc2FormIndex:
                 f"入口与索引之间夹着 `{sub}` —— 入口必须紧邻索引; "
                 "读者会先读完那一节才看到索引, 入口形同虚设")
 
-    def test_index_covers_exactly_the_five_forms(self):
-        """索引表必须**恰好**列出 5 种形态, 不多不少。
+    def test_index_covers_exactly_the_six_forms(self):
+        """索引表必须**恰好**列出 6 种形态, 不多不少。
 
         多列 = 索引里有详细章节没写的形态(读者找不到细节);
         少列 = 新形态只写进正文却没进索引(读者扫不到)。
         两个方向都要拦。
+
+        [2026-09-25] 用户要求补第 ⑥ 种「降级过程无告警」, 故由五种扩到六种。
+        **这条断言必须跟着改** —— 若只改文档不改它, 用例会以"找不到 ⑥"失败
+        (这是好事: 说明守卫真的在盯索引与正文的一致性)。
         """
         src = self._src()
-        i = src.find("失效形态索引")
-        j = src.find("### 四种", i)
+        i = src.find("### 失效形态索引")
+        j = src.find("### 详细判据", i)
         index_block = src[i:j]
         for f in self._FORMS:
             assert f in index_block, f"索引里缺形态 {f}"
-        # 详细章节那边也必须五种都在(① 的定义在正文措辞里, 故按 "①②③④⑤" 数标题)
+        # 详细章节那边也必须六种都在: 前四种在对照表里以 `| **① ` 起行,
+        # ⑤⑥ 各有独立的 `### ⑤ ...` / `### ⑥ ...` 小节标题。
         detail = src[j:]
-        for f in self._FORMS[1:]:        # ②~⑤ 各有独立的 `### ② ...` 式小节标题
-            assert f"**{f}" in detail or f"### {f}" in detail or f"{f} " in detail, \
+        for f in self._FORMS:
+            assert f"**{f}" in detail or f"### {f}" in detail, \
                 f"详细章节里找不到形态 {f}"
 
-    def test_index_marks_two_forms_as_high_priority(self):
-        """④/⑤ 必须被标为**高**优先级, 且理由写出来(用户指定)。
+    def test_index_marks_three_forms_as_high_priority(self):
+        """④/⑤/⑥ 必须被标为**高**优先级, 且理由写出来(用户指定)。
 
-        为什么单锁这 4 个字符: 用户的原话是「⑤ 和 ④ 应该优先检查 —— 它们最难发现,
-        且会把人引向错误方向」。若将来有人"顺手"把优先级都抹平, 这张表就只剩
-        装饰作用 —— 而"没有优先级的索引"与"没有索引"在排查时的效果一样。
+        为什么单锁这几个字符: 用户的原话是「⑤ 和 ④ 应该优先检查 —— 它们最难发现,
+        且会把人引向错误方向」, 后又在 2026-09-25 要求补 ⑥。
+        若将来有人"顺手"把优先级都抹平, 这张表就只剩装饰作用 ——
+        而"没有优先级的索引"与"没有索引"在排查时的效果一样。
         """
         src = self._src()
-        i = src.find("失效形态索引")
-        j = src.find("### 四种", i)
+        i = src.find("### 失效形态索引")
+        j = src.find("### 详细判据", i)
         block = src[i:j]
-        for f in ("④", "⑤"):
+        for f in ("④", "⑤", "⑥"):
             row = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f}")]
             assert row, f"索引表里找不到形态 {f} 的行"
             assert "高" in row[0], f"形态 {f} 未被标为高优先级: {row[0][:90]}"

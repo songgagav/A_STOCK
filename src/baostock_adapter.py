@@ -141,7 +141,7 @@ def make_baostock_fetcher(*, start: str, end: str, adjustflag: str = "3",
 
 def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
                 limiter: RateLimiter | None = None, adjustflag: str = "3",
-                fetch_one=None, fetcher=None) -> dict:
+                fetch_one=None, fetcher=None, on_row=None) -> dict:
     """**定向补数**入口: 按 symbol 列表取指定区间, 返回契约三的归类结果。
 
     `symbols` 为 h5i 裸代码列表(如 `["600000","000001"]`)。
@@ -150,6 +150,13 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
 
     `fetcher` / `fetch_one` 可注入: 前者是 `make_baostock_fetcher(...)` 的产物,
     后者是"裸代码 -> DataFrame"的简版。**测试用注入版, 生产用真实版。**
+
+    `on_row(bare_code, df)` [2026-09-25 新增]: 每取到一只**立即回调**, 用于**流式聚合**。
+    为什么需要它: 全市场 5481 只的 DataFrame 同时留在内存里约数百 MB, 而**补数**
+    必须按"日"聚合成一个整截面才能过 `bars_ingest.normalize` 的残截面阈值
+    (默认 1000 行/日)。有了回调, 调用方可以逐日累加并在取完后立刻释放,
+    不必先攒齐全市场。**回调抛错不吞**: 聚合逻辑出错必须立刻暴露,
+    否则会变成"部分日静默少了标的"。
 
     返回 `classify_outcome(...)` 的结果 + `rows` / `failed` / `limiter`。
     """
@@ -189,7 +196,10 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
 
     lim = limiter or RateLimiter()
     got = fetch_batch([to_baostock_code(s, market_of.get(s)) for s in todo],
-                      fetch_one, limiter=lim)
+                      fetch_one, limiter=lim, on_row=(
+                          (lambda code, df: on_row(
+                              code.split(".")[-1] if "." in code else code, df))
+                          if on_row is not None else None))
     # 把结果键从 baostock 代码折回裸代码, 便于与引擎/ h5i 对齐
     rows = {}
     for k, v in got["rows"].items():
@@ -355,10 +365,12 @@ def classify_targets(symbols_df) -> dict:
 
 
 def fetch_batch(codes, fetch_one, *, limiter: RateLimiter | None = None,
-                on_error=None) -> dict:
+                on_error=None, on_row=None) -> dict:
     """按 `codes` 逐个取数, 逐只应用限流与退避。**不抛**(逐只失败被收集)。
 
     `fetch_one(code)` 由调用方注入 —— 真实实现调 baostock, 测试注入假实现。
+    `on_row(code, df)` 每取到一只**立即回调**(成功取数才调, 空/失败不调),
+    供调用方流式聚合、及时释放内存(见 `fetch_range` 的说明)。
     返回 {'rows': {code: DataFrame}, 'failed': {code: reason}, 'limiter': stats}
     """
     lim = limiter or RateLimiter()
@@ -387,6 +399,10 @@ def fetch_batch(codes, fetch_one, *, limiter: RateLimiter | None = None,
             continue
         lim.note(True)
         rows[c] = d
+        if on_row is not None:
+            # **不吞回调异常**: 聚合出错必须立刻暴露 —— 否则会变成
+            # "某些日静默少了标的", 而那正是补数最危险的失败模式。
+            on_row(c, d)
     return {"rows": rows, "failed": failed, "limiter": dict(lim.stats),
             "interval_ms": lim.interval_ms}
 
