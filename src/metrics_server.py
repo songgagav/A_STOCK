@@ -216,6 +216,21 @@ _g_ds_level = Gauge("astock_datasource_level",
 _g_ds_read_ok = Gauge("astock_datasource_read_ok",
                       "数据源门禁结论可读性 (0=读失败 => 告警源已失效)")
 
+# [2026-09-25] 引擎数据落后 —— **按交易日**计的量化值。
+#
+# 为什么必须有这个指标(实测出来的缺口, 不是预防性添加):
+# 厂商引擎停在 2026-09-22, 而当时应到 09-24 ⇒ 落后 **2 个交易日**。
+# 而现有两条规则都盖不住这段窗口:
+#   · `DataSourceHalt` 只在 `astock_datasource_allow == 0` 时响, 而门禁的降级判据
+#     (落后 > 发布宽限 1 天)只让它到 DEGRADED, `allow` 仍为 1 ⇒ **不响**;
+#   · `TableStaleDaily` 阈值是 **5 个自然日** 且实测 daily_bars 才 3.08 天 ⇒ 要等到第 6 天。
+# 于是「厂商连续几天不发布数据」——一个**正在静默降级**的过程——完全没有告警。
+# 交易日语义很关键: 3 个**自然日**里可能只含 2 个交易日(周末), 用自然日算会忽早忽晚。
+_g_engine_lag = Gauge("astock_engine_lag_days",
+                      "厂商引擎数据落后**交易日**数 (0=已追平; 越大越旧)")
+_g_engine_lag_read_ok = Gauge("astock_engine_lag_read_ok",
+                              "引擎落后结论可读性 (0=读失败 => 告警源失效)")
+
 # [2026-09-22 死手开关接线] 该模块此前**只被喂 tick、从不被求值**
 # (全仓检索 `deadman_switch.verdict` 零命中), 于是本仓唯一一个
 # "失联本身即是证据"的机制恰恰是唯一没接线的那个。
@@ -254,6 +269,38 @@ def _refresh_deadman() -> None:
     lvl = str(dm.get("level"))
     _g_dm_overdue.set(1 if lvl == "OVERDUE" else 0)
     _g_dm_unknown.set(1 if lvl == "UNKNOWN" else 0)
+
+
+def _refresh_engine_lag() -> None:
+    """暴露厂商引擎的数据落后**交易日**数 (2026-09-25)。
+
+    与 `_refresh_datasource` 同样的取材方式(读**健康快照**, 不在这里重跑探测):
+    快照由守护进程每 ~5 分钟发布一次, 已经算好 `lag_trading_days`。
+
+    命名取舍: 用 `astock_engine_lag_days` 而不是复用 `astock_datasource_*` ——
+    门禁那三个 gauge 说的是**该不该停手**(策略层结论), 这个说的是**数据有多旧**
+    (事实层量化值)。两者语义不同, 混用会让"落后 2 天"看起来像"已经停手"。
+    """
+    try:
+        import health_state as _HS
+        pub = _HS.read_published()
+    except Exception as e:  # noqa: BLE001
+        _g_engine_lag_read_ok.set(0)
+        print("engine lag read err:", str(e)[:160], flush=True)
+        return
+    obs = (pub or {}).get("observed") or {}
+    lag = obs.get("lag_trading_days")
+    if lag is None:
+        # 快照没有该字段: 可能是旧版本快照, 或探针失败(那份快照里 engine_day 也没有)。
+        # 记"不可读", **不记 0** —— 记 0 会让"读不到"显示成"已追平"。
+        _g_engine_lag_read_ok.set(0)
+        return
+    try:
+        _g_engine_lag.set(float(lag))
+    except Exception:  # noqa: BLE001
+        _g_engine_lag_read_ok.set(0)
+        return
+    _g_engine_lag_read_ok.set(1)
 
 
 def _refresh_datasource() -> None:
@@ -320,6 +367,11 @@ def _refresh() -> None:
         _refresh_deadman()
     except Exception as e:  # noqa: BLE001
         print("deadman refresh err:", str(e)[:200], flush=True)
+    # 同理独立: 引擎落后指标失败不得连带影响上面四项
+    try:
+        _refresh_engine_lag()
+    except Exception as e:  # noqa: BLE001
+        print("engine lag refresh err:", str(e)[:200], flush=True)
 
 
 def main() -> None:

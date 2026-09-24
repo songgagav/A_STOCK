@@ -252,6 +252,17 @@ def gather() -> dict:
             snap["freshness_ok"] = f.get("ok")
             snap["engine_day"] = p.get("day")
             snap["expected_day"] = f.get("expected_day")
+            # [2026-09-25] 把「落后几个交易日」也带出来 —— 它是本项**唯一可告警的量化值**。
+            #
+            # 为什么必须补: `freshness_ok` 是布尔的, 而门禁的降级判据是
+            # 「落后 > 发布宽限(1 个交易日)」。2026-09-25 实测厂商引擎停在 09-22、
+            # 落后 **2 个交易日**, 系统全程 **DEGRADED 但 allow=True** ⇒
+            # `DataSourceHalt`(只在 allow==0 时响)**不会响**; 而
+            # `TableStaleDaily` 用的是 5 天且按**自然日**算(实测 daily_bars 3.08 天)
+            # ⇒ 也要等到第 6 天才响。两条规则都盖不住"落后 2~3 天"这段窗口,
+            # 于是「厂商连续几天没发数据」这件事**没有任何告警**。
+            # 有 `lag_trading_days` 之后就能加一条按**交易日**、阈值 1 的规则。
+            snap["lag_trading_days"] = f.get("lag_trading_days")
         else:
             snap["freshness_ok"] = False
             snap["engine_error"] = p.get("error")

@@ -171,6 +171,57 @@ groups:
             以及 data/health/state.json 的 observed.datasource.reasons。
             常见: 服务 AStockStockdb 停止 / 厂商未发布 / db_update 表级全失败。
 
+      - alert: EngineDataLag
+        # [2026-09-25 新增] 厂商引擎的数据落后**交易日**数 —— 覆盖 2~3 天这段
+        # 「正在静默降级」的窗口。这是实测出来的缺口, 不是预防性添加:
+        #
+        # 当时引擎停在 2026-09-22, 应到 09-24 ⇒ 落后 **2 个交易日**, 而:
+        #   · `DataSourceHalt` 只在 `astock_datasource_allow == 0` 时响, 而门禁的
+        #     降级判据(落后 > 发布宽限 1 个交易日)只让它到 **DEGRADED**、`allow` 仍为 1
+        #     ⇒ **不响**;
+        #   · `TableStaleDaily` 阈值是 **5 个自然日**, 而实测 `daily_bars` 才 3.08 天
+        #     ⇒ 要等到第 6 天才响。
+        # 于是「厂商连续几天没发数据」这件事**完全没有告警** ——
+        # 而它正是本仓反复出现的形态: 系统在**正确地降级**, 却没人知道。
+        #
+        # 阈值 1 而非 0: 0 表示已追平; 1 表示还差一个已收盘交易日 —— 那在 A 股
+        # 盘后 1~4 小时才发布数据的现实下**属正常发布延迟**, 不该叫。
+        # 2 起才是"厂商可能漏发了", 故用 `> 1` 与门禁的
+        # `ENGINE_LAG_HALT_TRADING_DAYS`/`PUBLISHER_GRACE_TRADING_DAYS` 对齐。
+        #
+        # `for: 30m` 而非 0: 健康快照每 ~5 分钟发布一次, 单次探针抖动不该叫。
+        expr: astock_engine_lag_days > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "厂商引擎数据落后 {{ $value }} 个交易日 (正在静默降级)"
+          description: >-
+            astock_engine_lag_days={{ $value }}: 厂商引擎最新数据日 vs 应有数据日
+            相差 {{ $value }} 个交易日。此时选股仍在跑, 但用的是**旧截面** ——
+            看 data/daily/<最新回执>/daily_summary.json 的
+            steps.engine_bars_sync(engine_last_day) 与 target_plan.json 的
+            section_as_of / data_lag_days 即可确认"用哪天的数据在做决策"。
+            处置: 这是**厂商侧**发布问题, 本仓无法补 —— 先确认
+            `AStockStockdb` 服务在跑(它活着但没新数据 ≠ 它挂了);
+            落后达 3 个交易日时门禁会自行 HALT 并改为 DataSourceHalt 告警。
+
+      - alert: EngineDataLagUnreadable
+        # 与 DataSourceGateUnreadable 同理: 读不到落后结论时上面那条会哑掉
+        # (旧版快照没有 lag_trading_days 字段), 必须显式暴露, 否则"没有告警"
+        # 与"没有在监控"不可区分。
+        expr: astock_engine_lag_read_ok == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "引擎落后结论不可读 (告警源已失效)"
+          description: >-
+            metrics_server 读不到 data/health/state.json 的 observed.lag_trading_days
+            (快照为旧版本, 或引擎探针失败) => EngineDataLag 可能漏报。
+            查 daemon 日志的"健康快照已发布"是否仍在出现, 以及快照里有没有
+            observed.engine_error / probe_error_kind。
+
       - alert: DataSourceGateUnreadable
         # 与 FusionHealthUnreadable / DrlDegradeStatusUnreadable 同理: 读数失败会
         # 让 astock_datasource_* 停留在过期值, 使 DataSourceHalt 漏报 ——
