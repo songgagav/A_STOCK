@@ -248,6 +248,8 @@ def main(argv=None) -> int:
     ap.add_argument("--write", action="store_true",
                     help="**真正写入** h5i; 不给则只做 dry-run(归一化+哨兵, 不落盘)")
     ap.add_argument("--max-days", type=int, default=None)
+    ap.add_argument("--out", default=None,
+                    help="完整结果的落盘路径(默认 data/backfill_last_run.json)")
     a = ap.parse_args(argv)
 
     # symbols.parquet: 用于区分市场并显式报出北交所不可得
@@ -264,10 +266,27 @@ def main(argv=None) -> int:
         print(f"  {d}: {info.get('status')} {json.dumps({k: v for k, v in info.items() if k != 'guard'}, ensure_ascii=False)[:200]}", flush=True)
 
     res = backfill_days(a.days, write=a.write, symbols_df=symbols_df, progress=_prog)
-    print(json.dumps({k: v for k, v in res.items() if k != "days"}, ensure_ascii=False, indent=2)[:2000])
+    # [2026-09-25] **结果落盘成 JSON 文件**, 不只打到 stdout。
+    # 为什么: 第一次全市场 dry-run 我把 stdout 重定向到文件, 结果文件被截断在
+    # 北交所清单中途(`bj_not_requested` 有 339 项, 4.4KB) —— 关键的
+    # `days`/`error` 全丢, 于是**无法判断它为什么失败**, 只能再跑一遍 30 分钟。
+    # 教训: 让"结论"依赖管道/终端编码是脆的; 该把它写成文件。
+    # 同时把 bj 清单从 stdout 里**去掉**(339 行纯噪声, 需要时读 JSON)。
+    summary = {k: v for k, v in res.items()}
+    try:
+        fp = a.out or os.path.join(os.path.dirname(_HERE), "data",
+                                  "backfill_last_run.json")
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+        print(f"[backfill] 完整结果已写入 {fp}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[backfill] 结果落盘失败(不影响判定): {type(e).__name__}: {e}", flush=True)
+    brief = {k: v for k, v in res.items() if k != "bj_not_requested"}
+    print(json.dumps(brief, ensure_ascii=False, indent=2)[:3000])
     if res.get("bj_not_requested"):
         print(f"\n北交所 {len(res['bj_not_requested'])} 只**不在此路覆盖**: Baostock 仅沪深 "
-              f"(显式报出, 不静默少写)", flush=True)
+              f"(显式报出, 不静默少写; 完整清单见落盘 JSON)", flush=True)
     return 0 if res.get("ok") else 1
 
 
