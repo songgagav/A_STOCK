@@ -161,7 +161,16 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
             continue
         try:
             g = guard(norm)
-            info["guard"] = {"ok": bool(g.get("ok")), "reasons": (g.get("reasons") or [])[:3]}
+            # [2026-09-25 修] **记全 `checks` 与 `sample`, 不只记 `reasons`**。
+            # `data_quality_guard.validate_daily_bars` 返回的是
+            # `{ok, bad_rows, checks, sample}` —— **根本没有 `reasons` 字段**。
+            # 我第一版只取 `reasons` 并截前 3 条, 于是全市场 dry-run 失败时
+            # 留给我的是 `{"ok": false, "reasons": []}`: **拒了, 但没说为什么**。
+            # 这正是本仓 DISC-2 ⑤「归因在中间层丢失」——我在自己的新代码里又犯了一次。
+            info["guard"] = {"ok": bool(g.get("ok")), "bad_rows": g.get("bad_rows"),
+                             "checks": g.get("checks"),
+                             "sample": (g.get("sample") or [])[:3],
+                             "error": g.get("error")}
         except Exception as e:  # noqa: BLE001
             info["status"] = "guard_error"
             info["error"] = f"{type(e).__name__}: {str(e)[:160]}"
