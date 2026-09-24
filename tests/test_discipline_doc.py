@@ -205,3 +205,129 @@ class TestDisc1MechanismsActuallyExist:
         msg = str(ei.value)
         assert "不是肇事行" in msg, "报错未指向真因"
         assert "「」" in msg, "报错未给出修法"
+
+
+class TestDisc2FormIndex:
+    """DISC-2 的「失效形态索引」必须与详细章节**对得上** (2026-09-23, 用户建议)。
+
+    用户建议把 5 种形态列成一张带**排查优先级**的表。索引的价值全在"能扫一眼决定
+    先查哪个"; 一旦它与下面的详细章节脱节(改了形态却没改索引, 或反之),
+    它就从"索引"退化成"另一段会腐烂的文字" —— 而**索引腐烂比没有索引更糟**,
+    因为它会让人以为已经覆盖了, 实际指向的是过期的形态清单。
+    """
+
+    _FORMS = ("①", "②", "③", "④", "⑤")
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_index_section_exists_and_precedes_details(self):
+        src = self._src()
+        i_idx = src.find("失效形态索引")
+        assert i_idx > 0, "缺「失效形态索引」小节"
+        i_detail = src.find("四种\"测试看起来正常\"的形态")
+        assert i_detail > 0, "缺详细章节"
+        assert i_idx < i_detail, (
+            "索引必须排在详细章节**之前** —— 它的用途就是"
+            "让人先决定查哪个, 再往下读细节")
+
+    def test_disc2_top_has_a_navigation_pointer_to_the_index(self):
+        """DISC-2 章首必须有指向索引的**排查入口**, 且索引**紧邻其后**。
+
+        为什么这条单独锁: DISC-2 章首原本紧跟一张**很长的实例表**(六条真实事故)。
+        带症状来排查的人会从章首往下读, 于是**先读完整张历史档案**才可能碰到索引 ——
+        那索引等于没写。
+
+        [2026-09-23 两处自查]
+        ① 第一版用 `src.find("失效形态索引")` 取索引位置, 但**章首的入口本身就含
+           这五个字** ⇒ 取到指针自己 ⇒ 切片为空。教训: 断"某段在另一段之前"时,
+           边界关键词**不能是该引用自身的可见文字**, 要用小节标题。
+        ② 第二版只断言"入口在索引之前" —— 入口在章首、索引在章中段, 那条**恒真**,
+           真正的风险(中间夹着实例表)**抓不到**。故现在改成断言**紧邻**:
+           入口与索引之间**不得**出现其它小节标题。
+        """
+        src = self._src()
+        i_disc2 = src.find("## DISC-2:")
+        assert i_disc2 > 0
+        i_idx_head = src.find("### 失效形态索引", i_disc2)
+        assert i_idx_head > i_disc2, "找不到索引小节标题"
+        head = src[i_disc2:i_idx_head]
+        assert "排查入口" in head, (
+            "DISC-2 章首没有指向索引的排查入口 —— "
+            "读者会先逐条读六条事故实例, 才可能碰到索引")
+        assert "失效形态索引" in head, "入口应点名索引小节"
+        assert "优先级" in head and "检查方法" in head, (
+            "入口应说明索引里有什么(优先级/检查方法), 否则没人会跳过去")
+        # **核心**: 入口与索引之间不得夹任何其它小节 —— 否则"入口"要跨过它才到得了索引
+        for sub in ("### 事实依据", "### 关于", "### 四种"):
+            assert sub not in head, (
+                f"入口与索引之间夹着 `{sub}` —— 入口必须紧邻索引; "
+                "读者会先读完那一节才看到索引, 入口形同虚设")
+
+    def test_index_covers_exactly_the_five_forms(self):
+        """索引表必须**恰好**列出 5 种形态, 不多不少。
+
+        多列 = 索引里有详细章节没写的形态(读者找不到细节);
+        少列 = 新形态只写进正文却没进索引(读者扫不到)。
+        两个方向都要拦。
+        """
+        src = self._src()
+        i = src.find("失效形态索引")
+        j = src.find("### 四种", i)
+        index_block = src[i:j]
+        for f in self._FORMS:
+            assert f in index_block, f"索引里缺形态 {f}"
+        # 详细章节那边也必须五种都在(① 的定义在正文措辞里, 故按 "①②③④⑤" 数标题)
+        detail = src[j:]
+        for f in self._FORMS[1:]:        # ②~⑤ 各有独立的 `### ② ...` 式小节标题
+            assert f"**{f}" in detail or f"### {f}" in detail or f"{f} " in detail, \
+                f"详细章节里找不到形态 {f}"
+
+    def test_index_marks_two_forms_as_high_priority(self):
+        """④/⑤ 必须被标为**高**优先级, 且理由写出来(用户指定)。
+
+        为什么单锁这 4 个字符: 用户的原话是「⑤ 和 ④ 应该优先检查 —— 它们最难发现,
+        且会把人引向错误方向」。若将来有人"顺手"把优先级都抹平, 这张表就只剩
+        装饰作用 —— 而"没有优先级的索引"与"没有索引"在排查时的效果一样。
+        """
+        src = self._src()
+        i = src.find("失效形态索引")
+        j = src.find("### 四种", i)
+        block = src[i:j]
+        for f in ("④", "⑤"):
+            row = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f}")]
+            assert row, f"索引表里找不到形态 {f} 的行"
+            assert "高" in row[0], f"形态 {f} 未被标为高优先级: {row[0][:90]}"
+        # 理由必须写明(否则后人不知道为什么高)
+        assert "最难" in block or "反方向" in block, \
+            "未写出 ④/⑤ 为何优先(它们最难发现 / 会把人引向错误方向)"
+        # 低优先级的那个也要有标注, 保证三档都有
+        assert "🟢" in block and "🟡" in block and "🔴" in block, \
+            "优先级应有三档标记"
+
+    def test_index_names_a_concrete_check_per_form(self):
+        """每行必须给出**可执行的检查方法**, 而不是"注意一下"这类空话。
+
+        [2026-09-23 自查] 本用例第一版只断言"整行里含 检查/搜索/问 之一"——
+        反证实测它**抓不住**把检查方法改成"注意一下"的变异: 因为那一行的
+        **优先级列里也有"检查"二字**, 顺带满足了断言。
+        **教训**: 断言要落在**该落的那一列**上, 不是"这一行里有没有这几个字"。
+        故这里按 `|` 切列, 只取第 3 列(检查方法)来判。
+        """
+        src = self._src()
+        i = src.find("失效形态索引")
+        j = src.find("### 四种", i)
+        block = src[i:j]
+        for f in self._FORMS:
+            rows = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f}")]
+            assert rows, f"缺形态 {f} 的行"
+            cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+            assert len(cells) >= 3, f"形态 {f} 的行列数不对: {rows[0][:110]}"
+            method = cells[2]                    # 第 3 列 = 检查方法
+            assert method, f"形态 {f} 的检查方法为空"
+            assert any(k in method for k in ("检查", "搜索", "问")), (
+                f"形态 {f} 的**检查方法列**不含可执行动作, 像一句空话: {method!r}")
+            # 空话黑名单: 这些话看着像建议, 实际无法执行
+            for vague in ("注意一下", "关注", "留意", "小心"):
+                assert vague not in method, (
+                    f"形态 {f} 的检查方法流于空话({vague!r}): {method!r}")
