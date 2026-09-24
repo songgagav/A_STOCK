@@ -65,6 +65,43 @@ def _us(day: str) -> int:
     return int(dt.datetime.fromisoformat(str(day)).timestamp() * 1_000_000)
 
 
+def drop_suspended(recs) -> tuple:
+    """剔除 `tradestatus != '1'`(停牌)的原始记录, 返回 `(保留, 剔除数, 剔取样例)`。
+
+    ## 为什么必须剔, 而且必须在守卫**之前**剔
+
+    2026-09-25 全市场 dry-run 实测: 5212 只全部取到、**0 次限流退避**, 而两天都被
+    `data_quality_guard` **整日拒绝**, 原因是 **12 只**的 `volume`/`amount` 为空 ⇒
+    `core_nan` 命中 ⇒ `ok=False`。
+
+    查原始记录: 这 12 只**全部** `tradestatus=0`(停牌), 价格是停牌前收盘价、
+    量额为空 —— **这是 A 股每个交易日的正常状态**(当日停牌), 不是数据缺陷。
+
+    于是形成一个**过度反应**: 12 只停牌股把 5200 只有效行一起废掉。
+    这与本仓已修过的 `db_update` 12/12 误熔断是**同一形状** ——
+    「不重要的东西坏了, 导致重要的事停摆」。
+
+    ## 为什么不能靠"给守卫放行"来解决
+
+    那会把**真正的**核心列 NaN(数据缺陷)也一起放过。正确做法是**先剔掉确定的
+    非缺陷行**(停牌), 再让守卫只对"应当有数据却缺"的行负责 ——
+    即把判据从"有 NaN 就拒"收窄到"**交易中的标的**有 NaN 才拒"。
+
+    ## 为什么不用"丢弃坏行"的通用做法
+
+    通用丢弃会掩盖真缺陷: 若某标的 `tradestatus=1` 却缺量额, 那**必须**报错而不是
+    悄悄丢掉。故这里只按 `tradestatus` 这个**显式声明**来剔, 不用 NaN 当判据。
+    """
+    keep, dropped = [], []
+    for r in (recs or []):
+        st = str(r.get("tradestatus") or "").strip()
+        if st == "1":
+            keep.append(r)
+        else:
+            dropped.append(r)
+    return keep, len(dropped), [str(r.get("code") or "") for r in dropped[:8]]
+
+
 def missing_days(days, present) -> list:
     """在 `days` 里挑出**不在** `present` 中的交易日(纯函数, 便于测试)。
 
@@ -146,11 +183,18 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
             out["days"][d] = info
             continue
         try:
+            # **先剔停牌**(tradestatus != '1'), 再归一化与守卫 ——
+            # 理由见 `drop_suspended` 的完整说明: 停牌股量额为空是 A 股每日常态,
+            # 让它们把整日有效行废掉是过度反应(2026-09-25 实测 12 只废掉 5200 只)。
+            keep, n_drop, sample = drop_suspended(recs)
+            info["suspended_dropped"] = n_drop
+            if n_drop:
+                info["suspended_sample"] = sample
             # 复用**源无关**归一化: 单位换算/字段映射/符号规范化都在那里。
             # ⚠️ `normalize` 返回 **`(df, meta)` 元组**(与 `engine_bars_sync.fetch_day` 同约定),
             # 不是裸 DataFrame —— 我第一次就写错了, 于是 guard 收到 tuple 而报
             # `AttributeError: 'tuple' object has no attribute ...`, 被包装成 guard_error。
-            norm, nmeta = normalize(recs, SOURCE)
+            norm, nmeta = normalize(keep, SOURCE)
             info["normalize"] = {"rows": nmeta.get("rows"),
                                  "symbols": nmeta.get("symbols"),
                                  "min_rows_per_day": nmeta.get("min_rows_per_day")}

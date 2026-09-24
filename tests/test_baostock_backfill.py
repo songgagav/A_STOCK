@@ -152,6 +152,87 @@ class TestWholeDayRejection:
         assert res["written"] == [], "dry-run 不得写入"
 
 
+class TestSuspendedRowsAreDroppedNotFatal:
+    """停牌股量额为空是 **A 股每日常态**, 不得让它废掉整日。
+
+    2026-09-25 全市场 dry-run 实测: 5212 只全部取到、**0 次限流退避**, 而两天都被
+    `data_quality_guard` **整日拒绝** —— 原因是 **12 只**的 `volume`/`amount` 为空 ⇒
+    `core_nan` 命中。查原始记录, 这 12 只**全部** `tradestatus=0`(停牌)。
+
+    即 **12 只停牌股废掉 5200 只有效行** —— 与本仓已修过的 `db_update` 12/12
+    误熔断是**同一形状**: 不重要的东西坏了, 导致重要的事停摆。
+    """
+
+    def test_drop_suspended_keeps_only_trading_rows(self):
+        recs = [
+            {"code": "sh.600000", "tradestatus": "1"},
+            {"code": "sz.000016", "tradestatus": "0"},      # 停牌
+            {"code": "sz.000002", "tradestatus": "1"},
+            {"code": "sz.000003", "tradestatus": ""},        # 空 => 不可信, 一并剔
+        ]
+        keep, n, sample = BF.drop_suspended(recs)
+        assert n == 2 and len(keep) == 2
+        assert [r["code"] for r in keep] == ["sh.600000", "sz.000002"]
+        assert "sz.000016" in sample
+
+    def test_empty_input(self):
+        assert BF.drop_suspended([]) == ([], 0, [])
+        assert BF.drop_suspended(None) == ([], 0, [])
+
+    def test_suspension_is_not_a_defect_but_missing_data_is(self):
+        """**反证**: 剔停牌之后, `tradestatus=1` 却缺量额的行**必须仍被守卫拒**。
+
+        为什么这条必须有: 如果只图方便"把 NaN 行丢掉", 就会把**真缺陷**也一起放过 ——
+        那样补数会静默产出缺数据。故判据只能按 `tradestatus` 这个**显式声明**,
+        不能按 NaN。
+        """
+        import data_quality_guard as DQ
+        import bars_ingest as BI
+        good = {"date": "2026-09-23", "code": "sh.600000", "open": "9.0000",
+                "high": "9.1000", "low": "8.9000", "close": "9.0500",
+                "preclose": "9.0000", "volume": "1000", "amount": "9050",
+                "adjustflag": "3", "turn": "0.1", "tradestatus": "1", "pctChg": "0.5"}
+        # 停牌行: 量额为空 -> 剔掉后守卫应通过
+        susp = dict(good, code="sz.000016", tradestatus="0", volume="", amount="")
+        keep, n, _ = BF.drop_suspended([good, susp])
+        assert n == 1 and len(keep) == 1
+        norm, _ = BI.normalize(keep, "baostock", min_rows_per_day=0)
+        assert DQ.validate_daily_bars(norm)["ok"] is True
+        # 但"在交易"却缺量额 -> 必须被拒(这是真缺陷, 不能靠剔停牌掩盖)
+        broken = dict(good, volume="", amount="", tradestatus="1")
+        norm2, _ = BI.normalize([broken], "baostock", min_rows_per_day=0)
+        g2 = DQ.validate_daily_bars(norm2)
+        assert g2["ok"] is False and g2["checks"]["core_nan"] >= 1, g2
+
+    def test_backfill_records_how_many_were_dropped(self, monkeypatch):
+        """剔了多少只**必须记进结果** —— 否则"这个日少了几只"无从解释。"""
+        import tempfile
+        monkeypatch.setattr(BF, "PROVENANCE_FP",
+                            os.path.join(tempfile.mkdtemp(), "p.jsonl"))
+        syms = [f"6{i:05d}" for i in range(1200)]
+        # 让 fetcher 把前 12 只标成停牌
+        base = _fake_fetch_range(len(syms), ["2026-09-23"])
+
+        def _f(symbols, *, start, end, symbols_df=None, on_row=None, **kw):
+            out = base(symbols, start=start, end=end, symbols_df=symbols_df)
+            if on_row:
+                for i, (sym, df) in enumerate(list(out["rows"].items())):
+                    if i < 12:
+                        df = df.copy()
+                        df["tradestatus"] = "0"
+                        df["volume"] = ""
+                        df["amount"] = ""
+                    on_row(sym, df)
+            return out
+
+        res = BF.backfill_days(["2026-09-23"], write=False,
+                               symbols_df=_Symbols(syms), fetch_range=_f)
+        info = res["days"]["2026-09-23"]
+        assert info["suspended_dropped"] == 12, info
+        assert info["status"] == "ready", info
+        assert info["normalize"]["rows"] == 1188, info
+
+
 class TestDryRunWritesNothing:
     def test_no_write_flag_means_no_db_call(self, monkeypatch):
         """`write=False` 时**绝不能**碰到数据库。"""
