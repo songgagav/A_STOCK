@@ -287,12 +287,63 @@ def _write_day(day: str, frame, *, db=None) -> dict:
     return {"rows": int(tbl.num_rows), "summary": plan.summary, "apply": res}
 
 
+def _engine_day() -> str | None:
+    """当前**厂商引擎**的数据日(`YYYY-MM-DD`)。取不到返回 None(**不猜**)。"""
+    try:
+        import engine_bars_sync as _E
+        p = _E.engine_available()
+        if not p.get("ok"):
+            return None
+        d = str(p.get("day") or "")
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _h5i_watermark() -> str | None:
+    """当前 h5i `daily_bars` 水位(`YYYY-MM-DD`)。取不到返回 None。"""
+    try:
+        import h5i_sync
+        return str(h5i_sync.max_bar_date()) if h5i_sync.max_bar_date() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _append_provenance(day: str, rows: int, ctx: dict) -> None:
-    """把"这天来自 Baostock"写进留痕文件。**失败不阻断写入**(但会记进返回)。"""
+    """把"这天来自 Baostock"写进留痕文件。**失败不阻断写入**(但会记进返回)。
+
+    ## 为什么必须有 `engine_probe_unchanged` 与 `h5i_watermark_after`
+
+    用户 2026-09-25 指出的**语义澄清**: 回填改的是 **h5i 的水位**,
+    而**引擎探针读的是厂商引擎** —— 回填**不解决选股滞后**。
+    若不显式记下这一点, 下次(09-28)看到 `target_plan.data_lag_days = 3` 的人
+    会**误以为回填失败**, 而实际是"回填本来就不改选股口径, 只能等厂商发布"。
+
+    故每条留痕都记:
+      · `h5i_watermark_after` —— 回填后水位, 供核对"我确实补进去了";
+      · `engine_day_at_backfill` / `engine_probe_unchanged` —— 厂商引擎当时在哪一天;
+        两者一起说明「即使水位前进了, 引擎探针仍在旧日期」;
+      · `affects_selection` —— **明文写 false**, 这是给未来读日志的人看的结论。
+
+    **为什么记 `engine_probe_unchanged: true` 是安全的**: 本次回填**不碰引擎**,
+    它只写 h5i。若将来有人让回填也去改引擎侧的东西, 这个字段就必须重新审视 ——
+    故它是"当时的事实", 不是恒真的常量。
+    """
+    eng = _engine_day()
+    wm = _h5i_watermark()
     rec = {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "day": day,
+           "action": "backfill",
            "source": SOURCE, "rows": int(rows),
            "adjustflag": "3", "endpoint": "baostock",
-           "note": "厂商引擎未发布该日; 本行来自 Baostock, 非引擎口径",
+           # ---- 语义澄清字段(用户要求) ----
+           "h5i_watermark_after": wm,
+           "engine_day_at_backfill": eng,
+           "engine_probe_unchanged": True,
+           "affects_selection": False,
+           "note": ("厂商引擎未发布该日; 本行来自 Baostock, 非引擎口径。"
+                    "**回填不改变选股口径** —— 引擎探针仍看厂商引擎, "
+                    "故 target_plan.section_as_of / data_lag_days 在厂商发布前不会改善; "
+                    "本次回填的受益方是读 h5i 的下游(回测/因子/IC)。"),
            "bj_not_requested": len(ctx.get("bj_not_requested") or [])}
     try:
         os.makedirs(os.path.dirname(PROVENANCE_FP), exist_ok=True)

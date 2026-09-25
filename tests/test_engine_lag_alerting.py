@@ -160,3 +160,50 @@ class TestAlertRule:
         assert "target_plan" in desc or "section_as_of" in desc, (
             "应指出用 target_plan 的 section_as_of / data_lag_days 确认"
             "『用哪天的数据在做决策』")
+
+
+class TestKnownStructuralFalsePositiveIsLabelled:
+    """`DrlEnvMissing` 必须被**标注为已知结构性误报** (用户 2026-09-25 要求)。
+
+    ## 为什么它是结构性误报
+
+    `drl_degrade.probe_runtime()` 探的是 **metrics_server 自己那个解释器**
+    (`sys.executable`, 生产 VM 的 CPython 3.10: 有 `h5i_db`、无 `torch`),
+    而 DRL 训练实际跑在 **`TRAE_PY`** 上 —— 实测 09-24 的
+    `drl_train_heartbeat.json` 是 `{phase: "done", ok: true, total_timesteps: 800}`,
+    **训练是成功的**。即该指标描述的是**读数那个解释器**, 不是**训练那个解释器**。
+
+    ## 为什么选择"标注已知"而不是 silence 或改判据
+
+    用户给出的三个选项与本仓立场:
+      · **标记已知状态** ✅ —— 与 `TableStaleDaily` 对 valuation 的处理一致;
+      · **静音** ❌ —— 会连"TRAE_PY 真的缺依赖"这一真故障一起盖掉,
+        而且本仓原话是「用 silence 盖掉更糟: 它让你以为问题被处理了」;
+      · **保持现状** ⚠️ —— 持续 firing 会训练人忽略它(本仓
+        `TableStale24h` 330 次 firing 的教训: 长期无人处理的告警 = 没有告警)。
+
+    故: **保留 warning, 把"已知"与"核对办法"写进注解**, 并给出
+    「看 drl_train_heartbeat 判断是否真故障」这个可执行步骤。
+    """
+
+    @_needs_yaml
+    def test_drlenvmissing_is_labelled_known_structural(self):
+        rules = _load_rules()
+        assert "DrlEnvMissing" in rules, "规则不见了"
+        r = rules["DrlEnvMissing"]
+        # 判据**不得**改动 —— 只标注, 不替用户做 P0-DRLDEP 决策
+        expr = " ".join(str(r["expr"]).split())
+        assert expr == "astock_drl_env_ok == 0", f"判据被改了: {expr!r}"
+        # 级别保持 warning(**不静音**: 它同时覆盖 TRAE_PY 真缺依赖)
+        assert r["labels"]["severity"] == "warning"
+        summary = str(r["annotations"]["summary"])
+        desc = str(r["annotations"]["description"])
+        assert "已知结构性误报" in summary, summary
+        assert "P0-DRLDEP" in desc, "未指向已登记的决策项"
+        assert "drl_train_heartbeat" in desc, (
+            "必须给出**可执行的核对办法**(看心跳判断是否真故障), "
+            "否则「已知」就只是一句免责声明")
+        assert "silence" in desc, (
+            "应说明为何不用 silence 盖掉 —— 否则后人会「顺手」把它静音")
+        assert "probe_runtime" in desc or "metrics_server" in desc, (
+            "应说清误报的机理(探针探的是哪个解释器)")

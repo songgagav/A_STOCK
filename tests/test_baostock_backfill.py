@@ -152,6 +152,55 @@ class TestWholeDayRejection:
         assert res["written"] == [], "dry-run 不得写入"
 
 
+class TestProvenanceCarriesTheSemanticClarification:
+    """留痕必须记清「回填**不改变**选股口径」(用户 2026-09-25 指出的语义澄清)。
+
+    为什么这条是必需的: 回填改的是 **h5i 的水位**, 而**引擎探针读的是厂商引擎**。
+    若不显式记下这一点, 下次看到 `target_plan.data_lag_days = 3` 的人会
+    **误以为回填失败** —— 而实际是"回填本来就不改选股口径, 只能等厂商发布"。
+    """
+
+    def test_record_has_the_clarification_fields(self, monkeypatch):
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        BF._append_provenance("2026-09-23", 5200, {"bj_not_requested": [None] * 339})
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["action"] == "backfill"
+        assert rec["affects_selection"] is False, (
+            "必须**明文**写 false —— 这是给未来读日志的人看的结论, "
+            "不能靠他自己推断")
+        assert rec["engine_probe_unchanged"] is True
+        assert "h5i_watermark_after" in rec
+        assert "engine_day_at_backfill" in rec
+        assert "不改变选股口径" in rec["note"], rec["note"][:120]
+        assert rec["bj_not_requested"] == 339
+
+    def test_helpers_never_invent_a_date(self, monkeypatch):
+        """取不到引擎日/水位时返回 **None**, 不得猜一个日期。
+
+        猜错的日期比 None 危险得多: 它会被当成事实写进留痕, 而留痕正是
+        事后追溯的唯一依据。
+        """
+        import engine_bars_sync as E
+        monkeypatch.setattr(E, "engine_available", lambda: {"ok": False, "error": "x"})
+        assert BF._engine_day() is None
+        monkeypatch.setattr(E, "engine_available", lambda: {"ok": True, "day": "bad"})
+        assert BF._engine_day() is None
+        monkeypatch.setattr(E, "engine_available", lambda: {"ok": True, "day": "20260922"})
+        assert BF._engine_day() == "2026-09-22"
+
+    def test_helpers_tolerate_exceptions(self, monkeypatch):
+        """辅助函数抛错也必须返回 None —— 留痕不能把主流程拖垮。"""
+        import engine_bars_sync as E
+
+        def boom():
+            raise RuntimeError("engine down")
+        monkeypatch.setattr(E, "engine_available", boom)
+        assert BF._engine_day() is None
+
+
 class TestSuspendedRowsAreDroppedNotFatal:
     """停牌股量额为空是 **A 股每日常态**, 不得让它废掉整日。
 

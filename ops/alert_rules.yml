@@ -129,16 +129,42 @@ groups:
             effective_source_day, 确认回退到的模型是否仍可用。
       - alert: DrlEnvMissing
         # 决策 D 的根因暴露: 运行环境不齐备 => run_daily 会显式置 L3。
+        #
+        # [2026-09-25 标注「已知状态」, 与 TableStaleDaily 对 valuation 的处理一致]
+        #
+        # **这是一条结构性误报, 会长期 firing** —— 原因不是"环境坏了", 而是
+        # **探针探错了环境**:
+        #   · `drl_degrade.probe_runtime()` 探的是 **metrics_server 自己那个解释器**
+        #     (`sys.executable`), 即生产 VM 的 CPython 3.10: 有 `h5i_db`、无 `torch`;
+        #   · 而 DRL 训练实际跑在 **`TRAE_PY`**(守护用 `TRAE_PYTHON` 指定的解释器)上 ——
+        #     实测 09-24 的 `data/drl/20260924/drl_train_heartbeat.json` 是
+        #     `{phase: "done", ok: true, total_timesteps: 800}`, **训练是成功的**。
+        #   即 `astock_drl_env_ok=0` 描述的是**读数那个解释器**, 不是**训练那个解释器**。
+        #
+        # **为什么不 silence**: 与本仓一贯立场一致 —— silence 会连"真的缺依赖"一起
+        # 盖掉(本仓原话: 长期无人处理的告警 = 没有告警, 但**用 silence 盖掉更糟**:
+        # 它让你以为问题被处理了)。故保留为 warning, 只把"已知"写进这里。
+        #
+        # **为什么现在不改判据**: 改它等于替用户做 `P0-DRLDEP`(h5i_db 仅支持 CPython 3.10
+        # 而 torch 侧在 3.14, 两条路线互斥)的决策。故只标注, 不动逻辑。
         expr: astock_drl_env_ok == 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "DRL 运行环境缺依赖 (将导致显式 L3)"
+          summary: "DRL 运行环境缺依赖 (将导致显式 L3) —— **已知结构性误报, 见 P0-DRLDEP**"
           description: >-
-            astock_drl_env_ok=0: 当前解释器缺少 h5i_db 与 torch 之一(或 gymnasium/
-            stable_baselines3)。注意 h5i_db 仅支持 CPython 3.10, 而 torch 侧在 3.14,
-            故需按登记册 P0-DRLDEP 的四条路径之一决策后才可能齐备。
+            astock_drl_env_ok=0: `probe_runtime()` 报告当前解释器缺 h5i_db 与 torch
+            之一(或 gymnasium/stable_baselines3)。h5i_db 仅支持 CPython 3.10, 而 torch
+            侧在 3.14, 故需按登记册 P0-DRLDEP 的四条路径之一决策后才可能齐备。
+
+            **已知状态 · 2026-09-25 登记**: 若本告警**持续 firing**, 通常**不是**新故障:
+            探针探的是 metrics_server 自己的解释器, 而 DRL 训练跑在 TRAE_PY 上。
+            核对办法: 看 data/drl/<最新交易日>/drl_train_heartbeat.json ——
+            若 `phase=done, ok=true`, 则训练正常, 本告警属结构性误报。
+            处置: **保留为 warning**(不用 silence 盖掉) —— 因为它同时覆盖
+            「TRAE_PY 真的缺依赖」这一真故障; 收到时按上面办法判断即可。
+            根治需 P0-DRLDEP 决策(让探针指向训练实际使用的解释器)。
       - alert: DrlDegradeStatusUnreadable
         # 与 FusionHealthUnreadable 同理: 读数失败会让其余 astock_drl_* 停留在过期值,
         # 使 DrlHalted 漏报 —— 告警源自身失效必须显式暴露。
