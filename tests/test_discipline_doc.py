@@ -376,24 +376,37 @@ class TestGuardSelfReferenceIsDocumented:
         assert "守卫自指涉" in block, "⑥ 节缺「守卫自指涉」这个实例"
         assert "守卫依赖缺失" in block, "应与「守卫依赖缺失」并列对照"
 
+    def _form6_block(self):
+        """⑥ 节的正文块 —— 用**标题**定位, 不用关键字(关键字可能先出现在别处)。
+
+        [2026-09-25 自查] 本类原先用 `src.find("守卫自指涉")` 定位,
+        而章首「守卫的设计原则」里也提到了"守卫自指涉", 于是**取到了章首那段** ⇒
+        断言在一个完全无关的片段上失败(报"缺 docstring")。
+        教训与之前几次同源: **定位要用唯一锚点(标题), 不要用可能在多处出现的词**。
+        """
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("#### ⑥ 的补充实例")
+        assert i > 0, "找不到 ⑥ 的补充实例小节"
+        j = src.find("### 关于「已提交 vs 已推送」", i)
+        assert j > i, "找不到该小节的结束边界"
+        return src[i:j]
+
     def test_explains_the_benign_vs_malignant_boundary(self):
         """必须说清**良性(报错)与恶性(永远通过)**的分界 —— 这才是它的价值。"""
-        src = open(self._DOC_, encoding="utf-8").read()
-        i = src.find("守卫自指涉")
-        block = src[i:i + 4200]
+        block = self._form6_block()
         assert "假信心测试" in block, "应点明它可能退化成 ① 假信心测试"
         assert "永远通过" in block, "应说明恶性形态是'永远通过'"
         assert "docstring" in block, "应说明根因(get_source_segment 含 docstring)"
 
     def test_gives_three_operational_rules(self):
         """必须给出可操作做法, 而不是只描述现象。"""
-        src = open(self._DOC_, encoding="utf-8").read()
-        i = src.find("守卫自指涉")
-        block = src[i:i + 4200]
+        block = self._form6_block()
         assert "声明" in block and "排除" in block, (
             "应要求守卫**声明它排除了什么**")
         assert "下限" in block or "total >=" in block or "扫描量" in block, (
             "应要求加一条'扫描量下限'断言, 防止判据意外变窄")
+        # 「守不变量」那条设计原则现在住在**章首**(用户要求)—— 故这里断言它
+        # 在本小节里被**引用**(指向章首), 而不是要求它复述全文。
         assert "不变量" in block, "应点明'守卫要守不变量, 不要守实现细节'"
 
     def test_the_described_guard_actually_has_the_safeguards(self):
@@ -410,6 +423,105 @@ class TestGuardSelfReferenceIsDocumented:
         assert "total >=" in block, "缺'扫描量下限'断言"
         assert "本守卫自身除外" in block or "自身除外" in block, (
             "排除必须写在断言文本里(声明的输入, 不是偷偷跳过)")
+
+    def test_three_rows_distinguish_benign_from_malignant(self):
+        """表格必须区分**良性/恶性两档** —— 用户指出这个区分是关键。
+
+        两档的后果差一个数量级: 良性**报错 ⇒ 立刻可见**;
+        恶性**永远通过 ⇒ 退化成 ① 假信心测试**。
+        """
+        block = self._form6_block()
+        assert "守卫自指涉(良性)" in block, "缺『守卫自指涉(良性)』这一行"
+        assert "守卫自指涉(恶性)" in block, "缺『守卫自指涉(恶性)』这一行"
+        assert "守卫依赖缺失" in block, "缺『守卫依赖缺失』这一行"
+        assert "报的是它自己" in block
+
+    def test_scan_volume_floor_is_called_the_only_gate(self):
+        """必须点明「扫描量下限」是防恶性形态的**唯一闸门** (用户原话)。
+
+        为什么单锁这句: 它是**唯一的机制性保险**; 别的都是写法建议,
+        而写法建议靠注意力维持 —— 只有这条断言会在判据变窄时**主动失败**。
+        """
+        block = self._form6_block()
+        assert "唯一闸门" in block, "未点明扫描量下限是唯一闸门"
+        assert "total >= 13" in block, "未写出具体下限值"
+        assert "无人察觉" in block, "应说明没有它会退化成'无人察觉'"
+
+    def test_guard_design_principle_is_in_the_opening(self):
+        """「守卫要守不变量, 不要守实现细节」必须写进**章首** (用户要求)。
+
+        用户原话: 「这条建议应写入 DISC-2 章首或索引表, 作为所有守卫的设计原则」。
+
+        **为什么放章首而不是索引表**: 索引表列的是**六种失效形态**
+        ("守卫可能怎么失效"), 而这条是**设计原则**("怎么写才不容易失效")——
+        两者维度不同, 硬塞进形态表会污染该表的语义(它每行是一个"形态")。
+        章首已有"依赖一次对照"那条共同原则, 设计原则与之并列最合适。
+        """
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("## DISC-2:")
+        j = src.find("### 失效形态索引", i)
+        assert i > 0 and j > i
+        opening = src[i:j]
+        assert "守「不变量」" in opening or "守不变量" in opening, (
+            "DISC-2 章首缺『守卫要守不变量』这条设计原则")
+        assert "实现细节" in opening, "应点明不要守实现细节"
+        assert "正常演进" in opening, "应说明为何(正常演进时会撞到它)"
+        assert "判断方法" in opening, "应给出可操作的判断方法"
+
+    def test_design_principle_is_distinct_from_the_six_forms(self):
+        """设计原则必须**显式声明它与六种形态维度不同** —— 否则读者会以为它是第 7 种形态。"""
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("守「不变量」")
+        block = src[i:i + 2000]
+        assert "设计" in block and "形态" in block, (
+            "应说清: 六种形态说的是『守卫可能怎么失效』, 这条说的是『怎么写』")
+
+
+class TestNetworkTroubleshootingHasTwoBranches:
+    """「网络看着正常但 git 连不上」必须分成**两种**可能 (用户 2026-09-25 要求)。
+
+    用户原话: 「这两次形态不同, 不能一概归因到配置」。
+
+    | 症状 | 真因 | 处置 |
+    |---|---|---|
+    | `TLS connect error` / `SSL routines` | 本仓配置(代理 + sslbackend) | **改配置** |
+    | `Could not connect` / `Connection was reset` | 传输层波动 | **重试, 不动配置** |
+    """
+
+    def test_both_branches_present_with_different_remedies(self):
+        src = open(_DOC, encoding="utf-8").read()
+        i = src.find("网络看着正常但 git 连不上", src.find("## 环境不可用项"))
+        assert i > 0, "缺「两种可能」小节"
+        block = src[i:i + 3200]
+        assert "TLS connect error" in block, "缺 TLS 那一支"
+        assert "Could not connect" in block or "Connection was reset" in block, (
+            "缺传输层波动那一支")
+        assert "--local --unset" in block, "TLS 支应给改配置的修法"
+        assert "重试" in block, "传输层支应给「重试」的修法"
+
+    def test_warns_against_attributing_everything_to_config(self):
+        """必须写明**不能一概归因到配置** —— 这正是用户强调的点。
+
+        代价: 改配置去修一个本来会自愈的问题 ⇒ 配置改动**会留下来**,
+        下次再出问题时多一个变量要排除。
+        """
+        src = open(_DOC, encoding="utf-8").read()
+        i = src.find("网络看着正常但 git 连不上", src.find("## 环境不可用项"))
+        block = src[i:i + 3200]
+        assert "一概归因" in block, "未点明「不能一概归因」"
+        assert "自愈" in block, "应说明传输层波动会自愈"
+        assert "留下来" in block or "多一个变量" in block, (
+            "应说明误改配置的代价(改动会留下来)")
+
+    def test_gives_the_classification_procedure(self):
+        """必须给**先分类再动手**的可操作判据, 而不是只列两种现象。"""
+        src = open(_DOC, encoding="utf-8").read()
+        i = src.find("网络看着正常但 git 连不上", src.find("## 环境不可用项"))
+        block = src[i:i + 3200]
+        assert "关键词" in block or "看错误文本" in block, "应教人看错误文本关键词分类"
+        assert "Test-NetConnection" in block, "应用网络探测区分"
+        assert "api.github.com" in block, (
+            "应说明『某个 GitHub 端点通』不能推断『git 的端点也通』")
 
 
 class TestDisc1LoggingDiscipline:
@@ -550,6 +662,108 @@ class TestErrorMagnitudeIsNotAttributionBasis:
         block = src[i:i + 4200]
         assert "12" in block and "5212" in block, "缺 12/5212 那个实例"
         assert "停牌" in block, "应说明这 12 行查出来是停牌(正常状态)"
+
+
+class TestGuardMustNotDependOnGitignoredMachineState:
+    """『守卫不得依赖 gitignored 的机器状态』必须写进 DISC-2 共同原则 (2026-09-25)。
+
+    **为什么这条值得单独立守卫**: 它是本仓第一个「**按预案正常操作**却让守卫变红**」的
+    实例 —— `data/backfill_switch.json` 按 09-28 预案建成 `{"enabled": true}` 之后,
+    `assert BT.is_enabled({}) is False` 就失败了(机器上多了一个 gitignored 文件)。
+
+    这类失效**最难自查**, 因为: 代码全对、失败信息指向错误的方向("默认值不对"),
+    而最省事的处理是**放宽断言** —— 正是 DISC-2「守卫的设计原则」描述的退化路径。
+    所以除了写进文档, 还要机械断言"守卫自己已经不再依赖机器状态"。
+    """
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_documented_as_a_paid_for_instance(self):
+        """必须列进「已经付出过代价的实例」, 而不是只当一条泛泛的原则。"""
+        src = self._src()
+        i = src.find("共同原则: **依赖一次对照, 不依赖注意力**")
+        assert i > 0, "找不到共同原则小节"
+        block = src[i:i + 9000]
+        assert "版本控制之外" in block or "gitignored" in block, (
+            "实例里必须点明「版本控制之外/ignored」这个关键词")
+        assert "五个" in block, "实例数应从四个更新为五个"
+
+    def test_names_the_actual_file_and_the_actual_test(self):
+        """用真实文件名与用例名, 不写泛泛的"某个配置文件"。"""
+        src = self._src()
+        i = src.find("断言依赖 <u>gitignored 的机器状态</u>")
+        assert i > 0, "找不到该实例小节"
+        block = src[i:i + 6000]
+        assert "backfill_switch.json" in block, "必须点名真实的开关文件"
+        assert "test_disabled_by_default" in block, "必须点名真实的失败用例"
+        assert "2431" in block, "必须给出当时的真实计数(2431 passed / 1 failed)"
+
+    def test_explains_why_it_is_not_a_regression(self):
+        """关键区分: **代码是对的**, 错的是断言把环境事实当成了显式输入。
+
+        若读者以为这是"改了代码导致回归", 他会去改代码; 正确的动作是改断言。
+        """
+        src = self._src()
+        i = src.find("断言依赖 <u>gitignored 的机器状态</u>")
+        block = src[i:i + 6000]
+        assert "不是回归" in block, "必须明确写出「这不是回归」"
+        assert "显式输入" in block, "必须给出正解: 把前提改成**显式输入**"
+
+    def test_distinguishes_it_from_form3(self):
+        """必须与 ③「前置状态没造出来」区分开 —— 否则六种形态的边界就糊了。"""
+        src = self._src()
+        i = src.find("与 ③ 的区别")
+        assert i > 0, "缺「与 ③ 的区别」一行"
+        block = src[i:i + 400]
+        assert "没造出来" in block and "外部改变" in block, (
+            "应说清: ③ 是自己没造前置状态, 本条是被**外部**改变了")
+
+    def test_gives_the_one_line_judgement_rule(self):
+        """必须有一条可机械执行的判据, 否则又退回"靠注意力"。"""
+        src = self._src()
+        i = src.find("这条断言依赖的任何东西")
+        assert i > 0, "缺一句话判据"
+        block = src[i:i + 600]
+        for kw in ("logs", "环境变量"):
+            assert kw in block, f"判据里应把 {kw} 一并列出(同类风险源)"
+
+    def test_says_the_conflict_will_grow_not_shrink(self):
+        """附注必须说明「这类冲突会随运维成熟而增加」—— 这是"现在就立"的理由。"""
+        src = self._src()
+        i = src.find("为什么这类问题会越来越多")
+        assert i > 0, "缺该附注"
+        block = src[i:i + 600]
+        assert "增加" in block and "不会减少" in block
+
+    def test_the_real_test_now_injects_the_switch_path(self):
+        """反向验证: 真实用例必须**已经**把开关路径变成显式输入(不是只写了文档)。"""
+        fp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "tests", "test_backfill_trigger.py")
+        src = open(fp, encoding="utf-8").read()
+        i = src.find("class TestDefaultOff")
+        assert i > 0, "找不到 TestDefaultOff"
+        j = src.find("\nclass ", i + 1)
+        block = src[i:j if j > 0 else len(src)]
+        assert "switch_fp=" in block, (
+            "TestDefaultOff 必须**显式注入** switch_fp, 否则又依赖机器上有没有那个文件")
+        assert "no_such_switch.json" in block, "应注入一个确定不存在的路径"
+
+    def test_the_real_test_locks_purity_of_decide(self):
+        """再反向验证: 必须有用例锁住 `decide()` 的**纯函数性**。
+
+        这是本条的**机械化**形式 —— 不靠人去记住"别在 decide 里读环境",
+        而是把"读环境/读文件"变成一条会自动变红的断言。
+        """
+        fp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "tests", "test_backfill_trigger.py")
+        src = open(fp, encoding="utf-8").read()
+        i = src.find("test_machine_switch_file_does_not_break_the_pure_decide")
+        assert i > 0, "缺 decide 纯函数性守卫"
+        block = src[i:i + 900]
+        assert "getsource" in block, "应检查 **源码** 而非行为(行为会漏)"
+        assert "os.environ" in block and "_load_switch_file" in block, (
+            "应同时禁止读环境变量与读开关文件")
 
 
 class TestDisc2FormIndex:

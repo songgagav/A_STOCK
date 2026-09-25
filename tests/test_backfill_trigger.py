@@ -74,13 +74,38 @@ class TestTheAcceptanceCriterion:
 
 
 class TestDefaultOff:
-    def test_disabled_by_default(self):
-        """**默认关闭**, 且关闭时不做任何推断(disabled 是第一个分支)。"""
-        assert BT.is_enabled({}) is False, "默认必须是关闭"
+    def test_disabled_by_default(self, tmp_path):
+        """**默认关闭**, 且关闭时不做任何推断(disabled 是第一个分支)。
+
+        [2026-09-25 自查修正] 本用例原先直接调 `BT.is_enabled({})` 并断言 `False` ——
+        那在**没有开关文件**的机器上成立, 但在**已建开关文件的机器上会失败**:
+        `{}.get(ENABLED_ENV)` 返回 `None` ⇒ 代码落到"读开关文件" ⇒ 返回 `True`。
+
+        **这暴露了一个真问题**: 该断言**依赖机器本地状态**(`data/` 是 gitignored,
+        操作员按预案建了 `{"enabled": true}` 的开关文件)。
+        测试不该因为"操作员按预案开了开关"而失败 —— 那不是回归。
+
+        故改为**注入一个不存在的开关文件路径**, 把"没有配置"这件事变成**显式输入**
+        (与 DISC-3「加速层不得改变语义」同一思路: 让被测条件由参数决定, 不由环境决定)。
+        文件路径本身的行为由 `TestSwitchFileBecauseEnvAloneIsNotEnough` 覆盖。
+        """
+        nth = os.path.join(str(tmp_path), "no_such_switch.json")
+        assert BT.is_enabled({}, switch_fp=nth) is False, "无配置时必须是关闭"
         r = BT.decide(engine_day="2026-09-22", h5i_watermark="2026-09-22",
                       expected_day="2026-09-24", enabled=False)
         assert r["action"] == "disabled" and r["triggered"] is False
         assert r["missing_days"] == [], "关闭时不该算出待补日"
+
+    def test_machine_switch_file_does_not_break_the_pure_decide(self):
+        """`decide()` 是**纯函数** —— 不受机器上有没有开关文件影响。
+
+        为什么单锁这条: 若 `decide` 自己去读环境/文件, 它就不再是纯函数,
+        守卫也会变成机器相关(本次实测正是这样漏掉了一次)。`enabled` 必须**由调用方传入**。
+        """
+        import inspect
+        src = inspect.getsource(BT.decide)
+        assert "os.environ" not in src, "decide 不该读环境变量(破坏纯函数性)"
+        assert "_load_switch_file" not in src, "decide 不该读开关文件(破坏纯函数性)"
 
     @pytest.mark.parametrize("val,expect", [
         ("1", True), ("true", True), ("TRUE", True), ("yes", True), ("on", True),

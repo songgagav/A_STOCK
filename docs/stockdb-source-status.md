@@ -448,4 +448,62 @@ $env:BACKFILL_ENABLED=1 ; python src/run_daily.py
 2. 确认门禁不是 HALT;
 3. **知道它会写生产行情库**(不可逆)。
 
+### 6.13 09-28 观察清单(19:10 收盘管道之后)
+
+> **状态: 开关已按 09-28 预案开启** —— 2026-09-25 已创建
+> `data/backfill_switch.json`, 内容 `{"enabled": true}`, 用 **ascii 编码(无 BOM)** 写入。
+> 实测该文件已生效: 用**生产解释器**跑 `is_enabled()` 返回 `True`
+> (即守护拉起的那次 `run_daily` 会看到它 —— 这一条必须用生产解释器验,
+> 因为在 shell 里设 `$env:` 对守护拉起的进程**无效**, 见 §6.12)。
+
+## 检查顺序(按这个顺序看, 不要跳)
+
+```text
+□ 1. 厂商是否恢复?
+     看 data/health/state.json 的 observed.engine_day 与 lag_trading_days
+     或 python src/engine_bars_sync.py --probe
+```
+
+**若恢复**(引擎追平):
+
+```text
+□ 2a. EngineDataLag 自动 resolve(Alertmanager 里该告警消失)
+□ 2b. steps.backfill_trigger 的 action = no_gap
+□ 2c. 结论: **安全不触发** ✅ —— 这正是「A 且 B」想要的行为
+        (engine_bars_sync 在 trigger 之前跑, 水位当场前进 ⇒ B 变假)
+```
+
+**若未恢复**(引擎仍停旧日):
+
+```text
+□ 2a. steps.backfill_trigger 的 action = trigger
+□ 2b. 补数 09-25 / 09-28
+□ 2c. 验证**两件事同时成立**(§6.10):
+        ① steps.backfill_trigger.run.verify.h5i_advanced   = true
+        ② steps.backfill_trigger.run.verify.engine_unchanged = true
+□ 2d. 确认 unfillable_symbols 含 **339** 只北交所(§6.11 第 3 项 / 留痕字段)
+□ 2e. 通过后: 把 **§6.11 标题改为 ✅ 已验证** + 写上实测数字
+        (哪一天触发 / 补了几个交易日 / 多少行)
+```
+
+## 关于「长期开启」
+
+**首次自动触发验证成功后, 建议保持开启**:
+
+1. **触发条件严格** —— A 且 B, 且门禁非 HALT(见 §6.12);
+2. 它正是「数据及时更新」的**冗余机制** —— 主源(厂商引擎)不发布时, 系统自己兜一层;
+3. **关闭它等于回到「靠人记得手动补」** —— 那正是本仓一贯要消除的东西
+   (靠注意力而非对照)。
+
+**但若首次触发出现任何异常**:
+
+```text
+□ 立即把 data/backfill_switch.json 的 enabled 改为 false
+□ 记录异常(日期 / action / 报错 / 留痕内容)
+□ 修复后再开 —— 期间靠人工补
+```
+
+**判据**: 异常时**先关掉再排查** —— 因为开着但行为不明, 会在下一次收盘管道里
+**再次写生产行情库**, 把现场覆盖掉。**先止损, 再定位。**
+
 
