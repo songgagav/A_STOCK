@@ -157,6 +157,45 @@ git config --local --unset http.sslbackend     # 让系统级的 schannel 生效
 > 4. **`api.github.com` 通但 `github.com:443` 不通是可能的**
 >    (不同的 IP/路径), 故"某个 GitHub 端点通"不能推断"git 的端点也通"。
 
+### `git commit -F` 报 **`a NUL byte in commit log message not allowed`** (2026-09-26 实测)
+
+**症状**: `git push` 前一步就失败, 报
+
+```
+error: a NUL byte in commit log message not allowed.
+fatal: failed to write commit object
+```
+
+紧接着 `git push` 会说 `Everything up-to-date` —— **因为根本没有提交产生**。
+**这正是 ③「前置状态没造出来」的现场**: 后续步骤在操作一个**不存在的提交**,
+而它的报错信息(`up-to-date`)看起来像"已经推过了"。
+
+**真因**: 用 PowerShell 的 `Set-Content -Encoding utf8` 写提交信息文件时,
+**UTF-16 内部表示被写出**, 产生 NUL 字节。`git` 拒绝 NUL。
+
+**修法(一次到位, 不要再试 `Set-Content`)**:
+
+```powershell
+$m = @'
+...(提交信息)...
+'@
+[System.IO.File]::WriteAllText("$PWD\.git\CM.txt", $m,
+    (New-Object System.Text.UTF8Encoding($false)))   # $false = 不写 BOM
+git commit -F .git\CM.txt
+```
+
+**自查(建议每次都做, 一行)**: 写完先验字节, 再提交 ——
+
+```powershell
+$b = [System.IO.File]::ReadAllBytes("$PWD\.git\CM.txt")
+"bytes=$($b.Length) NULs=$(($b | Where-Object { $_ -eq 0 }).Count) BOM=$($b[0] -eq 0xEF)"
+```
+
+**同族**: 这与 §6.12 的「`Out-File -Encoding UTF8` 给开关文件写出 BOM」
+是**同一个根因**(PowerShell 的编码默认值与"无 BOM UTF-8"不一致),
+已出现两次。**判据: 凡要交给别的程序读的文件, 写完都验一次首字节** ——
+"我写对了内容"与"文件字节正确"是两件事。
+
 ---
 
 ## METHOD-1: 边界/阈值必须由**下游表现**决定, 而非**分布范围**
