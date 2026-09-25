@@ -48,6 +48,50 @@ hindsight_ingest_document(...)  ->  401 {"detail":"Authentication ..."}
 
 **判据**: 遇到"这个工具/模块用不了"时, **先查本节**; 若本节没记, 登记进来再往下走。
 
+### `git push` 报 TLS 错: **本仓 `.git/config` 里的代理与 sslbackend** (2026-09-25 已修)
+
+**症状**(实测):
+
+```
+git push origin main
+  -> fatal: unable to access 'https://github.com/songgagav/A_STOCK.git/':
+     TLS connect error: error:0A000126:SSL routines::unexpected eof while reading
+```
+
+**关键误导**: 同时 `Test-NetConnection github.com:443` 是 **True**,
+`Invoke-WebRequest https://api.github.com` 返回 **HTTP 200**, 且 `github_api` 工具也正常 ——
+**只有 `git push` 失败**。故很容易误判成"网络问题"或"GitHub 挂了", 白等。
+
+**真因**(`git config --list --show-origin` 一眼看出):
+
+```
+file:C:/Program Files/Git/etc/gitconfig   http.sslbackend=schannel   <- 系统级, 正常
+file:.git/config                          http.proxy=http://127.0.0.1:6696
+file:.git/config                          https.proxy=http://127.0.0.1:6696
+file:.git/config                          http.sslbackend=openssl    <- 覆盖了系统的 schannel
+```
+
+**本仓自己的 `.git/config` 里留着一条代理 + 一条 `sslbackend=openssl`**。
+该代理端口**在监听**(pid 存在), 但它对 git 的 TLS 握手不工作 ⇒ 失败点在 TLS 层,
+于是错误信息指向 "SSL routines" 而**完全不提代理** —— 这就是它的误导性所在。
+
+**修法**(只动本仓, **不碰全局**):
+
+```
+git config --local --unset http.proxy
+git config --local --unset https.proxy
+git config --local --unset http.sslbackend     # 让系统级的 schannel 生效
+```
+
+**注意一个坑**: `git config http.proxy ""` **不解决问题** —— 实测设成空串后
+`--local --get` 仍返回代理地址(空串在该键上不构成有效覆盖),
+必须用 `--unset` 真正删掉。
+
+**判据(下次遇到同类)**:
+> 「网络看着正常, 只有某个工具连不上」时, **先查那个工具自己的配置**,
+> 而不是先怀疑网络。用 `git config --list --show-origin` 看**每一层的来源**,
+> 而不是只看 `--get` 的最终值 —— 最终值会掩盖"是哪一层设的"。
+
 ---
 
 ## METHOD-1: 边界/阈值必须由**下游表现**决定, 而非**分布范围**
