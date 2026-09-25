@@ -207,6 +207,192 @@ class TestDisc1MechanismsActuallyExist:
         assert "「」" in msg, "报错未给出修法"
 
 
+class TestCrossCuttingPrinciples:
+    """跨形态的**共同原则**必须写在章首, 且钉死 (2026-09-25 用户要求)。
+
+    用户的原话: 「建议把『依赖对照而非注意力』写入 DISC-2 章首 ——
+    它是所有形态的共同原则, 也是唯一能对抗『注意力耗尽』的方法。」
+
+    **为什么单独守卫它**: 索引表列的是"查哪几种"(战术), 而这条是"凭什么能防住"(战略)。
+    它一旦被删或退化, 六种形态就退回成六条"靠更小心"的建议 —— 而**建议不防任何东西**。
+    """
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_disc2_opens_with_the_shared_principle(self):
+        src = self._src()
+        i = src.find("## DISC-2:")
+        assert i > 0
+        # 原则必须在索引**之前**(章首), 否则读者先看到战术表、看不到依据
+        i_principle = src.find("依赖一次对照, 不依赖注意力", i)
+        i_index = src.find("### 失效形态索引", i)
+        assert i_principle > 0, "DISC-2 章首缺「依赖一次对照, 不依赖注意力」"
+        assert i_index > 0
+        assert i_principle < i_index, "共同原则必须排在失效形态索引**之前**"
+
+    def test_principle_says_why_attention_fails(self):
+        """必须写清**为什么**: 注意力会耗尽且耗尽时不报警 —— 否则它只是句口号。"""
+        src = self._src()
+        i = src.find("依赖一次对照, 不依赖注意力")
+        block = src[i:i + 3600]
+        assert "耗尽" in block, "未说明注意力会耗尽"
+        assert "不报警" in block or "不报" in block, (
+            "未说明注意力耗尽时**不报警** —— 这正是它与本纪律要防的东西同源的原因")
+        assert "同一个病" in block, "未点出它与所防之病同源"
+
+    def test_principle_gives_a_contrast_table_for_every_form(self):
+        """六种形态**每一种**都要有「靠注意力 ❌ vs 一次对照 ✅」的对照。
+
+        为什么逐种都要求: 只写一句原则、不落到每种形态上, 读者会认同原则、
+        然后回到"靠注意"的老做法。**对照表是原则与行动的接口。**
+        """
+        src = self._src()
+        i = src.find("依赖一次对照, 不依赖注意力")
+        j = src.find("排查入口(先读这一行)", i)
+        assert j > i, "找不到原则块的结束边界"
+        block = src[i:j]
+        # 注意: 这块整体在 Markdown **引用块**里, 故每行前缀是 `> ` ——
+        # 断言里必须带上它(我第一次就漏了, 于是 `| ① ` 匹配不到而失败)。
+        for f in ("①", "②", "③", "④", "⑤", "⑥"):
+            assert (f"> | {f} ") in block, (
+                f"共同原则的对照表里缺形态 {f}(行首应为 `> | {f} `)")
+        # ❌/✅ 只出现在**表头**的两个列名里(每行不再重复) —— 故断言"表头有这两列",
+        # 而不是"每行都有"。我第一次写成 `count >= 6`, 实测是 1/1, 属想当然。
+        header = [ln for ln in block.splitlines() if ln.startswith("> | 形态")]
+        assert header, "找不到对照表的表头行"
+        assert "❌" in header[0] and "✅" in header[0], (
+            f"表头应含有 ❌/✅ 两列: {header[0][:120]}")
+
+    def test_principle_has_an_operational_self_check(self):
+        """必须给一条**可执行的自检**, 而不是停在原则上。"""
+        src = self._src()
+        i = src.find("依赖一次对照, 不依赖注意力")
+        block = src[i:i + 3600]
+        assert "注意" in block and "小心" in block, "自检应点名那些无用的词"
+        assert "改写" in block or "对照动作" in block, "自检应要求把它改写成对照动作"
+
+
+class TestDisc1LoggingDiscipline:
+    """DISC-1 同族纪律: 留痕字段**宁可 None, 不猜** (2026-09-25 用户要求)。"""
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_rule_present_under_disc1(self):
+        src = self._src()
+        i = src.find("## DISC-1:")
+        j = src.find("## DISC-2:")
+        assert i > 0 and j > i
+        block = src[i:j]
+        assert "宁可 None, 不猜" in block, "DISC-1 下缺「留痕字段宁可 None, 不猜」"
+        assert "留痕" in block, "应明确它管的是留痕/上报字段"
+
+    def test_rule_explains_why_guessing_is_worse(self):
+        """必须说清**为什么猜的日期比 None 危险** —— 否则会被当成"太保守"。"""
+        src = self._src()
+        i = src.find("宁可 None, 不猜")
+        block = src[i:i + 2600]
+        assert "事后追溯" in block or "唯一依据" in block, (
+            "未说明留痕是事后追溯的唯一依据")
+        assert "当成事实" in block, "未说明猜测会被当成事实"
+        assert "沿用上次" in block or "last-known" in block, (
+            "应显式否掉「沿用上次值」这个常见做法 —— 否则后人会顺手加上")
+
+    def test_rule_links_to_the_implementation_and_guards(self):
+        """必须点名实现与守卫 —— 文档说"有守卫"而守卫不存在, 就是文件在撒谎。"""
+        src = self._src()
+        i = src.find("宁可 None, 不猜")
+        block = src[i:i + 2600]
+        assert "_engine_day" in block and "_h5i_watermark" in block, (
+            "应点名实现(`_engine_day` / `_h5i_watermark`)")
+        for fn in ("test_helpers_never_invent_a_date", "test_helpers_tolerate_exceptions"):
+            assert fn in block, f"应点名守卫 {fn}"
+        # 守卫必须真实存在(文档指向已删除的东西是最常见的腐烂)
+        import test_baostock_backfill as T
+        cls = T.TestProvenanceCarriesTheSemanticClarification
+        for fn in ("test_helpers_never_invent_a_date", "test_helpers_tolerate_exceptions"):
+            assert hasattr(cls, fn), f"文档点名了 {fn}, 但它不存在"
+
+
+class TestBackfillTwoWayVerificationIsDocumented:
+    """回填后**必须同时**验证两件事 —— 且两件是相反的期望 (2026-09-25 用户要求)。"""
+
+    _DOC2 = os.path.join(_REPO, "docs", "stockdb-source-status.md")
+
+    def _src(self):
+        return open(self._DOC2, encoding="utf-8").read()
+
+    def test_section_present(self):
+        src = self._src()
+        assert "验证两件事" in src, (
+            "stockdb-source-status.md 缺「回填后需同时验证两件事」小节")
+
+    def test_both_expectations_are_stated_and_are_opposite(self):
+        """两件事的**期望值必须相反** —— 这是该小节的全部价值。"""
+        src = self._src()
+        i = src.find("验证两件事")
+        assert i > 0
+        block = src[i:i + 2600]
+        assert "h5i" in block and "引擎探针" in block, "应分别列出 h5i 与引擎探针两项"
+        assert "相反" in block or "同时成立才是正确" in block, (
+            "必须点明两件期望是**相反**的、且同时成立才对 —— "
+            "否则读者仍会只验一件")
+        assert "不代表失败" in block or "本来就不会改善" in block, (
+            "必须预先否掉「data_lag_days 没改善 = 回填失败」这个误读")
+
+    def test_names_the_provenance_fields_that_record_it(self):
+        """应指向留痕里那两个字段 —— 让读的人能自己追溯。"""
+        src = self._src()
+        i = src.find("验证两件事")
+        block = src[i:i + 2600]
+        assert "engine_probe_unchanged" in block, "未指向 engine_probe_unchanged"
+        assert "affects_selection" in block, "未指向 affects_selection"
+
+
+class TestErrorMagnitudeIsNotAttributionBasis:
+    """『错误的规模不作归因依据』必须写进 ⑤ 子节 (2026-09-25 用户要求)。"""
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_rule_present_in_form5_block(self):
+        src = self._src()
+        i = src.find("### ⑤ 归因在中间层丢失")
+        j = src.find("### ⑥ ", i)
+        assert i > 0 and j > i
+        block = src[i:j]
+        # 实际措辞是 `错误的"规模"不作归因依据`(**带引号**) —— 我第一次写成不带引号的
+        # `规模不作归因依据` 就匹配不到。教训: 断言文档时, 搜索串要**照抄原文**,
+        # 不要凭记忆写。
+        assert "不作归因依据" in block, "⑤ 子节缺「规模不作归因依据」"
+        assert "只作优先级依据" in block, "应说明规模只能作**优先级**依据"
+
+    def test_uses_the_two_real_magnitudes_as_evidence(self):
+        """必须用本仓**真实**的两个量级作对照(28 股 vs 100 倍), 而不是泛泛而谈。"""
+        src = self._src()
+        i = src.find("不作归因依据")
+        assert i > 0, "找不到该小节"
+        block = src[i:i + 4200]
+        assert "28" in block, "缺 28 股那个极小差异的实例"
+        assert "100" in block, "缺 100 倍那个极大差异的实例"
+        assert "机制" in block and "结构" in block, (
+            "应给出替代判据(机制可否解释 / 是否稳定结构)")
+
+    def test_uses_the_12_of_5212_case_where_magnitude_misled_twice(self):
+        """本仓最有说服力的实例: 12/5212 —— **规模给了两次相反的暗示, 两次都错**。
+
+        小规模 ⇒ "应该没事"(会放行真缺口); 中等比例 ⇒ "整日废掉"(会丢 5200 行)。
+        必须写进去, 因为它是唯一一个"两个方向都被规模骗到"的实例。
+        """
+        src = self._src()
+        i = src.find("不作归因依据")
+        assert i > 0
+        block = src[i:i + 4200]
+        assert "12" in block and "5212" in block, "缺 12/5212 那个实例"
+        assert "停牌" in block, "应说明这 12 行查出来是停牌(正常状态)"
+
+
 class TestDisc2FormIndex:
     """DISC-2 的「失效形态索引」必须与详细章节**对得上** (2026-09-23, 用户建议)。
 
