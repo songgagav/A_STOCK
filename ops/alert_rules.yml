@@ -88,6 +88,14 @@ groups:
             **回填不改选股口径** —— 引擎探针仍看厂商引擎, 见
             docs/stockdb-source-status.md §6.10(回填后需同时验证两件事)。
 
+            【同一件事的两级阈值 · 2026-09-25 明确】**本条与 `EngineDataLag`
+            看的是同一个指标 `astock_engine_lag_days`, 只是阈值不同** ——
+            故两条同时 firing **不是两个故障, 而是同一个故障在升级**:
+            `EngineDataLag` 在 >1 时先响, 本条在 >2 时跟上。
+            判据: **不要分别排查两次**; 按当前落后天数处理一次即可
+            (1~2 天: 只 `EngineDataLag` / >2 天: 两条 / 达 3 天: 门禁自行 HALT,
+            届时改为 `DataSourceHalt`)。
+
       - alert: TableStaleQuarterly
         # 季报类表(财报节奏) —— **刻意与日报类分开**: 用 24h 判它必然永久误报
         expr: >-
@@ -284,6 +292,14 @@ groups:
             处置: 这是**厂商侧**发布问题, 本仓无法补 —— 先确认
             `AStockStockdb` 服务在跑(它活着但没新数据 ≠ 它挂了);
             落后达 3 个交易日时门禁会自行 HALT 并改为 DataSourceHalt 告警。
+
+            【与 TableStaleEngineFed 的关系 · 2026-09-25 补】**同一起因的两级阈值,
+            不是两件事**: 本条在落后 **>1 个交易日**时响(第一级 / 预警),
+            `TableStaleEngineFed` 在 **>2 个交易日**时响(第二级 / 兜底)。
+            故**两条同时 firing 是预期的升级过程**, 只说明"同一个引擎落后得更久了",
+            不代表出现了第二个故障 —— 不需要分别排查两次。
+            判据: 若两条同时亮, 按 `astock_engine_lag_days` 的**当前值**处理即可
+            (1~2 天看本条, >2 天看两条, 达 3 天门禁自行 HALT)。
 
       - alert: EngineDataLagUnreadable
         # 与 DataSourceGateUnreadable 同理: 读不到落后结论时上面那条会哑掉

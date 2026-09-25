@@ -273,6 +273,73 @@ class TestCrossCuttingPrinciples:
         assert "改写" in block or "对照动作" in block, "自检应要求把它改写成对照动作"
 
 
+class TestEveryYamlUsingTestIsMarked:
+    """用了 yaml 的用例**必须**挂 `@_needs_yaml` (2026-09-25 用户要求)。
+
+    ## 为什么这条值得单独做成守卫
+
+    2026-09-25 我新加了一条 `test_filter_logic_accepts_per_table_thresholds`,
+    它调用 `_load_rules()`(内部 `import yaml`) —— 却**漏了 `@_needs_yaml`**。
+    后果: 在 `.venv314`(无 PyYAML)下它**不是 skip 而是 ERROR**,
+    把全量测试从 `0 failed` 变成 `1 failed`。
+
+    **新加的守卫自己成了破坏源** —— 这正是本仓 DISC-2 要防的形态, 只是这次
+    破坏者是守卫本身。人工核对靠不住(我当时也以为标了), 故做成**静态扫描**:
+    凡"用了 yaml"的用例, 装饰器里必须有 `_needs_yaml`。
+
+    ## 判据为什么用 AST 而不是正则
+
+    正则会把**注释里提到 yaml** 也当成"用了 yaml"(本仓注释里大量出现 `alert_rules.yml`),
+    于是产出大量假阳性、最后被人加白名单绕过 —— 那等于没有守卫。
+    AST 只看**函数体里真实的调用**, 没有这个问题。
+    """
+
+    def test_no_yaml_using_case_misses_the_marker(self):
+        import ast as _ast
+        import glob as _glob
+        missing = []
+        total = 0
+        # 本守卫**自己**也要按同一规则检查 —— 它里面出现了那些模式串(在提示文本里),
+        # 若不过滤就会**自我误报**(实测第一次就报了它自己)。
+        # 过滤是本测试的一个**输入**(文件名), 不是"跳过检查"的例外。
+        _SELF = os.path.basename(__file__)
+        for p in sorted(_glob.glob(os.path.join(_REPO, "tests", "*.py"))):
+            src = open(p, encoding="utf-8").read()
+            if "yaml" not in src:
+                continue
+            tree = _ast.parse(src)
+            for cls in [n for n in _ast.walk(tree) if isinstance(n, _ast.ClassDef)]:
+                if cls.name == "TestEveryYamlUsingTestIsMarked":
+                    continue          # 见上: 本守卫的提示文本含模式串, 会自我误报
+                for fn in [n for n in cls.body if isinstance(n, _ast.FunctionDef)]:
+                    body = _ast.get_source_segment(src, fn) or ""
+                    uses = (("import yaml" in body) or ("yaml.safe_load" in body)
+                            or ("_load_rules(" in body) or ("safe_load(" in body))
+                    if not uses:
+                        continue
+                    total += 1
+                    deco = " ".join(_ast.unparse(d) for d in fn.decorator_list)
+                    if "_needs_yaml" not in deco:
+                        missing.append(f"{os.path.basename(p)}::{cls.name}::{fn.name}")
+        assert total > 0, "扫描没找到任何用 yaml 的用例 —— 守卫本身失效了, 需检查判据"
+        assert not missing, (
+            f"以下用例用了 yaml 但没挂 @_needs_yaml —— 在无 PyYAML 的解释器上它们会"
+            f"**ERROR 而不是 skip**, 把全量测试变成 failed ({_SELF} 自身除外):\n  "
+            + "\n  ".join(missing))
+        # 顺带证明"过滤只排除了本守卫", 而不是把别的也漏掉
+        assert total >= 13, f"扫描到的用 yaml 用例只有 {total} 个, 判据可能过窄"
+
+    def test_the_marker_exists_in_files_that_use_it(self):
+        """点名的 `_needs_yaml` 必须**真的定义**在用到它的文件里 —— 否则是 NameError。"""
+        import glob as _glob
+        for p in sorted(_glob.glob(os.path.join(_REPO, "tests", "*.py"))):
+            src = open(p, encoding="utf-8").read()
+            if "_needs_yaml" not in src:
+                continue
+            assert "_needs_yaml = pytest.mark.skipif" in src, (
+                f"{os.path.basename(p)} 用了 _needs_yaml 但没定义它")
+
+
 class TestDisc1LoggingDiscipline:
     """DISC-1 同族纪律: 留痕字段**宁可 None, 不猜** (2026-09-25 用户要求)。"""
 
@@ -348,6 +415,26 @@ class TestBackfillTwoWayVerificationIsDocumented:
         block = src[i:i + 2600]
         assert "engine_probe_unchanged" in block, "未指向 engine_probe_unchanged"
         assert "affects_selection" in block, "未指向 affects_selection"
+
+    def test_end_to_end_backfill_is_marked_unverified(self):
+        """自动回填的端到端必须**明确标为未验证** (用户 2026-09-25 要求)。
+
+        用户原话: 「标注『自动回填端到端待验证』—— 判定通过 ≠ 自动回填已验证」。
+
+        **为什么这条值得守卫**: 触发判据有 35 例守卫、全部通过, 而"判据通过"
+        与"端到端能用"是**两件事**。不写明的话, 下一次会话看到满屏绿色
+        很自然会以为自动回填已经就绪 —— 而这正是"看起来做了 vs 实际生效"。
+        """
+        src = self._src()
+        assert "自动回填端到端" in src, "缺「自动回填端到端待验证」的标注"
+        assert "尚未验证" in src or "待验证" in src, "未显式说明它还没验证"
+        assert "判定通过 ≠ " in src or "不是一回事" in src, (
+            "应写明『判定通过 ≠ 自动回填已验证』这个区分")
+        # 提到"从未实跑"这个事实, 而不是含糊的"待完善"
+        assert "未实跑" in src or "从未" in src, "应说明『从未实跑过』这个具体事实"
+        # 必须给出验证步骤(否则"待验证"就成了一句免责声明)
+        assert "backfill_trigger.py --evaluate" in src, "应给出可执行的验证入口"
+        assert "BACKFILL_ENABLED=1" in src, "应给出开启方式"
 
 
 class TestErrorMagnitudeIsNotAttributionBasis:

@@ -162,6 +162,54 @@ class TestAlertRule:
             "『用哪天的数据在做决策』")
 
 
+class TestTwoTierLagAlertsAreCrossReferenced:
+    """`EngineDataLag` 与 `TableStaleEngineFed` 必须**互相点名**并说明"不是两件事"。
+
+    ## 为什么需要这条守卫(用户 2026-09-25 要求)
+
+    两条规则看的是**同一个指标** `astock_engine_lag_days`, 只是阈值不同
+    (`>1` 与 `>2`)。故它们**同时 firing 是同一个故障在升级**, 不是两个故障。
+
+    但只看告警清单的人**没法知道这一点** —— 两条不同的 `alertname`、
+    两条不同的 summary, 很自然会被读成"有两件事要查", 于是**分别排查两次**。
+    这正是本仓 DISC-2 ⑤ 的形态: 信息在传递链里丢了(丢的是"它们是同一个指标")。
+
+    **为什么放在两条 description 里而不是只在文档里**: 收到告警的人**先看 description**,
+    不一定去翻 `docs/`。告警文本是那件事发生的**现场**。
+    """
+
+    @_needs_yaml
+    def test_both_directions_name_each_other(self):
+        rules = _load_rules()
+        for a, other in (("EngineDataLag", "TableStaleEngineFed"),
+                         ("TableStaleEngineFed", "EngineDataLag")):
+            assert a in rules, f"缺规则 {a}"
+            desc = str(rules[a]["annotations"]["description"])
+            assert other in desc, (
+                f"{a} 的 description 没有点名 {other} —— "
+                "收到告警的人会以为这是两个独立故障")
+
+    @_needs_yaml
+    def test_both_say_it_is_one_problem_not_two(self):
+        rules = _load_rules()
+        for a in ("EngineDataLag", "TableStaleEngineFed"):
+            desc = str(rules[a]["annotations"]["description"])
+            assert ("两件事" in desc) or ("不是两个" in desc) or ("同一个" in desc), (
+                f"{a} 未说明『不是两件事 / 是同一个故障』")
+            assert ("重复" in desc) or ("分别排查" in desc) or ("升级" in desc), (
+                f"{a} 未说明『不要分别排查 / 这是升级过程』")
+
+    @_needs_yaml
+    def test_the_two_thresholds_are_kept_distinct(self):
+        """两级阈值不得被"顺手"改成相同 —— 相同就等于重复报同一件事。"""
+        rules = _load_rules()
+        e1 = " ".join(str(rules["EngineDataLag"]["expr"]).split())
+        e2 = " ".join(str(rules["TableStaleEngineFed"]["expr"]).split())
+        assert e1 == "astock_engine_lag_days > 1", e1
+        assert e2 == "astock_engine_lag_days > 2", e2
+        assert e1 != e2, "两条判据变得完全相同 —— 会重复报同一件事"
+
+
 class TestKnownStructuralFalsePositiveIsLabelled:
     """`DrlEnvMissing` 必须被**标注为已知结构性误报** (用户 2026-09-25 要求)。
 
