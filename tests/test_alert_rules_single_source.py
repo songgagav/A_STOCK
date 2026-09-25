@@ -55,6 +55,43 @@ _needs_yaml = pytest.mark.skipif(
            "改 alert_rules.yml 后请用生产解释器手工核一次")
 
 
+def _load_rules() -> dict:
+    """把 `ops/alert_rules.yml` 读成 `{alert 名: 规则 dict}`。
+
+    ## 这个函数曾经**不存在**, 而三个用例在调它 (2026-09-26 修复)
+
+    三个用例(`test_engine_fed_tables_use_trading_day_threshold` /
+    `test_every_daily_table_is_in_exactly_one_staleness_rule` /
+    `test_filter_logic_accepts_per_table_thresholds`)都写了 `rules = _load_rules()`,
+    但**本文件从未定义过它** —— 于是它们一跑就 `NameError`。
+
+    **它们从来没跑过**: 三者都挂 `@_needs_yaml`, 而 `.venv314`/`.venv310` 都没有 PyYAML,
+    于是**恒为 skip**, 而 skip 在报告里长得像通过(DISC-2 ② 形态) ——
+    里面藏着一个 ① 形态的缺陷(断言引用了不存在的东西)。
+
+    **发现方式**: 2026-09-26 把生产解释器的 `yaml` 包桥接进 `.venv310` 后跑全量,
+    这三条立刻变红。**这不是回归, 是它们第一次被执行。**
+
+    故本函数必须**存在且被注释保住** —— 若将来有人"清理未使用的函数"而删掉它,
+    那三个用例会重新退化成 NameError(skip 状态下不可见)。
+    返回整个规则 dict(而不只是 expr), 因为调用方要用 `.get("for")` 与
+    `["annotations"]["description"]`。
+    """
+    import yaml
+    fp = os.path.join(_REPO, "ops", "alert_rules.yml")
+    d = yaml.safe_load(open(fp, encoding="utf-8"))
+    out = {}
+    for g in d["groups"]:
+        for r in g["rules"]:
+            name = r["alert"]
+            # 重名会让"恰好一条覆盖"这类断言失去意义(后者静默覆盖前者)
+            assert name not in out, f"规则名重复: {name} —— 后一条会覆盖前一条"
+            out[name] = r
+    assert len(out) >= 13, (
+        f"只读到 {len(out)} 条规则, 少于此前的基线 —— 可能改坏了 YAML 结构")
+    return out
+
+
 class TestSingleSourceOfTruthForAlertRules:
     def test_repo_has_exactly_one_alert_rules_file(self):
         """仓内只允许一份告警规则文件。**这条不需要 yaml, 永远真跑**。

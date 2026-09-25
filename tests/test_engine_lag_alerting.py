@@ -210,48 +210,90 @@ class TestTwoTierLagAlertsAreCrossReferenced:
         assert e1 != e2, "两条判据变得完全相同 —— 会重复报同一件事"
 
 
-class TestKnownStructuralFalsePositiveIsLabelled:
-    """`DrlEnvMissing` 必须被**标注为已知结构性误报** (用户 2026-09-25 要求)。
+class TestDrlEnvMissingIsATrueAlertNotAFalsePositive:
+    """`DrlEnvMissing` **不是**误报 —— 它曾于 2026-09-25 被错标, 09-26 更正。
 
-    ## 为什么它是结构性误报
+    本类替换原先的 `TestKnownStructuralFalsePositiveIsLabelled`。**改了断言方向**:
+    从"必须标注为已知误报"改成"不得再被标成误报, 且更正理由必须留痕"。
 
-    `drl_degrade.probe_runtime()` 探的是 **metrics_server 自己那个解释器**
-    (`sys.executable`, 生产 VM 的 CPython 3.10: 有 `h5i_db`、无 `torch`),
-    而 DRL 训练实际跑在 **`TRAE_PY`** 上 —— 实测 09-24 的
-    `drl_train_heartbeat.json` 是 `{phase: "done", ok: true, total_timesteps: 800}`,
-    **训练是成功的**。即该指标描述的是**读数那个解释器**, 不是**训练那个解释器**。
+    ## 我错在哪 (这条比规则本身值钱, 故原样写进 docstring)
 
-    ## 为什么选择"标注已知"而不是 silence 或改判据
+    09-25 我的理由是"探针探错了环境": 我以为 `probe_runtime()`(跑在 metrics_server 里)
+    探的解释器与 DRL 训练用的解释器是**两个**。**这个前提是错的**:
 
-    用户给出的三个选项与本仓立场:
-      · **标记已知状态** ✅ —— 与 `TableStaleDaily` 对 valuation 的处理一致;
-      · **静音** ❌ —— 会连"TRAE_PY 真的缺依赖"这一真故障一起盖掉,
-        而且本仓原话是「用 silence 盖掉更糟: 它让你以为问题被处理了」;
-      · **保持现状** ⚠️ —— 持续 firing 会训练人忽略它(本仓
-        `TableStale24h` 330 次 firing 的教训: 长期无人处理的告警 = 没有告警)。
+      · `daemon.py:35` `PY = sys.executable`; 第 38-40 行若 `TRAE_PYTHON` 存在则覆盖;
+      · metrics_server 与 run_daily **都由这个同一个 `PY` 启动**;
+      · 生产守护由 `scripts/start_daemon.ps1` 用 **`.venv310`** 启动, 而 `P0-DRLDEP`
+        已在 **2026-09-20 修复** ⇒ h5i_db 与 torch **同处一个解释器**。
 
-    故: **保留 warning, 把"已知"与"核对办法"写进注解**, 并给出
-    「看 drl_train_heartbeat 判断是否真故障」这个可执行步骤。
+    ⇒ 探针探的解释器**就是**训练用的解释器, 没有"探错"这回事。
+    实测 `astock_drl_env_ok=1`、`drl_degrade.probe.missing=[]`、`drl_train.ok=true`。
+
+    ## 为什么必须更正而不是"顺手留着"
+
+    一条标着"已知误报"的**真**告警, 比没有告警更坏: 将来 `TRAE_PY` 真缺依赖时,
+    值班人会**照着那段注释把它忽略掉**。这是 ⑥ 号形态的反向 ——
+    不是"降级无告警", 而是"**告警在, 但被文字解释掉了**"。
+
+    ## 为什么这个错误很难自查(值得写成用例)
+
+    当时的"证据"是**真的**: 09-24 的 `drl_train_heartbeat` 确实是
+    `{phase: done, ok: true}`。但那条证据**同时兼容两种解释**:
+      (a) 探针探错了解释器(我选的) —— 与心跳并存, 看似被心跳"证实";
+      (b) 探针在对的解释器上、环境本来就齐备 —— 与心跳并存, 也完全一致。
+    我拿一条**两种假设都能解释**的证据, 当成了对其中一种的确认。
+    ⇒ **判据**: 一条证据若能同时支持两个互斥假设, 它就不构成对任一假设的确认;
+      必须去找**能区分**两者的那个观测(本例: 查 `PY` 的来源, 而不是看训练成不成功)。
     """
 
     @_needs_yaml
-    def test_drlenvmissing_is_labelled_known_structural(self):
+    def test_rule_is_unchanged_and_still_a_real_warning(self):
+        """判据与级别**不得**被这次更正改动 —— 错的只是文字, 不是逻辑。"""
         rules = _load_rules()
         assert "DrlEnvMissing" in rules, "规则不见了"
         r = rules["DrlEnvMissing"]
-        # 判据**不得**改动 —— 只标注, 不替用户做 P0-DRLDEP 决策
         expr = " ".join(str(r["expr"]).split())
         assert expr == "astock_drl_env_ok == 0", f"判据被改了: {expr!r}"
-        # 级别保持 warning(**不静音**: 它同时覆盖 TRAE_PY 真缺依赖)
-        assert r["labels"]["severity"] == "warning"
-        summary = str(r["annotations"]["summary"])
-        desc = str(r["annotations"]["description"])
-        assert "已知结构性误报" in summary, summary
-        assert "P0-DRLDEP" in desc, "未指向已登记的决策项"
+        assert r["labels"]["severity"] == "warning", (
+            "必须保持 warning —— 它是真告警, 不是需要降级的误报")
+
+    @_needs_yaml
+    def test_no_longer_labelled_a_false_positive(self):
+        """**关键断言**: summary 里不得再出现"已知结构性误报"这类免责话术。"""
+        rules = _load_rules()
+        summary = str(rules["DrlEnvMissing"]["annotations"]["summary"])
+        assert "结构性误报" not in summary, (
+            "summary 仍标着误报 —— 值班人会照着它忽略真故障: " + summary)
+        assert "已知" not in summary or "已知状态" not in summary, (
+            "summary 不得再用「已知状态」把告警解释掉: " + summary)
+
+    @_needs_yaml
+    def test_correction_is_documented_with_the_wrong_premise(self):
+        """更正必须写明**当初错在哪个前提**, 否则后人会重新推出同一个结论。"""
+        rules = _load_rules()
+        desc = str(rules["DrlEnvMissing"]["annotations"]["description"])
+        assert "TRAE_PYTHON" in desc, "必须点名 TRAE_PYTHON 这个真正的解释器来源"
+        assert "start_daemon.ps1" in desc or ".venv310" in desc, (
+            "必须给出「守护实际用哪个解释器」的可查证依据")
+
+    @_needs_yaml
+    def test_gives_an_actionable_check_not_a_disclaimer(self):
+        """必须给可执行核对步骤, 而不是一句「可能是误报」。"""
+        rules = _load_rules()
+        desc = str(rules["DrlEnvMissing"]["annotations"]["description"])
+        assert "probe_runtime" in desc, "应说清探针是什么"
         assert "drl_train_heartbeat" in desc, (
-            "必须给出**可执行的核对办法**(看心跳判断是否真故障), "
-            "否则「已知」就只是一句免责声明")
-        assert "silence" in desc, (
-            "应说明为何不用 silence 盖掉 —— 否则后人会「顺手」把它静音")
-        assert "probe_runtime" in desc or "metrics_server" in desc, (
-            "应说清误报的机理(探针探的是哪个解释器)")
+            "必须保留交叉核对办法(看心跳判断读数与训练是否同源)")
+        assert "不要" in desc, "应显式提醒**不要**因历史上的误标而忽略它"
+
+    @_needs_yaml
+    def test_the_interpreter_single_source_is_the_mechanism(self):
+        """必须写明机制: **单一 `PY` 来源** ⇒ 所有子进程天然同源。
+
+        这是本条更正的核心事实。若只写"我查过了, 是对的", 后人无法复核。
+        """
+        rules = _load_rules()
+        desc = str(rules["DrlEnvMissing"]["annotations"]["description"])
+        assert "共用" in desc or "同一个解释器" in desc, (
+            "必须点明 metrics_server 与训练共用解释器这一机制")
+

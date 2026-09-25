@@ -311,6 +311,11 @@ class TestEveryYamlUsingTestIsMarked:
             for cls in [n for n in _ast.walk(tree) if isinstance(n, _ast.ClassDef)]:
                 if cls.name == "TestEveryYamlUsingTestIsMarked":
                     continue          # 见上: 本守卫的提示文本含模式串, 会自我误报
+                # 同理: 那个守卫用**样本源码字符串**做反向验证, 样本里必然出现
+                # 模式串 —— 它不是在"用 yaml", 而是在**构造关于 yaml 的样本**。
+                # 这是守卫自指涉的第三种形态: 判据命中"关于判据的数据"。
+                if cls.name == "TestNoTestCallsAnUndefinedHelper":
+                    continue
                 for fn in [n for n in cls.body if isinstance(n, _ast.FunctionDef)]:
                     body = _ast.get_source_segment(src, fn) or ""
                     uses = (("import yaml" in body) or ("yaml.safe_load" in body)
@@ -764,6 +769,324 @@ class TestGuardMustNotDependOnGitignoredMachineState:
         assert "getsource" in block, "应检查 **源码** 而非行为(行为会漏)"
         assert "os.environ" in block and "_load_switch_file" in block, (
             "应同时禁止读环境变量与读开关文件")
+
+
+class TestProductionDaemonInterpreterIsNotTheToolOne:
+    """`docs/disciplines.md` 必须写对**生产守护用的是哪个解释器** (2026-09-26 更正)。
+
+    ## 为什么这条值得单独立守卫
+
+    09-25 我据「生产解释器无 torch」把 `DrlEnvMissing` 标成**结构性误报**;
+    实际 `src/daemon.py:35-40` 是 `PY = sys.executable`(可被 `TRAE_PYTHON` 覆盖),
+    metrics_server 与 run_daily **共用这一个 `PY`**, 而生产守护由
+    `scripts/start_daemon.ps1` 用 **`.venv310`** 启动 —— 那里四项齐备, 规则本应 inactive。
+
+    **代价**: 一条真告警被仓库自己的文字标注成"已知误报",
+    将来真故障时值班人会照注释忽略它 —— 比没有告警更坏。
+
+    **故这里锁两件事**:
+      1. 那张表必须把"生产 VM 工具解释器"与"生产守护用的解释器"**分开列**;
+      2. 必须写明 `daemon.py` 的**单一 `PY` 来源**这一机制 —— 否则后人会重新推断出
+         "探针与训练是两个解释器"。
+    """
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    #: 出现"误报"时, 同一行必须同时出现这些**更正/否定**信号之一, 否则视为"主张式误报"
+    _CORRECTION_MARKERS = ("不是误报", "曾", "错标", "更正", "⚠️", "不应", "不再")
+
+    def test_does_not_call_drlenvmissing_a_false_positive(self):
+        """**关键**: 正文/表格里不得把 `DrlEnvMissing` **主张**成误报。
+
+        ## 判据为什么是"误报 且 无更正信号", 而不是"行里没有误报"
+
+        写这条时我连踩两次假阳性, 两次都值得记:
+
+        1. **第一版扫全文** ⇒ 报了我自己: 更正的叙述里必须**原样引用**当初的错误
+           (「我把告警 `DrlEnvMissing` 标注成『已知结构性误报』」)—— 那是病历,
+           不是主张。**禁止引用错误 = 禁止记录错误**, 而那正是本仓最看重的部分。
+        2. **第二版只排除 `>` 叙述块** ⇒ 仍报: 那张**汇总表**里也有一行是更正
+           (「**不是误报**！曾于 09-25 被错标, 09-26 已更正」)。
+
+        ⇒ 判据最终定为: **出现"误报" 且 同一行没有任何更正/否定信号** 才算违规。
+        这样"引用错误"与"主张错误"可机械区分 ——
+        而**一个会误报的守卫等于没有**(本仓守卫设计原则), 故这两次返工必须记下。
+        """
+        src = self._src()
+        offenders = []
+        for ln in src.splitlines():
+            s = ln.strip()
+            if s.startswith(">"):        # 叙述块: 允许原样引用错误
+                continue
+            if "DrlEnvMissing" in ln and "误报" in ln:
+                if not any(m in ln for m in self._CORRECTION_MARKERS):
+                    offenders.append(s)
+        assert not offenders, (
+            "docs 在**正文/表格**里把 DrlEnvMissing 主张成误报, 会误导值班人:\n  "
+            + "\n  ".join(offenders))
+
+    def test_the_guard_is_not_vacuous(self):
+        """反向验证: 判据必须能抓到"主张式误报"这一**真实**形态。
+
+        不做这条, 上一条可能因排除条件写宽而变成**空守卫**(永远通过)。
+        这里直接喂两行样本: 一个主张式(该报)、一个更正式(不该报)。
+        """
+        markers = self._CORRECTION_MARKERS
+
+        def is_offender(ln):
+            return ("DrlEnvMissing" in ln and "误报" in ln
+                    and not ln.strip().startswith(">")
+                    and not any(m in ln for m in markers))
+
+        assert is_offender("| `DrlEnvMissing` | metrics_server 的解释器无 torch | 结构性误报 |"), \
+            "抓不到主张式误报 —— 守卫是空的"
+        assert not is_offender("| `DrlEnvMissing` 告警 | —— | **不是误报**！曾于 09-25 被错标 |"), \
+            "更正式表述被误报"
+        assert not is_offender("> 我把 `DrlEnvMissing` 标注成「已知结构性误报」, 这是错的"), \
+            "叙述块里的引用被误报"
+
+    def test_the_narrative_is_allowed_to_quote_the_error(self):
+        """更正叙述里**必须**能原样引用错误 —— 否则后人不知道曾经错过什么。"""
+        src = self._src()
+        narrative = [ln for ln in src.splitlines()
+                     if ln.strip().startswith(">") and "DrlEnvMissing" in ln and "误报" in ln]
+        assert narrative, (
+            "更正叙述里应**原样引用**当初的错误标注 —— 否则后人不知道曾经错过什么")
+
+    def test_names_venv310_as_the_daemon_interpreter(self):
+        src = self._src()
+        i = src.find("生产守护用的是")
+        assert i > 0, "缺「生产守护用的是哪个解释器」这一小节"
+        block = src[i:i + 2600]
+        assert ".venv310" in block, "必须点明守护用 .venv310"
+        assert "start_daemon.ps1" in block, "必须给出可查证的启动点"
+        assert "vm\\tools\\python" in block or "vm\\tools" in block, (
+            "必须把那个工具解释器也列出来做**对照**, 否则读者仍会混淆两者")
+
+    def test_states_the_single_py_mechanism_with_line_refs(self):
+        """机制必须带**行号**引用 —— 否则"查启动点"无法复核。"""
+        src = self._src()
+        i = src.find("生产守护用的是")
+        block = src[i:i + 2600]
+        assert "daemon.py:35" in block, "必须给出 daemon.py 的行号"
+        assert "TRAE_PYTHON" in block, "必须点明覆盖它的环境变量"
+        assert "同源" in block, "必须说清结论: 所有子进程天然同源"
+
+    def test_records_the_pyyaml_bridge_recipe(self):
+        """必须记 PyYAML 桥接法 —— 否则 YAML 用例永远 skip(skip 被读成通过)。"""
+        src = self._src()
+        i = src.find("桥接法")
+        assert i > 0, "缺桥接法小节"
+        block = src[i:i + 1200]
+        assert "PYTHONPATH" in block, "桥接靠 PYTHONPATH"
+        assert "getsitepackages" in block, "必须给出取 site-packages 的确切写法"
+        assert "skip" in block, "必须说明不桥接的后果是**静默 skip**"
+
+    def test_evidence_fitting_both_hypotheses_is_documented(self):
+        """必须立「一条证据同时支持两个互斥假设 ⇒ 不构成确认」这条判据。
+
+        这是本次错标的**根因**, 也是最可复用的一课 —— 若只记"我查错了解释器",
+        后人遇到同类"证据看着对、方向却错"的情形会重犯。
+        """
+        src = self._src()
+        i = src.find("同时支持两个互斥假设")
+        assert i > 0, "缺「证据同时支持两个假设」这条判据"
+        block = src[i:i + 2600]
+        assert "判别力" in block or "会不一样吗" in block, (
+            "必须给出可操作的判据(如果反过来才是真的, 这条证据会不一样吗)")
+        assert "比没有告警更坏" in block, (
+            "必须写明后果量级 —— 否则这条判据会被当成纯粹的思辨")
+        assert "被文字解释掉了" in block, (
+            "应点明形态: ⑥ 的反向(告警在, 但被文字解释掉了)")
+
+    def test_guard_self_reference_third_form_is_documented(self):
+        """「守卫自指涉」必须补上**第三种形态**: 判据命中「关于判据的数据」。"""
+        src = self._src()
+        i = src.find("守卫自指涉的**第三种形态**")
+        assert i > 0, "缺守卫自指涉第三种形态"
+        block = src[i:i + 2200]
+        assert "样本" in block, (
+            "必须点明第三种形态命中的是**样本字符串**, 不是守卫自己的源码")
+        assert "排除" in block and "理由" in block, (
+            "必须要求排除项写明理由 —— 否则分不清「已知副作用」与「为变绿而加的例外」")
+
+    def test_empty_guard_case_history_is_documented(self):
+        """「连负样本都抓不到的守卫」必须留病历 —— 空守卫比没有守卫更危险。"""
+        src = self._src()
+        i = src.find("空守卫")
+        assert i > 0, "缺「空守卫」病历"
+        block = src[i:i + 2200]
+        assert "v1" in block and "v3" in block, "应保留三版返工的过程"
+        assert "负样本" in block, (
+            "必须写明「负样本必须被抓到」是这类守卫的存在性证明")
+        assert "全绿" in block, "必须点明空守卫**显示为全绿**这一要点"
+
+
+class TestNoTestCallsAnUndefinedHelper:
+    """用例调用的 helper 必须真的存在 —— 静态查, **不需要 PyYAML**。
+
+    ## 被查出来的真实缺陷 (2026-09-26)
+
+    `tests/test_alert_rules_single_source.py` 里**三个**用例写了
+    `rules = _load_rules()`, 而那个函数**在该文件里从未定义**。
+    三者都挂 `@_needs_yaml`, 而 `.venv314`/`.venv310` 都没有 PyYAML ⇒
+    **恒为 skip** ⇒ 报告里"看起来通过", 实际一跑就 `NameError`。
+
+    **这是 ①(假信心)藏在 ②(skip 读成通过)后面**: 只看任一种形态都不够,
+    而"用需要 yaml 的解释器跑一次"同时暴露了两者。
+    本守卫把这件事变成**不需要 yaml 也真跑**的静态检查。
+
+    ## 判据为什么写得这么窄 (三次返工的教训, 值得完整保留)
+
+    这是本条纪律最贵的部分 —— 我写了**三版**, 前两版都不能用:
+
+    | 版本 | 做法 | 结果 |
+    |---|---|---|
+    | v1 | 收集 `def`/参数名再比对 | **大量假阳性**: 把内置 `__import__`、函数内局部定义的类(`_Cfg`)全报成"未定义" |
+    | v2 | `symtable` 遍历子表 | 仍有假阳性: `seen`/`called`/`tmp_path` 这类**在嵌套作用域里赋值**的名字被误报 |
+    | v3 | 只看 `Call` + "任何作用域都没赋过值" + 跳过首字母小写 | **0 假阳性**(全仓 90 个测试文件), 且能抓到原缺陷 |
+
+    **为什么 v2 也会错**: `seen` 常常是 fixture 内部赋的值, 而我只看"本函数的符号表",
+    看不到别的函数里的赋值 ⇒ 判据比语言语义**更窄**, 于是误报。
+
+    **为什么 v3 跳过首字母小写**: pytest 的 fixture 是**参数注入** ——
+    原名在文件里以 `arg` 出现(已收集), 但像 `monkeypatch.setattr` 之类还会
+    引入"用了但没赋值"的名字。跳过小写开头即可覆盖这类约定,
+    而**缺陷形态**(helper 函数)习惯上不是小写开头。
+
+    **一次真实的自我打脸**(必须记下): v1 的反向样本我用的是 `_LoadRules()`,
+    而当时的过滤器是 `if not nm[:1].isupper(): continue` ——
+    `"_"[:1].isupper()` 是 **False** ⇒ 连**反向样本自己都被跳过**,
+    于是"负样本没报警"被我误读成"负样本通过"。**一个连负样本都抓不到的守卫,
+    会显示为全绿** —— 这正是本仓 ① 形态的教科书例子。
+    故下面 `test_negative_samples_are_actually_caught` 是**必需**的, 不是装饰。
+    """
+
+    def _test_dir(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+
+    @staticmethod
+    def _assigned_anywhere(tree) -> set:
+        """收集**任何作用域**里绑定过名字的标识符。"""
+        import ast
+
+        out = set()
+
+        class V(ast.NodeVisitor):
+            def visit_Name(self, n):
+                if isinstance(n.ctx, (ast.Store, ast.Del)):
+                    out.add(n.id)
+                self.generic_visit(n)
+
+            def visit_arg(self, n):
+                out.add(n.arg)
+                self.generic_visit(n)
+
+            def visit_FunctionDef(self, n):
+                out.add(n.name)
+                self.generic_visit(n)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, n):
+                out.add(n.name)
+                self.generic_visit(n)
+
+            def visit_Import(self, n):
+                for a in n.names:
+                    out.add(a.asname or a.name.split(".")[0])
+                self.generic_visit(n)
+
+            def visit_ImportFrom(self, n):
+                for a in n.names:
+                    out.add(a.asname or a.name)
+                self.generic_visit(n)
+
+            def visit_ExceptHandler(self, n):
+                if n.name:
+                    out.add(n.name)
+                self.generic_visit(n)
+
+            def visit_Global(self, n):
+                out.update(n.names)
+                self.generic_visit(n)
+
+            def visit_Nonlocal(self, n):
+                out.update(n.names)
+                self.generic_visit(n)
+
+        V().visit(tree)
+        return out
+
+    def _scan(self, src: str) -> list:
+        """返回 [(行号, 名字)]: 被调用、却在本文件里查不到任何绑定的名字。"""
+        import ast
+        import builtins
+
+        tree = ast.parse(src)
+        known = self._assigned_anywhere(tree) | set(dir(builtins))
+        bad = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                nm = n.func.id
+                if nm in known or nm[:1].islower():
+                    continue
+                bad.append((n.lineno, nm))
+        return sorted(set(bad))
+
+    def test_no_test_file_calls_an_undefined_helper(self):
+        offenders = []
+        for fn in sorted(os.listdir(self._test_dir())):
+            if not fn.endswith(".py"):
+                continue
+            fp = os.path.join(self._test_dir(), fn)
+            try:
+                bad = self._scan(open(fp, encoding="utf-8").read())
+            except (SyntaxError, ValueError) as e:  # pragma: no cover
+                offenders.append(f"{fn}: 无法解析 {e}")
+                continue
+            if bad:
+                offenders.append(f"{fn}: 未定义却被调用 {bad}")
+        assert not offenders, (
+            "存在「调用了不存在的东西」的测试文件 —— 若这些调用又挂着 skip 条件, "
+            "就会**静默地永不执行**(2026-09-26 `_load_rules` 实例):\n  "
+            + "\n  ".join(offenders))
+
+    def test_negative_samples_are_actually_caught(self):
+        """**必须有**: 证明上面的判据不是空的。
+
+        v1 的反向样本(`_LoadRules()`)因过滤器写成 `not nm[:1].isupper()` 而
+        **自己也被跳过**, 于是"没报警"被我误读成"通过" —— 全绿的空守卫。
+
+        注: 下面的样本串**刻意不含 PyYAML 的字样** —— 否则会撞上
+        `TestEveryYamlUsingTestIsMarked`(它按源码里是否出现该库名来判断
+        "这个用例用没用 PyYAML", 而本用例其实与它无关)。
+        **这是守卫自指涉的又一实例**: 一条守卫的判据(子串匹配)会命中
+        另一条守卫的**说明文字**。
+        """
+        assert self._scan("def test_a():\n    rules = _load_helper()\n"), (
+            "抓不到原始缺陷形态 —— 守卫是空的")
+        assert self._scan("def test_a():\n    _SomeHelper()\n"), "抓不到下划线前缀"
+        assert self._scan("def test_a():\n    UnknownThing()\n"), "抓不到普通未定义名"
+
+    def test_positive_samples_are_not_flagged(self):
+        """已定义的 helper / fixture 注入 / 局部定义**不得**误报。
+
+        会误报的守卫等于没有 —— 而且会被"顺手"删掉(本仓守卫设计原则)。
+        """
+        assert self._scan(
+            "def _load_helper():\n    return {}\n\n\ndef test_a():\n    _load_helper()\n"
+        ) == [], "已定义的 helper 被误报"
+        assert self._scan(
+            "def test_a(some_fixture):\n    assert some_fixture\n"
+        ) == [], "fixture 注入被误报"
+        assert self._scan(
+            "def test_a():\n    class _Cfg:\n        pass\n    _Cfg()\n"
+        ) == [], "函数内局部定义被误报"
+        assert self._scan(
+            "import os as _os\n\n\ndef test_a():\n    assert _os.sep\n"
+        ) == [], "import 别名被误报"
 
 
 class TestDisc2FormIndex:

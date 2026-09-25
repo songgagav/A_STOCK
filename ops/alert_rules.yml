@@ -190,42 +190,65 @@ groups:
             effective_source_day, 确认回退到的模型是否仍可用。
       - alert: DrlEnvMissing
         # 决策 D 的根因暴露: 运行环境不齐备 => run_daily 会显式置 L3。
+        # **本规则现在是一条真告警, 一直 inactive** —— 它曾经被错标为"结构性误报",
+        # 于 2026-09-26 更正, 更正过程本身就是一条纪律(见下)。
         #
-        # [2026-09-25 标注「已知状态」, 与 TableStaleDaily 对 valuation 的处理一致]
+        # --- 更正记录: 我为什么错标了它 (2026-09-25 标注 -> 2026-09-26 更正) ---
         #
-        # **这是一条结构性误报, 会长期 firing** —— 原因不是"环境坏了", 而是
-        # **探针探错了环境**:
-        #   · `drl_degrade.probe_runtime()` 探的是 **metrics_server 自己那个解释器**
-        #     (`sys.executable`), 即生产 VM 的 CPython 3.10: 有 `h5i_db`、无 `torch`;
-        #   · 而 DRL 训练实际跑在 **`TRAE_PY`**(守护用 `TRAE_PYTHON` 指定的解释器)上 ——
-        #     实测 09-24 的 `data/drl/20260924/drl_train_heartbeat.json` 是
-        #     `{phase: "done", ok: true, total_timesteps: 800}`, **训练是成功的**。
-        #   即 `astock_drl_env_ok=0` 描述的是**读数那个解释器**, 不是**训练那个解释器**。
+        # 09-25 我把本规则标成「结构性误报, 会长期 firing」, 理由是"探针探错了环境":
+        # 我以为 `probe_runtime()`(跑在 metrics_server 里)探的解释器, 与
+        # DRL 训练实际用的解释器是**两个不同的** —— 前者无 torch, 后者有。
         #
-        # **为什么不 silence**: 与本仓一贯立场一致 —— silence 会连"真的缺依赖"一起
-        # 盖掉(本仓原话: 长期无人处理的告警 = 没有告警, 但**用 silence 盖掉更糟**:
-        # 它让你以为问题被处理了)。故保留为 warning, 只把"已知"写进这里。
+        # **这个前提是错的。** 查证 (2026-09-26):
+        #   · `daemon.py:35` `PY = sys.executable`, 第 38-40 行若 `TRAE_PYTHON` 存在
+        #     则 `PY = TRAE_PYTHON`;
+        #   · metrics_server 与 run_daily **都由这个同一个 `PY` 启动**
+        #     (daemon.py 分别用 `[PY, .../metrics_server.py]` 与 run_daily 子进程);
+        #   · 生产守护由 `scripts/start_daemon.ps1` 用 **`.venv310`** 启动, 而
+        #     `P0-DRLDEP` 已在 **2026-09-20 修复** —— `.venv310` 里 h5i_db 与 torch
+        #     **同处一个解释器**。
+        #   ⇒ 探针探的解释器 **就是** 训练用的解释器, 没有"探错"这回事。
         #
-        # **为什么现在不改判据**: 改它等于替用户做 `P0-DRLDEP`(h5i_db 仅支持 CPython 3.10
-        # 而 torch 侧在 3.14, 两条路线互斥)的决策。故只标注, 不动逻辑。
+        # 实测: `astock_drl_env_ok = 1`; `data/daily/20260925/daily_summary.json` 的
+        # `drl_degrade.ok=true, level=0/L0_正常, probe.missing=[]`, 且
+        # `drl_train.ok=true`(PPO, 800 timesteps, 产出 model.zip 254944 bytes)。
+        # 即本规则**从未真正故障**, 只是当时**没在看**; 我把"我看到的旧值"当成了"规则在响"。
+        #
+        # **为什么这个更正重要**: 一个标着"已知误报"的真告警, 比没有告警更坏 ——
+        # 将来 TRAE_PY 真的缺依赖时, 值班人会**照着这段注释把它忽略掉**。
+        # 这正是本仓 ⑥ 号形态的反向: 不是"降级无告警", 而是"告警在, 但被文字解释掉了"。
+        #
+        # **同类错误的判据(写进注释以免重犯)**: 判断"两个环节是否用了不同解释器"时,
+        # **必须查两者的启动点**, 不能从"它们职责不同"推断 —— 尤其当上游有
+        # `PY = TRAE_PYTHON or sys.executable` 这种**单一来源**时, 所有子进程天然同源。
+        #
+        # 附: `P0-DRLDEP` 已修(2026-09-20, `.venv310` 四项齐备), 故 description 里
+        # 不再需要"需先决策才可能齐备"的说法; 但 `probe_runtime()` 的 `note` 字段
+        # 仍是旧文案(说 h5i_db 与 torch 无法共存)—— 那是 `drl_degrade.py` 的静态字符串,
+        # 已登记待改, 不影响本规则的判据。
         expr: astock_drl_env_ok == 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "DRL 运行环境缺依赖 (将导致显式 L3) —— **已知结构性误报, 见 P0-DRLDEP**"
+          summary: "DRL 运行环境缺依赖 (将导致显式 L3)"
           description: >-
-            astock_drl_env_ok=0: `probe_runtime()` 报告当前解释器缺 h5i_db 与 torch
-            之一(或 gymnasium/stable_baselines3)。h5i_db 仅支持 CPython 3.10, 而 torch
-            侧在 3.14, 故需按登记册 P0-DRLDEP 的四条路径之一决策后才可能齐备。
+            astock_drl_env_ok=0: `probe_runtime()` 报告**当前解释器**缺 h5i_db / torch /
+            gymnasium / stable_baselines3 之一。
 
-            **已知状态 · 2026-09-25 登记**: 若本告警**持续 firing**, 通常**不是**新故障:
-            探针探的是 metrics_server 自己的解释器, 而 DRL 训练跑在 TRAE_PY 上。
-            核对办法: 看 data/drl/<最新交易日>/drl_train_heartbeat.json ——
-            若 `phase=done, ok=true`, 则训练正常, 本告警属结构性误报。
-            处置: **保留为 warning**(不用 silence 盖掉) —— 因为它同时覆盖
-            「TRAE_PY 真的缺依赖」这一真故障; 收到时按上面办法判断即可。
-            根治需 P0-DRLDEP 决策(让探针指向训练实际使用的解释器)。
+            **本规则应当长期 inactive。** 生产守护由 scripts/start_daemon.ps1 用
+            `.venv310` 启动, 该环境四项齐备(h5i_db 0.1.6 + torch 2.14.0+cpu +
+            gymnasium 1.3.0 + stable_baselines3 2.9.0, 均为 CPython 3.10.11),
+            且 metrics_server 与 DRL 训练**共用同一个解释器**(daemon.py 的单一 `PY`)。
+
+            若它真的 firing, 说明解释器确实退化/被换过, 处置:
+            1. 先确认探针探的解释器: `TRAE_PYTHON` 环境变量(daemon.py:38-40)是否存在;
+            2. 直接用该解释器跑 `drl_degrade.probe_runtime()`, 看 `missing` 列了什么;
+            3. 交叉核对 data/drl/<最新交易日>/drl_train_heartbeat.json ——
+               若 `phase=done, ok=true` 而本告警仍在响, 才是"读数与训练不同源";
+            4. 修复后按 ops 流程重启守护(改解释器 = 换一条启动命令)。
+
+            **不要**因为历史上曾把它当作"已知误报"就忽略它 —— 那个标注是错的, 已更正。
       - alert: DrlDegradeStatusUnreadable
         # 与 FusionHealthUnreadable 同理: 读数失败会让其余 astock_drl_* 停留在过期值,
         # 使 DrlHalted 漏报 —— 告警源自身失效必须显式暴露。
