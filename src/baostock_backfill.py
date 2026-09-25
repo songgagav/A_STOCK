@@ -135,6 +135,10 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
     out = {"ok": False, "source": SOURCE, "write": bool(write), "written": [],
            "days": {}, "bj_not_requested": [], "error": None,
            "provenance_fp": PROVENANCE_FP}
+    # [2026-09-25 第 8 项] **回填前**先取一次基准, 才能事后判"水位是否前进 / 引擎是否不变"。
+    # 取不到就是 None —— verify_two_things 会据 None 判为"判不出", 而不是判通过。
+    out["h5i_watermark_before"] = _h5i_watermark()
+    out["engine_day_before"] = _engine_day()
     todo = [str(d)[:10] for d in (days or [])]
     if max_days:
         todo = todo[:int(max_days)]
@@ -235,6 +239,16 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
             except Exception as e:  # noqa: BLE001
                 info["status"] = "write_failed"
                 info["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+            # [2026-09-25 用户清单第 8 项] **"两件事同时验证"要自动化**:
+            # ① h5i 水位前进(下游受益) ② 引擎探针不变(选股口径未变)。
+            # 故写入后**立刻复测**这两个值, 并把结论一并放进 `out` ——
+            # 让"回填成功"这件事自带证据, 而不是等人工去两边各查一次
+            # (只查一边必然误判: 只查 ① 会以为选股也能用新数据;
+            #  只查 ② 会以为回填没生效)。
+            if info["status"] == "written":
+                info["verify"] = verify_two_things(
+                    h5i_watermark_before=out.get("h5i_watermark_before"),
+                    engine_day_before=out.get("engine_day_before"))
         out["days"][d] = info
         if progress:
             try:
@@ -244,6 +258,12 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
 
     out["ok"] = bool(out["written"]) or (not write and all(
         (v.get("status") == "ready") for v in out["days"].values()))
+    # [2026-09-25 第 8 项] 写入模式下给出**整体**的两件事验证结论
+    # (逐日的结论已在 `days[day]["verify"]` 里)。
+    if write and out["written"]:
+        out["verify"] = verify_two_things(
+            h5i_watermark_before=out.get("h5i_watermark_before"),
+            engine_day_before=out.get("engine_day_before"))
     return out
 
 
@@ -304,9 +324,55 @@ def _h5i_watermark() -> str | None:
     """当前 h5i `daily_bars` 水位(`YYYY-MM-DD`)。取不到返回 None。"""
     try:
         import h5i_sync
-        return str(h5i_sync.max_bar_date()) if h5i_sync.max_bar_date() else None
+        d = h5i_sync.max_bar_date()
+        return str(d) if d else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def verify_two_things(*, h5i_watermark_before=None, engine_day_before=None) -> dict:
+    """[2026-09-25 用户清单第 8 项] 回填后**同时**验证两件事, 并把结论自动化。
+
+    用户的原话(与 `docs/stockdb-source-status.md` §6.10 同一件事), 两件期望**相反**,
+    而**同时成立才是正确结果**:
+
+    | # | 要验的事 | 期望 |
+    |---|---|---|
+    | ① | h5i 水位**前进**(下游受益) | 比回填前**更晚** |
+    | ② | 引擎探针**不变**(选股口径未变) | 与回填前**相同** —— 这不代表失败 |
+
+    **为什么必须自动化**: 人工只查一边必然误判 —— 只查 ① 会以为选股也能用新数据了;
+    只查 ② 会以为回填没生效。两个结论都错, 而**两个错法方向相反**,
+    所以"下次注意两边都查"是句无用的建议(DISC-2 章首: 靠注意力不靠对照)。
+    把它做成一次调用、一个结论。
+
+    返回 `{ok, h5i_advanced, engine_unchanged, after, before, verdict}`;
+    取不到就记 `None`(不猜)。
+    """
+    wm_after = _h5i_watermark()
+    eng_after = _engine_day()
+    out = {"h5i_watermark_before": h5i_watermark_before,
+           "h5i_watermark_after": wm_after,
+           "engine_day_before": engine_day_before,
+           "engine_day_after": eng_after,
+           "h5i_advanced": None, "engine_unchanged": None,
+           "ok": None, "verdict": None}
+    if h5i_watermark_before and wm_after:
+        out["h5i_advanced"] = str(wm_after) > str(h5i_watermark_before)
+    if engine_day_before and eng_after:
+        out["engine_unchanged"] = str(eng_after) == str(engine_day_before)
+    # 两件事都判得出来才算 ok; 判不出来记 None(不把"不知道"当成"通过")
+    if out["h5i_advanced"] is not None and out["engine_unchanged"] is not None:
+        out["ok"] = bool(out["h5i_advanced"] and out["engine_unchanged"])
+        out["verdict"] = ("① h5i 水位前进 + ② 引擎探针不变 ⇒ **符合预期**"
+                          "(下游受益, 选股口径未变)"
+                          if out["ok"] else
+                          "**不符合预期**: ① h5i 水位前进=%s, ② 引擎探针不变=%s —— "
+                          "两者应同时成立" % (out["h5i_advanced"], out["engine_unchanged"]))
+    else:
+        out["verdict"] = ("判不出(缺对比基准) —— **不记为通过**; "
+                          "需人工核对 ① h5i 水位 ② 引擎探针")
+    return out
 
 
 def _append_provenance(day: str, rows: int, ctx: dict) -> None:
@@ -331,6 +397,16 @@ def _append_provenance(day: str, rows: int, ctx: dict) -> None:
     """
     eng = _engine_day()
     wm = _h5i_watermark()
+    # [2026-09-25 用户清单第 3 项] 把"原理上补不到的标的"**显式**记进留痕。
+    #
+    # 为什么必须记 `unfillable_symbols` 而不是只记一个计数: 北交所 339 只是
+    # **Baostock 原理上的覆盖缺口**(它对 `bj.*` 返回空), 不是本次故障。
+    # 只记 `bj_not_requested: 339` 时, 读的人**拿不到具体是哪些标的** ——
+    # 想核对"我关心的那只补上了吗"就得自己去重算。记下名单, 才能逐只核对。
+    #
+    # 同时记 `unfillable_reason`(机器可读的稳定标识): 只有中文说明的话,
+    # 下游没法按原因归类统计。
+    _bj = sorted(str(s) for s in (ctx.get("bj_not_requested") or []))
     rec = {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "day": day,
            "action": "backfill",
            "source": SOURCE, "rows": int(rows),
@@ -340,11 +416,17 @@ def _append_provenance(day: str, rows: int, ctx: dict) -> None:
            "engine_day_at_backfill": eng,
            "engine_probe_unchanged": True,
            "affects_selection": False,
+           # ---- 补不到的标的(用户清单第 3 项) ----
+           "unfillable_symbols": _bj,
+           "unfillable_count": len(_bj),
+           "unfillable_reason": ("baostock_no_bj_data" if _bj else None),
            "note": ("厂商引擎未发布该日; 本行来自 Baostock, 非引擎口径。"
                     "**回填不改变选股口径** —— 引擎探针仍看厂商引擎, "
                     "故 target_plan.section_as_of / data_lag_days 在厂商发布前不会改善; "
-                    "本次回填的受益方是读 h5i 的下游(回测/因子/IC)。"),
-           "bj_not_requested": len(ctx.get("bj_not_requested") or [])}
+                    "本次回填的受益方是读 h5i 的下游(回测/因子/IC)。"
+                    + (f" 另有 {len(_bj)} 只北交所标的**原理上补不到**"
+                       f"(Baostock 无 bj 数据), 见 unfillable_symbols。" if _bj else "")),
+           "bj_not_requested": len(_bj)}
     try:
         os.makedirs(os.path.dirname(PROVENANCE_FP), exist_ok=True)
         with open(PROVENANCE_FP, "a", encoding="utf-8") as f:

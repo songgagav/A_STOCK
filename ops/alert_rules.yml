@@ -11,12 +11,34 @@ groups:
       # 判据改为**按更新节奏分档**: 日报类 5 天(留出周末+一个容错交易日),
       # 季报类 120 天(一个季度 + 缓冲)。阈值来自"该表**本该**多久更新一次",
       # 而不是一刀切 —— 与本仓 METHOD-1(判据须基于下游真实语义)一致。
+      #
+      # [2026-09-25 第二次分档: 把「日报类」再拆成两组]
+      #
+      # 起因(用户清单第 6、7 项): `daily_bars` 单独用 5 个**自然日**盖不住 ——
+      # 实测厂商引擎停更时 `daily_bars` 才 3.08 自然日, 要等到第 6 天才响,
+      # 而**落后 2 个交易日**就已经是"厂商漏发"。5 个自然日 ≈ 3~4 个交易日,
+      # 期间选股一直在用旧截面(见 docs/stockdb-source-status.md §6.10)。
+      #
+      # 判据不是"阈值调小一点", 而是**按更新机制归类** —— 这决定了"谁负责更新":
+      #   · **引擎/专属 sync 写入**(daily_bars, northbound_money, margin_daily):
+      #     有**自己的摄入路径**, 每个交易日都该推进 ⇒ 用**交易日**口径。
+      #     交易日口径很关键: 3 个自然日里可能只含 2 个交易日(周末),
+      #     按自然日算会让同一件事**忽早忽晚**地报。
+      #   · **上游数据商节奏**(valuation / valuation_snapshot / money_flow_estimate):
+      #     这几张停在 09-08 是**已登记的已知状态**, 不是每天都能更新的东西 ⇒
+      #     保留 5 个自然日的宽松口径, 别把它们逼成噪声(它们已是长期 warning)。
+      #
+      # 为什么 `daily_bars` 用「> 2 个交易日」而不是 `> 1`:
+      # `astock_engine_lag_days > 1` 已经在落后 2 个交易日时**专门**报 `EngineDataLag`
+      # (见 astock_scrape_health 组的说明)。此处若也用 >1, 同一件事会**报两遍** ——
+      # 而重复告警与噪声告警一样会训练人忽略频道。故这里用 >2 作**第二级**:
+      # 落后 2 天由 EngineDataLag 报, 落后 **>2 天**(即 3 天, 门禁的 HALT 阈值)由本条兜底。
       - alert: TableStaleDaily
-        # 日报类表(每交易日应更新)
+        # 日报类表(每交易日应更新) —— **上游数据商节奏**那一组: 自然日口径。
         expr: >-
           (time() - astock_db_lastday_ts) / 86400 > 5
           and astock_db_lastday_ts > 0
-          and astock_db_lastday_ts{table=~"daily_bars|valuation|valuation_snapshot|margin_daily|money_flow_estimate|northbound_money"}
+          and astock_db_lastday_ts{table=~"valuation|valuation_snapshot|money_flow_estimate"}
         for: 1h
         labels:
           severity: warning
@@ -32,8 +54,39 @@ groups:
             它们停在 2026-09-08(14.9 天), 属上游数据源问题 ——
             见 docs/stockdb-source-status.md 与登记 P0-DB-UPDATE-ALL-TABLES-FAIL。
             处置: 该告警**保留为 warning**(不用 silence 盖掉) —— 因为它同时覆盖
-            真正需要人看的表(daily_bars 等); 收到时按上表判断是否属已知三张,
+            真正需要人看的表; 收到时按上表判断是否属已知三张,
             属则记录后关闭, 不属则按新故障处理。
+
+      - alert: TableStaleEngineFed
+        # [2026-09-25 新增] **引擎/专属 sync 写入**的日报表 —— **交易日**口径。
+        #
+        # 这一组有**自己的摄入路径**(engine_bars_sync / northbound_sync / margin_sync),
+        # 每个交易日都该推进; 故用交易日而不是自然日 ——
+        # 判据是 `astock_engine_lag_days`(按**交易日**计的落后), 见 metrics_server。
+        #
+        # 阈值 >2 交易日: 落后 2 天已由 `EngineDataLag` 专门报(阈值 >1),
+        # 此处作**第二级**兜底 —— 落后 3 天正是门禁 `ENGINE_LAG_HALT_TRADING_DAYS`
+        # 的位置, 也就是"再不动手系统就要停手"的时刻。
+        # **刻意不重复**: 与 EngineDataLag 分工, 避免同一件事报两遍。
+        #
+        # 与上面那条自然日规则的分工(用户清单第 7 项要求"按表分别设阈值"):
+        #   · 本组(引擎喂数): 交易日口径, 因为它们的更新节奏由**交易日**决定;
+        #   · TableStaleDaily(数据商节奏): 自然日口径, 因为上游按自然节奏发布。
+        expr: astock_engine_lag_days > 2
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "引擎喂数的日报表已落后 {{ $value }} 个交易日 (第二级兜底)"
+          description: >-
+            astock_engine_lag_days={{ $value }} (>2 个交易日): 厂商引擎的日线已落后
+            超过 2 个交易日 ⇒ daily_bars / northbound_money / margin_daily 等
+            **由引擎与专属 sync 喂数的表**同步陈旧。
+            与 `EngineDataLag`(阈值 >1 个交易日)的分工: 那条是**第一级预警**,
+            本条是**第二级兜底**; 落后达 3 个交易日时门禁会自行 HALT。
+            处置: 若已跑过 Baostock 按需回填(`src/baostock_backfill.py`), 注意
+            **回填不改选股口径** —— 引擎探针仍看厂商引擎, 见
+            docs/stockdb-source-status.md §6.10(回填后需同时验证两件事)。
 
       - alert: TableStaleQuarterly
         # 季报类表(财报节奏) —— **刻意与日报类分开**: 用 24h 判它必然永久误报

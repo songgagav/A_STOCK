@@ -8,6 +8,48 @@
 
 ---
 
+## 环境不可用项(会话开始前先看这一节, 避免重复排查)
+
+> 这一节记的是**本机环境里已知不可用的东西**。写在这里是为了让每次会话
+> **不必重新发现一遍**同一个 401 / 缺依赖 —— 那是纯浪费, 而且容易让人
+> 误以为"这次坏了"。
+
+### Hindsight 记忆库: **不可用(401 未授权)** — 2026-09-25 登记
+
+**状态**: 工具已注册但**调用一律被拒**。
+
+```
+hindsight_ingest_document(...)  ->  401 {"detail":"Authentication ..."}
+```
+
+**实测**: 2026-09-25 尝试把 DISC-2 六种形态的摘要 ingest 进去, 返回 401。
+此前 `hindsight_search_knowledge_pages` 也报错, 且**知识页列表为空**
+("No knowledge pages yet — Hindsight is still learning this repo")。
+
+**含义与处置**:
+
+- **不要把 Hindsight 当作本仓知识的存放处** —— 本仓的权威记录是:
+  纪律 → `docs/disciplines.md`; 漏洞/决策登记 → `ops/acceptance_status.json`
+  (+ 自动生成的 `docs/vulnerability-register.md`); 数据源状态 → `docs/stockdb-source-status.md`。
+  **这些都是 committed 的文本, 不依赖外部服务 —— 这是刻意的。**
+- **不要因为 401 就改走别的路径假装写成功**: 做不到就**明说做不到**
+  (与 DISC-1「宁可 None 不猜」同一立场)。
+- 若将来某次会话发现它能用了, **更新本节**并写明"何时起可用" ——
+  一份说"不可用"而实际可用的文档, 会让人白白放弃一个能力。
+
+### 其它已知缺依赖(与登记册对应)
+
+| 项 | 缺什么 | 后果 / 归属 |
+|---|---|---|
+| `DrlEnvMissing` 告警 | metrics_server 的解释器无 `torch` | **结构性误报**, 见 `P0-DRLDEP`; 核对办法见 `ops/alert_rules.yml` 该规则 description |
+| `.venv314`(跑测试) | 无 `h5i_db` / `baostock` / PyYAML | 相关用例**带原因 skip**; PyYAML 那几条请用生产解释器手工核 |
+| 生产解释器 | 无 `torch` / `baostock` / pytest | DRL 训练走 `TRAE_PY`; Baostock 取数走 `.venv310` |
+| `.venv310` | 无 `vnpy` / pytest 可用 | 取数 + `h5i_db` 的真跑环境 |
+
+**判据**: 遇到"这个工具/模块用不了"时, **先查本节**; 若本节没记, 登记进来再往下走。
+
+---
+
 ## METHOD-1: 边界/阈值必须由**下游表现**决定, 而非**分布范围**
 
 **状态**: 已固化(2026-09-19 用户定)。**原始出处**: `docs/drl-learning-verification.md` §📌

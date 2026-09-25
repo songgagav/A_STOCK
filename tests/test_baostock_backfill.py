@@ -200,6 +200,53 @@ class TestProvenanceCarriesTheSemanticClarification:
         monkeypatch.setattr(E, "engine_available", boom)
         assert BF._engine_day() is None
 
+    def test_unfillable_symbols_are_recorded_with_a_machine_readable_reason(
+            self, monkeypatch):
+        """[用户清单第 3 项] 补不到的标的必须**逐只**记下 + 机器可读的原因。
+
+        ## 为什么"记名单"而不是"只记计数"
+
+        北交所 339 只是 **Baostock 原理上的覆盖缺口**(它对 `bj.*` 返回空),
+        不是本次故障。只记 `bj_not_requested: 339` 时, 读的人**拿不到具体是哪些标的** ——
+        想核对"我关心的那只补上了吗"就得自己重算一遍。记下名单才能逐只核对。
+
+        ## 为什么还要 `unfillable_reason`
+
+        只有中文说明的话, 下游**没法按原因归类统计**。`baostock_no_bj_data` 是稳定标识,
+        将来若出现第二种"补不到"的原因(如某源不支持 ST), 可以分开计数而不必解析文本。
+
+        **验收要求**: `backfill_provenance.jsonl` 中包含 `unfillable_symbols`。
+        """
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        bj = [f"92{i:04d}" for i in range(339)]
+        BF._append_provenance("2026-09-23", 5200, {"bj_not_requested": bj})
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert "unfillable_symbols" in rec, "验收要求: 留痕里必须有 unfillable_symbols"
+        assert rec["unfillable_symbols"] == sorted(bj)
+        assert rec["unfillable_count"] == 339
+        assert rec["unfillable_reason"] == "baostock_no_bj_data", (
+            "原因必须是**机器可读的稳定标识**, 不能只有中文说明")
+        assert "北交所" in rec["note"], "note 应向人说明这 339 只为什么补不到"
+
+    def test_no_unfillable_means_none_not_a_placeholder(self, monkeypatch):
+        """没有补不到的标的时, `unfillable_reason` 应为 **None**, 不得编造占位符。
+
+        与 DISC-1「留痕宁可 None, 不猜」同一条: 写 `"none"` / `"-"` / `""` 这类占位符,
+        下游就得学会识别多种"空"的写法 —— 那是自找的解析歧义。
+        """
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        BF._append_provenance("2026-09-24", 5200, {})
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["unfillable_symbols"] == []
+        assert rec["unfillable_count"] == 0
+        assert rec["unfillable_reason"] is None, rec["unfillable_reason"]
+
 
 class TestSuspendedRowsAreDroppedNotFatal:
     """停牌股量额为空是 **A 股每日常态**, 不得让它废掉整日。

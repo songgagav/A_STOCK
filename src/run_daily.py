@@ -92,6 +92,77 @@ def self_closed_loop(day: str, day_dir: str, db) -> dict:
     return fb
 
 
+def _backfill_interpreter() -> str | None:
+    """找一个**装了 baostock** 的解释器。取不到返回 None(**不猜**)。
+
+    为什么需要它: 取数用 Baostock, 而它只在 `.venv310`; `run_daily` 自己跑在生产
+    解释器上(那里没有 baostock, 也**不该**为了补数去装 —— 生产解释器要保持最小依赖面)。
+
+    判据用"真的 import 一次"而不是"文件存不存在": 一个存在的解释器未必装了 baostock,
+    而"看着像"正是本仓 DISC-1 禁止的自算口径。用 `-c "import baostock"` 实测, 成功才用。
+    """
+    import subprocess as _sp
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cands = [os.path.join(root, ".venv310", "Scripts", "python.exe"),
+             os.path.join(root, ".venv310", "bin", "python")]
+    for exe in cands:
+        if not os.path.isfile(exe):
+            continue
+        try:
+            p = _sp.run([exe, "-c", "import baostock"],
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=60)
+            if p.returncode == 0:
+                return exe
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _run_backfill_subprocess(missing_days: list) -> dict:
+    """在**有 baostock 的解释器**里跑回填, 返回它落盘的完整结果。
+
+    刻意不在这里 import `baostock_backfill` —— 本进程没有 baostock, import 会失败;
+    而且即便成功, 取数也会因为缺依赖而中途报错。故走子进程。
+    结果文件由 `baostock_backfill` 自己写(`--out`), 这里读回来 ——
+    比解析 stdout 可靠(stdout 曾被 339 项清单截断过, 见登记册)。
+    """
+    import subprocess as _sp
+    days = [str(d) for d in (missing_days or []) if d]
+    if not days:
+        return {"ok": False, "error": "没有待补交易日"}
+    exe = _backfill_interpreter()
+    if not exe:
+        return {"ok": False,
+                "error": "找不到装了 baostock 的解释器(试过 .venv310) —— "
+                         "**不猜、不静默跳过**: 判定成立但无法取数, 需人处理",
+                "missing_days": days}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out_fp = os.path.join(DATA_DIR, "backfill_last_run.json")
+    # 日期转回 YYYY-MM-DD 再传(baostock_backfill 的 --days 用这种格式)
+    pretty = [f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d for d in days]
+    cmd = [exe, os.path.join(root, "src", "baostock_backfill.py"),
+           "--days", *pretty, "--write", "--out", out_fp]
+    try:
+        p = _sp.run(cmd, cwd=root, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", timeout=5400)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "interpreter": exe, "missing_days": days}
+    res = {"ok": p.returncode == 0, "exit": p.returncode, "interpreter": exe,
+           "missing_days": days, "out_fp": out_fp}
+    try:
+        with open(out_fp, encoding="utf-8") as f:
+            full = json.load(f)
+        res["written"] = full.get("written")
+        # [第 8 项] 把"两件事同时验证"的结论一并带回回执
+        res["verify"] = full.get("verify")
+    except Exception as e:  # noqa: BLE001
+        res["read_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+    if p.returncode != 0:
+        res["tail"] = (p.stdout or "")[-400:]
+    return res
+
+
 def portfolio_construction() -> dict:
     """组合**建仓进度** —— 让"未建满"这件事进入回执 (2026-09-23 新增, 用户决策方案 B)。
 
@@ -669,6 +740,53 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
             pass
         except Exception as e:  # noqa: BLE001
             report["steps"]["engine_bars_sync"] = {"ok": False, "error": str(e)[:300]}
+
+        # 1.06) [2026-09-25 用户清单第 1、2 项] Baostock **按需回填**的自动触发。
+        #
+        # 判据(用户指定): **A 且 B** —— A=引擎缺口, B=h5i 存储缺口, 只有两者同时成立才补。
+        # 判据本身在 `backfill_trigger.decide`(纯函数, 有守卫); 这里只负责接线与留痕。
+        #
+        # **默认关闭**(`BACKFILL_ENABLED=0`): 回填会写生产行情库, 属不可逆动作。
+        #
+        # **解释器问题(实测踩到)**: 取数用 Baostock(装在 `.venv310`),
+        # 而 run_daily 跑在生产解释器上——那里**没有 baostock**。
+        # 故本步骤**不 import 取数模块**: 先在本进程内用 `_eng` 的现成值做判定
+        # (纯计算, 零依赖), 只有真要取数时才 `subprocess` 到有 baostock 的解释器。
+        # 这样"判定"永远可用(即使取数环境缺失), 且缺环境时会**明说**而不是静默跳过。
+        try:
+            import backfill_trigger as _BT
+            _bf = {"enabled": _BT.is_enabled(),
+                   "lookback_days": _BT.lookback_days()}
+            _expected = None
+            _strength = "official"
+            try:
+                import engine_bars_sync as _EBS
+                _f = _EBS.freshness((_eng or {}).get("engine_last_day"))
+                _expected = _f.get("expected_day")
+                _strength = _f.get("calendar_strength") or "official"
+            except Exception as _e2:  # noqa: BLE001
+                _bf["freshness_error"] = f"{type(_e2).__name__}: {str(_e2)[:120]}"
+            _d = _BT.decide(
+                engine_day=(_eng or {}).get("engine_last_day") or None,
+                # h5i 水位直接用 engine_bars_sync 刚报的 `h5i_max_before` ——
+                # 它**就是**本次摄入前的水位, 语义正好是判据 B 要的"存储缺口"。
+                h5i_watermark=(_eng or {}).get("h5i_max_before") or None,
+                expected_day=_expected, calendar_strength=_strength,
+                enabled=_bf["enabled"], lookback=_bf["lookback_days"])
+            _bf.update(_d)
+            _bf["note"] = ("判据 A 且 B(引擎缺口 AND h5i 缺口); "
+                           "默认关闭, 需 BACKFILL_ENABLED=1")
+            if _d.get("triggered"):
+                if not ds_allow:
+                    _bf["skipped"] = "datasource_gate_halt"
+                    _bf["note"] += "; 门禁 HALT, 不补(数据源不可信时换个源再抓只会灌进不可信数据)"
+                else:
+                    _bf["run"] = _run_backfill_subprocess(_d.get("missing_days") or [])
+            report["steps"]["backfill_trigger"] = _bf
+        except Exception as e:  # noqa: BLE001
+            report["steps"]["backfill_trigger"] = {
+                "ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "note": "触发判定异常不阻断收盘管道"}
 
         if not ds_allow:
             # 门禁 HALT: 镜像回退路径同样跳过 —— 数据源不可信时,

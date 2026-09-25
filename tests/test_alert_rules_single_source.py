@@ -109,14 +109,103 @@ class TestSingleSourceOfTruthForAlertRules:
         names = {r["alert"] for g in d["groups"] for r in g["rules"]}
         assert "TableStale24h" not in names, \
             "TableStale24h 回来了 —— 用 24h 判季度表必然永久误报"
-        assert "TableStaleDaily" in names, "缺日报类阈值"
+        assert "TableStaleDaily" in names, "缺数据商节奏类阈值"
         assert "TableStaleQuarterly" in names, "缺季报类阈值"
         # 两条的阈值必须不同(否则等于没分档)
         exprs = {r["alert"]: str(r["expr"]) for g in d["groups"] for r in g["rules"]}
         for a in ("TableStaleDaily", "TableStaleQuarterly"):
             assert "> 5" in exprs[a] or "> 120" in exprs[a], f"{a} 阈值可疑: {exprs[a][:80]}"
-        assert "> 5" in exprs["TableStaleDaily"], "日报类阈值应为 5 天"
+        assert "> 5" in exprs["TableStaleDaily"], "数据商节奏类阈值应为 5 天"
         assert "> 120" in exprs["TableStaleQuarterly"], "季报类阈值应为 120 天"
+
+    @_needs_yaml
+    def test_engine_fed_tables_use_trading_day_threshold(self):
+        """[2026-09-25 用户清单第 6、7 项] 引擎喂数的表必须用**交易日**阈值。
+
+        ## 起因(实测, 不是推演)
+
+        `daily_bars` 原先只由 `TableStaleDaily`(5 个**自然日**)覆盖 ——
+        而厂商引擎停更时它才 **3.08 自然日**, 要等到第 6 天才响;
+        可 **落后 2 个交易日**就已经是"厂商漏发"了。5 个自然日 ≈ 3~4 个交易日,
+        这段窗口里选股一直用旧截面(见 docs/stockdb-source-status.md §6.10)。
+
+        ## 判据不是"把阈值调小", 而是**按更新机制归类**
+
+        这决定了"谁负责更新":
+          · **引擎/专属 sync 写入**(daily_bars / northbound_money / margin_daily):
+            有**自己的摄入路径**, 每个交易日都该推进 ⇒ **交易日**口径;
+          · **上游数据商节奏**(valuation 等): 保留自然日宽松口径, 别逼成噪声。
+
+        **为何交易日口径重要**: 3 个自然日里可能只含 2 个交易日(周末),
+        按自然日算会让同一件事**忽早忽晚**地报。
+
+        **为何本组阈值是 >2 而不是 >1**: `EngineDataLag` 已在 >1 时专门报,
+        此处作**第二级兜底**; 若也用 >1, 同一件事**报两遍** ——
+        而重复告警与噪声告警一样会训练人忽略频道。
+        """
+        rules = _load_rules()
+        assert "TableStaleEngineFed" in rules, "缺引擎喂数类的交易日阈值规则"
+        expr = " ".join(str(rules["TableStaleEngineFed"]["expr"]).split())
+        assert expr == "astock_engine_lag_days > 2", (
+            f"应用**交易日**口径的 `astock_engine_lag_days > 2`: {expr!r}\n"
+            "· 若改用 `astock_db_lastday_ts / 86400` 则退回自然日口径, 周末会忽早忽晚;\n"
+            "· 若改成 >1 则与 EngineDataLag 重复报同一件事")
+        assert rules["TableStaleEngineFed"].get("for"), "缺 for:"
+        assert rules["TableStaleEngineFed"]["labels"]["severity"] == "warning"
+        desc = str(rules["TableStaleEngineFed"]["annotations"]["description"])
+        assert "EngineDataLag" in desc, "应说明与 EngineDataLag 的分工(避免重复报)"
+        assert "回填" in desc or "baostock" in desc.lower(), (
+            "应提醒『回填不改选股口径』—— 否则收到告警的人会以为回填能解决它")
+
+    @_needs_yaml
+    def test_every_daily_table_is_in_exactly_one_staleness_rule(self):
+        """每张日报表必须**恰好**被一条 staleness 规则覆盖 —— 不重不漏。
+
+        **为什么单锁这条**: 2026-09-25 把日报类拆成"引擎喂数 / 数据商节奏"两组时,
+        最容易犯的错是**两边都留** `daily_bars`(于是同一件事报两遍),
+        或者**两边都删**(于是它不再被任何规则覆盖)。这两种错**都不会报错**,
+        只会静默地多报或少报 —— 正是本仓 DISC-2 的形态。
+
+        本用例把"分组"这件事变成一个可机械核对的账:
+        `TableStaleDaily` 与 `TableStaleEngineFed` 的 filter/语义必须**互斥且完整**。
+        """
+        rules = _load_rules()
+        d = rules["TableStaleDaily"]
+        expr = " ".join(str(d["expr"]).split())
+        # 数据商节奏组: 只含那三张已知滞后的表 —— 不能含引擎喂数的表
+        for t in ("valuation", "valuation_snapshot", "money_flow_estimate"):
+            assert t in expr, f"数据商节奏组应覆盖 {t}: {expr[:120]}"
+        for t in ("daily_bars", "northbound_money", "margin_daily"):
+            assert t not in expr, (
+                f"{t} 是**引擎喂数**的表, 不该留在数据商节奏组(应由 "
+                f"TableStaleEngineFed 的交易日口径覆盖): {expr[:120]}")
+        # 引擎喂数组用**同一条指标**判所有表, 故它不按表名分组 ——
+        # 这是刻意的: 它们的更新节奏**相同**(都由引擎决定), 无需再分档。
+        fed = " ".join(str(rules["TableStaleEngineFed"]["expr"]).split())
+        assert "astock_engine_lag_days" in fed, fed
+
+    @_needs_yaml
+    def test_filter_logic_accepts_per_table_thresholds(self):
+        """`test_no_single_threshold_for_all_tables` 的判据不能被"顺手"放宽。
+
+        它的本意是**禁止一刀切**, 而不是"只允许两条规则"。2026-09-25 拆成三条
+        (数据商 / 引擎喂数 / 季报)之后, 那条守卫仍须通过 ——
+        即: **分档可以更多, 但不能退回单一阈值**。
+
+        [2026-09-25 自查] 本用例第一版**漏了 `@_needs_yaml`** —— 它调用
+        `_load_rules()`, 而那个函数顶层 `import yaml`。于是在 `.venv314`(无 yaml)
+        下它**不是 skip 而是 ERROR**, 把全量测试从"0 failed"变成"1 failed"。
+        这正是本仓 DISC-2 的形态: 新加的守卫自己成了破坏源。
+        **凡是用到 yaml 的用例, 必须挂 `@_needs_yaml`。**
+        """
+        rules = _load_rules()
+        stale = [n for n in rules if n.startswith("TableStale")]
+        assert len(stale) >= 3, (
+            f"staleness 规则应至少三档(数据商节奏/引擎喂数/季报), 实际 {stale}")
+        # 三档的判据必须**不是**同一个表达式(否则等于没分档)
+        exprs = {" ".join(str(rules[n]["expr"]).split()) for n in stale}
+        assert len(exprs) == len(stale), (
+            f"存在判据完全相同的 staleness 规则 —— 等于没分档: {sorted(exprs)}")
 
     @_needs_yaml
     def test_every_rule_has_severity_and_description(self):
