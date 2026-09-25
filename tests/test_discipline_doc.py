@@ -833,21 +833,39 @@ class TestProductionDaemonInterpreterIsNotTheToolOne:
         两类都是"引用错误", 都不是主张:
           · `>` 引用的块;
           · **⑦ 的实例小节**(2026-09-26 起, 病历从块引用搬进了正文,
-            因为 ⑦ 成了正式形态)—— 从 `### ⑦` 到下一个 `### ` 为止。
-        第一版只判 `>` ⇒ 迁移之后立刻误报(实测), 故这里把两处都算作叙述。
+            因为 ⑦ 成了正式形态)—— 从 `### ⑦` 到下一个非引用 `### ` 为止。
+
+        ## 定位小节标题时必须同时满足两个条件(两次踩坑的结论)
+
+        1. **行首锚定**(`line.startswith("### ⑦")`) —— 否则正文里
+          「`### ⑦ 证据无判别力`」这种**引用**也会被当成标题(④b 的近亲);
+        2. **不是引用行**(`not line.startswith(">")`) —— 否则 `> #### 追加判据`
+          这类**被引用的小节**会被当成真正的小节起点。
+
+        第一版只做了 1 的近似(`src.find("### ⑦")`), 结果命中了**块引用里的
+        一个 `> ####` 标题**(因为该块内恰好也含 `⑦` 字样) ⇒ 叙述区被算到几千行,
+        把正文的**主张**也划进了"允许引用"的范围 ⇒ 主守卫静默失效。
+        **这正是本条要防的: 识别条件与实际格式不符。**
         """
         lines = src.splitlines()
-        flags = [ln.strip().startswith(">") for ln in lines]
-        i = src.find("### ⑦")
-        if i > 0:
-            j = src.find("\n### ", i + 1)
-            if j < 0:
-                j = len(src)
-            # 按字符偏移换算成行号: 数 ⑦ 小节里有多少行
-            start = src[:i].count("\n")
-            end = src[:j].count("\n")
-            for k in range(start, min(end, len(flags))):
-                flags[k] = True
+        flags = [ln.lstrip().startswith(">") for ln in lines]
+        start = None
+        for n, ln in enumerate(lines):
+            if flags[n]:
+                continue                      # 引用行里的小节标题不算
+            if ln.startswith("### ⑦"):
+                start = n
+                break
+        if start is not None:
+            end = len(lines)
+            for n in range(start + 1, len(lines)):
+                if flags[n]:
+                    continue                  # 引用行里的小节标题不算
+                if lines[n].startswith("### "):
+                    end = n
+                    break
+            for n in range(start, end):
+                flags[n] = True
         return flags
 
     def test_does_not_call_drlenvmissing_a_false_positive(self):
@@ -902,11 +920,13 @@ class TestProductionDaemonInterpreterIsNotTheToolOne:
                                narrative=True), "叙述区里的引用被误报"
 
     def test_the_narrative_regions_are_detected(self):
-        """叙述区必须**真的**识别出来 —— 否则上面的排除条件是空转。
+        """叙述区必须**真的**识别出来, 且**不得过大** —— 否则排除条件是空转或过宽。
 
-        [2026-09-26] 第一版只认 `>` 块; 病历搬进 `### ⑦` 之后立刻失效。
-        故这里显式断言: `>` 块**与** ⑦ 小节都必须被标为叙述区,
-        且 ⑦ 小节里确实有一行引用了"误报"。
+        [2026-09-26 两次失效]
+        · 第一版只认 `>` 块 ⇒ 病历搬进 `### ⑦` 后立刻误报;
+        · 第二版用 `src.find("### ⑦")` 定位小节 ⇒ 命中了**块引用里的一个标题**
+          (该块恰好也含 `⑦` 字样) ⇒ 叙述区被算到几千行, 把正文**主张**也划了进去
+          ⇒ 主守卫静默失效。**故这里必须同时断言"识别到了"与"没有识别过头"。**
         """
         src = self._src()
         flags = self._is_narrative(src)
@@ -914,14 +934,22 @@ class TestProductionDaemonInterpreterIsNotTheToolOne:
         n_quote = sum(1 for n, ln in enumerate(lines)
                       if n < len(flags) and flags[n] and "误报" in ln)
         assert n_quote > 0, "没有任何叙述行引用「误报」—— 排除条件在空转"
-        # ⑦ 小节必须被标进叙述区
-        i = src.find("### ⑦")
-        assert i > 0, "缺 ⑦ 小节"
-        k = src[:i].count("\n")
-        assert flags[k], "⑦ 小节未被识别为叙述区(病历在那里)"
+        # ⑦ 小节必须被标进叙述区(且必须是**正文那个**, 不是引用里的)
+        start = next(n for n, ln in enumerate(lines)
+                     if ln.startswith("### ⑦"))
+        assert flags[start], "正文 ⑦ 小节未被识别为叙述区(病历在那里)"
         # `>` 块也必须仍被识别
-        q = [n for n, ln in enumerate(lines) if ln.strip().startswith(">")]
+        q = [n for n, ln in enumerate(lines) if ln.lstrip().startswith(">")]
         assert q and all(flags[n] for n in q), "`>` 块未被识别为叙述区"
+        # **不得识别过头**: 叙述区不能占全文一大半(否则主守卫等于失效)
+        assert sum(flags) < len(lines) * 0.5, (
+            f"叙述区占了 {sum(flags)}/{len(lines)} 行 —— "
+            "识别条件过宽, 主守卫已静默失效")
+        # 注: **刻意不断言"叙述区段数"** —— 本 doc 的 `>` 块本来就散落在全文各处
+        # (实测 34 段), 拿"段数少"当判据是错的判据(会误报)。
+        # 真正能抓住"识别过头"的是上面的**占幅**断言: 本次的 bug 是把叙述区
+        # 算到了几千行, 占幅会立刻超过一半。**判据要选能区分对错的那一个**,
+        # 而不是"看起来相关的那个"。
 
     def test_the_narrative_is_allowed_to_quote_the_error(self):
         """更正叙述里**必须**能原样引用错误 —— 否则后人不知道曾经错过什么。"""
@@ -1166,6 +1194,131 @@ class TestNoTestCallsAnUndefinedHelper:
         ) == [], "import 别名被误报"
 
 
+class TestBackfillObservationMustRecordCriteria:
+    """§6.13/§6.14 的检查单必须把 **criteria 两值(A/B)** 列为**必记项** (2026-09-26 用户要求)。
+
+    ## 为什么这条必须写成纪律而不是"记得看一眼"
+
+    `no_gap` 有**两个来由**, 二值不同、运维含义相反:
+
+    | A_engine_gap | B_h5i_gap | action | 含义 |
+    |---|---|---|---|
+    | `false` | 任意 | no_gap | **厂商已恢复**(引擎追平 ⇒ 没有"厂商缺席的日子"要补) |
+    | `true` | `false` | no_gap | **厂商未恢复, 但 h5i 已补齐**(重复回填无意义) |
+    | `true` | `true` | **trigger** | 真正要回填的缺口 |
+
+    前两行**都会打印 `no_gap`**。只记 `action`, 一周后**分不清**当时是哪种局面 ——
+    而 09-28 这场自然实验要回答的正是这个问题。
+
+    **通用判据**: 凡"同一个结论有两个不同来由"的地方, 记录时**必须连判据一起记**。
+    本仓同族: ⑤ 要求保留每层的 `error` 字段, 而不是只留最终 `ok`。
+    """
+
+    _DOC2 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "docs", "stockdb-source-status.md")
+
+    def _src(self):
+        return open(self._DOC2, encoding="utf-8").read()
+
+    def test_checklist_has_a_mandatory_criteria_step(self):
+        src = self._src()
+        i = src.find("### 6.13")
+        assert i > 0, "缺 §6.13"
+        blk = src[i:i + 4000]
+        assert "criteria" in blk, "§6.13 检查单里没提 criteria"
+        assert "A_engine_gap" in blk and "B_h5i_gap" in blk, (
+            "必须**分别**列出两个布尔值(只写 criteria 不够明确)")
+        # 必须是"强制/不可省"级别的措辞, 而不是可选
+        assert ("强制" in blk) or ("必记" in blk), (
+            "必须标明这是**必记项**, 否则执行时会跳过")
+
+    def test_explains_the_two_reasons_for_no_gap(self):
+        """必须给出那张三行表 —— 否则读者不知道"为什么要记两个布尔值"。"""
+        src = self._src()
+        i = src.find("为什么 `criteria` 是**必记项**")
+        assert i > 0, "缺「为什么 criteria 是必记项」小节"
+        blk = src[i:i + 2600]
+        assert "两个来由" in blk or "两个不同来由" in blk, "应点明 no_gap 有两个来由"
+        # 三行都要有
+        assert "false" in blk and "true" in blk, "缺判据取值"
+        assert "厂商已恢复" in blk, "缺「A=false = 厂商恢复」这一行"
+        assert "trigger" in blk, "缺「A 且 B 都真 ⇒ trigger」这一行"
+
+    def test_observation_1_actually_recorded_both_values(self):
+        """**以身作则**: 观测 ① 必须真的记了 A/B 两个值, 不能只记 action。"""
+        src = self._src()
+        i = src.find("#### 观测 ①")
+        assert i > 0, "缺观测 ①"
+        blk = src[i:i + 2000]
+        assert "A_engine_gap" in blk and "B_h5i_gap" in blk, (
+            "观测 ① 没记 criteria 两值 —— 那条纪律自己就没被遵守")
+        assert "true" in blk and "false" in blk, "观测 ① 的判据取值不全"
+
+    def test_observation_2_checklist_also_requires_criteria(self):
+        """走向 A/B 的判定必须**基于 criteria**, 而不是"看引擎日期猜"。"""
+        src = self._src()
+        i = src.find("#### 观测 ②")
+        assert i > 0, "缺观测 ②"
+        blk = src[i:i + 2600]
+        assert "A_engine_gap" in blk, "观测 ② 的清单必须以 criteria 为判据"
+        assert "B 决定 action" in blk or "**B 决定" in blk, (
+            "应写清: 厂商未恢复时由 **B** 决定是否 trigger")
+
+
+class TestGuardRecognitionMustCoverAllFormats:
+    """『识别条件必须覆盖该节的所有可能格式』必须写入守护设计原则 (2026-09-26 用户要求)。
+
+    ## 两天内踩了三次同一个坑(每条都是实测)
+
+    | # | 识别条件写的 | 结构怎么变的 | 后果 |
+    |---|---|---|---|
+    | 1 | 源码文本含 `yaml.safe_load` | 守卫自己的 docstring 里也有 | 报了自己(良性) |
+    | 2 | 函数体含 `_load_rules(` | 另一守卫的**样本串**里也有 | 误报样本(良性) |
+    | 3 | 叙述区 = `>` 开头的块 | 病历**搬进正文** `### ⑦` | **反向误报**: 去报病历 |
+
+    根因同一个: 把"识别条件"写成了**当时文档的偶然形状**, 而不是**语义特征**。
+    """
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_principle_is_stated_as_a_design_rule(self):
+        src = self._src()
+        i = src.find("识别条件必须覆盖该节的所有可能格式")
+        assert i > 0, "缺「识别条件必须覆盖所有格式」这条设计原则"
+        blk = src[i:i + 3000]
+        assert "语义" in blk, "必须给出正解: 用**语义特征**而非位置/字面量"
+        assert "枚举" in blk, "必须要求**枚举**该节的可能格式"
+
+    def test_lists_all_three_real_occurrences(self):
+        """三次实测必须都列出来 —— 只写一条会显得像偶发。"""
+        src = self._src()
+        i = src.find("两天内踩了三次")
+        assert i > 0, "必须说明这是**三次**重复, 不是偶发"
+        blk = src[i:i + 1600]
+        assert "docstring" in blk or "样本" in blk, "缺第 1/2 次(自指涉/样本串)"
+        assert "搬进正文" in blk or "⑦" in blk, "缺第 3 次(病历搬进正文)"
+
+    def test_requires_a_nonempty_recognition_region_assertion(self):
+        """必须要求一条「识别区非空」的反向验证 —— 否则识别条件可能空转。"""
+        src = self._src()
+        i = src.find("识别条件必须覆盖该节的所有可能格式")
+        blk = src[i:i + 3000]
+        assert "识别区非空" in blk or "非空" in blk, (
+            "必须要求反向验证: 识别出的区域**确实有内容**")
+        assert "识别一切" in blk or "识别不到" in blk, (
+            "应说清两种退化方向: 识别一切(主断言变空) / 识别不到(恒真)")
+
+    def test_distinguishes_from_4b(self):
+        """必须与 ④b 分工说清 —— 否则两条形态的边界糊掉。"""
+        src = self._src()
+        i = src.find("与 ④b 的分工")
+        assert i > 0, "缺「与 ④b 的分工」"
+        blk = src[i:i + 400]
+        assert "切片边界" in blk and "识别条件" in blk, (
+            "应说清: ④b 管**切片边界**, 本条管**识别条件**")
+
+
 class TestDisc2FormIndex:
     """DISC-2 的「失效形态索引」必须与详细章节**对得上** (2026-09-23, 用户建议)。
 
@@ -1175,11 +1328,11 @@ class TestDisc2FormIndex:
     因为它会让人以为已经覆盖了, 实际指向的是过期的形态清单。
     """
 
-    #: 全部形态。**③b 与 ③ 并列**, 故不是简单的 1..7。
+    #: 全部形态。**③b 与 ④b 都是"并列"形态**, 故不是简单的 1..7。
     #: 判据 = 「索引表里有一行」且「详细章节里有对应小节/行」。
-    _FORMS = ("①", "②", "③", "③b", "④", "⑤", "⑥", "⑦")
+    _FORMS = ("①", "②", "③", "③b", "④", "④b", "⑤", "⑥", "⑦")
     #: 索引表结束的位置 —— 详细章节的标题。**改标题时这里必须同步**,
-    #: 否则切片会一路取到文末, 断言随之变弱(2026-09-26 实测发生)。
+    #: 否则切片会一路取到文末, 断言随之变弱(2026-09-26 实测发生, 即 ④b 本身)。
     _DETAIL_HEADING = "### 详细判据"
 
     def _src(self):
@@ -1203,11 +1356,27 @@ class TestDisc2FormIndex:
         `find` 返回 -1 ⇒ `src[i:-1]` 取到**几乎整篇** ⇒
         断言"索引里没有多列形态"**恒真**(详细章节的内容把它喂饱了)。
         这是 ③b 的近亲: **切片边界依赖了一个被改掉的字面量**。
-        故此处显式锁住边界标题本身。
+
+        ## 为什么用"行首锚定"而不是 `src.count(...)`
+
+        第一版写的是 `src.count(_DETAIL_HEADING) == 1` —— 结果**报了我自己**:
+        我在 ④b 的说明里**引用了**该标题的字面量(`find("### 四种")` 这种例子),
+        于是计数变成 2。**这正是"识别条件必须覆盖该节所有可能格式"的又一实例**:
+        说明文字与真实标题**同形**, 故判据必须收窄到"**行首**且**不是引用行**"。
         """
         src = self._src()
-        assert src.count(self._DETAIL_HEADING) == 1, (
-            f"详细章节标题应恰好出现一次: {self._DETAIL_HEADING}")
+        lines = src.splitlines()
+
+        def is_real_heading(ln):
+            # 行首锚定, 且排除 `>` 引用行里被引用的小节标题
+            return ln.startswith(self._DETAIL_HEADING)
+
+        hits = [n for n, ln in enumerate(lines) if is_real_heading(ln)]
+        assert len(hits) == 1, (
+            f"详细章节标题应**恰好一行以它开头**, 实际 {len(hits)} 行: "
+            f"{[lines[n][:60] for n in hits]}")
+        assert not any(lines[n].lstrip().startswith(">") for n in hits), (
+            "命中的是引用行里的小节标题, 不是正文标题")
         i = src.find("### 失效形态索引")
         j = src.find(self._DETAIL_HEADING, i)
         assert 0 < i < j, "索引与详细章节的先后/存在性不对"
@@ -1243,8 +1412,11 @@ class TestDisc2FormIndex:
         assert "优先级" in head and "检查方法" in head, (
             "入口应说明索引里有什么(优先级/检查方法), 否则没人会跳过去")
         # **核心**: 入口与索引之间不得夹任何其它小节 —— 否则"入口"要跨过它才到得了索引
-        for sub in ("### 事实依据", "### 关于", "### 四种"):
-            assert sub not in head, (
+        # 判据也按**行首锚定**: 若只查子串, ④b 的说明里引用了 `### 四种` 这类例子,
+        # 会把守卫自己举例的文字当成"夹着的小节"(2026-09-26 实测)。
+        head_lines = head.splitlines()
+        for sub in ("### 事实依据", "### 关于", "### 详细判据"):
+            assert not any(ln.startswith(sub) for ln in head_lines), (
                 f"入口与索引之间夹着 `{sub}` —— 入口必须紧邻索引; "
                 "读者会先读完那一节才看到索引, 入口形同虚设")
 
@@ -1284,12 +1456,12 @@ class TestDisc2FormIndex:
             assert f"**{f}" in detail or f"### {f}" in detail or f"#### {f}" in detail, \
                 f"详细章节里找不到形态 {f}"
 
-    def test_index_marks_four_forms_as_high_priority(self):
-        """④/⑤/⑥/⑦ 必须被标为**高**优先级, 且理由写出来。
+    def test_index_marks_the_hard_to_find_forms_as_high_priority(self):
+        """④/④b/⑤/⑥/⑦ 必须被标为**高**优先级, 且理由写出来。
 
         为什么单锁这几个字符: 用户的原话是「⑤ 和 ④ 应该优先检查 —— 它们最难发现,
-        且会把人引向错误方向」, 2026-09-25 要求补 ⑥,
-        2026-09-26 要求补 ⑦(证据无判别力) —— 用户明示 ⑦ 与它们同级。
+        且会把人引向错误方向」; 2026-09-25 要求补 ⑥;
+        2026-09-26 要求补 ⑦(证据无判别力)与 ④b(边界腐烂), 均明示与它们同级。
         若将来有人"顺手"把优先级都抹平, 这张表就只剩装饰作用 ——
         而"没有优先级的索引"与"没有索引"在排查时的效果一样。
         """
@@ -1297,14 +1469,15 @@ class TestDisc2FormIndex:
         i = src.find("### 失效形态索引")
         j = src.find(self._DETAIL_HEADING, i)
         block = src[i:j]
-        for f in ("④", "⑤", "⑥", "⑦"):
+        for f in ("④", "④b", "⑤", "⑥", "⑦"):
             row = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f}")]
             assert row, f"索引表里找不到形态 {f} 的行"
             assert "高" in row[0], f"形态 {f} 未被标为高优先级: {row[0][:90]}"
-        # ③b 是中等(它会红, 但要误判方向才贵)
-        row3b = [ln for ln in block.splitlines() if ln.strip().startswith("| **③b")]
-        assert row3b, "索引表里找不到形态 ③b 的行"
-        assert "中" in row3b[0], f"③b 应为中优先级: {row3b[0][:90]}"
+        # ③/③b 是中等(它们会红, 但要误判方向才贵)
+        for f in ("③", "③b"):
+            row = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f} ")]
+            assert row, f"索引表里找不到形态 {f} 的行"
+            assert "中" in row[0], f"{f} 应为中优先级: {row[0][:90]}"
         # 理由必须写明(否则后人不知道为什么高)
         assert "最难" in block or "反方向" in block, \
             "未写出 ④/⑤ 为何优先(它们最难发现 / 会把人引向错误方向)"

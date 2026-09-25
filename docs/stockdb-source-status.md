@@ -459,32 +459,67 @@ $env:BACKFILL_ENABLED=1 ; python src/run_daily.py
 ## 检查顺序(按这个顺序看, 不要跳)
 
 ```text
+□ 0. **先记 criteria 两值(强制, 不可省)** —— 见下面「为什么 criteria 是必记项」
+     steps.backfill_trigger 里读:
+       criteria.A_engine_gap  = ?
+       criteria.B_h5i_gap     = ?
+       engine_day / h5i_watermark / expected_day / missing_days = ?
+     (与 0 同时记下 action 的值)
 □ 1. 厂商是否恢复?
      看 data/health/state.json 的 observed.engine_day 与 lag_trading_days
      或 python src/engine_bars_sync.py --probe
 ```
 
-**若恢复**(引擎追平):
+> ### 为什么 `criteria` 是**必记项**, 而不是"顺带看一眼"
+>
+> **`no_gap` 有两个来由, 二值相同但含义完全不同** —— 只记 `action=no_gap`
+> 事后**无法区分**当时是哪种, 而这正是 09-28 这场自然实验要回答的问题之一。
+>
+> | `A_engine_gap` | `B_h5i_gap` | action | 真实含义 |
+> |---|---|---|---|
+> | `false` | 任意 | `no_gap` | **厂商已恢复**: 引擎追平 ⇒ **没有"厂商缺席的日子"要补**。h5i 可能仍滞后(那只是存储同步滞后, 不是缺口) |
+> | `true` | `false` | `no_gap` | **厂商未恢复, 但 h5i 已补齐**: A 真但 B 假 ⇒ 重复回填无意义(09-25/09-26 实测就是这一格) |
+> | `true` | `true` | **`trigger`** | 厂商缺席 **且** 存储缺失 ⇒ 真正要回填的缺口 |
+>
+> **实测(2026-09-26 预演)**: 三种组合都跑过, 上表第三行返回
+> `missing_days=['20260928']`, 前两行都是 `no_gap`。
+>
+> **为什么这会坑到人**: 走向 A(厂商恢复)与走向 B 的"已经在存储侧补齐"两条路径
+> **都会打印 `no_gap`**, 而它们的运维含义相反 ——
+> 一条是"厂商好了, 系统什么都不用做", 另一条是"厂商还坏着, 只是 h5i 恰好不缺"。
+> 若只记 `action`, 一周后回头看根本分不清; 而记下两个布尔值, 一眼就能重建当时的局面。
+>
+> **通用判据**: 凡"同一个结论有两个不同来由"的地方, 记录时**必须连判据一起记**
+> (本仓同族: ⑤ 要求保留每层的 `error` 字段, 而不是只留最终 `ok`)。
+
+**若恢复**(引擎追平 ⇒ 预期 `A=false`):
 
 ```text
-□ 2a. EngineDataLag 自动 resolve(Alertmanager 里该告警消失)
-□ 2b. steps.backfill_trigger 的 action = no_gap
-□ 2c. 结论: **安全不触发** ✅ —— 这正是「A 且 B」想要的行为
+□ 2a. criteria 应为 A=false(见上面第 0 项); 记下 B 的实际值
+□ 2b. EngineDataLag 自动 resolve(Alertmanager 里该告警消失)
+□ 2c. steps.backfill_trigger 的 action = no_gap
+□ 2d. 结论: **安全不触发** ✅ —— 这正是「A 且 B」想要的行为
         (engine_bars_sync 在 trigger 之前跑, 水位当场前进 ⇒ B 变假)
 ```
 
-**若未恢复**(引擎仍停旧日):
+**若未恢复**(引擎仍停旧日 ⇒ 预期 `A=true`):
 
 ```text
-□ 2a. steps.backfill_trigger 的 action = trigger
-□ 2b. 补数 09-25 / 09-28
-□ 2c. 验证**两件事同时成立**(§6.10):
-        ① steps.backfill_trigger.run.verify.h5i_advanced   = true
+□ 3a. criteria 应为 A=true; **B 是本走向的关键**: B=true 才应 trigger
+□ 3b. steps.backfill_trigger 的 action = trigger(若 B=false 则是 no_gap, 要解释清楚)
+□ 3c. 补数 09-25 / 09-28
+□ 3d. 验证**两件事同时成立**(§6.10):
+        ① steps.backfill_trigger.run.verify.h5i_advanced     = true
         ② steps.backfill_trigger.run.verify.engine_unchanged = true
-□ 2d. 确认 unfillable_symbols 含 **339** 只北交所(§6.11 第 3 项 / 留痕字段)
-□ 2e. 通过后: 把 **§6.11 标题改为 ✅ 已验证** + 写上实测数字
+□ 3e. 确认 unfillable_symbols 含 **339** 只北交所(§6.11 第 3 项 / 留痕字段)
+□ 3f. 通过后: 把 **§6.11 标题改为 ✅ 已验证** + 写上实测数字
         (哪一天触发 / 补了几个交易日 / 多少行)
 ```
+
+> **编号说明**: 原清单两个分支都从 `2a` 开始, 事后引用"2a"会歧义
+> (恢复分支的 2a 与未恢复分支的 2a 是两件事)。现改为**恢复 = 2x、未恢复 = 3x**,
+> 且第 0 项(记 criteria)在两分支**共用**。**改了编号就要改引用** ——
+> 这也是 ④b「边界腐烂」的同族: 标识一变, 依赖它的引用就静默指错。
 
 ## 关于「长期开启」
 
@@ -519,11 +554,11 @@ $env:BACKFILL_ENABLED=1 ; python src/run_daily.py
 | 项 | 实测值 |
 |---|---|
 | `backfill_trigger.evaluate().action` | **`no_gap`** |
+| **`criteria.A_engine_gap`** | **`true`** |
+| **`criteria.B_h5i_gap`** | **`false`** ← 这就是"no_gap 的第二来由" |
 | `engine_day` | `20260922`(**厂商仍未发布**, 与 09-25 相同) |
 | `h5i_watermark` | `20260924` |
 | `expected_day` | `20260924`(`latest_calendar_day(09-25)`; 09-25 为非交易日) |
-| 判据 `A_engine_gap` | `true`(引擎 09-22 < 应到 09-24) |
-| 判据 `B_h5i_gap` | **`false`**(h5i 已到 09-24 ⇒ 存储不缺) |
 | `missing_days` | `[]` |
 | 开关文件 | `{"enabled": true}`, 19 字节, 首 4 字节 `7B 22 65 6E`(**无 BOM**) |
 | 最近一次回填 | 仍为 09-25 15:03 那两条(09-23 / 09-24); **本次无新回填** |
@@ -533,6 +568,11 @@ $env:BACKFILL_ENABLED=1 ; python src/run_daily.py
 **结论**: **符合预期, 无需动作**。厂商未恢复; 但因 h5i 已由 09-25 的人工回填补齐,
 `B` 为假 ⇒ `A AND B` 不成立 ⇒ **不触发**(这正是 §6.12 说的"09-28 前安全"的机理,
 现在有了实测确认)。**开关保持开启。**
+
+**⚠️ 这一格必须连着 criteria 一起读**: 本次 `action=no_gap` 的来由是
+**`A=true, B=false`**(厂商缺席但存储已补), **不是** `A=false`(厂商恢复)。
+只记 `action` 会把这两种局面混为一谈 —— 详见 §6.13 的
+「为什么 criteria 是必记项」。本次观测即为该表格第二行的实测样本。
 
 **日历已核实**(用 `trading_calendar.is_trading_day` 逐日验证):
 
@@ -556,17 +596,27 @@ $env:BACKFILL_ENABLED=1 ; python src/run_daily.py
 沿用 §6.13 的检查顺序。**两条走向都要记录**, 不论哪一条:
 
 ```text
-□ 走向 A(厂商已恢复): engine_day == expected_day
+□ 第 0 项(强制, 两分支共用): **记 criteria 两值 A / B**
+   + engine_day / h5i_watermark / expected_day / missing_days / action
+   ⇒ 缺了 A/B 就无法事后区分下面两条走向(两者都可能打印 no_gap)
+□ 走向 A(厂商已恢复): criteria.A_engine_gap == false
    ⇒ action 应为 no_gap; EngineDataLag 应自动 resolve
-   ⇒ 记录自动 resolve 的时刻(证明它自己会好, 不需要人去清)
-□ 走向 B(厂商未恢复): engine_day 仍 < expected_day
-   ⇒ A 真; B 取决于 h5i 是否已含 09-28
-   ⇒ 若 B 也真 ⇒ 这是**第一次真实自动回填**, 按 §6.13 + §6.10 逐项验:
+   ⇒ 记录**自动 resolve 的时刻**(证明它自己会好, 不需要人去清)
+   ⇒ 注意: 此时 B 可能是 true(h5i 尚未追上), 但**仍不触发** —— 因为
+      A 为假表示"没有厂商缺席的日子要补", 存储滞后不是缺口
+□ 走向 B(厂商未恢复): criteria.A_engine_gap == true
+   ⇒ **B 决定 action**: B=true ⇒ trigger; B=false ⇒ no_gap(要写明为什么)
+   ⇒ 若 B 也真 ⇒ 这是**第一次真实自动回填**, 按 §6.13 第 3 项 + §6.10 逐项验:
       ① h5i 水位推进到 09-28
       ② 留痕含 engine_probe_unchanged=true / affects_selection=false
       ③ unfillable_symbols 含 339 只北交所(baostock_no_bj_data)
       ④ 回填后 target_plan.data_lag_days **仍为 3** —— 这是**预期**, 不是失败
-□ 无论哪条: 都要记录当次 action / engine_day / h5i_watermark / 是否写了生产库
+□ 无论哪条: 追加到本节的"观测 ②"
 ```
+
+> **判据(为什么第 0 项排在最前)**: 「**结论相同、来由不同**」的地方,
+> 记录必须**连判据一起记**。本仓同族: ⑤ 要求保留每层的 `error` 字段,
+> 而不是只留最终 `ok` —— 只留结论等于把判别信息丢掉,
+> 而事后**重建不了**当时的局面。
 
 
