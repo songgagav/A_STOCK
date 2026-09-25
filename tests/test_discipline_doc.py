@@ -1319,6 +1319,225 @@ class TestGuardRecognitionMustCoverAllFormats:
             "应说清: ④b 管**切片边界**, 本条管**识别条件**")
 
 
+class TestDocAnchorPhrasesAreUnique:
+    """被守卫用作**定位锚点**的关键句, 在全文里必须**只出现一次** (2026-09-26)。
+
+    ## 为什么单独立这条
+
+    多个守卫用 `src.find("某句关键话")` 来**定位某一节**(因为它们要切片取证)。
+    而写文档时**引用某节的关键句**是极自然的冲动 —— 一旦引用出现在
+    **更靠前的位置**, `find` 就命中那个引用, 切片窗口随之落空 ⇒
+    **守卫失败, 而文档本身没有任何问题**。
+
+    **实测(本会话第 5 次"守卫自指涉")**: 我在「验首字节」那节里引用了 DISC-1 的
+    留痕原则原句来作类比, 结果 `test_rule_explains_why_guessing_is_worse` 与
+    `test_rule_links_to_the_implementation_and_guards` **两条同时失败** ——
+    它们以为自己在读 DISC-1, 实际读的是我那段编码说明。
+
+    处置: 把全文里**所有**对该句的引用改成同义描述, 使其**唯一**。
+    本条守卫把这个不变量锁住 —— 下次再有人引用, 会**立刻红**,
+    而不是让那两条 DISC-1 守卫以"找不到实现名"这种**误导性理由**失败。
+
+    ## 判据
+
+    > 凡被守卫当作**定位锚点**的字符串, 都必须**唯一**;
+    > 不唯一 ⇒ 改锚点(用行首锚定的小节标题), 或把其它引用改写成同义描述。
+    """
+
+    #: 被守卫用作定位锚点的关键句 -> 它应当出现在哪一节里
+    _ANCHORS = {
+        "宁可 None, 不猜": "### 同族纪律: 留痕字段",   # DISC-1 的小节标题
+    }
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_each_anchor_appears_exactly_once(self):
+        src = self._src()
+        for anchor, must_be_in in self._ANCHORS.items():
+            n = src.count(anchor)
+            assert n == 1, (
+                f"锚点 {anchor!r} 在全文出现 {n} 次 —— 必须唯一。"
+                "多处出现时, 用 src.find() 定位那一节的守卫会命中**更靠前的引用**"
+                "⇒ 切片落空 ⇒ 守卫以误导性理由失败(实测过)")
+            i = src.find(anchor)
+            # 它必须落在预期的那一节里(前后各看几行即可)
+            near = src[max(0, i - 200):i + 200]
+            assert "留痕字段" in near, (
+                f"锚点 {anchor!r} 已不在 DISC-1 的留痕小节附近, 实际上下文: {near[-120:]!r}")
+
+    def test_the_guard_is_not_vacuous(self):
+        """反向验证: 重复的锚点必须被抓到。"""
+        src = self._src()
+        anchor = "宁可 None, 不猜"
+        dup = src + "\n" + anchor + "\n"
+        for a in self._ANCHORS:
+            assert dup.count(a) == 2, "反向样本没造出重复 —— 断言会空转"
+
+
+class TestSameConclusionDifferentReasonsMustRecordCriteria:
+    """『结论相同、来由不同处, 必须连判据一起记』必须写进 DISC-2 ⑦ (2026-09-26 用户要求)。
+
+    用户指出: 它与 ⑤ **同族, 但更一般化** ——
+    ⑤ 要求「保留每层 `error` 字段」, 本质就是"不要只留最终那个 `ok`";
+    本条把它推广到**所有多来由的结论**(不限于错误信息)。
+    """
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def _form7_bounds(self, src):
+        """返回 ⑦ **正文小节**的字符区间。
+
+        必须**行首锚定且排除引用行** —— 否则会命中两个非小节的地方
+        (实测: 索引表里的一格内容、以及一段引用里的 `### ⑦` 字样),
+        这正是「识别条件必须覆盖所有格式」要求的做法。
+        """
+        lines = src.splitlines(keepends=True)
+        start = end = None
+        off = 0
+        for ln in lines:
+            if start is None:
+                if ln.startswith("### ⑦"):
+                    start = off
+            elif ln.startswith("### "):
+                end = off
+                break
+            off += len(ln)
+        if start is None:
+            return None, None
+        return start, (end if end is not None else len(src))
+
+    def test_subitem_present_under_form7(self):
+        src = self._src()
+        i = src.find("结论相同、来由不同处, 必须连判据一起记")
+        assert i > 0, "缺「结论相同、来由不同处必须连判据一起记」这条子条目"
+        a, b = self._form7_bounds(src)
+        assert a is not None, "找不到 ⑦ 的正文小节标题"
+        assert a < i < b, (
+            f"该子条目应落在 ⑦ 正文小节内({a}..{b}), 实际位置 {i}")
+
+    def test_the_bounds_helper_is_not_vacuous(self):
+        """反向验证: 边界必须是**正文小节**, 不能命中索引表或引用里的同名字样。"""
+        src = self._src()
+        a, b = self._form7_bounds(src)
+        assert a is not None, "没找到 ⑦ 小节"
+        # 起点必须是行首, 且前面不是表格行
+        assert src[a:a + 4] == "### ", "起点不在行首"
+        assert src.rfind("\n", 0, a) >= 0
+        prev_line = src[src.rfind("\n", 0, a) + 1:a]
+        assert not prev_line.startswith("|"), "命中了索引表的格子, 不是小节标题"
+        assert not prev_line.startswith(">"), "命中了引用行"
+        # 区间内必须真的含 ⑦ 的三条判据(否则切到了别处)
+        seg = src[a:b]
+        for kw in ("反过来才是真的", "能区分对错吗", "来由不同"):
+            assert kw in seg, f"⑦ 正文小节里缺判据: {kw}"
+
+    def test_gives_the_three_row_backfill_table(self):
+        """必须用**本仓真实**的三行判据表作实例, 而不是泛泛举例。"""
+        src = self._src()
+        i = src.find("结论相同、来由不同处, 必须连判据一起记")
+        blk = src[i:i + 3000]
+        for kw in ("A_engine_gap", "B_h5i_gap", "no_gap", "trigger"):
+            assert kw in blk, f"实例表里缺 {kw}"
+        assert "打印出来完全一样" in blk or "打印出来一模一样" in blk, (
+            "必须点明前两行**输出相同**(这才是问题所在)")
+
+    def test_explains_relation_to_form5_as_generalization(self):
+        """必须写清与 ⑤ 的关系是**更一般化**, 而不是重复。"""
+        src = self._src()
+        i = src.find("结论相同、来由不同处, 必须连判据一起记")
+        blk = src[i:i + 3000]
+        assert "更一般化" in blk, "应说明本条是 ⑤ 的推广"
+        assert "每层" in blk or "每層" in blk, "应点出 ⑤ 的落点是「保留每层 error」"
+        assert "特例" in blk, "应点明 ⑤ 是本条在错误传递场景下的特例"
+
+
+class TestJudgementRuleMustDiscriminate:
+    """⑦ 必须补「这个判据, 能区分对错吗?」—— 且用「叙述区段数 <= 4」作反例 (2026-09-26 用户要求)。"""
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_second_criterion_present(self):
+        src = self._src()
+        i = src.find("这个判据, 能区分对错吗?")
+        assert i > 0, "缺「这个判据能区分对错吗」这条判据"
+        blk = src[i:i + 2600]
+        assert "两种情况下结果相同" in blk or "两种情况" in blk, (
+            "必须给出判据: 两种情况结果是否不同")
+
+    def test_names_the_segment_count_counterexample(self):
+        """必须写明反例就是「叙述区段数 <= 4」, 且说明**方向相反**。"""
+        src = self._src()
+        i = src.find("这个判据, 能区分对错吗?")
+        blk = src[i:i + 2600]
+        assert "段数" in blk, "反例应点名「段数」这条判据"
+        assert "34" in blk, "应给出实测段数(34 段), 否则读者不知为何它错"
+        assert "方向相反" in blk or "相反" in blk, (
+            "必须点明它不只是无效, 而是**方向相反**(做对了失败、做错了通过)")
+
+    def test_gives_the_replacement_and_contrast_table(self):
+        src = self._src()
+        i = src.find("这个判据, 能区分对错吗?")
+        blk = src[i:i + 2600]
+        assert "占幅" in blk, "应给出替换后的判据(占幅 < 半篇)"
+        assert "能区分" in blk, "应有对照表(能区分? 列)"
+
+    def test_links_to_negative_sample_rule(self):
+        """必须与既有「负样本必须能触发守卫」挂钩, 否则两条规则看着重复。"""
+        src = self._src()
+        i = src.find("这个判据, 能区分对错吗?")
+        blk = src[i:i + 2600]
+        assert "负样本" in blk, "应说明它与「负样本必须能触发守卫」是同一件事的两个说法"
+
+
+class TestFirstBytesMustBeVerified:
+    """环境节必须固化「凡要交给别的程序读的文件, 写完都验一次首字节」(2026-09-26 用户要求)。"""
+
+    def _src(self):
+        return open(_DOC, encoding="utf-8").read()
+
+    def test_rule_present_in_env_section(self):
+        src = self._src()
+        i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
+        assert i > 0, "环境节缺「验首字节」这条"
+        blk = src[i:i + 3200]
+        for kw in ("bytes", "NULs", "BOM"):
+            assert kw in blk, f"必须给出三项验收({kw})"
+
+    def test_records_both_real_occurrences(self):
+        """本仓实测两次必须都记 —— 只记一次会显得像偶发。"""
+        src = self._src()
+        i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
+        blk = src[i:i + 3200]
+        assert "backfill_switch.json" in blk, "缺开关文件 BOM 那次"
+        assert "NUL" in blk, "缺提交信息 NUL 那次"
+        assert "Everything up-to-date" in blk, (
+            "应记下它的**连带症状**(push 报 up-to-date, 看起来像已推过)")
+
+    def test_gives_the_one_shot_write_and_read_defence(self):
+        src = self._src()
+        i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
+        blk = src[i:i + 3200]
+        assert "UTF8Encoding($false)" in blk, "必须给一次性写对的写法"
+        assert "utf-8-sig" in blk, "读侧必须给防御(utf-8-sig)"
+        assert "吞成默认值" in blk or "吞掉" in blk, (
+            "必须点明第 1 次就是被 except 吞掉才变成静默")
+
+    def test_this_doc_does_not_quote_the_anchor_phrase(self):
+        """**反向验证**: 这一节**不得**再引用 DISC-1 的定位锚点原句。
+
+        实测: 我第一版正是引用了它 ⇒ 两条 DISC-1 守卫失败(见
+        `TestDocAnchorPhrasesAreUnique`)。故这里锁住"本节的写法不会再犯"。
+        """
+        src = self._src()
+        i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
+        blk = src[i:i + 3200]
+        assert "宁可 None, 不猜" not in blk, (
+            "本节又引用了 DISC-1 的定位锚点原句 —— 会劫持那两条 DISC-1 守卫")
+
+
 class TestDisc2FormIndex:
     """DISC-2 的「失效形态索引」必须与详细章节**对得上** (2026-09-23, 用户建议)。
 
