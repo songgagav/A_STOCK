@@ -50,17 +50,88 @@ ENABLED_ENV = "BACKFILL_ENABLED"
 LOOKBACK_ENV = "BACKFILL_LOOKBACK_DAYS"
 DEFAULT_LOOKBACK_DAYS = 10
 
-
-def is_enabled(env=None) -> bool:
-    """是否允许自动回填。**默认关闭**; 只认显式的正数标志。"""
-    e = os.environ if env is None else env
-    return str(e.get(ENABLED_ENV, "0")).strip().lower() in ("1", "true", "yes", "on")
+#: 开关的**配置文件**(2026-09-25 新增)。见 `_load_switch_file` 的说明 ——
+#: 为什么光有环境变量不够。
+SWITCH_FP = os.path.join(os.path.dirname(_HERE), "data", "backfill_switch.json")
 
 
-def lookback_days(env=None) -> int:
-    e = os.environ if env is None else env
+def _load_switch_file(path: str | None = None) -> dict:
+    """读运行时开关文件 `data/backfill_switch.json`。
+
+    ## 为什么**必须有**这条路径(实测踩到, 不是预防性设计)
+
+    `run_daily` 是由**守护进程**(Windows 服务 `AStockDaemon`)以
+    `subprocess.Popen(cmd, cwd=_BASE, ...)` 拉起的, **没有传 `env=`** ——
+    即它继承的是**守护进程的环境**。
+
+    后果: 在交互式 shell 里 `$env:BACKFILL_ENABLED=1` 再手工跑 `run_daily`
+    **有效**; 但**守护自动拉起的那次完全看不到** —— 而我们要的恰恰是自动触发。
+    没有这个文件, 唯一的开启方式就变成"去改服务的环境变量并重启服务",
+    那既难验证也容易被忘掉(改完以为开了, 实际没生效)。
+
+    ## 取值优先级(**与 `factor_gate` 同一约定**)
+
+       环境变量  >  配置文件  >  代码默认值
+
+    环境变量优先: 它让"手工跑一次带开关"成为可能(不必改文件);
+    配置文件兜底: 它让**守护拉起的那次**也能拿到开关。
+
+    **文件不存在/读不动/格式错** => 返回 `{}`(即"没配") ⇒ 落到默认关闭。
+    **绝不因为读不到就当成开启** —— 那会让一个手滑的坏文件变成"自动写生产库"。
+
+    ## ⚠️ 必须用 `utf-8-sig` 读(实测踩到)
+
+    第一次实现用了普通 `utf-8`, 而用 PowerShell 写这个文件
+    (`Out-File -Encoding UTF8` / `Set-Content -Encoding UTF8`)**会带 UTF-8 BOM**
+    (`EF BB BF`)。于是 `json.load` 抛 `Unexpected UTF-8 BOM`,
+    被下面的 `except` 吞掉 ⇒ **文件明明写着 `enabled: true`, 却读成"没配"**,
+    开关静默保持关闭。
+
+    这与 `metrics_server` 里 `fusion_health.json` 踩过的是**同一个坑**
+    (那里已注明"Windows 工具如 PowerShell Set-Content -Encoding UTF8 会写 BOM")。
+    故此处同样用 `utf-8-sig` —— 它兼容带 BOM 与不带 BOM 两种。
+    """
+    p = path or SWITCH_FP
+    if not p or not os.path.exists(p):
+        return {}
     try:
-        return max(0, int(str(e.get(LOOKBACK_ENV, DEFAULT_LOOKBACK_DAYS)).strip()))
+        import json
+        # utf-8-sig: 兼容 PowerShell 写出的 BOM(见 docstring 说明)
+        with open(p, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def is_enabled(env=None, *, switch_fp=None) -> bool:
+    """是否允许自动回填。**默认关闭**; 优先级: 环境变量 > 开关文件 > 关。
+
+    只认显式的正数标志 —— 与"没配就是关"一致: 一个写错的值不该把回填打开。
+    """
+    e = os.environ if env is None else env
+    raw = e.get(ENABLED_ENV)
+    if raw is None:
+        raw = _load_switch_file(switch_fp).get("enabled")
+    if raw is None:
+        return False
+    # bool 直接判; 其余按字符串走白名单(避免 "0" 被当成真)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def lookback_days(env=None, *, switch_fp=None) -> int:
+    e = os.environ if env is None else env
+    raw = e.get(LOOKBACK_ENV)
+    if raw is None:
+        raw = _load_switch_file(switch_fp).get("lookback_days")
+    if raw is None:
+        return DEFAULT_LOOKBACK_DAYS
+    try:
+        return max(0, int(str(raw).strip()))
     except Exception:  # noqa: BLE001
         return DEFAULT_LOOKBACK_DAYS
 

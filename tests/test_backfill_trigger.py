@@ -173,6 +173,86 @@ class TestMissingDaysUsesTheCalendarNotGuessing:
         assert all(d >= "20260922" for d in narrow), narrow
 
 
+class TestSwitchFileBecauseEnvAloneIsNotEnough:
+    """开关键必须能通过**文件**打开 (2026-09-25 实测踩到)。
+
+    ## 为什么光有环境变量不够
+
+    `run_daily` 由**守护进程**(Windows 服务)以 `subprocess.Popen(cmd, cwd=_BASE, ...)`
+    拉起, **没有传 `env=`** ⇒ 它继承的是**守护进程的环境**。
+    于是: 在交互式 shell 里设 `$env:BACKFILL_ENABLED=1` 再手工跑 `run_daily`
+    **有效**; 但**守护自动拉起的那次完全看不到** —— 而我们要的恰恰是自动触发。
+
+    没有文件这条路, 唯一的开启方式就变成"改服务的环境变量并重启服务",
+    既难验证也容易被忘掉(**改完以为开了, 实际没生效** —— 本仓最忌讳的形状)。
+
+    ## 取值优先级(与 `factor_gate` 同一约定)
+
+        环境变量 > 配置文件(data/backfill_switch.json) > 代码默认值(关)
+    """
+
+    def _write(self, tmp_path, text, encoding="utf-8"):
+        p = os.path.join(str(tmp_path), "sw.json")
+        with open(p, "w", encoding=encoding) as f:
+            f.write(text)
+        return p
+
+    def test_no_file_no_env_means_disabled(self, tmp_path):
+        assert BT.is_enabled({}, switch_fp=os.path.join(str(tmp_path), "none.json")) is False
+
+    def test_file_can_enable(self, tmp_path):
+        p = self._write(tmp_path, '{"enabled": true}')
+        assert BT.is_enabled({}, switch_fp=p) is True
+
+    def test_env_overrides_file(self, tmp_path):
+        """环境变量优先 —— 它让"手工跑一次带开关"不必改文件。"""
+        p = self._write(tmp_path, '{"enabled": true}')
+        assert BT.is_enabled({BT.ENABLED_ENV: "0"}, switch_fp=p) is False
+        p2 = self._write(tmp_path, '{"enabled": false}')
+        assert BT.is_enabled({BT.ENABLED_ENV: "1"}, switch_fp=p2) is True
+
+    def test_bom_must_be_tolerated(self, tmp_path):
+        """**必须容忍 UTF-8 BOM** —— PowerShell 写这个文件一定会带 BOM。
+
+        实测: 普通 `utf-8` 读带 BOM 的文件会抛 `Unexpected UTF-8 BOM`,
+        被 `except` 吞掉 ⇒ **文件明明写着 `enabled: true`, 却读成"没配"**,
+        开关静默保持关闭。这与 `metrics_server` 里 `fusion_health.json`
+        踩过的是**同一个坑**。
+        """
+        p = os.path.join(str(tmp_path), "bom.json")
+        with open(p, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + '{"enabled": true}'.encode("utf-8"))
+        assert BT._load_switch_file(p) == {"enabled": True}, "带 BOM 的文件读不出来"
+        assert BT.is_enabled({}, switch_fp=p) is True
+
+    def test_bad_file_shapes_fall_back_to_disabled(self, tmp_path):
+        """坏文件/非 dict 一律当"没配" ⇒ **关**。
+
+        **绝不因为读不到就当成开启** —— 那会让一个手滑的坏文件变成"自动写生产库"。
+        方向性很重要: 宁可少补一次(人工可补), 不可误补一次(不可逆)。
+        """
+        assert BT.is_enabled({}, switch_fp=self._write(tmp_path, "{bad")) is False
+        assert BT.is_enabled({}, switch_fp=self._write(tmp_path, "[1,2,3]")) is False
+        assert BT.is_enabled({}, switch_fp=self._write(tmp_path, "null")) is False
+        assert BT.is_enabled({}, switch_fp=self._write(tmp_path, '{"enabled": "maybe"}')) is False
+        assert BT.is_enabled({}, switch_fp=self._write(tmp_path, "{}")) is False
+
+    def test_lookback_from_file(self, tmp_path):
+        p = self._write(tmp_path, '{"lookback_days": 3}')
+        assert BT.lookback_days({}, switch_fp=p) == 3
+        # 环境变量仍优先
+        assert BT.lookback_days({BT.LOOKBACK_ENV: "7"}, switch_fp=p) == 7
+
+    def test_switch_path_is_under_data_and_not_in_git(self):
+        """开关文件放在 `data/`(gitignored)—— 它含机器本地状态, 不该进版本库。"""
+        assert BT.SWITCH_FP.replace("\\", "/").endswith("data/backfill_switch.json"), \
+            BT.SWITCH_FP
+        gi = os.path.join(_REPO, ".gitignore")
+        assert os.path.isfile(gi)
+        txt = open(gi, encoding="utf-8").read()
+        assert "data/" in txt, "data/ 应被 gitignore(开关文件是本地状态)"
+
+
 class TestRunDailyWiring:
     """接线必须存在, 且**默认关闭**这个语义要在源码里看得到。"""
 

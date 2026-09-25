@@ -340,6 +340,78 @@ class TestEveryYamlUsingTestIsMarked:
                 f"{os.path.basename(p)} 用了 _needs_yaml 但没定义它")
 
 
+class TestGuardSelfReferenceIsDocumented:
+    """DISC-2 ⑥ 的补充实例「**守卫自指涉**」必须写进纪律 (用户 2026-09-25 要求)。
+
+    ## 为什么单列这一条
+
+    它与「守卫依赖缺失」并列但形态不同:
+
+    | 形态 | 现象 |
+    |---|---|
+    | 守卫依赖缺失 | 守卫**没跑** ⇒ 它保护的路径无人看守 |
+    | **守卫自指涉** | 守卫**跑了、也报了**, 但它报的是**它自己** |
+
+    实测: 2026-09-25 新加的静态守卫
+    `TestEveryYamlUsingTestIsMarked` **第一次运行就报了它自己** ——
+    因为它的**提示文本里**含 `yaml.safe_load` 这个模式串, 而
+    `ast.get_source_segment` 返回的片段**包含 docstring**。
+    即**"用来描述规则的话"被"规则的判据"当成了输入**。
+
+    **良性与恶性的分界**: 本次它**报错而非静默通过**(良性, 改掉即可);
+    但若某守卫的模式串**恰好只匹配它自己**、真实目标一个都不匹配,
+    它会**永远通过**并报告"全部合格" —— 那就退化成 ① 假信心测试,
+    且更隐蔽: 它看起来真的在检查。
+    """
+
+    _DOC_ = _DOC
+
+    def test_documented_under_form6(self):
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("### ⑥ 降级过程无告警")
+        assert i > 0
+        j = src.find("### 关于「已提交 vs 已推送」", i)
+        assert j > i, "找不到 ⑥ 节的结束边界"
+        block = src[i:j]
+        assert "守卫自指涉" in block, "⑥ 节缺「守卫自指涉」这个实例"
+        assert "守卫依赖缺失" in block, "应与「守卫依赖缺失」并列对照"
+
+    def test_explains_the_benign_vs_malignant_boundary(self):
+        """必须说清**良性(报错)与恶性(永远通过)**的分界 —— 这才是它的价值。"""
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("守卫自指涉")
+        block = src[i:i + 4200]
+        assert "假信心测试" in block, "应点明它可能退化成 ① 假信心测试"
+        assert "永远通过" in block, "应说明恶性形态是'永远通过'"
+        assert "docstring" in block, "应说明根因(get_source_segment 含 docstring)"
+
+    def test_gives_three_operational_rules(self):
+        """必须给出可操作做法, 而不是只描述现象。"""
+        src = open(self._DOC_, encoding="utf-8").read()
+        i = src.find("守卫自指涉")
+        block = src[i:i + 4200]
+        assert "声明" in block and "排除" in block, (
+            "应要求守卫**声明它排除了什么**")
+        assert "下限" in block or "total >=" in block or "扫描量" in block, (
+            "应要求加一条'扫描量下限'断言, 防止判据意外变窄")
+        assert "不变量" in block, "应点明'守卫要守不变量, 不要守实现细节'"
+
+    def test_the_described_guard_actually_has_the_safeguards(self):
+        """文档描述的那三道保险必须**真的在代码里** —— 否则文件在撒谎。
+
+        这是本仓一贯要求(文档点名的东西必须能被点到名)。
+        """
+        src = open(os.path.join(_REPO, "tests", "test_discipline_doc.py"),
+                   encoding="utf-8").read()
+        i = src.find("class TestEveryYamlUsingTestIsMarked")
+        assert i > 0
+        block = src[i:i + 3000]
+        assert "TestEveryYamlUsingTestIsMarked" in block, "自排除必须按**类名**(不是路径)"
+        assert "total >=" in block, "缺'扫描量下限'断言"
+        assert "本守卫自身除外" in block or "自身除外" in block, (
+            "排除必须写在断言文本里(声明的输入, 不是偷偷跳过)")
+
+
 class TestDisc1LoggingDiscipline:
     """DISC-1 同族纪律: 留痕字段**宁可 None, 不猜** (2026-09-25 用户要求)。"""
 
