@@ -24,8 +24,31 @@ import pytest
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
+#: 按**小节标题行首锚定**取区间的工具 —— 根治"用关键句首次出现定位一节"
+#: (那会被任何更靠前的**引用**劫持, 实测踩过; 见 tests/doc_section.py 的模块说明)
+sys.path.insert(0, os.path.join(_REPO, "tests"))
+from doc_section import find_unique, line_of, section_bounds  # noqa: E402
 
 _DOC = os.path.join(_REPO, "docs", "disciplines.md")
+
+#: `docs/disciplines.md` 里被多个守卫引用的**小节标题**(行首锚点)。
+#: 集中成常量 —— 同一件事写两处, 迟早只剩一处是对的。
+_DISC2 = "## DISC-2:"
+_INDEX = "### 失效形态索引"
+_DETAIL = "### 详细判据"
+_FORM7 = "### ⑦ "
+_FORM3B = "#### ③b"
+
+
+def _sec(src, heading, start=0):
+    """取小节全文 —— 薄封装, 让断言只关心"哪一节", 不关心偏移。
+
+    未找到时 `section_bounds` 会**抛错**(不是返回 -1) —— 这正是要取代
+    `src.find(标题)` + `src[i:i+N]` 那个写法: 后者在标题改名后会**静默取到文末**
+    (DISC-2 形态 ④b 边界腐烂)。
+    """
+    a, b = section_bounds(src, heading, start)
+    return src[a:b]
 
 
 class TestDisciplineDocExists:
@@ -235,7 +258,7 @@ class TestCrossCuttingPrinciples:
         """必须写清**为什么**: 注意力会耗尽且耗尽时不报警 —— 否则它只是句口号。"""
         src = self._src()
         i = src.find("依赖一次对照, 不依赖注意力")
-        block = src[i:i + 3600]
+        block = src[i:i + 2600]
         assert "耗尽" in block, "未说明注意力会耗尽"
         assert "不报警" in block or "不报" in block, (
             "未说明注意力耗尽时**不报警** —— 这正是它与本纪律要防的东西同源的原因")
@@ -268,7 +291,7 @@ class TestCrossCuttingPrinciples:
         """必须给一条**可执行的自检**, 而不是停在原则上。"""
         src = self._src()
         i = src.find("依赖一次对照, 不依赖注意力")
-        block = src[i:i + 3600]
+        block = src[i:i + 2600]
         assert "注意" in block and "小心" in block, "自检应点名那些无用的词"
         assert "改写" in block or "对照动作" in block, "自检应要求把它改写成对照动作"
 
@@ -373,28 +396,27 @@ class TestGuardSelfReferenceIsDocumented:
 
     def test_documented_under_form6(self):
         src = open(self._DOC_, encoding="utf-8").read()
-        i = src.find("### ⑥ 降级过程无告警")
-        assert i > 0
-        j = src.find("### 关于「已提交 vs 已推送」", i)
-        assert j > i, "找不到 ⑥ 节的结束边界"
-        block = src[i:j]
+        a, b = section_bounds(src, "### ⑥ ")
+        block = src[a:b]
         assert "守卫自指涉" in block, "⑥ 节缺「守卫自指涉」这个实例"
         assert "守卫依赖缺失" in block, "应与「守卫依赖缺失」并列对照"
 
     def _form6_block(self):
-        """⑥ 节的正文块 —— 用**标题**定位, 不用关键字(关键字可能先出现在别处)。
+        """⑥ 节的正文块 —— 用**标题行首锚定**, 不用关键字。
 
         [2026-09-25 自查] 本类原先用 `src.find("守卫自指涉")` 定位,
         而章首「守卫的设计原则」里也提到了"守卫自指涉", 于是**取到了章首那段** ⇒
         断言在一个完全无关的片段上失败(报"缺 docstring")。
-        教训与之前几次同源: **定位要用唯一锚点(标题), 不要用可能在多处出现的词**。
+        **教训与之后几次同源**: 定位要用**唯一的结构锚点(行首标题)**,
+        不要用"可能在别处出现的词"。
+
+        [2026-09-26 收口] 现改用 `section_bounds` —— 它自己负责"止于同级或更高级的
+        下一个标题", 故**不再需要第二个 `find` 当右边界**(那个写法正是
+        ④b「边界腐烂」的现场: 标题改名 ⇒ 右边界 -1 ⇒ 区间静默变形)。
         """
         src = open(self._DOC_, encoding="utf-8").read()
-        i = src.find("#### ⑥ 的补充实例")
-        assert i > 0, "找不到 ⑥ 的补充实例小节"
-        j = src.find("### 关于「已提交 vs 已推送」", i)
-        assert j > i, "找不到该小节的结束边界"
-        return src[i:j]
+        a, b = section_bounds(src, "#### ⑥ 的补充实例")
+        return src[a:b]
 
     def test_explains_the_benign_vs_malignant_boundary(self):
         """必须说清**良性(报错)与恶性(永远通过)**的分界 —— 这才是它的价值。"""
@@ -463,10 +485,9 @@ class TestGuardSelfReferenceIsDocumented:
         章首已有"依赖一次对照"那条共同原则, 设计原则与之并列最合适。
         """
         src = open(self._DOC_, encoding="utf-8").read()
-        i = src.find("## DISC-2:")
-        j = src.find("### 失效形态索引", i)
-        assert i > 0 and j > i
-        opening = src[i:j]
+        a, b = section_bounds(src, _DISC2)
+        j = section_bounds(src, _INDEX, a)[0]
+        opening = src[a:j]
         assert "守「不变量」" in opening or "守不变量" in opening, (
             "DISC-2 章首缺『守卫要守不变量』这条设计原则")
         assert "实现细节" in opening, "应点明不要守实现细节"
@@ -477,7 +498,7 @@ class TestGuardSelfReferenceIsDocumented:
         """设计原则必须**显式声明它与六种形态维度不同** —— 否则读者会以为它是第 7 种形态。"""
         src = open(self._DOC_, encoding="utf-8").read()
         i = src.find("守「不变量」")
-        block = src[i:i + 2000]
+        block = src[i:i + 2600]
         assert "设计" in block and "形态" in block, (
             "应说清: 六种形态说的是『守卫可能怎么失效』, 这条说的是『怎么写』")
 
@@ -511,8 +532,9 @@ class TestNetworkTroubleshootingHasTwoBranches:
         下次再出问题时多一个变量要排除。
         """
         src = open(_DOC, encoding="utf-8").read()
-        i = src.find("网络看着正常但 git 连不上", src.find("## 环境不可用项"))
-        block = src[i:i + 3200]
+        _a, _b = section_bounds(src, "## 环境不可用项")
+        i = line_of(src, "网络看着正常但 git 连不上", _a, _b)
+        block = src[i:_b]
         assert "一概归因" in block, "未点明「不能一概归因」"
         assert "自愈" in block, "应说明传输层波动会自愈"
         assert "留下来" in block or "多一个变量" in block, (
@@ -521,8 +543,9 @@ class TestNetworkTroubleshootingHasTwoBranches:
     def test_gives_the_classification_procedure(self):
         """必须给**先分类再动手**的可操作判据, 而不是只列两种现象。"""
         src = open(_DOC, encoding="utf-8").read()
-        i = src.find("网络看着正常但 git 连不上", src.find("## 环境不可用项"))
-        block = src[i:i + 3200]
+        _a, _b = section_bounds(src, "## 环境不可用项")
+        i = line_of(src, "网络看着正常但 git 连不上", _a, _b)
+        block = src[i:_b]
         assert "关键词" in block or "看错误文本" in block, "应教人看错误文本关键词分类"
         assert "Test-NetConnection" in block, "应用网络探测区分"
         assert "api.github.com" in block, (
@@ -530,25 +553,46 @@ class TestNetworkTroubleshootingHasTwoBranches:
 
 
 class TestDisc1LoggingDiscipline:
-    """DISC-1 同族纪律: 留痕字段**宁可 None, 不猜** (2026-09-25 用户要求)。"""
+    """DISC-1 同族纪律: 留痕字段**宁可 None, 不猜** (2026-09-25 用户要求)。
 
-    def _src(self):
-        return open(_DOC, encoding="utf-8").read()
+    ## [2026-09-26 根治] 本类原先用「某句关键话的首次出现」定位 DISC-1 那一节
+
+    原写法:
+
+    ```python
+    i = src.find("宁可 None, 不猜")     # 用关键句定位一节
+    block = src[i:i + 2600]            # 再取一个**拍的**窗口长度
+    ```
+
+    **两个独立缺陷, 都会让守卫静默失效**:
+
+    1. **锚点会被"引用"劫持** —— 实测踩到(本会话第 5 次守卫自指涉):
+       我在新增的「验首字节」小节里引用了这句原句作类比, 而引用**更靠前**
+       ⇒ `find` 命中引用 ⇒ 本类两条守卫**同时失败**, 而 DISC-1 一个字没改,
+       且报错理由是「未说明留痕是事后追溯的唯一依据」—— **指向错误的方向**;
+    2. **窗口长度是魔数** —— `i + 2600`: 该节一旦写长, 断言会**默默看不到**
+       后面的内容(不是失败, 是看不到)。
+
+    现改为 `section_bounds(src, "## DISC-1:")` **行首锚定**取整节:
+    区间由文档结构决定, 且**不受任何引用影响**。
+    工具见 `tests/doc_section.py`(自带守卫, 含"围栏代码块里的 `#` 不算标题")。
+    """
+
+    def _disc1(self):
+        """返回 DISC-1 小节的 `(src, 区间)` —— 单一来源, 不各写一份定位逻辑。"""
+        src = open(_DOC, encoding="utf-8").read()
+        return src, section_bounds(src, "## DISC-1:")
 
     def test_rule_present_under_disc1(self):
-        src = self._src()
-        i = src.find("## DISC-1:")
-        j = src.find("## DISC-2:")
-        assert i > 0 and j > i
-        block = src[i:j]
+        src, (a, b) = self._disc1()
+        block = src[a:b]
         assert "宁可 None, 不猜" in block, "DISC-1 下缺「留痕字段宁可 None, 不猜」"
         assert "留痕" in block, "应明确它管的是留痕/上报字段"
 
     def test_rule_explains_why_guessing_is_worse(self):
         """必须说清**为什么猜的日期比 None 危险** —— 否则会被当成"太保守"。"""
-        src = self._src()
-        i = src.find("宁可 None, 不猜")
-        block = src[i:i + 2600]
+        src, (a, b) = self._disc1()
+        block = src[a:b]
         assert "事后追溯" in block or "唯一依据" in block, (
             "未说明留痕是事后追溯的唯一依据")
         assert "当成事实" in block, "未说明猜测会被当成事实"
@@ -557,9 +601,8 @@ class TestDisc1LoggingDiscipline:
 
     def test_rule_links_to_the_implementation_and_guards(self):
         """必须点名实现与守卫 —— 文档说"有守卫"而守卫不存在, 就是文件在撒谎。"""
-        src = self._src()
-        i = src.find("宁可 None, 不猜")
-        block = src[i:i + 2600]
+        src, (a, b) = self._disc1()
+        block = src[a:b]
         assert "_engine_day" in block and "_h5i_watermark" in block, (
             "应点名实现(`_engine_day` / `_h5i_watermark`)")
         for fn in ("test_helpers_never_invent_a_date", "test_helpers_tolerate_exceptions"):
@@ -569,6 +612,25 @@ class TestDisc1LoggingDiscipline:
         cls = T.TestProvenanceCarriesTheSemanticClarification
         for fn in ("test_helpers_never_invent_a_date", "test_helpers_tolerate_exceptions"):
             assert hasattr(cls, fn), f"文档点名了 {fn}, 但它不存在"
+
+    def test_the_locator_is_heading_anchored_not_phrase_anchored(self):
+        """**反向验证**: 本类的定位**必须**对"更靠前的引用"免疫。
+
+        构造: 在 DISC-1 之前插一行引用关键句的文字;
+        断言本类使用的定位法取到的区间**仍然正确**(含实现名与依据句)。
+        """
+        src, (a0, b0) = self._disc1()
+        key = "宁可 None, 不猜"
+        # 旧写法在插入后会被劫持
+        hij = src[:a0] + f"> 引用: {key} —— 见 DISC-1\n" + src[a0:]
+        assert not (section_bounds(hij, "## DISC-1:")[0]
+                    <= hij.find(key) < section_bounds(hij, "## DISC-1:")[1]), (
+            "前提: 旧写法确实会被劫持")
+        # 新写法: 区间依旧正确
+        a2, b2 = section_bounds(hij, "## DISC-1:")
+        seg = hij[a2:b2]
+        assert "_engine_day" in seg, "新定位法受引用影响 —— 那这次改造就没起作用"
+        assert key in seg
 
 
 class TestBackfillTwoWayVerificationIsDocumented:
@@ -634,10 +696,7 @@ class TestErrorMagnitudeIsNotAttributionBasis:
 
     def test_rule_present_in_form5_block(self):
         src = self._src()
-        i = src.find("### ⑤ 归因在中间层丢失")
-        j = src.find("### ⑥ ", i)
-        assert i > 0 and j > i
-        block = src[i:j]
+        block = _sec(src, "### ⑤ ")
         # 实际措辞是 `错误的"规模"不作归因依据`(**带引号**) —— 我第一次写成不带引号的
         # `规模不作归因依据` 就匹配不到。教训: 断言文档时, 搜索串要**照抄原文**,
         # 不要凭记忆写。
@@ -713,9 +772,7 @@ class TestGuardMustNotDependOnGitignoredMachineState:
         assert "代码完全正确" in blk or "代码是对的" in blk or "而代码完全正确" in blk, (
             "章首摘要必须点明最反直觉的一点: **代码是对的**")
         # 正式形态 ③b 那一节必须点名真实的文件/用例/计数
-        k = src.find("#### ③b")
-        assert k > 0, "缺正式形态 ③b 小节"
-        sec = src[k:k + 6000]
+        sec = _sec(src, _FORM3B)
         assert "backfill_switch.json" in sec, "③b 一节必须点名真实的开关文件"
         assert "test_disabled_by_default" in sec, "③b 一节必须点名真实的失败用例"
         assert "2431" in sec, "必须给出当时的真实计数(2431 passed / 1 failed)"
@@ -726,18 +783,14 @@ class TestGuardMustNotDependOnGitignoredMachineState:
         若读者以为这是"改了代码导致回归", 他会去改代码; 正确的动作是改断言。
         """
         src = self._src()
-        k = src.find("#### ③b")
-        assert k > 0, "缺正式形态 ③b 小节"
-        sec = src[k:k + 6000]
+        sec = _sec(src, _FORM3B)
         assert "不是回归" in sec, "必须明确写出「这不是回归」"
         assert "显式输入" in sec, "必须给出正解: 把前提改成**显式输入**"
 
     def test_distinguishes_it_from_form3(self):
         """必须与 ③「前置状态没造出来」区分开 —— 否则形态边界就糊了。"""
         src = self._src()
-        k = src.find("#### ③b")
-        assert k > 0, "缺正式形态 ③b 小节"
-        sec = src[k:k + 3000]
+        sec = _sec(src, _FORM3B)
         assert "没造出来" in sec and "外部" in sec, (
             "应说清: ③ 是自己没造前置状态, ③b 是被**外部**改变了")
         assert "并列" in sec, "应声明 ③b 与 ③ **并列**而不是第 9 种形态"
@@ -762,9 +815,8 @@ class TestGuardMustNotDependOnGitignoredMachineState:
     def test_form3b_and_form7_are_both_in_the_index(self):
         """③b 与 ⑦ 必须**同时**出现在索引表里 —— 否则读者扫不到。"""
         src = self._src()
-        i = src.find("### 失效形态索引")
-        j = src.find("### 详细判据", i)
-        idx = src[i:j]
+        a, b = section_bounds(src, "### 失效形态索引")
+        idx = src[a:b]
         assert "| **③b" in idx, "索引里缺 ③b 行"
         assert "| **⑦" in idx, "索引里缺 ⑦ 行"
         # 两条都必须是**独立行**, 不能并进 ③ / ⑥ 的格里
@@ -1303,7 +1355,7 @@ class TestGuardRecognitionMustCoverAllFormats:
         """必须要求一条「识别区非空」的反向验证 —— 否则识别条件可能空转。"""
         src = self._src()
         i = src.find("识别条件必须覆盖该节的所有可能格式")
-        blk = src[i:i + 3000]
+        blk = src[i:i + 2600]
         assert "识别区非空" in blk or "非空" in blk, (
             "必须要求反向验证: 识别出的区域**确实有内容**")
         assert "识别一切" in blk or "识别不到" in blk, (
@@ -1437,7 +1489,7 @@ class TestSameConclusionDifferentReasonsMustRecordCriteria:
         """必须用**本仓真实**的三行判据表作实例, 而不是泛泛举例。"""
         src = self._src()
         i = src.find("结论相同、来由不同处, 必须连判据一起记")
-        blk = src[i:i + 3000]
+        blk = src[i:i + 2600]
         for kw in ("A_engine_gap", "B_h5i_gap", "no_gap", "trigger"):
             assert kw in blk, f"实例表里缺 {kw}"
         assert "打印出来完全一样" in blk or "打印出来一模一样" in blk, (
@@ -1447,7 +1499,7 @@ class TestSameConclusionDifferentReasonsMustRecordCriteria:
         """必须写清与 ⑤ 的关系是**更一般化**, 而不是重复。"""
         src = self._src()
         i = src.find("结论相同、来由不同处, 必须连判据一起记")
-        blk = src[i:i + 3000]
+        blk = src[i:i + 2600]
         assert "更一般化" in blk, "应说明本条是 ⑤ 的推广"
         assert "每层" in blk or "每層" in blk, "应点出 ⑤ 的落点是「保留每层 error」"
         assert "特例" in blk, "应点明 ⑤ 是本条在错误传递场景下的特例"
@@ -1510,7 +1562,7 @@ class TestFirstBytesMustBeVerified:
         """本仓实测两次必须都记 —— 只记一次会显得像偶发。"""
         src = self._src()
         i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
-        blk = src[i:i + 3200]
+        blk = src[i:i + 2600]
         assert "backfill_switch.json" in blk, "缺开关文件 BOM 那次"
         assert "NUL" in blk, "缺提交信息 NUL 那次"
         assert "Everything up-to-date" in blk, (
@@ -1519,7 +1571,7 @@ class TestFirstBytesMustBeVerified:
     def test_gives_the_one_shot_write_and_read_defence(self):
         src = self._src()
         i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
-        blk = src[i:i + 3200]
+        blk = src[i:i + 2600]
         assert "UTF8Encoding($false)" in blk, "必须给一次性写对的写法"
         assert "utf-8-sig" in blk, "读侧必须给防御(utf-8-sig)"
         assert "吞成默认值" in blk or "吞掉" in blk, (
@@ -1533,7 +1585,7 @@ class TestFirstBytesMustBeVerified:
         """
         src = self._src()
         i = src.find("凡要交给别的程序读的文件, 写完都验一次首字节")
-        blk = src[i:i + 3200]
+        blk = src[i:i + 2600]
         assert "宁可 None, 不猜" not in blk, (
             "本节又引用了 DISC-1 的定位锚点原句 —— 会劫持那两条 DISC-1 守卫")
 
@@ -1685,9 +1737,8 @@ class TestDisc2FormIndex:
         而"没有优先级的索引"与"没有索引"在排查时的效果一样。
         """
         src = self._src()
-        i = src.find("### 失效形态索引")
-        j = src.find(self._DETAIL_HEADING, i)
-        block = src[i:j]
+        a, b = section_bounds(src, "### 失效形态索引")
+        block = src[a:b]
         for f in ("④", "④b", "⑤", "⑥", "⑦"):
             row = [ln for ln in block.splitlines() if ln.strip().startswith(f"| **{f}")]
             assert row, f"索引表里找不到形态 {f} 的行"
