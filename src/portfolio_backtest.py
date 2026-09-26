@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
@@ -182,7 +183,8 @@ def simulate_portfolio(dates: Sequence[str], symbols: Sequence[str], weights: np
                        book_factory: Callable[[], object] | None = None,
                        invest_ratio: float | None = None,
                        init_capital: float | None = None,
-                       rebalance_band: float = 0.0) -> dict:
+                       rebalance_band: float = 0.0,
+                       min_hold_days: int | None = None) -> dict:
     """用 `paper_book.PaperBook` 走一遍日频撮合, 得到组合净值曲线。
 
     Parameters
@@ -196,6 +198,8 @@ def simulate_portfolio(dates: Sequence[str], symbols: Sequence[str], weights: np
         参数化是为了测试里能注入一个受控账本, 同时生产路径用的仍是同一个类。
     rebalance_band : 权重变化小于该值就不动手(降摩擦)。**默认 0 = 不动既有行为**;
         生产接线处显式传 config 的值。
+    min_hold_days : 最小持仓天数(日历日); **None = 读 `config.PAPER["min_hold_days"]`**。
+        显式传入是为了让测试不依赖机器配置(DISC-2 形态 ③b: 前提要成为显式输入)。
 
     返回 {'curve','final_equity','total_return_pct','max_drawdown_pct',
           'trades','turnover_pct','orders_skipped','leg_exposure'} 等。
@@ -256,11 +260,43 @@ def simulate_portfolio(dates: Sequence[str], symbols: Sequence[str], weights: np
             return t is not False
 
         # --- 1) 先卖: 权重降到目标以下 / 离场的 ---
+        #
+        # [2026-09-27 修: 补 `min_hold_days` 门槛 —— 口径分叉]
+        #
+        # **问题**: 本模块此前**没有**最小持仓天数判定, 于是它做的是
+        # **每日全量再平衡**。实测后果: 10 天窗口换手 **484%**
+        # (= 2.42 个完整往返 ⇒ 隐含持有期约 4.1 天), 而 `config.PAPER`
+        # 明写 `min_hold_days=2`, 且 `realtime_engine.py:952`(实盘)与
+        # `backtest_engine.py:433` **都按它跳过"持仓不足 N 天"的卖出**。
+        # ⇒ 本模块产出的换手/收益**不忠实于实盘约束**, 与"回测池与虚拟盘池
+        #   分叉"是同一类问题(口径分叉): 同一个名字下面跑的不是同一件事。
+        #
+        # **为什么不去调 `paper_book.rebalance`**: 那条路径用 `band` 语义做
+        # 权重再平衡, 与本模块的"目标市值差分"撮合口径不同; 换过去会**同时**
+        # 改变成本口径与撮合顺序, 那就不是"补齐一个门槛", 而是"换一套回测"。
+        # 故此处按 `backtest_engine` 的既有语义**逐行对齐**地补上。
+        #
+        # 语义与 `backtest_engine.py:433-446` 完全一致(含"日历日"这个既有口径
+        # 与其 `held=999` 的异常兜底), 以便两个回测给出可比的数。
+        # `min_hold_days=None` ⇒ 读生产配置; 显式传入则用传入值(测试用)。
+        min_hold = (int(PAPER.get("min_hold_days", 0) or 0)
+                    if min_hold_days is None else int(min_hold_days))
         for canon in list(getattr(pb, "positions", {}).keys()):
             pr = px.get(canon, 0.0)
             if pr <= 0 or not _ok(canon):
                 skipped += 1
                 continue
+            # 最小持仓天数: 持仓不足 N 天不出售(与 backtest_engine 同语义)
+            if min_hold > 0:
+                buy_date = pb.positions[canon].get("buy_date")
+                if buy_date:
+                    try:
+                        held = (datetime.date.fromisoformat(day) -
+                                datetime.date.fromisoformat(str(buy_date))).days
+                    except Exception:  # noqa: BLE001
+                        held = 999          # 解析不了不阻断(与既有实现一致)
+                    if held < min_hold:
+                        continue
             cur_qty = pb.positions[canon]["qty"]
             tgt = target_mv.get(canon, 0.0)
             cur_mv = cur_qty * pr

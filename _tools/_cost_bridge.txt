@@ -1,0 +1,35 @@
+窗口: 2026-09-11 .. 2026-09-24  (10 天)
+改造前产物: turnover=484.1049%  return=-5.8972%  trades=57  max_dd=6.5035%
+
+=== A) 补 min_hold_days 之后(生产口径: min_hold=2) ===
+  [min_hold=2 (生产)] return=-5.4929%  turnover=407.87%  trades=48  max_dd=6.1018%
+
+=== B) 精确成本桥接: 费用与滑点归零 ===
+  [零成本] return=-5.1263%  turnover=407.87%  trades=48  max_dd=5.7994%
+
+=== C) 持有期规则对比(覆盖 min_hold_days) ===
+  [min_hold=0] return=-5.8972%  turnover=484.10%  trades=57  max_dd=6.5035%
+  [min_hold=2] return=-5.4929%  turnover=407.87%  trades=48  max_dd=6.1018%
+  [min_hold=5] return=-4.3645%  turnover=282.39%  trades=31  max_dd=4.9807%
+  [min_hold=10] return=-4.3645%  turnover=282.39%  trades=31  max_dd=4.9807%
+  [min_hold=20] return=-2.5632%  turnover=98.24%  trades=11  max_dd=3.1910%
+
+=== 桥接表(生产口径 min_hold=2) ===
+  项                                     数值
+  ----------------------------------------
+  零成本(毛)收益                        -5.1263%
+  生产口径(净)收益                       -5.4929%
+  => 成本贡献                         -0.3666pp
+  换手(生产口径)                         407.87%
+  => 每 1% 换手的成本(bp)                 -8.99bp
+
+  改造前(无 min_hold)                 -5.8972%   turnover=484.10%
+  => min_hold 修复带来的改善             +0.4043pp
+
+=== 持有期规则汇总 ===
+   min_hold         换手%         收益%      交易数       最大回撤%
+          0      484.10     -5.8972       57      6.5035
+          2      407.87     -5.4929       48      6.1018
+          5      282.39     -4.3645       31      4.9807
+         10      282.39     -4.3645       31      4.9807
+         20       98.24     -2.5632       11      3.1910

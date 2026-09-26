@@ -242,12 +242,60 @@ class TestSimulatePortfolio:
         assert all(t["side"] == "buy" for t in day1)
 
     def test_exit_when_weight_goes_to_zero(self):
+        """权重归零即离场 —— 但**受 `min_hold_days` 约束**, 故显式关掉它。
+
+        [2026-09-27 修正] 本用例原先**隐式依赖** `config.PAPER["min_hold_days"]`
+        为 0/缺失。补上门槛后它失败(首笔卖单从 09-02 推到 09-03) ——
+        这不是回归, 是它此前依赖了一个**它没有声明的环境前提**。
+        按 DISC-2 形态 ③b: 把前提改成**显式输入**。
+        """
         prices = {("2026-09-01", "AAA"): 10.0, ("2026-09-02", "AAA"): 10.0,
                   ("2026-09-03", "AAA"): 10.0}
         w = [[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
-        res = self._run(w, prices, invest_ratio=0.4)
+        res = self._run(w, prices, invest_ratio=0.4, min_hold_days=0)
         sells = [t for t in res["trade_log"] if t["side"] == "sell"]
         assert sells and sells[0]["day"] == "2026-09-02"
+
+    def test_min_hold_days_blocks_early_exit(self):
+        """**补的门槛**: `min_hold_days=2` 时, 09-01 买入的仓位 09-02 不得卖出。
+
+        语义与 `backtest_engine.py:433-446` **逐行对齐**(**日历日**口径:
+        `(day - buy_date).days < min_hold` ⇒ 09-01 买、09-02 只差 1 天 ⇒ 拦住;
+        09-03 差 2 天 ⇒ 放行)。
+        """
+        prices = {("2026-09-01", "AAA"): 10.0, ("2026-09-02", "AAA"): 10.0,
+                  ("2026-09-03", "AAA"): 10.0}
+        w = [[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+        res = self._run(w, prices, invest_ratio=0.4, min_hold_days=2)
+        sells = [t for t in res["trade_log"] if t["side"] == "sell"]
+        assert sells, "第 3 天应放行卖出(已持 2 个日历日)"
+        assert sells[0]["day"] == "2026-09-03", (
+            f"门槛未生效: 09-02 就卖了({sells[0]['day']})")
+        assert not [t for t in res["trade_log"]
+                    if t["side"] == "sell" and t["day"] == "2026-09-02"], \
+            "持仓仅 1 天, 不该卖出"
+
+    def test_min_hold_days_reads_from_paper_config(self):
+        """不传参时必须回落到 `PAPER["min_hold_days"]`(即生产配置真的被读)。
+
+        零门槛的对照: 同一场景传 0 就应立即卖出 —— 两者一起证明
+        **参数确实在起作用**, 而不是"恰好都没卖"(空断言)。
+        """
+        from config import PAPER
+        prices = {("2026-09-01", "AAA"): 10.0, ("2026-09-02", "AAA"): 10.0,
+                  ("2026-09-03", "AAA"): 10.0}
+        w = [[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+        res = self._run(w, prices, invest_ratio=0.4)      # 不传 => 读 config
+        prod = int(PAPER.get("min_hold_days", 0) or 0)
+        sells = [t for t in res["trade_log"] if t["side"] == "sell"]
+        assert sells, "无论如何最终都应卖出(否则是空断言)"
+        first_sell = sells[0]["day"]
+        if prod >= 2:
+            assert first_sell == "2026-09-03", (
+                f"生产 min_hold_days={prod}, 首笔卖单应在 09-03, 实际 {first_sell}")
+        else:
+            assert first_sell == "2026-09-02", (
+                f"生产 min_hold_days={prod}, 首笔卖单应在 09-02, 实际 {first_sell}")
 
     def test_no_price_means_skipped(self):
         w = [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
