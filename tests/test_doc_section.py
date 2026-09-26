@@ -210,7 +210,80 @@ class TestHeadingsIn:
         assert lv["### 留痕字段: 要么如实, 要么留空"] == 3
 
 
-class TestItIsUsedOnTheRealDoc:
+class TestCodeBlockBounds:
+    """`code_block_bounds` —— 取代 `src[i:i + 700]` 这类"拍的窗口"。
+
+    ## 为什么必须换 (2026-09-26 实测)
+
+    魔数窗口有两个方向的失效, **都不会报错**:
+      · 太短 ⇒ 断言**看不到**本该看到的东西(静默失败, 而它是绿的);
+      · 太长 ⇒ 断言被**下一段代码**满足 ⇒ 它验的**不是**它声称要验的那段。
+        实测: `### 6.13` 的 `i + 4000` 窗口跨进了 6.14 的「观测 ①」,
+        于是 `A_engine_gap` / `B_h5i_gap` 是**观测 ① 里**的字符串在满足断言。
+    """
+
+    SRC = (
+        "def a():\n"
+        "    x = 1\n"
+        "    return x\n"
+        "\n"
+        "\n"
+        "def b():\n"
+        "    y = 2\n"
+        "    return y\n"
+        "\n"
+        "\n"
+        "class C:\n"
+        "    pass\n"
+    )
+
+    def test_stops_at_next_top_level_def(self):
+        from doc_section import code_block_bounds
+
+        i = self.SRC.index("def a():")
+        end = code_block_bounds(self.SRC, i)
+        seg = self.SRC[i:end]
+        assert "return x" in seg
+        assert "def b():" not in seg, "块应止于下一个顶格 def"
+        assert "y = 2" not in seg
+
+    def test_stops_at_top_level_class(self):
+        from doc_section import code_block_bounds
+
+        i = self.SRC.index("def b():")
+        seg = self.SRC[i:code_block_bounds(self.SRC, i)]
+        assert "return y" in seg
+        assert "class C:" not in seg
+
+    def test_last_block_goes_to_eof(self):
+        from doc_section import code_block_bounds
+
+        i = self.SRC.index("class C:")
+        assert code_block_bounds(self.SRC, i) == len(self.SRC)
+
+    def test_nested_def_does_not_truncate(self):
+        """**关键**: 内嵌的 `def`(有缩进)**不得**提前结束块。
+
+        否则 `src[i:end]` 会在函数体中间被截断 —— 那正是"窗口太短"的静默失效。
+        """
+        from doc_section import code_block_bounds
+
+        src = (
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    z = inner()\n"
+            "    return z\n"
+            "\n"
+            "\n"
+            "def next_one():\n"
+            "    pass\n"
+        )
+        i = src.index("def outer():")
+        seg = src[i:code_block_bounds(src, i)]
+        assert "z = inner()" in seg, "内嵌 def 导致块被提前截断"
+        assert "def next_one" not in seg
+
     """工具必须**真的用在真文档上** —— 只在小样本上通过不算。"""
 
     _DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
@@ -449,7 +451,7 @@ class TestWiring:
         src = inspect.getsource(RD.run_daily)
         assert "datasource_gate" in src
         i = src.find("datasource_gate")
-        block = src[i:i + 2500]
+        block = src[i:code_block_bounds(src, i)]
         assert "ds_allow" in src or "allow" in block
         assert "跳过摄入" in src or "skip" in block.lower()
 
@@ -460,7 +462,7 @@ class TestWiring:
         src = inspect.getsource(RD.run_daily)
         i = src.find("ds_allow")
         assert i > 0
-        block = src[i:i + 3000]
+        block = src[i:code_block_bounds(src, i)]
         assert "自选股/持仓归档" in block or "持仓归档照常" in block
 
     def test_run_daily_probes_the_engine(self):

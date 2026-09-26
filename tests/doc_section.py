@@ -41,7 +41,7 @@ i = line_of(src, "事后追溯", a, b)   # 在该节内定位一句话(可选)
 from __future__ import annotations
 
 __all__ = ["section_bounds", "line_of", "headings_in", "find_unique",
-           "line_index", "scan_lines"]
+           "line_index", "scan_lines", "code_block_bounds", "lines_after"]
 
 
 def line_index(src: str, off: int) -> int:
@@ -70,6 +70,54 @@ def scan_lines(src: str, needle: str) -> list:
         if needle in ln:
             out.append((n, ln))
     return out
+
+
+def code_block_bounds(src: str, start: int) -> int:
+    """给定源码里某个位置, 返回**它所在代码块的结束偏移**。
+
+    ## 取代 `src[i:i + 700]` 这类"拍的窗口"
+
+    多个守卫的写法是「先找到某个函数的定义/某句关键代码, 再看它**往后**若干字符
+    里有没有某件事」。那个"若干"是**拍的**:
+
+    · 太短 ⇒ 断言**看不到**本该看到的东西(**静默失败** —— 而它是"绿"的);
+    · 太长 ⇒ 断言被**下一段代码**满足, 于是它验的不是它声称要验的那段
+      (2026-09-26 实测: `### 6.13` 的窗口跨进了 6.14 的「观测 ①」)。
+
+    本函数用**结构**代替魔数: 块止于下一个**顶格**的 `def` / `class` / `async def`。
+
+    ## ⚠️ 适用边界(2026-09-26 实测踩到, 必读)
+
+    它**只**适用于"**整个函数体**"这种结构 —— 因为**顶格 `def` 就是函数体的天然边界**。
+    若你要看的是函数**内部**的一段(某个 `if` 分支、某个 `try` 块), 顶格 `def`
+    **可能是很远的未来**, 于是区间会**变长**, 可能把本该排除的东西也包进来
+    (实测: `if _dec.get("halt"):` 的"不含 `_build_target_plan`"断言因此变红 ——
+    因为那个调用在同级的 `else` 分支里, 属于**同一个函数剩余部分**)。
+    这种情形请用 `lines_after`(按**行**数并写明理由), 或改成基于 `ast` 的判据。
+    """
+    n = len(src)
+    end = n
+    for kw in ("\ndef ", "\nclass ", "\nasync def "):
+        j = src.find(kw, start + 1)
+        if j >= 0:
+            end = min(end, j + 1)      # 保留换行, 便于后续按行处理
+    return end
+
+
+def lines_after(src: str, off: int, n_lines: int) -> str:
+    """返回 `off` 起**若干行**的片段 —— 按行计, 比按字符计更可读、更可复现。
+
+    ## 什么时候用它, 而不是 `code_block_bounds`
+
+    当要看的是**函数内部的一段**(不是整个函数体)时, 顶格 `def` 不是边界。
+    此时按**行**取一个明确的行数, 并**在调用处写明为什么是这个行数** ——
+    即把原先隐藏的魔数**变成一个带理由的显式参数**。
+
+    这不能消除"窗口是拍"的风险, 但能让它**可审查**: 读者能看到具体行数,
+    而 `src[i:i + 400]` 里的 400 往往没人知道是怎么来的。
+    """
+    lines = src[off:].splitlines(keepends=True)
+    return "".join(lines[:n_lines])
 
 
 def _iter_heading_lines(src: str):

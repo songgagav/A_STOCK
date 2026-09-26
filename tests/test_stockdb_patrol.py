@@ -19,6 +19,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
@@ -171,7 +173,7 @@ class TestPatrolIsWired:
         src = inspect.getsource(D)
         i = src.find("dash_tick >= 20")
         assert i > 0, "找不到 5 分钟看护块"
-        block = src[i:i + 400]
+        block = src[i:code_block_bounds(src, i)]
         assert "_ensure_stockdb()" in block, "行情引擎巡检未接进周期看护"
         assert "_ensure_dashboard()" in block and "_ensure_obs_stack()" in block
 

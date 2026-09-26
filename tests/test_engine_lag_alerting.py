@@ -31,6 +31,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 if _SRC not in sys.path:
@@ -88,7 +90,7 @@ class TestMetricIsExposed:
         # 缺字段分支里必须在 return 之前就 set read_ok=0, 且**不得** set lag=0
         i_none = src.find("if lag is None")
         assert i_none > 0, "没有处理'字段缺失'的分支"
-        branch = src[i_none:i_none + 400]
+        branch = src[i_none:code_block_bounds(src, i_none)]
         assert "_g_engine_lag_read_ok.set(0)" in branch
         assert "_g_engine_lag.set(0" not in branch, (
             "缺字段分支把 lag 记成了 0 —— 那会让'读不到'显示成'已追平'")

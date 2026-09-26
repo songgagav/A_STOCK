@@ -1272,11 +1272,29 @@ class TestBackfillObservationMustRecordCriteria:
     def _src(self):
         return open(self._DOC2, encoding="utf-8").read()
 
-    def test_checklist_has_a_mandatory_criteria_step(self):
+    def _613(self):
+        """返回 §6.13 的**实际**区间 —— 从 `### 6.13` 到 `### 6.14`。
+
+        [2026-09-26 实测] 不能简单用 `section_bounds(src, "### 6.13")`:
+        该节的内容**挂在后续几个 `##` 标题之下**(`## 检查顺序` / `## 关于「长期开启」`),
+        故 `section_bounds` 在第一个 `##` 就结束了 —— 那是**正确的 Markdown 语义**,
+        但这个文档的**语义分组**是"6.13 一直管到 6.14 之前"。
+        ⇒ 显式取到 6.14 作右边界。
+
+        **顺带修正一个既有的隐性缺陷**: 原写法是
+        `i = src.find("### 6.13"); blk = src[i:i + 4000]` —— 那个窗口
+        **跨进了 §6.14 的「观测 ①」**, 于是 `A_engine_gap` / `B_h5i_gap`
+        是**观测 ① 里**的字符串在满足断言, 而不是 6.13 的检查单本身。
+        **魔数窗口让断言"通过了", 但它验的不是它声称要验的东西。**
+        """
         src = self._src()
-        i = src.find("### 6.13")
-        assert i > 0, "缺 §6.13"
-        blk = src[i:i + 4000]
+        a = section_bounds(src, "### 6.13")[0]
+        b = section_bounds(src, "### 6.14")[0]
+        assert a < b, "6.13 / 6.14 的先后不对"
+        return src, src[a:b]
+
+    def test_checklist_has_a_mandatory_criteria_step(self):
+        src, blk = self._613()
         assert "criteria" in blk, "§6.13 检查单里没提 criteria"
         assert "A_engine_gap" in blk and "B_h5i_gap" in blk, (
             "必须**分别**列出两个布尔值(只写 criteria 不够明确)")
@@ -1286,10 +1304,7 @@ class TestBackfillObservationMustRecordCriteria:
 
     def test_explains_the_two_reasons_for_no_gap(self):
         """必须给出那张三行表 —— 否则读者不知道"为什么要记两个布尔值"。"""
-        src = self._src()
-        i = src.find("为什么 `criteria` 是**必记项**")
-        assert i > 0, "缺「为什么 criteria 是必记项」小节"
-        blk = src[i:i + 2600]
+        src, blk = self._613()
         assert "两个来由" in blk or "两个不同来由" in blk, "应点明 no_gap 有两个来由"
         # 三行都要有
         assert "false" in blk and "true" in blk, "缺判据取值"
@@ -1299,9 +1314,7 @@ class TestBackfillObservationMustRecordCriteria:
     def test_observation_1_actually_recorded_both_values(self):
         """**以身作则**: 观测 ① 必须真的记了 A/B 两个值, 不能只记 action。"""
         src = self._src()
-        i = src.find("#### 观测 ①")
-        assert i > 0, "缺观测 ①"
-        blk = src[i:i + 2000]
+        blk = _sec(src, "#### 观测 ①")
         assert "A_engine_gap" in blk and "B_h5i_gap" in blk, (
             "观测 ① 没记 criteria 两值 —— 那条纪律自己就没被遵守")
         assert "true" in blk and "false" in blk, "观测 ① 的判据取值不全"
@@ -1309,9 +1322,7 @@ class TestBackfillObservationMustRecordCriteria:
     def test_observation_2_checklist_also_requires_criteria(self):
         """走向 A/B 的判定必须**基于 criteria**, 而不是"看引擎日期猜"。"""
         src = self._src()
-        i = src.find("#### 观测 ②")
-        assert i > 0, "缺观测 ②"
-        blk = src[i:i + 2600]
+        blk = _sec(src, "#### 观测 ②")
         assert "A_engine_gap" in blk, "观测 ② 的清单必须以 criteria 为判据"
         assert "B 决定 action" in blk or "**B 决定" in blk, (
             "应写清: 厂商未恢复时由 **B** 决定是否 trigger")

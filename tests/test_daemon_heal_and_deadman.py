@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+from doc_section import code_block_bounds  # noqa: E402
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
@@ -49,7 +50,7 @@ class TestEngineHealDoesNotDependOnVolatileMemory:
         import daemon as D
         src = inspect.getsource(D.run_loop)
         i = src.find("elif _state[\"running_day\"] != day_str")
-        block = src[i:i + 2200]
+        block = src[i:code_block_bounds(src, i)]
         assert "_log(" in block, "自愈分支里没有任何日志 —— 失效又会变静默"
         assert "_proc_alive(" in block
 
@@ -70,7 +71,7 @@ class TestEngineHealDoesNotDependOnVolatileMemory:
         i = src.find("elif _state[\"running_day\"] != day_str")
         assert i > 0
         # 自愈块必须在遇到收盘闸门时**放弃重启**并转入 engine_done
-        block = src[i:i + 2200]
+        block = src[i:code_block_bounds(src, i)]
         assert "dtime(15, 3)" in block, "自愈分支缺少收盘时间闸门 => 收盘后会无限重启"
         assert "engine_done" in block, "过了收盘窗口应标记完成, 而不是继续拉引擎"
 

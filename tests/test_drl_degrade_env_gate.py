@@ -33,6 +33,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 sys.path.insert(0, _SRC)
@@ -92,7 +94,7 @@ class TestProbeRuntime:
         import importlib.util as iu
         src = open(os.path.join(_SRC, "drl_degrade.py"), encoding="utf-8").read()
         i = src.index("def probe_runtime")
-        seg = src[i:i + 1400]
+        seg = src[i:code_block_bounds(src, i)]
         assert "find_spec" in seg
         assert "import torch" not in seg and "import h5i_db" not in seg
         assert iu.find_spec  # 存在性

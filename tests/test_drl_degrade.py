@@ -31,6 +31,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds, lines_after  # noqa: E402
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 sys.path.insert(0, _SRC)
@@ -532,17 +534,17 @@ class TestNoSilentFailurePathsInTrain:
         """`_load_factor_state` 抛异常也必须走降级链（原先在外层 try 之外 -> 逃出函数）。"""
         src = self._src()
         i = src.index("因子状态数据源不可用")
-        assert "_degrade_on_failure" in src[i:i + 700]
+        assert "_degrade_on_failure" in src[i:code_block_bounds(src, i)]
 
     def test_data_insufficient_path_goes_through_chain(self):
         src = self._src()
         i = src.index("数据不足 (<15 日)")
-        assert "_degrade_on_failure" in src[i:i + 700]
+        assert "_degrade_on_failure" in src[i:code_block_bounds(src, i)]
 
     def test_outer_except_replaces_bare_failure_return(self):
         src = self._src()
         i = src.index("DRL 训练异常")
-        seg = src[i:i + 900]
+        seg = src[i:code_block_bounds(src, i)]
         assert "_degrade_on_failure" in seg and '"degrade"' in seg
 
     def test_resolve_is_called_before_target_plan(self):
@@ -554,6 +556,14 @@ class TestNoSilentFailurePathsInTrain:
     def test_halt_skips_plan_construction(self):
         src = self._src()
         i = src.index('if _dec.get("halt"):')
-        seg = src[i:i + 400]
+        # [2026-09-26] 这里**不能**用 `code_block_bounds` —— 它止于下一个**顶格**
+        # `def`, 而本用例要看的是**函数内部的一个分支**。顶格 def 在很远的将来
+        # ⇒ 区间会变长, 把同级 `else` 分支(里面**正是要**调用 `_build_target_plan`)
+        # 也包进来 ⇒ 断言变红。**工具没错, 是它不适用于这个粒度** ——
+        # 这条边界已写进 `code_block_bounds` 的 docstring。
+        #
+        # 该分支很短(实测 7 行), 故按**行**取: 行数显式写在调用处, 便于审查。
+        # (原写法是 `src[i:i + 400]` —— 400 是个没人知道来由的魔数。)
+        seg = lines_after(src, i, 7)
         assert "blocked_by_degrade" in seg
         assert "_build_target_plan" not in seg, "L3 分支内不得构建 plan"

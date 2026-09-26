@@ -31,6 +31,8 @@ import sys
 import numpy as np
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 sys.path.insert(0, _SRC)
@@ -161,7 +163,7 @@ class TestDataSourceFailureIsNotSilent:
     def test_source_failure_returns_degrade(self):
         src = self._src()
         i = src.index("因子状态数据源不可用")
-        seg = src[i:i + 700]
+        seg = src[i:code_block_bounds(src, i)]
         assert '_degrade_on_failure' in seg and '"degrade"' in seg
 
     def test_behavioural_source_failure_does_not_raise(self, monkeypatch, tmp_path):

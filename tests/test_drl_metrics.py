@@ -25,6 +25,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 sys.path.insert(0, _SRC)
@@ -331,7 +333,7 @@ class TestTrainWiring:
         # 注意: 必须锚定**调用点** `th.nn.utils.clip_grad_norm_(`, 不能锚 `clip_grad_norm_`
         # —— 后者会先命中解释该做法的注释。
         i = src.index("th.nn.utils.clip_grad_norm_(")
-        assert "grad_norms.append" in src[i:i + 600], \
+        assert "grad_norms.append" in src[i:code_block_bounds(src, i)], \
             "必须采集梯度范数（clip_grad_norm_ 返回的裁剪前总范数）"
 
     def test_snapshot_at_end_of_train_not_via_callback(self):

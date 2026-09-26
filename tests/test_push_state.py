@@ -30,6 +30,8 @@ import sys
 
 import pytest
 
+from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -285,7 +287,7 @@ class TestRunDailyLogsWithoutAlerting:
             "push_state 接入未包 try/except —— 一个 git 故障会打断收盘管道"
         # helper 自身也必须吞异常
         j = src.find("def _push_state_meta")
-        hblk = src[j:j + 1800]
+        hblk = src[j:code_block_bounds(src, j)]
         assert "except Exception" in hblk, "helper 未吞异常"
 
     def test_streak_needs_consecutive_days_not_one(self):
