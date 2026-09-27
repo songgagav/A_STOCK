@@ -124,5 +124,42 @@ def test_selector_weights_accepts_as_of():
     assert selector_weights(as_of="2018-06-29")["vol"] >= 0.0
 
 
+def test_ic_neutral_artifact_labels_directions_as_a_snapshot():
+    """`data/ic_neutral_check.json` 必须把 `directions` 标成**快照**, 并带运行时刻。
+
+    ## 为什么锁这个 (2026-09-27 实测)
+
+    该产物的 `directions` 只是**运行时对 `factor_fusion.DIRECTIONS` 的快照**,
+    而 `ic_by_factor` 的数值是按**当时的方向**算的。生产方向一改, 这个文件就
+    **自身前后不一致** —— 实测踩到: 文件里 `directions.roe_yy_chg = -1`,
+    而 `factor_fusion.py` 已是 `+1`(2026-09-13 修正)。
+
+    **危害**: 读者会把它当权威口径而读错; 且文件此前**没有任何时间字段**,
+    "这是哪天的口径"无法从文件本身回答 —— 只能靠文件 mtime, 而 mtime 在
+    复制/归档后就丢了。
+
+    故锁三件事: `directions_at_run` 存在、`run_at` 存在、`directions_note` 存在
+    且点明"快照"。产物不存在时跳过(不是所有环境都有 data/)。
+    """
+    import json
+    import os
+
+    fp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "data", "ic_neutral_check.json")
+    if not os.path.exists(fp):
+        pytest.skip("无 data/ic_neutral_check.json(该环境未跑过该脚本)")
+    d = json.load(open(fp, encoding="utf-8"))
+    assert "directions_at_run" in d, (
+        "缺 `directions_at_run` —— 无法区分「运行当时的口径」与「现行口径」")
+    assert "run_at" in d, (
+        "缺 `run_at` —— 产物新鲜度无法判断(该文件此前没有任何时间字段)")
+    assert "directions_note" in d, (
+        "缺 `directions_note` —— `directions` 会被读成权威口径")
+    assert "快照" in str(d["directions_note"]), "note 必须点明它是**快照**"
+    assert isinstance(d["directions_at_run"], dict) and d["directions_at_run"]
+    # 注: 快照与现行口径**允许不同**(历史快照本来就该是旧的) —— 不锁相等,
+    # 只锁"读者能看出它是旧的"。
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

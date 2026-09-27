@@ -14,6 +14,7 @@ pb_inv / ep / ocf_ps / roe_yy_chg 的 IC, 决定是否改 DIRECTIONS 并切换�
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import statistics as st
@@ -48,6 +49,16 @@ def ret_at(day: str, end: str) -> pd.DataFrame:
     df["s6"] = df["s6"].astype(str).str.zfill(6)
     df["r"] = pd.to_numeric(df["r"], errors="coerce")
     return df
+
+
+def _now_iso() -> str:
+    """产物时间戳 —— `run_at` 是判断该产物**新鲜度**的唯一依据。
+
+    为什么必须写: 本产物此前**没有任何时间字段**, 而它的 `directions` 是快照。
+    于是"这份 directions 是哪天的口径"**无法从文件本身回答** —— 只能靠文件
+    修改时间, 而文件时间在复制/归档后就丢了。实测就是因此把旧快照当成了现行口径。
+    """
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def main() -> None:
@@ -161,7 +172,28 @@ def main() -> None:
                    "ic_by_factor": {f: {str(h): ic_n[f][h] for h in HORIZONS} for f in FACTORS},
                    "fusion": {t: {str(h): fuse[t][h] for h in HORIZONS} for t in fuse},
                    "r_size": rsize,
-                   "directions": ff.DIRECTIONS, "weights": ff.FACTOR_WEIGHTS},
+                   # [2026-09-27 修: 字段语义 —— 用户清单项「改名为 directions_at_run」]
+                   #
+                   # **原字段名 `directions` 会误导读者**: 它只是运行时对
+                   # `factor_fusion.DIRECTIONS` 的**快照**, 而 `ic_by_factor` 的数值
+                   # 是**按当时的方向**算出来的。生产方向一改, 这个文件就
+                   # **自身前后不一致**。实测踩到: 文件里 `directions.roe_yy_chg = -1`,
+                   # 而 `factor_fusion.py` 已是 `+1`(2026-09-13 修正), 且同文件的
+                   # `ic_by_factor` 用的已是 +1 的口径 ⇒ **读者会把它当权威而读错**。
+                   #
+                   # 修法(三条, 缺一不可):
+                   #   ① 新增 `directions_at_run` —— 明确"这是运行当时的口径";
+                   #   ② 新增 `run_at` —— 判断新鲜度的**唯一**依据;
+                   #   ③ **保留** 旧的 `directions` 并加 `directions_note` ——
+                   #      不删(避免下游 KeyError, 也不抹掉历史), 但它不再是权威口径。
+                   "directions_at_run": dict(ff.DIRECTIONS),
+                   "run_at": _now_iso(),
+                   "directions": dict(ff.DIRECTIONS),
+                   "directions_note": ("**快照, 非生产口径** —— 这是本次运行时 "
+                                       "`factor_fusion.DIRECTIONS` 的值; 生产方向可能"
+                                       "在此后已改。请对照 `factor_fusion.py`, "
+                                       "或读 `directions_at_run` + `run_at`。"),
+                   "weights": ff.FACTOR_WEIGHTS},
                   fh, ensure_ascii=False, indent=2, default=str)
     print("\n已保存:", OUT)
 
