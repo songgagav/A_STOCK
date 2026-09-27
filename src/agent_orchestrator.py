@@ -313,24 +313,30 @@ def weekend_deep_analysis(day: str | None = None) -> dict:
 
 
 def _call_llm_orch(messages, max_tokens=2048):
-    from llm_commentary import _load_dotenv as _ld, _build_messages_url as _bmu
+    """[2026-09-28] 改走 `llm_commentary._post_messages` —— 支持 ollama/openai/anthropic。
+
+    此前这是**第 5 份**内联协议实现: 自己拼 URL、自己加
+    `x-api-key` + `anthropic-version` 头、`timeout=90` 写死。切到 Ollama 后
+    本函数必然 404(`<base>/anthropic/v1/messages`), 且超时也不跟
+    `OPENAI_TIMEOUT_SECONDS` 走。协议与超时现统一由 `llm_commentary` 提供。
+    """
+    from llm_commentary import (
+        _load_dotenv as _ld, _build_messages_url as _bmu,
+        _post_messages, _split_system, _env_timeout, _resolve_api_type)
     _ld()
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "minimax-m3").strip()
-    if not base or not api_key:
+    if not base or (not api_key and _resolve_api_type(base) != "ollama"):
         return None
-    from urllib import request
-    url = _bmu(base)
-    body = {"model": model, "max_tokens": max_tokens, "messages": messages}
-    data = json.dumps(body).encode("utf-8")
-    req = request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("x-api-key", api_key)
-    req.add_header("anthropic-version", "2023-06-01")
+    sys_text, rest = _split_system(messages)
+    user_text = "\n\n".join(
+        str(m.get("content") or "") for m in rest) if rest else ""
     try:
-        with request.urlopen(req, timeout=90) as resp:
-            r = json.loads(resp.read().decode("utf-8"))
+        url = _bmu(base)
+        r = _post_messages(url, api_key, model, sys_text, user_text,
+                           max_tokens=max_tokens, timeout=_env_timeout(),
+                           user_agent="A_stock_rotation/agent_orchestrator")["body"]
         content = r.get("content", [])
         if isinstance(content, list) and content:
             for block in content:

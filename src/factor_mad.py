@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR  # noqa: E402
 from llm_commentary import (  # noqa: E402
     _load_dotenv, _build_messages_url, _post_messages, _split_system,
-    _extract_first_json_object, _repair_json)
+    _env_timeout, _extract_first_json_object, _repair_json)
 
 # ============================================================
 # 配置
@@ -165,7 +165,7 @@ def _call_llm(messages: list[dict], max_tokens: int = 2048) -> str | None:
     try:
         url = _build_messages_url(base)
         r = _post_messages(url, api_key, model, sys_text, user_text,
-                           max_tokens=max_tokens, timeout=60.0,
+                           max_tokens=max_tokens, timeout=_env_timeout(),
                            user_agent="A_stock_rotation/factor_mad")["body"]
         content = r.get("content", [])
         if isinstance(content, list) and content:

@@ -36,8 +36,10 @@ _LOG = logging.getLogger("pre_drl_brief")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR, DUCKDB_PATH  # noqa: E402
 
-# 复用 llm_commentary 的 .env / MiniMax 协议代码
-from llm_commentary import _load_dotenv, _build_messages_url, _extract_first_json_object
+# 复用 llm_commentary 的 .env / 多协议(ollama/openai/anthropic)代码
+from llm_commentary import (  # noqa: E402
+    _load_dotenv, _build_messages_url, _extract_first_json_object,
+    _env_timeout, _resolve_api_type)
 
 SCORE_FACTORS = ["signal", "trend", "govern", "liquidity", "vol", "mom_rev"]
 
@@ -415,9 +417,14 @@ def generate_pre_drl_brief(day: str,
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "MiniMax-M3").strip()
-    timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60") or 60)
-    if not base or not key:
-        return {"ok": False, "error": "缺少 OPENAI_BASE_URL 或 OPENAI_API_KEY", "stage": "config"}
+    timeout = _env_timeout()
+    # [2026-09-28] 与 llm_commentary 同源判据: 本地端点(Ollama)无鉴权, 不强制 key。
+    # 此前 `not base or not key` 会让"地址配好、没配 key"的本地部署直接降级。
+    if not base or (not key and _resolve_api_type(base) != "ollama"):
+        return {"ok": False,
+                "error": ("缺少 OPENAI_BASE_URL" if not base
+                          else "缺少 OPENAI_API_KEY"),
+                "stage": "config"}
 
     messages_url = _build_messages_url(base)
     payload = _evidence_payload(day, market, perf, vnpy_summary, ic_trend,

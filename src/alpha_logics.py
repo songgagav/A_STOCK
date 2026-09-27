@@ -43,7 +43,7 @@ from config import DATA_DIR, DUCKDB_PATH  # noqa: E402
 
 from llm_commentary import (  # noqa: E402
     _load_dotenv, _build_messages_url, _post_messages, _split_system,
-    _extract_first_json_object, _repair_json)
+    _env_timeout, _extract_first_json_object, _repair_json)
 
 # ============================================================
 # 配置
@@ -101,7 +101,7 @@ def _call_llm(messages: list[dict], max_tokens: int = 4096) -> str | None:
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "minimax-m3").strip()
-    timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 90)
+    timeout = _env_timeout()
     if not base:
         _LOG.warning("alpha_logics: 缺少 LLM 配置(OPENAI_BASE_URL)")
         return None

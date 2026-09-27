@@ -218,15 +218,119 @@ class TestSplitSystem(unittest.TestCase):
                          [{"role": "user"}])
 
 
+class TestEnvTimeout(unittest.TestCase):
+    """超时**必须**统一从 `OPENAI_TIMEOUT_SECONDS` 读。
+
+    [2026-09-28] 本仓原先有 5 处各自 `float(os.environ.get("OPENAI_TIMEOUT_SECONDS", ...))`,
+    且**兜底值不一致**(60/60/90/90 混用), `factor_mad` 与 `agent_orchestrator`
+    更是把 60/90 **写死**。切到本地 Ollama 后把该变量调大时, 那些写死的调用点
+    **不会跟着变** —— 症状是"配置改了、超时没变", 只在提示词变长时才暴露。
+    """
+
+    def test_reads_env_value(self):
+        with mock.patch.dict(os.environ, {lc.ENV_TIMEOUT: "180"}, clear=False):
+            self.assertEqual(lc._env_timeout(), 180.0)
+
+    def test_default_when_unset_or_blank(self):
+        for v in (None, "", "   "):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                if v is None:
+                    os.environ.pop(lc.ENV_TIMEOUT, None)
+                else:
+                    os.environ[lc.ENV_TIMEOUT] = v
+                self.assertEqual(lc._env_timeout(), lc.DEFAULT_LLM_TIMEOUT_S)
+
+    def test_explicit_default_argument_is_respected(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(lc.ENV_TIMEOUT, None)
+            self.assertEqual(lc._env_timeout(30.0), 30.0)
+
+    def test_invalid_value_falls_back_instead_of_raising(self):
+        """非法值**不抛异常** —— 超时写错不该让整个盘后流程崩掉。"""
+        for bad in ("abc", "--", "1e999x"):
+            with mock.patch.dict(os.environ, {lc.ENV_TIMEOUT: bad}, clear=False):
+                self.assertEqual(lc._env_timeout(), lc.DEFAULT_LLM_TIMEOUT_S,
+                                 f"{bad!r} 应回落默认而不是抛异常")
+
+    def test_non_positive_falls_back(self):
+        for bad in ("0", "-5"):
+            with mock.patch.dict(os.environ, {lc.ENV_TIMEOUT: bad}, clear=False):
+                self.assertEqual(lc._env_timeout(), lc.DEFAULT_LLM_TIMEOUT_S)
+
+    def test_resolve_llm_config_uses_same_source(self):
+        """`_resolve_llm_config` 必须与 `_env_timeout` 同源, 否则又是两套。"""
+        with mock.patch.dict(os.environ, {
+                lc.ENV_TIMEOUT: "150",
+                "OPENAI_BASE_URL": "http://192.168.1.5:11434"}, clear=False):
+            with mock.patch.object(lc, "_load_dotenv", lambda: None):
+                cfg, err = lc._resolve_llm_config()
+        self.assertIsNone(err)
+        self.assertEqual(cfg["timeout"], 150.0)
+
+    def test_no_module_hardcodes_an_llm_timeout(self):
+        """静态护栏: 各业务模块不得再写死 LLM 超时。
+
+        这条是本组用例的核心 —— 它把"以后有人又加一处写死的 60s"变成红灯。
+
+        [2026-09-28 自查] 第一版只查 `urlopen(...timeout=<数字>)`。**该判据是空的**:
+        业务模块走的是 `_post_messages`, 那个调用里根本没有 `urlopen` 字样,
+        于是把 `timeout=_env_timeout()` 改回 `timeout=60.0` 后**用例照样全绿**。
+        实测(变异测试)发现后改为按**参数名**查: 只要在调用 `_post_messages` /
+        `_post_chat` / `_post_anthropic` 时把 `timeout=` 写成数字字面量, 即红灯。
+        """
+        import re
+        src_root = Path(_SRC)
+        # 只查 LLM 模块; 其它模块的 urlopen/subprocess 超时与此无关
+        for name in ("alpha_logics.py", "factor_mad.py", "incremental_learn.py",
+                     "pre_drl_brief.py", "agent_orchestrator.py",
+                     "llm_commentary.py"):
+            body = (src_root / name).read_text(encoding="utf-8")
+            # 需要跳过**注释与文档字符串**: 说明文字里常引用旧写法
+            # (如 "`timeout=90` 写死"), 那是叙述而非代码。
+            # [2026-09-28 自查] 第一版没跳过, 于是被自己的 docstring 判为红灯。
+            in_doc = False
+            bad = []
+            for line in body.splitlines():
+                stripped = line.strip()
+                n_triple = stripped.count('"""') + stripped.count("'''")
+                if in_doc:
+                    if n_triple % 2 == 1:
+                        in_doc = False
+                    continue
+                if n_triple % 2 == 1:
+                    in_doc = True
+                    continue
+                if stripped.startswith("#") or n_triple >= 2:
+                    continue
+                # ① 任何 `timeout=<数字>` —— 不论出现在 urlopen 还是 _post_* 调用里。
+                #    函数**签名默认值**(`timeout: float = 90.0`)是合法写法, 故跳过 def 行。
+                for m in re.finditer(r"timeout\s*=\s*([0-9][0-9_.]*)", line):
+                    if stripped.startswith("def ") or "timeout: float" in line:
+                        continue
+                    bad.append(f"{name}:{line.strip()}")
+            self.assertEqual(
+                bad, [],
+                f"写死了 LLM 超时(应改用 _env_timeout()): {bad}")
+            # ② 也不得再自己手写解析该环境变量(必须走 _env_timeout)
+            self.assertNotIn(
+                f'os.environ.get("{lc.ENV_TIMEOUT}"', body,
+                f"{name} 又自己解析 {lc.ENV_TIMEOUT}, 应改用 _env_timeout()")
+
+
 class TestDuplicateImplementationsWereDelegated(unittest.TestCase):
     """防止协议实现再次分叉成多份。
 
-    [2026-09-28] 本仓曾有 4 份 `_post_anthropic`。只改主模块时, 副本所在模块
-    会**单独**在切换协议后失效, 且表现为"没有输出"而非报错 —— 极难发现。
-    故这里静态断言: 副本必须是**委托**, 不得再自己构造 Anthropic 请求头。
+    [2026-09-28] 本仓曾有 **5 份**协议实现: `llm_commentary` /
+    `incremental_learn` / `pre_drl_brief` 各一份 `_post_anthropic`,
+    外加 `alpha_logics` / `factor_mad` / `agent_orchestrator` 各自内联 POST。
+    只改主模块时, 副本所在模块会**单独**在切换协议后失效, 且表现为"没有输出"
+    而非报错 —— 极难发现。故这里静态断言: 副本必须是**委托**,
+    不得再自己构造 Anthropic 请求头。
     """
 
     _DELEGATED = ("pre_drl_brief.py", "incremental_learn.py")
+    _INLINE_POST_SITES = ("alpha_logics.py", "factor_mad.py",
+                          "agent_orchestrator.py")
 
     def test_shims_delegate_instead_of_reimplementing(self):
         src_root = Path(_SRC)
@@ -239,13 +343,19 @@ class TestDuplicateImplementationsWereDelegated(unittest.TestCase):
                              f"{name} 仍在自行构造 Anthropic 请求头 —— 协议实现又分叉了")
 
     def test_handwritten_post_sites_are_gone(self):
-        """`alpha_logics` / `factor_mad` 原先各自内联 POST, 也应改走共享实现。"""
+        """原先各自内联 POST 的三处也应改走共享实现。
+
+        `agent_orchestrator._call_llm_orch` 是**最晚发现**的第 5 份 ——
+        首轮排查时被漏掉, 因为它在 agent 编排器里而不在 LLM 模块里。
+        """
         src_root = Path(_SRC)
-        for name in ("alpha_logics.py", "factor_mad.py"):
+        for name in self._INLINE_POST_SITES:
             body = (src_root / name).read_text(encoding="utf-8")
             self.assertIn("_post_messages", body, f"{name} 应使用共享的 _post_messages")
             self.assertNotIn('"anthropic-version": "2023-06-01"', body,
                              f"{name} 仍在写死 Anthropic 版本头")
+            self.assertNotIn("add_header(\"x-api-key\"", body,
+                             f"{name} 仍在手工添加 Anthropic 鉴权头")
 
 
 class TestPostChatRequestShapes(unittest.TestCase):

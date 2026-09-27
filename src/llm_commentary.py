@@ -596,6 +596,38 @@ def _fallback_commentary() -> dict:
     }
 
 
+#: 单次 LLM 调用的默认超时(秒)。本地 36B 模型单次可能数十秒, 故给得比云端宽。
+DEFAULT_LLM_TIMEOUT_S = 90.0
+#: 超时环境变量名。
+ENV_TIMEOUT = "OPENAI_TIMEOUT_SECONDS"
+
+
+def _env_timeout(default: float | None = None) -> float:
+    """读 `OPENAI_TIMEOUT_SECONDS`, 非法/缺失时回落到 `DEFAULT_LLM_TIMEOUT_S`。
+
+    **为什么需要这个集中函数**: 本仓原先有 5 处各自 `float(os.environ.get(...))`,
+    而且**兜底值不一致**(60 / 60 / 90 / 90 混用)。切到本地 Ollama 后把
+    `OPENAI_TIMEOUT_SECONDS` 调大时, 那些**写死 60/90 的调用点不会跟着变** ——
+    症状是"配置改了、超时没变", 且只在提示词变长时才暴露, 极难归因。
+
+    值非法(如 `abc`)时**不抛异常**而回落默认: 超时配置错误不该让整个盘后流程
+    崩掉, 用默认值继续跑并留一条 warning 更符合本项目"不停手"的取向。
+    """
+    d = DEFAULT_LLM_TIMEOUT_S if default is None else float(default)
+    raw = os.environ.get(ENV_TIMEOUT, "").strip()
+    if not raw:
+        return d
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _LOG.warning("%s=%r 无法解析为数字, 回落默认 %.0fs", ENV_TIMEOUT, raw, d)
+        return d
+    if v <= 0:
+        _LOG.warning("%s=%r 非正数, 回落默认 %.0fs", ENV_TIMEOUT, raw, d)
+        return d
+    return v
+
+
 def _resolve_llm_config() -> tuple[dict | None, str | None]:
     """读出 LLM 配置并做**前置校验**。返回 (cfg, error)。
 
@@ -619,7 +651,7 @@ def _resolve_llm_config() -> tuple[dict | None, str | None]:
         "key": key,
         "api_type": api_type,
         "model": os.environ.get("OPENAI_MODEL", "MiniMax-M3").strip(),
-        "timeout": float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 90),
+        "timeout": _env_timeout(),
     }, None
 
 

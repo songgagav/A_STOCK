@@ -31,7 +31,8 @@ import pandas as pd
 _LOG = logging.getLogger("incremental_learn")
 
 # 复用现有 LLM helper
-from llm_commentary import _load_dotenv, _build_messages_url
+from llm_commentary import (  # noqa: E402
+    _load_dotenv, _build_messages_url, _env_timeout, _resolve_api_type)
 
 
 # ============================================================================
@@ -258,9 +259,11 @@ def run_incremental_learn(day: str, days: int = 10,
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "MiniMax-M3").strip()
-    timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 60)
-    if not base or not key:
-        out["error"] = "缺少 OPENAI_BASE_URL 或 OPENAI_API_KEY"
+    timeout = _env_timeout()
+    # [2026-09-28] 本地端点(Ollama)无鉴权, 不强制 key(与 llm_commentary 同源判据)。
+    if not base or (not key and _resolve_api_type(base) != "ollama"):
+        out["error"] = ("缺少 OPENAI_BASE_URL" if not base
+                        else "缺少 OPENAI_API_KEY")
         hb.stop(phase="config_error", ok=False, error=out["error"])
         return out
     url = _build_messages_url(base)
