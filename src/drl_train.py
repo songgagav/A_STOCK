@@ -1778,6 +1778,66 @@ def _load_plan_frame(as_of: "str | None" = None):
     return b, "h5i_bars_fallback"
 
 
+def _is_trading_day8(day: str) -> bool:
+    """`day`(YYYY-MM-DD 或 YYYYMMDD)是否为交易日。日历不可用时**保守返回 False**。
+
+    保守方向的选择依据: 本函数只用来决定"要不要写 `consume_day`"。
+    写错的代价是**让非交易日的 `--maint` 产物被第 1 档采纳**(污染目标池);
+    不写的代价只是回退到旧判据(该产物本来就被旧判据拒绝)。故取 False。
+    """
+    try:
+        import datetime as _dt
+
+        import trading_calendar as _tc
+        return bool(_tc.is_trading_day(
+            _dt.datetime.strptime(_d8(day), "%Y%m%d").date()))
+    except Exception:                  # noqa: BLE001
+        return False
+
+
+def _next_trade_day(day: str) -> "str | None":
+    """返回**严格晚于** `day` 的最近一个交易日(YYYY-MM-DD), 取不到则 None。
+
+    ## 为什么这个字段必须存在(而不是让读者去猜)
+
+    `data/drl/<D>/target_plan.json` 是 **D 日盘后(19:10)产出**的, 但它服务的是
+    **下一个交易日** —— 因为 D 日当天开盘时这份文件还不存在。
+
+    此前产物里**只有 `day`(撰写日)**, 没有任何字段说明"它给哪天用"。于是
+    引擎只能靠目录名猜, 而它猜成了"目录日 == 消费日": 按 `day=D` 去校验
+    `generated_at ∈ [prev_trade(D) 16:00, D 00:00)`, 而文件实际写于 D 日 19:1x
+    ⇒ **必然晚于上界** ⇒ 第 1 档(`drl_same_day`)结构上永不可达(实测命中率 0%)。
+    正确的那一份只能靠"当日目录不存在/校验失败后倒序回退"**间接**取到,
+    取到了还被记成 `drl_cross_day`(跨日回退) ⇒ 档位留痕失真。
+
+    故这里把消费日**显式写进产物**: 读者按字段办事, 不再猜。
+
+    ## 为什么用交易日历而不是"数据里的交易日"
+
+    消费日在**未来**, 行情库里当然没有它的数据 —— 只能查日历。
+    `realtime_engine._prev_trade_day` 走的是"数据里出现过的日期", 那个办法
+    对**向前**推断无效, 故此处不复用。
+
+    日历不可用时**返回 None**(而不是猜一个日历日): 宁可不写该字段而让读者
+    回退旧逻辑, 也不要写一个错的消费日 —— 错的消费日比没有更危险。
+    """
+    try:
+        import datetime as _dt
+
+        import trading_calendar as _tc
+        d = _dt.datetime.strptime(_d8(day), "%Y%m%d").date()
+        for _ in range(30):            # 覆盖春节等长假
+            d = d + _dt.timedelta(days=1)
+            try:
+                if _tc.is_trading_day(d):
+                    return d.isoformat()
+            except Exception:          # noqa: BLE001
+                return None
+        return None
+    except Exception:                  # noqa: BLE001
+        return None
+
+
 def _build_target_plan(day: str, day_dir: str,
                        final_weights: dict[str, float],
                        top_n: int = MAX_STOCKS,
@@ -1890,14 +1950,28 @@ def _build_target_plan(day: str, day_dir: str,
                     - dt.datetime.strptime(_d8(_sec), "%Y%m%d").date()).days
         except Exception:  # noqa: BLE001
             _lag = None
+    # [2026-09-28] `consume_day`: 这份 plan **给哪一个交易日用**(YYYY-MM-DD)。
+    # 语义: 本文件在 `day` 盘后写出, 服务的是**下一个交易日**; 引擎应在该日
+    # 以「消费日 == 今天」直接命中第 1 档, 不必再靠目录名猜(见 `_next_trade_day`)。
+    #
+    # ⚠️ **只在 `day` 本身是交易日时才写**。依据: 守护的 `--maint` 分支在**非交易日**
+    # 也会跑 run_daily 并写出 `data/drl/<非交易日>/target_plan.json`(实测 09-25 Fri /
+    # 09-26 Sat / 09-27 Sun 各留一份)。这类产物若也声明 `consume_day = 下一个交易日`,
+    # 那么在一个**长周末**里它就会成为"最近一份声明给今天用"的 plan 而被第 1 档取用 ——
+    # 而旧判据(时间戳窗口)恰好会把它们全部拒掉。**那会是一次由本次改动引入的回归。**
+    # 故非交易日一律写 None, 让读者回退旧判据、继续把这类产物排除在外。
+    # 依据"撰写日是计划的自然键"这一既有约定: payload["day"] 恒等于目录名。
+    _consume = _next_trade_day(day) if _is_trading_day8(day) else None
     payload = {
         "day": day,
+        "consume_day": _consume,
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "method": res["method"],
         "weights_used": norm_w,
         "universe_size": res["universe_size"],
         "top_n": items,
-        "note": "盘中 realtime_engine 优先消费此文件; 缺失时回退 selection.json",
+        "note": ("盘中 realtime_engine 优先消费此文件; 缺失时回退 selection.json; "
+                 "引擎按 consume_day 匹配当日"),
         # [2026-09-20] 留痕"这条 plan 是怎么来的": 截面日期 + 数据来源 + 是否回补。
         # 回补产物必须能与"当时真的产出了"区分开(用户要求标 source=backfill 且不纳入 OOS)。
         "section_as_of": _sec,

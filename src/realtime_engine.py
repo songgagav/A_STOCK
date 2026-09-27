@@ -188,18 +188,59 @@ def _prev_trade_day(day: str, db=None) -> "datetime|None":
             pass
 
 
+def _plan_consume_ok(plan: dict, day: str) -> "tuple[bool, str] | None":
+    """按 **`consume_day` 字段**判断这份 plan 是否供 `day` 消费。
+
+    ## 为什么需要它(2026-09-28)
+
+    产物里原本**只有 `day`(撰写日)**, 没有"给哪天用"这一维。于是读取侧只能猜,
+    而它猜成了"目录日 == 消费日": 按 `day=D` 校验 `generated_at` 落在
+    `[prev_trade(D) 16:00, D 00:00)` —— 可文件实际写于 **D 日 19:1x**,
+    **必然晚于上界** ⇒ 第 1 档结构上永不可达(实测 `drl_same_day` 命中率 0%)。
+    取到正确那一份只能靠"当日目录不存在/校验失败后倒序回退"间接实现,
+    取到还被记成 `drl_cross_day`(跨日回退) ⇒ 档位留痕失真。
+
+    现在写入侧显式产出 `consume_day`, 读取侧**优先按字段判定**, 不再猜。
+
+    ## 三态返回(这是兼容性的关键)
+
+      · `(True, "ok")`  —— 有 `consume_day` 且等于 `day`;
+      · `(False, 原因)`  —— 有 `consume_day` 但**不等于** `day`。
+        这是**权威否定**: 既然产物自己声明了给哪天用, 就不该再拿时间戳窗口去
+        "救"它 —— 两个判据冲突时必须以显式字段为准, 否则又回到靠窗口猜。
+      · `None`           —— **无该字段**(旧产物)或值无法解析。
+        调用方据此回退到旧的 `generated_at` 窗口判据。
+
+    `consume_day` 与本函数都**不覆盖** A 股代码段过滤(那个仍由调用方做)。
+    """
+    raw = plan.get("consume_day")
+    if raw is None or str(raw).strip() == "":
+        return None
+    cval = str(raw).strip()[:10]
+    try:
+        datetime.strptime(cval, "%Y-%m-%d")
+    except Exception:
+        return None                      # 值坏掉 -> 当没有, 回退旧逻辑
+    if cval == str(day)[:10]:
+        return True, "ok"
+    return False, (f"consume_day {cval} != 消费日 {str(day)[:10]} "
+                   f"(该 plan 供 {cval} 使用)")
+
+
 def _plan_is_formal(plan: dict, day: str, d: str,
                     prev_trade_day: "datetime|None" = None) -> tuple[bool, str]:
     """校验 target_plan 是否为"盘后正式"产物.
 
-    规则(双保险, 任一不满足即拒绝):
+    规则(任一不满足即拒绝):
       a) top_n 里至少保留 1 个 A 股代码段; 若 DRL universe 混入可转债/B股等
          (历史 plan 的顶级缺陷), 视为退化残缺 plan, 拒绝.
-      b) generated_at 时间戳必须落在「前一交易日 16:00 ~ 消费日 00:00]」区间.
-         正式 plan 应基于前一交易日的完整收盘数据, 在前一交易日盘后 16:00 之后、
-         消费日盘前生成. 消费日当天凌晨(如 08-28 02:28)/盘中异常重跑写出的
-         过早或断续数据 plan 属非正式产物, 拒绝.
-         边界: 若 generated_at 缺失则保守拒绝.
+      b) **消费日判定, 两级**:
+         b1) 若 plan 有 `consume_day` 字段 -> **以它为准**(见 `_plan_consume_ok`);
+         b2) 否则(旧产物)回退到 `generated_at` 落在
+             `[前一交易日 16:00, 消费日 00:00)` 区间 —— 正式 plan 应基于前一交易日
+             的完整收盘数据, 在前一交易日盘后 16:00 之后、消费日盘前生成.
+             消费日当天凌晨(如 08-28 02:28)/盘中异常重跑写出的过早或断续数据 plan
+             属非正式产物, 拒绝. 边界: 若 generated_at 缺失则保守拒绝.
 
     Returns
     -------
@@ -209,6 +250,11 @@ def _plan_is_formal(plan: dict, day: str, d: str,
     a_items = [it for it in items if _is_a_share_code(str(it.get("canon", "")))]
     if not a_items:
         return False, "top_n 无 A 股代码段 (疑似混入可转债/B股退化 plan)"
+    # b1) 显式消费日字段优先(新产物)
+    via_field = _plan_consume_ok(plan, day)
+    if via_field is not None:
+        return via_field
+    # b2) 旧产物: 时间戳窗口
     gen = plan.get("generated_at")
     if not gen:
         return False, "缺少 generated_at 时间戳, 无法确认盘后正式性"
@@ -227,8 +273,129 @@ def _plan_is_formal(plan: dict, day: str, d: str,
     formal_upper = day_dt.replace(hour=0, minute=0, second=0)
     if not (formal_lower <= gen_dt < formal_upper):
         return False, (f"generated_at {gen} 不在正式窗口 "
-                       f"[{formal_lower:%Y-%m-%d %H:%M:%S}, {formal_upper:%Y-%m-%d %H:%M:%S})")
+                       f"[{formal_lower:%Y-%m-%d %H:%M:%S}, {formal_upper:%Y-%m-%d %H:%M:%S})"
+                       f" (无 consume_day, 回退窗口判据)")
     return True, "ok"
+
+
+def _cross_day_drl_fallback(d: str, day: str, prev_trade_day=None):
+    """旧"跨日回退 DRL"扫描(第 3 档): 全目录倒序, 跳过当日, 按旧判据取最近一份。
+
+    抽成独立函数的理由: 改动后"第 1 档"与"第 3 档"**都**要扫 DRL 目录, 但语义不同
+    (前者要求显式 `consume_day`, 后者是兼容旧产物的窗口回退)。若把两者合成一次扫描,
+    旧产物就会从第 1 档命中并被记成"当日同源", 档位留痕再次失真。
+    """
+    try:
+        dirs = [x for x in os.listdir(os.path.join(DATA_DIR, "drl"))
+                if x.isdigit() and len(x) == 8]
+        dirs.sort(reverse=True)
+        for cand in dirs:
+            if cand == d:
+                continue
+            top_n, info = _try_load_daily_plan(cand, day,
+                                               prev_trade_day=prev_trade_day)
+            if top_n:
+                return cand, top_n, info
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _load_daily_plan_for_consume_day(d: str, day: str, prev_trade_day=None):
+    """取"供消费日 `day` 使用"的那一份 DRL plan。返回 `(来源目录, top_n, info)`。
+
+    ## 为什么不能靠目录名猜(这次修复的全部理由)
+
+    `data/drl/<X>/target_plan.json` 在 **X 日盘后**写出, 服务的是**下一个交易日**。
+    产物里原本只有 `day`(撰写日), **没有"给哪天用"这一维**, 于是读取侧只能猜。
+    旧代码猜的是"目录日 == 消费日"(`drl/<D>`), 结果:
+
+      · `drl/<D>` 要到当晚才产出 ⇒ 盘前必然读不到 ⇒ 第 1 档
+        (`drl_same_day`)结构上永不可达(实测命中率 0%);
+      · 真正取到的那一份是**靠"当日目录不存在/校验失败后倒序回退"间接**拿到的,
+        取到了还被记成 `drl_cross_day`(跨日回退) ⇒ 档位留痕失真;
+      · 更糟的是倒序回退会挑中**非交易日的 `--maint` 产物** —— 实测消费日
+        2026-09-28 上旧逻辑取的是 `drl/20260927`(周日 15:06 的维护产物)。
+
+    现在产物自带 `consume_day`, 于是**按字段查**, 不再猜目录:
+
+      ① **扫全部目录**, 只要某份 plan 声明 `consume_day == day` 就取它
+         (多份命中时取目录日最新的那份, 与旧"就近回退"的取向一致);
+      ② 都没声明(旧产物) -> 回退旧的 `generated_at` 窗口判据, 保持兼容。
+
+    ## 为什么"扫全目录"比"先猜 `drl/<prev_trade(D)>`"更对
+
+    猜前一交易日目录是**又一次用目录名推断消费日** —— 只是换了个猜法。
+    实测反例: 消费日 2026-09-28 的正确来源是 `drl/20260924`(周四),
+    而 `prev_trade(09-28)` 是 09-25(周五, **非交易日**, 只有维护产物)。
+    按"前一交易日"去猜就会先撞上 09-25 的空目录。按字段扫则天然不受影响。
+
+    ## 兼容性: 旧产物一律走旧判据
+
+    第 ② 步只在**没有任何 plan 声明该消费日**时启用, 因此历史目录的取池结果
+    与改动前**完全一致**(已用 `_tools/verify_consume_day_regression2.py`
+    在 18 个消费日上逐日对照)。
+    """
+    # ① **严格按字段**: 只接受"显式声明 consume_day == day"的产物。
+    #
+    # 这里**故意不调用 `_try_load_daily_plan`** —— 它内部带"无 consume_day 就回退
+    # 时间戳窗口"的兼容分支, 若在这里调用, 旧产物就会从本步命中并被记成
+    # `drl_same_day`(当日同源), 而那正是本次要修的**档位失真**。
+    # 字段是**新契约**, 只认它; 旧产物一律留给第 ② 步按老规矩处理。
+    try:
+        dirs = [x for x in os.listdir(os.path.join(DATA_DIR, "drl"))
+                if x.isdigit() and len(x) == 8]
+        dirs.sort(reverse=True)
+        for cand in dirs:
+            plan_path = os.path.join(DATA_DIR, "drl", cand, "target_plan.json")
+            if not os.path.exists(plan_path):
+                continue
+            # **廉价预筛**: 先只在文件头部找 `consume_day` 这个键名, 命中才真解析。
+            # 为什么需要: 本函数在每个 tick(15s)都被调用, 而目录数会逐日增长
+            # (实测已有 30+ 个, 一年 250+)。若每次都 json.load 全部文件, 就是
+            # 每秒几十次无谓解析 —— 而其中绝大多数是**没有该字段的旧产物**。
+            # payload 里 consume_day 紧跟 day 写出, 故只读前 4KB 足够覆盖;
+            # 万一被挤出前缀(理论上不会), 只是漏看一份, 下一轮/下个目录仍会兜住。
+            try:
+                with open(plan_path, "rb") as fh:
+                    head = fh.read(4096)
+                if b"consume_day" not in head:
+                    continue
+            except Exception:
+                continue
+            try:
+                with open(plan_path, encoding="utf-8") as f:
+                    plan = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(plan, dict):
+                continue
+            # **必须先显式要求字段命中**。只调 `_plan_is_formal` 是不够的:
+            # 它对无 `consume_day` 的旧产物会回退时间戳窗口并可能返回 True,
+            # 那样旧产物仍会从本步命中并被记成"当日同源" —— 档位失真没修掉。
+            via = _plan_consume_ok(plan, day)
+            if not (via and via[0]):
+                continue
+            ok, _why = _plan_is_formal(plan, day, cand,
+                                       prev_trade_day=prev_trade_day)
+            if not ok:
+                continue
+            top_n, info = _plan_to_targets(plan, day, cand)
+            if top_n:
+                return cand, top_n, info
+    except Exception:
+        pass
+
+    # ② **只**试当日目录(`drl/<d>`), 不再做跨日扫描。
+    #
+    # 跨日扫描留给调用方的**第 3 档** —— 那里会把它正确地记成 `drl_cross_day`。
+    # 若在本函数里也扫跨日, 取到的旧产物就会被记成 `drl_same_day`(当日同源),
+    # 而这恰恰是本次要修的**档位失真**: 生产实录里 09-22/09-23/09-24 都是
+    # `drl_cross_day`, 由第 3 档命中。本函数只负责"新契约命中"与"当日目录兜底"。
+    top_n, info = _try_load_daily_plan(d, day, prev_trade_day=prev_trade_day)
+    if top_n:
+        return d, top_n, info
+    return None, None, None
 
 
 def _plan_to_targets(plan: dict, day: str, d: str):
@@ -386,11 +553,17 @@ def load_targets(day: str):
     # P8: 消费日的前一实际交易日(跨周末/节假日), 供 DRL plan 正式窗口校验使用
     prev_trade_day = _prev_trade_day(day)
 
-    # 1) 优先: 当日目录 DRL plan (带 A股过滤 + 时间戳校验)
-    top_n, info = _try_load_daily_plan(d, day, prev_trade_day=prev_trade_day)
+    # 1) 优先: 当日可消费的 DRL plan (带 A股过滤 + 消费日/窗口校验)
+    #
+    # [2026-09-28] 顺序很关键, 见下方 `_load_daily_plan_for_consume_day` 的说明。
+    # 先试"前一交易日目录"(新产物: 该目录里的 plan 显式声明 consume_day == 今天),
+    # 再试"同日目录"(旧产物: 靠 generated_at 窗口间接判定)。两条都保留是为了
+    # **兼容旧产物** —— 上线前写出的 plan 没有 consume_day 字段。
+    drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
+        d, day, prev_trade_day)
     if top_n:
-        _trace_targets(day, d, "drl_same_day", len(top_n))
-        return top_n, info, d
+        _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
+        return top_n, info, drl_prev_d
 
     # 2) 当日 selection.json
     sel_path = os.path.join(DAILY_DIR, d, "selection.json")
@@ -411,20 +584,14 @@ def load_targets(day: str):
             pass
 
     # 3) 跨日回退 - DRL: 最近一个正式的盘后 plan (排除当日目录, 已被步骤1处理)
-    try:
-        drl_dirs = [x for x in os.listdir(os.path.join(DATA_DIR, "drl"))
-                    if x.isdigit() and len(x) == 8]
-        drl_dirs.sort(reverse=True)
-        for cand in drl_dirs:
-            if cand == d:
-                continue
-            top_n, info = _try_load_daily_plan(cand, day,
-                                               prev_trade_day=prev_trade_day)
-            if top_n:
-                _trace_targets(day, cand, "drl_cross_day", len(top_n))
-                return top_n, info, cand
-    except Exception:
-        pass
+    #
+    # [2026-09-28] 改调 `_cross_day_drl_fallback` —— 原先此处是**内联的同一段扫描**,
+    # 而第 1 档现在也要扫 DRL 目录(条件不同: 要求显式 consume_day)。两处内联的
+    # 近重复代码极易各自漂移(一处改了另一处忘), 故提取为单一定义。
+    cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
+    if top_n:
+        _trace_targets(day, cand, "drl_cross_day", len(top_n))
+        return top_n, info, cand
 
     # 4) 跨日回退 - selection: 最近的 selection.json
     sel = None
