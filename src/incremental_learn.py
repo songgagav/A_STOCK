@@ -186,27 +186,16 @@ def _parse_response(body: dict) -> dict:
 def _post_anthropic(messages_url: str, api_key: str, model: str,
                     system_text: str, user_text: str,
                     max_tokens: int = 4096, timeout: float = 90.0) -> dict:
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_text,
-        "messages": [{"role": "user", "content": user_text}],
-    }
-    req = request.Request(
-        messages_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 A_stock_rotation/incremental_learn",
-        },
-        method="POST",
-    )
-    t0 = time.time()
-    with request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    return {"body": body, "latency": time.time() - t0}
+    """[2026-09-28] 改为委托 `llm_commentary._post_messages` —— 支持 ollama/openai/anthropic.
+
+    此前本函数是 `llm_commentary._post_anthropic` 的**第 2 份复制**(仅 max_tokens
+    与 User-Agent 不同)。复制件不会随主实现一起支持新协议 ⇒ 切到 Ollama 后本模块
+    **静默失效**。协议细节现集中在 `llm_commentary` 一处。
+    """
+    from llm_commentary import _post_messages
+    return _post_messages(messages_url, api_key, model, system_text, user_text,
+                          max_tokens=max_tokens, timeout=timeout,
+                          user_agent="A_stock_rotation/incremental_learn")
 
 
 # ============================================================================

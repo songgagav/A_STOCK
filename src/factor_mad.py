@@ -40,7 +40,9 @@ _LOG = logging.getLogger("factor_mad")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR  # noqa: E402
-from llm_commentary import _load_dotenv, _build_messages_url, _extract_first_json_object, _repair_json  # noqa: E402
+from llm_commentary import (  # noqa: E402
+    _load_dotenv, _build_messages_url, _post_messages, _split_system,
+    _extract_first_json_object, _repair_json)
 
 # ============================================================
 # 配置
@@ -143,24 +145,28 @@ def _ensure_loaded():
 
 
 def _call_llm(messages: list[dict], max_tokens: int = 2048) -> str | None:
+    """[2026-09-28] 改走 `_post_messages` —— 支持 ollama/openai/anthropic 三种协议。
+
+    此前自己拼 URL + 自己 POST + 自己解 `r["content"]`, 写死 Anthropic 协议;
+    切到 Ollama 后必然 404。协议细节现集中在 `llm_commentary`。
+    """
     _ensure_loaded()
+    from llm_commentary import _post_messages
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "minimax-m3").strip()
-    if not base or not api_key:
+    if not base:
         return None
 
-    url = _build_messages_url(base)
-    body = {"model": model, "max_tokens": max_tokens, "messages": messages}
-    data = json.dumps(body).encode("utf-8")
-    req = request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("x-api-key", api_key)
-    req.add_header("anthropic-version", "2023-06-01")
+    sys_text, rest = _split_system(messages)
+    user_text = "\n\n".join(
+        str(m.get("content") or "") for m in rest) if rest else ""
 
     try:
-        with request.urlopen(req, timeout=60) as resp:
-            r = json.loads(resp.read().decode("utf-8"))
+        url = _build_messages_url(base)
+        r = _post_messages(url, api_key, model, sys_text, user_text,
+                           max_tokens=max_tokens, timeout=60.0,
+                           user_agent="A_stock_rotation/factor_mad")["body"]
         content = r.get("content", [])
         if isinstance(content, list) and content:
             for block in content:

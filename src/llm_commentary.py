@@ -18,40 +18,300 @@ from urllib import error, request
 
 _LOG = logging.getLogger("llm_commentary")
 
-# .env 路径推断: 与 research_trader/.env 共享. 支持环境变量覆盖.
+# .env 路径推断, **按优先级从高到低**:
+#   ① 环境变量 RESEARCH_TRADER_ENV 显式指定;
+#   ② 工作区级 research_trader/.env  —— **权威来源**, 含密钥, 优先级最高;
+#   ③ 本仓 A_stock_rotation/.env     —— 项目级覆盖/补充。
+#
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+#: 本仓根 —— **就是 src 的上一级**(实测: `_SRC_DIR` = `<工作区>/A_stock_rotation/src`)。
+_REPO_ROOT = os.path.abspath(os.path.join(_SRC_DIR, ".."))
+#: 工作区根 —— src 的上两级。
+_WORKSPACE_ROOT = os.path.abspath(os.path.join(_SRC_DIR, "..", ".."))
+
+# .env 候选, **按优先级从高到低**(先读到的键胜出, 见 _load_dotenv):
+#   ① 环境变量 RESEARCH_TRADER_ENV 显式指定;
+#   ② research_trader/.env —— **权威来源**(含密钥), 两种挂法都列上;
+#   ③ 本仓根 .env(`<工作区>/A_stock_rotation/.env`) —— 项目级补充。
+#
+# ⚠️ 这里**不要**再凭感觉推层级。`..` 的层数极易数错, 而数错的症状是
+#    "文件明明在、内容也对、就是不生效" —— 不报错, 只静默失效(本项目已踩过一次)。
+#    故一律用 `_REPO_ROOT` / `_WORKSPACE_ROOT` 这两个**实测过的**常量拼接,
+#    并由 `_tools/verify_env_priority.py` 断言"本仓 .env 里独有的键确实被加载"。
 _DEFAULT_ENV_PATHS = [
     os.environ.get("RESEARCH_TRADER_ENV", "").strip(),
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "research_trader", ".env")),
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "research_trader", ".env")),
+    os.path.join(_WORKSPACE_ROOT, "research_trader", ".env"),
+    os.path.join(_REPO_ROOT, "..", "research_trader", ".env"),
+    os.path.join(_REPO_ROOT, ".env"),
 ]
 
 
 def _load_dotenv() -> None:
-    """最小化 .env 加载, 优先用 os.environ 中已存在的值."""
+    """最小化 .env 加载: **依次读所有存在的候选文件**, 且不覆盖 os.environ 已有值。
+
+    优先级(高 -> 低):
+      1. 进程环境变量(本函数**从不**覆盖已存在的键);
+      2. `_DEFAULT_ENV_PATHS` 中**靠前**的文件;
+      3. 靠后的文件。
+
+    即 `research_trader/.env`(权威, 含密钥) > 本仓 `.env`(项目级补充)。
+
+    [2026-09-28] 去掉了旧实现里的 `return`(读到第一个文件就停)。保留它会让
+    靠后的文件**永远不被读**, 而"文件在、却不生效"是极难排查的静默失效。
+    """
     for p in _DEFAULT_ENV_PATHS:
-        if p and os.path.exists(p) and os.path.isfile(p):
-            try:
-                for raw_line in Path(p).read_text(encoding="utf-8").splitlines():
-                    line = raw_line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k = k.strip()
-                    if k and k not in os.environ:
-                        os.environ[k] = v.strip().strip('"').strip("'")
-                _LOG.debug("llm_commentary: 已加载 %s", p)
-                return
-            except Exception as e:
-                _LOG.warning("llm_commentary: 加载 %s 失败: %s", p, e)
+        if not (p and os.path.exists(p) and os.path.isfile(p)):
+            continue
+        try:
+            for raw_line in Path(p).read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k and k not in os.environ:
+                    os.environ[k] = v.strip().strip('"').strip("'")
+            _LOG.debug("llm_commentary: 已加载 %s", p)
+        except Exception as e:
+            _LOG.warning("llm_commentary: 加载 %s 失败: %s", p, e)
 
 
 def _build_messages_url(base_url: str) -> str:
+    """**兼容垫片**: 按当前协议返回**原生**对话路由。
+
+    旧语义固定返回 `<base>/anthropic/v1/messages`。现改为随 `_resolve_api_type`
+    返回对应原生路由, 于是 `alpha_logics` / `factor_mad` 这两处
+    "先取 URL 再自己 POST" 的调用点也能一并支持 Ollama/OpenAI。
+
+    注意: 用本函数拿到 URL 后**不要**再手工拼 `/anthropic/v1/messages` ——
+    应把该 URL 交给 `_post_messages`(它会剥回 base 再按协议发)。
+    """
+    api_type = _resolve_api_type(base_url)
     base = base_url.rstrip("/")
+    if api_type == "ollama":
+        return base if base.endswith("/api/chat") else f"{base}/api/chat"
+    if api_type == "openai":
+        if base.endswith("/chat/completions"):
+            return base
+        b = base[:-3].rstrip("/") if base.endswith("/v1") else base
+        return f"{b}/v1/chat/completions"
     if base.endswith("/anthropic"):
         return f"{base}/v1/messages"
     if base.endswith("/v1"):
         return f"{base[:-3]}/anthropic/v1/messages"
     return f"{base}/anthropic/v1/messages"
+
+
+# ============================================================
+# [2026-09-28] 多协议支持: anthropic / openai / ollama
+#
+# 背景: 此前本模块(及 alpha_logics / factor_mad / incremental_learn /
+# pre_drl_brief)**只会**走 Anthropic 协议 —— 地址恒被拼成
+# `<base>/anthropic/v1/messages`。切到本地 Ollama(192.168.1.5:11434)时
+# 该路由实测 **404** ⇒ 即使地址填对也必然失败。
+#
+# 各协议实测差异(2026-09-28, Ollama v0.34.0 + qwen3.6:35b):
+#   | 协议      | 路由                     | 请求体关键字段        | 返回文本路径                  |
+#   |-----------|--------------------------|-----------------------|-------------------------------|
+#   | anthropic | /anthropic/v1/messages   | system + max_tokens   | content[].text                |
+#   | openai    | /v1/chat/completions     | messages(含 system)   | choices[0].message.content    |
+#   | ollama    | /api/chat                | messages + think      | message.content               |
+#
+# 选 **ollama 原生**而非 OpenAI 兼容层作为 Ollama 的默认路由, 因为实测:
+#   /api/chat 0.46s  vs  /v1/chat/completions 3.58s(同一提示词、同一模型),
+# 且原生路由的 `think:false` 能干净地把思维链与正文分开
+# (OpenAI 兼容层把思维链放在 `message.reasoning`, 正文仍可能混入)。
+# ============================================================
+
+#: 协议类型环境变量。取值 `anthropic` / `openai` / `ollama`。
+#: 留空则按 base_url 自动推断(见 _resolve_api_type)。
+ENV_API_TYPE = "LLM_API_TYPE"
+#: Ollama 原生路由是否关闭思维链。qwen3.6 等 thinking 模型默认会输出一大段
+#: 思维链; 本项目的调用方都要的是**结构化 JSON**, 思维链既拖慢又可能干扰
+#: JSON 抽取, 故默认关闭。设 `LLM_THINK=1` 可打开。
+ENV_THINK = "LLM_THINK"
+
+#: 默认端口 -> 协议 的推断依据(Ollama 官方默认端口)。
+_OLLAMA_DEFAULT_PORTS = ("11434",)
+
+
+def _resolve_api_type(base_url: str = "") -> str:
+    """决定用哪种协议。返回 'anthropic' | 'openai' | 'ollama'。
+
+    优先级:
+      1) 环境变量 `LLM_API_TYPE`(用户显式指定, 最高优先);
+      2) base_url 含 Ollama 默认端口 `11434` -> ollama;
+      3) base_url 含 `openai` 或 `chat/completions` -> openai;
+      4) 兜底 anthropic —— **保持向后兼容**, 使未设该变量的既有部署行为不变。
+
+    `_resolve_api_type` 是**纯函数式**的(只读环境变量与入参), 便于用例断言。
+    """
+    explicit = os.environ.get(ENV_API_TYPE, "").strip().lower()
+    if explicit in ("anthropic", "openai", "ollama"):
+        return explicit
+    b = (base_url or "").lower()
+    if any(f":{p}" in b for p in _OLLAMA_DEFAULT_PORTS):
+        return "ollama"
+    if "openai" in b or "chat/completions" in b:
+        return "openai"
+    return "anthropic"
+
+
+def _split_system(messages: list) -> tuple[str, list]:
+    """把消息列表拆成 (system_text, 非 system 消息)。
+
+    Anthropic 的 `system` 是**顶层字段**而不是一条消息, 故从 Anthropic 形状
+    迁到 OpenAI/Ollama 形状时需要把 system 提出来单独处理(反向亦然)。
+    """
+    sys_parts, rest = [], []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role", "")).lower() == "system":
+            sys_parts.append(str(m.get("content") or ""))
+        else:
+            rest.append(m)
+    return "\n".join(p for p in sys_parts if p), rest
+
+
+def _post_chat(base_url: str, api_key: str, model: str,
+               system_text: str, user_text: str,
+               *, max_tokens: int = 1200, timeout: float = 90.0,
+               user_agent: str = "A_stock_rotation/llm_commentary") -> dict:
+    """按当前协议 POST 一次对话请求, 返回 {"body": <已归一化的 body>, "latency": s}。
+
+    **归一化**: 无论走哪种协议, 返回的 `body` 都被改写成 **Anthropic 形状**
+    (即含 `content: [{type:"text", text: ...}]`)。这样做的原因是本仓有
+    4 处 `_parse_response` 都只认 `body["content"]` —— 归一化之后它们
+    **一行都不用改**, 也不会出现"连通了却报响应缺少 content"这种半坏状态。
+    """
+    api_type = _resolve_api_type(base_url)
+    base = base_url.rstrip("/")
+    system_text = system_text or ""
+    user_msgs = [{"role": "user", "content": user_text}]
+
+    headers = {"Content-Type": "application/json",
+               "User-Agent": f"Mozilla/5.0 {user_agent}"}
+
+    if api_type == "ollama":
+        url = base if base.endswith("/api/chat") else f"{base}/api/chat"
+        msgs = ([{"role": "system", "content": system_text}] if system_text else []) + user_msgs
+        payload: dict = {"model": model, "messages": msgs, "stream": False}
+        # 选项统一走 options(见 Ollama API); 缺省不动, 避免覆盖服务端默认温度。
+        opts = {}
+        mt = int(os.environ.get("OLLAMA_NUM_PREDICT", "0") or 0)
+        if mt > 0:
+            opts["num_predict"] = mt
+        if opts:
+            payload["options"] = opts
+        # 思维链开关: 默认关闭(本项目只要结构化 JSON)。
+        payload["think"] = os.environ.get(ENV_THINK, "0").strip().lower() in (
+            "1", "true", "yes", "on")
+    elif api_type == "openai":
+        if base.endswith("/chat/completions"):
+            url = base
+        else:
+            # 允许 base 写成 `.../v1` 或裸地址两种形态, 避免拼出 `/v1/v1/...`
+            b = base[:-3].rstrip("/") if base.endswith("/v1") else base
+            url = f"{b}/v1/chat/completions"
+        msgs = ([{"role": "system", "content": system_text}] if system_text else []) + user_msgs
+        payload = {"model": model, "messages": msgs,
+                   "max_tokens": max_tokens, "stream": False}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    else:  # anthropic
+        url = _build_messages_url(base_url)
+        payload = {"model": model, "max_tokens": max_tokens,
+                   "system": system_text, "messages": user_msgs}
+        # Ollama 等本地端点无鉴权, 允许 api_key 为空。
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+
+    req = request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST")
+    t0 = time.time()
+    with request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return {"body": _to_anthropic_shape(body), "latency": time.time() - t0,
+            "_api_type": api_type, "_url": url}
+
+
+def _to_anthropic_shape(body: dict) -> dict:
+    """把 anthropic / openai / ollama 三种返回体统一成 Anthropic 形状。
+
+    统一后 `body["content"]` 恒为 `[{"type": "text", "text": ...}]`,
+    于是既有 `_parse_response` 无需改动即可消费任意协议的返回。
+
+    **为什么不用 `raise` 表达"取不到"**: 本函数是**解析归一化**而非校验;
+    取不到时返回 `content: []`(空列表), 由调用方的 `_parse_response` 统一报
+    "响应缺少 content" —— 保持与改动前一致的失败语义与报错位置。
+    """
+    if not isinstance(body, dict):
+        return {"content": []}
+    # ① 已是 Anthropic 形状
+    c = body.get("content")
+    if isinstance(c, list) and c and isinstance(c[0], dict) and "text" in c[0]:
+        return body
+    # ② OpenAI 兼容: choices[0].message.content
+    if isinstance(body.get("choices"), list) and body["choices"]:
+        msg = body["choices"][0].get("message") or {}
+        txt = msg.get("content")
+        if isinstance(txt, list):  # 少数实现返回分段
+            txt = "".join(str(s.get("text", "")) for s in txt if isinstance(s, dict))
+        out = dict(body)
+        out["content"] = [{"type": "text", "text": str(txt or "")}]
+        # 思维链另存, 不混进 content(reasoning 是推理过程, 不是回答)
+        if msg.get("reasoning"):
+            out["reasoning"] = msg["reasoning"]
+        return out
+    # ③ Ollama 原生: message.content
+    if isinstance(body.get("message"), dict):
+        msg = body["message"]
+        out = dict(body)
+        out["content"] = [{"type": "text", "text": str(msg.get("content") or "")}]
+        if msg.get("thinking"):
+            out["thinking"] = msg["thinking"]
+        return out
+    # ④ Anthropic 风格但 content 为空列表 —— 原样返回(交由调用方报错)
+    if isinstance(c, list):
+        return body
+    return {"content": [], "_raw_keys": sorted(body.keys())}
+
+
+def _post_messages(messages_url: str, api_key: str, model: str,
+                   system_text: str, user_text: str,
+                   max_tokens: int = 1200, timeout: float = 90.0,
+                   user_agent: str = "A_stock_rotation/llm_commentary") -> dict:
+    """**兼容垫片**: 保留旧签名, 内部改走多协议 `_post_chat`。
+
+    为什么保留: 本仓另有 4 个模块各自复制了一份 `_post_anthropic`, 且
+    `alpha_logics` / `factor_mad` 直接调 `_build_messages_url` 再自己 POST。
+    保留同名同签名的垫片可以让这些调用点**只改一行 import/一行函数名**,
+    而不是各自重写协议逻辑 —— 协议细节集中在本模块一处。
+
+    入参 `messages_url` 在旧语义下是"已拼好的 Anthropic 地址"; 现在
+    `_build_messages_url` 已按协议返回**原生地址**, 故这里只需把
+    `/api/chat` 或 `/chat/completions` 结尾的原生地址剥回 base 交给 `_post_chat`。
+    """
+    base = messages_url
+    for suffix in ("/api/chat", "/v1/chat/completions", "/v1/messages"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            if suffix == "/v1/messages" and base.endswith("/anthropic"):
+                base = base[: -len("/anthropic")]
+            break
+    return _post_chat(base, api_key, model, system_text, user_text,
+                      max_tokens=max_tokens, timeout=timeout,
+                      user_agent=user_agent)
+
+
+def _post_anthropic(messages_url: str, api_key: str, model: str,
+                    system_text: str, user_text: str,
+                    max_tokens: int = 1200, timeout: float = 90.0) -> dict:
+    """**兼容垫片**(保留旧名): 等价于 `_post_messages`。"""
+    return _post_messages(messages_url, api_key, model, system_text, user_text,
+                          max_tokens=max_tokens, timeout=timeout)
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -336,6 +596,33 @@ def _fallback_commentary() -> dict:
     }
 
 
+def _resolve_llm_config() -> tuple[dict | None, str | None]:
+    """读出 LLM 配置并做**前置校验**。返回 (cfg, error)。
+
+    抽成独立函数是为了让"缺配置"这条判据**可被用例直接测** ——
+    埋在 `generate_commentary` 内部时, 测它要先造 market/performance 一堆入参,
+    于是实践中没人测, 判据就随改动腐烂。
+
+    [2026-09-28] key 的强制要求**按协议区分**: 本地端点(Ollama)无鉴权,
+    缺 key 不该判为配置缺失(那是假前提 —— 改了地址就能用, 却报"缺配置")。
+    """
+    _load_dotenv()
+    base = os.environ.get("OPENAI_BASE_URL", "").strip()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_type = _resolve_api_type(base)
+    if not base:
+        return None, "缺少 OPENAI_BASE_URL"
+    if not key and api_type != "ollama":
+        return None, "缺少 OPENAI_API_KEY"
+    return {
+        "base": base,
+        "key": key,
+        "api_type": api_type,
+        "model": os.environ.get("OPENAI_MODEL", "MiniMax-M3").strip(),
+        "timeout": float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 90),
+    }, None
+
+
 def generate_commentary(day: str,
                         perf_report: dict,
                         market_report: dict | None = None,
@@ -346,14 +633,13 @@ def generate_commentary(day: str,
     """主入口: 拉取 evidence, 调 LLM, 返回结构化 commentary.
     返回: {"ok": True, "commentary": {...}, "meta": {...}} 或 {"ok": False, "error": "..."}.
     """
-    _load_dotenv()
-    base = os.environ.get("OPENAI_BASE_URL", "").strip()
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    model = os.environ.get("OPENAI_MODEL", "MiniMax-M3").strip()
-    timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 90)
-
-    if not base or not key:
-        return {"ok": False, "error": "缺少 OPENAI_BASE_URL 或 OPENAI_API_KEY", "stage": "config"}
+    cfg, cfg_err = _resolve_llm_config()
+    if cfg_err:
+        return {"ok": False, "error": cfg_err, "stage": "config"}
+    base = cfg["base"]
+    key = cfg["key"]
+    model = cfg["model"]
+    timeout = cfg["timeout"]
 
     messages_url = _build_messages_url(base)
     # 拉近 30 日 market 序列 (有就用, 没有传空 list 让 LLM 看到 availability=False)

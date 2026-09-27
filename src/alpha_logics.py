@@ -41,7 +41,9 @@ _LOG = logging.getLogger("alpha_logics")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA_DIR, DUCKDB_PATH  # noqa: E402
 
-from llm_commentary import _load_dotenv, _build_messages_url, _extract_first_json_object, _repair_json  # noqa: E402
+from llm_commentary import (  # noqa: E402
+    _load_dotenv, _build_messages_url, _post_messages, _split_system,
+    _extract_first_json_object, _repair_json)
 
 # ============================================================
 # 配置
@@ -88,29 +90,32 @@ def _ensure_loaded():
 
 
 def _call_llm(messages: list[dict], max_tokens: int = 4096) -> str | None:
+    """[2026-09-28] 改走 `_post_messages` —— 支持 ollama/openai/anthropic 三种协议。
+
+    此前这里自己拼 URL + 自己 POST + 自己解 `r["content"]`, 写死 Anthropic 协议。
+    切到 Ollama 后该路径必然 404。现协议细节集中在 `llm_commentary`, 且返回体
+    已被归一化成 Anthropic 形状, 故下面的解析逻辑保持不变。
+    """
     _ensure_loaded()
+    from llm_commentary import _post_messages
     base = os.environ.get("OPENAI_BASE_URL", "").strip()
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     model = os.environ.get("OPENAI_MODEL", "minimax-m3").strip()
-    if not base or not api_key:
-        _LOG.warning("alpha_logics: 缺少 LLM 配置")
+    timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "90") or 90)
+    if not base:
+        _LOG.warning("alpha_logics: 缺少 LLM 配置(OPENAI_BASE_URL)")
         return None
 
-    url = _build_messages_url(base)
-    body = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
-    data = json.dumps(body).encode("utf-8")
-    req = request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("x-api-key", api_key)
-    req.add_header("anthropic-version", "2023-06-01")
+    # messages 里若含 system, 提取出来交给 _post_messages(它会按协议摆位)
+    sys_text, rest = _split_system(messages)
+    user_text = "\n\n".join(
+        str(m.get("content") or "") for m in rest) if rest else ""
 
     try:
-        with request.urlopen(req, timeout=90) as resp:
-            r = json.loads(resp.read().decode("utf-8"))
+        url = _build_messages_url(base)
+        r = _post_messages(url, api_key, model, sys_text, user_text,
+                           max_tokens=max_tokens, timeout=timeout,
+                           user_agent="A_stock_rotation/alpha_logics")["body"]
         content = r.get("content", [])
         if isinstance(content, list) and content:
             for block in content:

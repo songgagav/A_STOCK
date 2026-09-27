@@ -249,27 +249,17 @@ def _parse_response(body: dict) -> dict:
 def _post_anthropic(messages_url: str, api_key: str, model: str,
                     system_text: str, user_text: str,
                     max_tokens: int = 1000, timeout: float = 60.0) -> dict:
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_text,
-        "messages": [{"role": "user", "content": user_text}],
-    }
-    req = request.Request(
-        messages_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 A_stock_rotation/pre_drl_brief",
-        },
-        method="POST",
-    )
-    t0 = time.time()
-    with request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    return {"body": body, "latency": time.time() - t0}
+    """[2026-09-28] 改为委托 `llm_commentary._post_messages` —— 支持 ollama/openai/anthropic.
+
+    此前本函数是 `llm_commentary._post_anthropic` 的**第 3 份复制**, 写死了
+    Anthropic 的请求头与请求体形状。复制件不会随主实现一起支持新协议, 于是
+    "改了主模块却漏了这一处"会让本模块在切到 Ollama 后**静默失效**
+    (连不上, 但仍安静地返回一份降级 brief)。协议细节现集中在 `llm_commentary`。
+    """
+    from llm_commentary import _post_messages
+    return _post_messages(messages_url, api_key, model, system_text, user_text,
+                          max_tokens=max_tokens, timeout=timeout,
+                          user_agent="A_stock_rotation/pre_drl_brief")
 
 
 def _latest_trade_day_from_db(day: str) -> str | None:
