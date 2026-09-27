@@ -34,7 +34,7 @@ python -m pytest tests/ -q        # 自检
 python src/run_daily.py                    # 收盘选股主流程
 python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
 python src/sentinel_daemon.py              # 估值覆盖率哨兵守护 (每日 18:30; 报缺口才补 pe_ttm)
-python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘 15:05 / 崩溃自动拉起
+python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘选股 **19:10** / 崩溃自动拉起
 python src/realtime_engine.py --once       # 盘中撮合单次
 python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i_db, 见 README)
 
@@ -86,6 +86,11 @@ python scripts/pbo_sweep.py              # PBO 参数扫描 + CSCV(约 50 分钟
 ## 5. 运维注意事项
 
 - 守护进程与引擎使用外部 Python(见 `TRAE_PYTHON`);确认该解释器含全部依赖。
-- 交易日引擎在 08:30 由 `daemon.py` 拉起,收盘 15:05 执行选股;崩溃自动拉起由守护负责。
+- 交易日引擎在 08:30 由 `daemon.py` 拉起,收盘选股在 **19:10** 执行(`daemon.py` 的
+  `MARKET_CLOSE`);崩溃自动拉起由守护负责。
+  **[2026-09-28 更正]** 此前本行写的是「收盘 15:05 执行选股」, 那是**过期**的 ——
+  15:05 自 2026-09-08 起只是**维护窗口**`--maint`(非交易日)的触发点与收盘窗口的**起点**,
+  真正的收盘选股已后移至 19:10(数据商收盘后 1-4 小时才出全量日线/估值)。
+  该过期描述曾直接导致一次误判: 把非交易日 15:06 的 `--maint` 产物当成了收盘选股产物。
 - 数据文件(`data/h5i/market.db`)被进程独占时,回测/重建脚本会因文件锁失败——请在收盘后或停止守护时执行批量任务。
 - 代码更新后重启顺序:`gate_refresh_daemon.py`(IC 门控)→ `daemon.py`(主调度)→ 视需要 `dashboard.py`。
