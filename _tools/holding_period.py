@@ -34,13 +34,27 @@ def p(s: str = "") -> None:
 
 
 def load_trades():
-    """把多个来源的 trades_history 合并去重 -> {day: [trade, ...]}。"""
+    """把多个来源的 trades_history 合并去重 -> {day: [trade, ...]}。
+
+    ⚠️ **2026-09-27 更正**: 本函数初版把 `data/_backup_before_dryrun/state.json`
+    当作生产台账一起合并, 从而算出「生产实际持有期中位 1 天」。
+    实测该目录是**解释器一致性预检在隔离临时目录里跑出的产物**
+    (`data/preflight_dryrun.json`: `tmp_data_dir=...\\Temp\\_interp_parity_B_*`,
+    `prod_state_untouched=True`), **不是生产实盘增量**。
+    样本构成: 预检回放卖出 54 笔 / 生产盘卖出 3 笔 ⇒ **预检占 95%**。
+
+    ⇒ 本函数现把**预检产物排除在"生产"之外**, 并在返回值里带上**来源构成**,
+      让调用方能看出"生产口径"的样本到底有多少。
+    """
     merged: dict[str, dict] = {}
     srcs = []
-    cand = [os.path.join(BASE, "data", "state.json"),
-            os.path.join(BASE, "data", "_backup_before_dryrun", "state.json")]
-    cand += sorted(glob.glob(os.path.join(BASE, "data", "daily", "*", "paper_book.json")))
-    for fp in cand:
+    prod = [os.path.join(BASE, "data", "state.json")]
+    # 预检隔离产物 —— **单列, 不计入生产口径**
+    dry = [os.path.join(BASE, "data", "_backup_before_dryrun", "state.json")]
+    snap = sorted(glob.glob(os.path.join(BASE, "data", "daily", "*", "paper_book.json")))
+    for fp, kind in ([(p, "prod") for p in prod]
+                     + [(p, "snapshot") for p in snap]
+                     + [(p, "preflight") for p in dry]):
         if not os.path.exists(fp):
             continue
         try:
@@ -52,28 +66,36 @@ def load_trades():
         for day, items in th.items():
             bucket = merged.setdefault(day, {})
             for t in items or []:
-                # 去重键: 日期+类型+代码+数量+时间
                 k = (t.get("date") or day, t.get("type"), t.get("canon"),
                      t.get("qty"), t.get("time"))
                 if k not in bucket:
-                    bucket[k] = t
+                    bucket[k] = dict(t, _src=kind)
                     got += 1
-        srcs.append((os.path.relpath(fp, BASE), len(th), got))
+        srcs.append((os.path.relpath(fp, BASE), kind, len(th), got))
     return ({d: list(v.values()) for d, v in merged.items()}, srcs)
 
 
 trades_by_day, srcs = load_trades()
 p("=" * 84)
-p("来源(生产台账)")
+p("来源(按**口径**分列 —— 预检产物不算生产台账)")
 p("=" * 84)
-for rel, ndays, got in srcs:
-    p(f"  {rel:52} 覆盖 {ndays:>2} 天, 新增 {got:>3} 笔")
+for rel, kind, ndays, got in srcs:
+    p(f"  [{kind:9}] {rel:50} 覆盖 {ndays:>2} 天, 新增 {got:>3} 笔")
 days = sorted(trades_by_day)
 alln = sum(len(v) for v in trades_by_day.values())
 buys = [t for v in trades_by_day.values() for t in v if t.get("type") == "buy"]
 sells = [t for v in trades_by_day.values() for t in v if t.get("type") == "sell"]
+prod_sells = [t for v in trades_by_day.values() for t in v
+              if t.get("type") == "sell" and t.get("_src") == "prod"]
 p()
 p(f"合并后: {len(days)} 个交易日  {days[0]} .. {days[-1]}   共 {alln} 笔 (买 {len(buys)} / 卖 {len(sells)})")
+p()
+p(f"  ⚠️ 其中**生产口径**(`data/state.json`, 标 `[prod]`)**只有 {len(prod_sells)} 笔卖出**")
+if len(prod_sells) < 20:
+    p("     ⇒ **不足以做持有期分布/卖出条件归因**。")
+    p("     本脚本下面的分布即便算出来, **也主要是预检回放(标 `[preflight]`)的口径**, ")
+    p("     **不能当作「生产实际持有期」**。见 ops/acceptance_status.json 的")
+    p("     `FINDING-STATE-LEDGER-TOO-SHORT-FOR-HOLDING-MEASUREMENT`。")
 p()
 assert alln, "没有读到任何成交流水 —— 不要在空数据上出结论"
 

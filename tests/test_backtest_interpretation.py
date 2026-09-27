@@ -94,3 +94,69 @@ class TestBacktestHoldingPeriodMustBeDisclosed:
         src = open(fp, encoding="utf-8").read()
         assert "fetch_day" in src, "工具应通过厂商引擎取 OHLC"
         assert "stdev" in src, "工具应做配对统计(否则无法判断显著性)"
+
+
+class TestPreflightArtifactsAreNotProductionData:
+    """`data/_backup_before_dryrun/` 是**预检隔离产物**, 不得当生产台账 (2026-09-27)。
+
+    ## 为什么锁这个
+
+    我把 `data/_backup_before_dryrun/state.json` 与 `data/state.json` 合并,
+    算出「生产实际持有期中位 **1 天**」并写进了协议文档。后来发现该目录来自
+    **解释器一致性预检**, 跑在隔离临时目录里:
+
+    ```
+    data/preflight_dryrun.json:
+      tmp_data_dir         = C:\\Users\\...\\Temp\\_interp_parity_B_blufu271
+      prod_state_untouched = True
+    ```
+
+    **样本构成**: 预检回放卖出 **54 笔(95%)** / 生产盘卖出 **3 笔(5%)**
+    ⇒ 那个「中位 1 天」主要来自预检回放, **不是生产实盘**。
+
+    **判据**: 判断一个文件是不是生产数据, 要看「**谁写的、写到哪里、有没有隔离标记**」,
+    而不是「它在 `data/` 下、名字像台账」。
+    """
+
+    def test_preflight_record_still_declares_isolation(self):
+        """预检记录必须仍在, 且仍声明隔离 —— 这是判据的依据本身。"""
+        import json
+
+        fp = os.path.join(_REPO, "data", "preflight_dryrun.json")
+        if not os.path.exists(fp):
+            pytest.skip("无 data/preflight_dryrun.json(该环境未跑过预检)")
+        d = json.load(open(fp, encoding="utf-8"))
+        assert d.get("prod_state_untouched") is True, (
+            "预检记录的隔离声明变了 —— 需重新评估 _backup_before_dryrun 的用途")
+        assert "tmp_data_dir" in d, "缺 tmp_data_dir —— 无法证明它跑在隔离目录"
+
+    def test_the_doc_retracts_the_contaminated_number(self):
+        """协议文档必须**撤回**那个被污染的数字, 而不是留着它。"""
+        src = open(_DOC, encoding="utf-8").read()
+        i = src.find("### 3b.")
+        assert i > 0
+        blk = src[i:i + 5200]
+        assert "证据被污染" in blk or "已撤回" in blk, (
+            "§3b 必须显式撤回「生产中位 1 天」")
+        assert "预检" in blk, "必须点明污染来源是预检隔离产物"
+        assert "3 笔" in blk or "不足以测" in blk, (
+            "必须说明排除预检后生产样本只剩 3 笔、不足以测量")
+
+    def test_the_holding_tool_separates_provenance(self):
+        """度量工具必须**按口径分列**来源, 不能把预检混进生产。"""
+        fp = os.path.join(_REPO, "_tools", "holding_period.py")
+        src = open(fp, encoding="utf-8").read()
+        assert "_src" in src, "工具应给每笔打来源标记"
+        assert "preflight" in src, "工具应把预检产物单列"
+        assert "不足以做持有期分布" in src or "不足以" in src, (
+            "工具应在生产样本过少时**显式告警**, 而不是照样输出分布")
+
+    def test_registered_as_a_finding(self):
+        """必须已登记 —— 否则后人会重新犯同一个错。"""
+        import json
+
+        fp = os.path.join(_REPO, "ops", "acceptance_status.json")
+        d = json.load(open(fp, encoding="utf-8"))
+        ids = {it["id"] for it in d["items"]}
+        assert "FINDING-STATE-LEDGER-TOO-SHORT-FOR-HOLDING-MEASUREMENT" in ids, (
+            "缺登记条目: FINDING-STATE-LEDGER-TOO-SHORT-FOR-HOLDING-MEASUREMENT")
