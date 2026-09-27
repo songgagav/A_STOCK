@@ -58,7 +58,11 @@ __pycache__/
 # [2026-09-23] 本仓 pytest 必须用 `--basetemp=.pytest_tmp\<run>` 才能在 Windows 上
 # 正常跑(默认 basetemp 目录不可写), 故该目录**每轮都会生成**且含大量临时产物;
 # 不忽略它会让每次 `git status` 都多出一坨噪声。
-.pytest_tmp/
+# [2026-09-28 修正] 原规则 `.pytest_tmp/` 只匹配**恰好**叫这个名字的目录,
+# 而实际用法是 `--basetemp=".pytest_tmp_<HHmmss>"`(带后缀, 每轮都不同)
+# ⇒ 通配不到 ⇒ 每轮 `git status` 都多出一个未跟踪目录。改成 `.pytest_tmp*/`
+# 同时覆盖「无后缀」与「带后缀」两种写法。
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .coverage
