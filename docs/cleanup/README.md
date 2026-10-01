@@ -24,4 +24,11 @@
 | [`h5i-call-map.md`](h5i-call-map.md) | 174 |
 | [`process-probe-call-map.md`](process-probe-call-map.md) | 105 |
 
+Phase 4–7 的边界结论：
+
+- [`duckdb-boundary.md`](duckdb-boundary.md)：保留兼容层，不再新增 DuckDB 调用；
+- [`fml-role.md`](fml-role.md)：标注 `ml_fusion_bridge` 的生产/回退角色和退役条件；
+- [`service-lifecycle.md`](service-lifecycle.md)：明确 daemon、keepalive、run_services 与 Celery 的职责边界；
+- [`env-blockers.md`](env-blockers.md)：记录 bandit/pip-audit/detect-secrets/coverage/deptry 缺失时的替代检查。
+
 原始复核命令见每份报告。命中数量包含注释、测试和文档，不能直接作为删除依据。
