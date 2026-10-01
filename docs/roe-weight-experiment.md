@@ -17,7 +17,7 @@ METHOD-1 查看下游组合表现，不用 IC 自身作为“调高/调低权重
 - 目标配权继续调用生产 `allocate_target_weights()`；
 - 变体：现行 `1.0618`、按第三档对齐 `0.7300`、半权 `0.5309`、留一消融 `0`；
 - 输出：`data/roe_weight_experiment.json`（运行产物，不入 Git）；
-- 复跑：`python scripts/roe_weight_experiment.py`。
+- 复跑：`python scripts/research/roe_weight_experiment.py`。
 
 ## 2026-10-01 结果
 

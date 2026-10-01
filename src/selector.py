@@ -118,7 +118,7 @@ class RotationSelector:
     def _apply_fusion_rank(self, scored: list, as_of: str) -> None:
         """(2026-09-13) 可选: 让四因子融合分参与排序, 而非只用旧 SCORE_WEIGHTS 复合.
 
-        背景(证据见 scripts/ic_neutral_check.py / docs/pit-valuation.md 第 10 条):
+        背景(证据见 scripts/research/ic_neutral_check.py / docs/pit-valuation.md 第 10 条):
           旧复合 `signal` 的 IC 全视界为负(均值 -0.0674);
           而 pb_inv+ep+ocf_ps+roe_yy_chg 融合分 IC 全视界为正(修正 roe 方向后 +0.1167)。
         融合分目前只用于权重分配, 未参与选股排名。本函数提供开关:

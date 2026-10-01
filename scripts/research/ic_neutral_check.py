@@ -9,7 +9,7 @@ pb_inv / ep / ocf_ps / roe_yy_chg 的 IC, 决定是否改 DIRECTIONS 并切换�
   roe_yy_chg 中性化 IC 均值 > 0  -> 生产方向 -1 是错的, 应改 +1
   roe_yy_chg 中性化 IC 均值 < 0  -> 生产方向正确, 不可改
 
-用法: python scripts/ic_neutral_check.py
+用法: python scripts/research/ic_neutral_check.py
 输出: data/ic_neutral_check.json
 """
 from __future__ import annotations

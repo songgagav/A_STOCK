@@ -13,7 +13,7 @@
 注: 此处未做 size/行业中性化(生产链路会做), 故绝对值与生产 IC 会有差异,
     但**用于判断符号方向是否搞反**是充分的。
 
-用法: python scripts/fusion_decompose.py
+用法: python scripts/research/fusion_decompose.py
 输出: data/fusion_decompose.json
 """
 from __future__ import annotations

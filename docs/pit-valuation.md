@@ -242,7 +242,7 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
    附带发现：门控实际只输出 `risk` 与 `unknown`（`neutral`/`bull` 恒为 0），
    即它本质是"风险闸"，不是三态状态机，值得后续复核。
 
-   **② IC 期限结构（`scripts/ic_term_structure.py`）**：同一决策日截面在
+   **② IC 期限结构（`scripts/research/ic_term_structure.py`）**：同一决策日截面在
    1/5/10/20/60/120 交易日视界上的 RankIC：
 
    | 视界 | 1d | 5d | 10d | 20d | 60d | 120d |
@@ -284,7 +284,7 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
     **实测影响**：`vol` 在 2022-12-30 / 2024-07-03 历史上**未被隔离（权重 0.100）**，
     而用今天的曲线会判隔离（0.000）——即此前所有历史截面与回测都用了错误的权重。
 
-    **② 融合因子拆解（`scripts/fusion_decompose.py`）**：复用生产链路
+    **② 融合因子拆解（`scripts/research/fusion_decompose.py`）**：复用生产链路
     （`factor_fusion._Snap` / `_assemble_snapshot`）取 11 个决策日的**原始**因子截面：
 
     | 成分 | 5d | 10d | 20d | 60d | 120d | 均值 | 正比例 |
@@ -324,7 +324,7 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
 
 11. **中性化 IC 复核 + 排序切换（2026-09-13，执行结果）**：
 
-    **① 中性化复核（`scripts/ic_neutral_check.py`）—— 结论：中性化不改变符号**。
+    **① 中性化复核（`scripts/research/ic_neutral_check.py`）—— 结论：中性化不改变符号**。
     用生产口径（Winsorize → OLS(ln_size+行业) → z）重算：
 
     | 成分 | 5d | 10d | 20d | 60d | 120d | 均值 | 正比例 | 生产方向 |
@@ -490,7 +490,7 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
     两者持仓重叠 **0.1/10**）。⇒ 秩相关为正、头部却更差，属**尾部非单调**，
     问题在选股下游，不在信号本身。
 
-    **② 第二层 选股逻辑**（`scripts/selection_tail_diag.py`）：十分档
+    **② 第二层 选股逻辑**（`scripts/research/selection_tail_diag.py`）：十分档
     D1..D10 = +0.42 / -0.29 / +1.86 / +4.21 / +3.42 / +4.03 / +5.61 / **+7.49** /
     +5.01 / +5.05 %（最高十分档**并未反转**，D8 最强），说明反转只发生在
     **池内最尖的 top10（约前 0.5%）**：
@@ -597,7 +597,7 @@ PIT 正确的 `valuation` 逐日数据，分叉消除。
 
 16. **极端头部反转专项诊断 + 截尾比例敏感性 + 开关落地（2026-09-13）**：
 
-    **① 截尾比例敏感性**（`scripts/trim_sensitivity.py`，11 窗口，池内 top10）：
+    **① 截尾比例敏感性**（`scripts/research/trim_sensitivity.py`，11 窗口，池内 top10）：
 
     | 截尾 | 纯融合截尾 均值/中位/正窗口 | 生产式掺入 均值/中位/正窗口 |
     |---|---|---|
@@ -1603,7 +1603,7 @@ $py = "$env:APPDATA\TRAE SOLO CN\ModularData\ai-agent\vm\tools\python\python.exe
 
 ### ② 方向一致性检查（§⑨ 执行路径第 3-4 步）
 
-**新增脚本** `scripts/hist_direction_consistency.py` → `data/hist_direction_consistency.json`。
+**新增脚本** `scripts/research/hist_direction_consistency.py` → `data/hist_direction_consistency.json`。
 
 **做法（与生产同管道，不另起口径）**：对每个候选决策日，复用 `factor_fusion` 的截面装配
 （`_Snap` PIT 财务排期 + valuation 同日可见 + 当日 bar + `_assemble_snapshot`），取四因子原值；
@@ -1690,7 +1690,7 @@ pb_inv +0.1219 / ep +0.1003 / ocf_ps +0.0439 / roe_yy_chg +0.0263（raw 口径�
   无 Sharpe/MDD），与 vnpy 口径**不可比**，故不进矩阵。
   （缺陷记录：该行应改为"取 `bar_map` 中第一个存在的标的"，本次未改 `src/`。）
 
-**按市场状态分层（`scripts/hist_regime_report.py` → `data/hist_regime_report.json`）**：
+**按市场状态分层（`scripts/research/hist_regime_report.py` → `data/hist_regime_report.json`）**：
 
 | 市场状态 | n | 均值 | 中位 | 正窗口 | Sharpe | MDD | 其中同向窗口 |
 |---|---|---|---|---|---|---|---|
@@ -1714,7 +1714,7 @@ pb_inv +0.1219 / ep +0.1003 / ocf_ps +0.0439 / roe_yy_chg +0.0263（raw 口径�
 
 ### ④ 历史窗口的口径对照（截尾是否跨环境成立？）
 
-**新增脚本** `scripts/hist_six_grid.py` → `data/hist_six_grid.json`；另落
+**新增脚本** `scripts/research/hist_six_grid.py` → `data/hist_six_grid.json`；另落
 `data/hist_six_grid_aligned.json`（剔除降级窗口后与 2018+ 对齐）。
 
 **探口径自检**：16/16 窗口的"快照派生 top-10 == 实时基线缓存"逐位一致 ⇒ 历史窗口也可
@@ -1771,7 +1771,7 @@ pb_inv +0.1219 / ep +0.1003 / ocf_ps +0.0439 / roe_yy_chg +0.0263（raw 口径�
 ②**确认**了"纯融合不可用"的方向可复现；③**证伪**了"峰值在 5%"与"纯融合普适劣性"
 这两条外推中的前者。按 §⑨ 约定，15 个历史窗口**不计入**显著性计数，
 n≥20 仍由 2018+ 未来窗口达成。
-分层产物：`data/hist_six_grid_by_envclass.json`（由 `scripts/hist_regime_report.py`
+分层产物：`data/hist_six_grid_by_envclass.json`（由 `scripts/research/hist_regime_report.py`
 的"按方向一致性分层"模块生成，可复现）。
 
 > 🔁 **判据更新（2026-09-19，本节的结论随之降级为"阈值相关"）**：
@@ -1799,7 +1799,7 @@ n≥20 仍由 2018+ 未来窗口达成。
    `[中止] 无任何窗口成功, 不覆盖既有产物` 并**跳过落盘**（本次实测造成过一次误覆盖，
    靠跑前备份 `data/fidelity_rebalance_pre_valrebuild.json` 还原）。
 4. 2010-2017 的 `pool_snapshot`（16 份）与选股缓存已落盘，后续可用
-   `scripts/hist_six_grid.py` 秒级派生其余排序/截尾口径，无需重跑选股。
+   `scripts/research/hist_six_grid.py` 秒级派生其余排序/截尾口径，无需重跑选股。
 5. **`hist_regime_report.py` 的分层核算不可省**：全量聚合会被"环境外"窗口主导而得出
    与协议相反的结论（本次已实测踩中并修正，见 ④ 判定 1）。
 
@@ -1807,8 +1807,8 @@ n≥20 仍由 2018+ 未来窗口达成。
 - 2026-09-18：新增 §⑪（解释器依赖恢复 + 方向一致性检查 + 历史窗口 OOS 扩展与分层报告）。
 - 2026-09-18：§⑪⓪ 记录解释器依赖被清空后的恢复步骤（h5i-db/duckdb/polars/vnpy/alphalens）
   与 `fidelity_rebalance.py` 空产物护栏。
-- 2026-09-18：§⑪②③ 落 `scripts/hist_direction_consistency.py`（方向一致性）与
-  `scripts/hist_six_grid.py` / `hist_regime_report.py`（历史窗口多口径 + 分层报告）。
+- 2026-09-18：§⑪②③ 落 `scripts/research/hist_direction_consistency.py`（方向一致性）与
+  `scripts/research/hist_six_grid.py` / `scripts/research/hist_regime_report.py`（历史窗口多口径 + 分层报告）。
 - 2026-09-18：§⑪④ **修正本文档上一版结论** —— 按 §⑨ 第 4 条分层后，截尾在协议口径下
   无增益；"纯融合完全反转"是环境外窗口主导的假象。新增 `--explain` 归因脚本
   `scripts/fidelity_compare.py`（保真度新旧对账）。
