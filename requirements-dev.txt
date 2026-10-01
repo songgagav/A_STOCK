@@ -18,6 +18,11 @@ prometheus_client>=0.20
 flower>=2.0
 psutil>=6.0
 requests>=2.32
+PyYAML>=6.0
+# --- release/security checks ---
+bandit>=1.7
+pip-audit>=2.7
+detect-secrets>=1.5
 # --- 主数据源 h5i 的依赖（**仅 CPython 3.10 可装**）---
 # h5i_db 的原生扩展只支持 CPython 3.10（见 README 第 171 行），故**不能**作为本文件的
 # 生效依赖: 本文件面向 .venv314(Python 3.14)，写进去会让整个文件装不上。

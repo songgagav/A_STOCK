@@ -21,7 +21,7 @@
 
 | # | 检查项 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| 1 | 数据时效（盘前哨兵覆盖率） | ⚠️ | 哨兵代码齐备（`src/sentinel_daemon.py`、`src/valuation_coverage_sentinel.py`）；`data/sentinel_last.json` 末次为 **2026-09-15**，`CRITICAL 0 / WARN 0`。但**当前无守护进程在跑**（`data/dashboard.pid`=16628 已不存在）⇒ "每日盘前自动跑"**未成立**，需起调度后复验 |
+| 1 | 数据时效（盘前哨兵覆盖率） | ⚠️ | 历史运行记录曾提及 `src/sentinel_daemon.py` / `src/valuation_coverage_sentinel.py`，但当前公开 checkout 不包含这些入口；因此该历史结果不能作为当前自动哨兵已启用的证据。当前状态和恢复前置见 `docs/patch-retirement-watch.md`，需恢复代码并起调度后复验 |
 | 2 | 口径边界（三段 PB 抽检） | ✅ | 本次 `scripts/preflight_data_checks.py`（5 日）：PB 非空率 **99.05% ~ 99.34%**；边界处中位 PB **2.696 → 2.747（+1.9%）**，落在 §⑩ 量化的"中位差异 1.0~2.6%"内 ⇒ **跳变可解释，无假信号**。source 亦与边界一致（2020-10-21/22 与 2025-08-01 为 `calculated_from_financials`，2025-08-04 起转 `unified_close_bvps_pit`） |
 | 3 | 幸存者偏差（池含退市股、top10 不受影响） | ✅ | §⑧/§⑩：退市股在池、top10 逐位一致；本会话独立复核**换池确实会改变调仓点成分**（保真度 4/11 窗口偏离，`600636.SH` 两次进入 top10）⇒ 修复有效且影响可控（§⑪①） |
 | 4 | 财务前视（availability 映射一致性） | ✅ + ⚠️ | 本次把**全部 5 份** `_avail_date` 实现（`db` / `factor_fusion` / `factor_library` / `valuation_backfill` / `factor_mine.m5_rebuild`）交叉比对 **102 个报告期 → 0 处分歧**。⚠️ **结构性风险**：同一规则 5 份拷贝，任一处单独修改即产生前视/滞后分歧，建议收敛为单一来源 |

@@ -24,6 +24,8 @@ factor_mine/*.jsonl
 !.env.example
 config_local.json
 config.local.json
+config_local.toml
+config.local.toml
 *secret*.json
 *credentials*.json
 *_key.json
@@ -98,6 +100,9 @@ ENV/
 # ---- 8. 大体积模型权重 (建议云盘或 Git LFS; 小权重可用 git add -f 强制提交) ----
 *.pt
 *.pth
+*.pkl
+*.pickle
+*.joblib
 *.onnx
 *.pkl.bak
 

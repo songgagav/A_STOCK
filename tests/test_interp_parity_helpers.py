@@ -33,6 +33,11 @@ class TestDiffClassifier:
         out = P._diff({"total_seconds": 1.0}, {"total_seconds": 2.0})
         assert [c for c, *_ in out] == ["VOLATILE"]
 
+    def test_trace_elapsed_is_volatile(self):
+        """不同解释器的单步耗时不应制造语义差异。"""
+        out = P._diff({"elapsed_s": 0.175}, {"elapsed_s": 0.009})
+        assert [c for c, *_ in out] == ["VOLATILE"]
+
     def test_timestamp_by_value_shape(self):
         """★ 初版踩坑处的回归: 键名不在白名单里, 但值是墙钟时间戳 -> TIMESTAMP。"""
         out = P._diff({"data_ts": "2026-09-20 19:03:22"},

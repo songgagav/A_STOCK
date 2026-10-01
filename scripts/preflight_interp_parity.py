@@ -46,7 +46,7 @@ _DRYRUN = os.path.join(_HERE, "preflight_dryrun_day.py")
 #: 天然可变字段（忽略但记账）
 VOLATILE_KEYS = {
     "generated_at", "updated_at", "at", "tmp_data_dir", "total_seconds",
-    "seconds", "tmp_artifacts", "pid", "run_id", "last_seen", "mtime",
+    "seconds", "elapsed_s", "tmp_artifacts", "pid", "run_id", "last_seen", "mtime",
     "checked_at", "started_at", "finished_at", "duration", "elapsed",
     "prod_state_md5_before", "prod_state_md5_after", "prod_state_untouched",
 }

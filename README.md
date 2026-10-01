@@ -155,6 +155,7 @@ A_stock_rotation/
 ├── .env.example                       # 环境变量模板
 ├── .gitignore                         # 数据、密钥、模型与缓存忽略规则
 ├── conftest.py                        # 测试路径初始化
+├── requirements.txt                   # 标准运行时依赖入口
 ├── requirements_314.txt               # 核心依赖
 ├── requirements-dev.txt               # 测试、DRL 与观测栈依赖
 ├── requirements-lock.txt              # 锁定依赖清单
@@ -177,13 +178,14 @@ A_stock_rotation/
 cd A_stock_rotation
 py -3.14 -m venv .venv314
 .venv314\Scripts\python.exe -m pip install --upgrade pip
+.venv314\Scripts\python.exe -m pip install -r requirements.txt
 .venv314\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-如果只需要不含 DRL 的基础逻辑，可安装核心依赖并额外安装 pytest：
+如果只需要不含 DRL 的基础逻辑，可只安装标准运行时依赖：
 
 ```powershell
-.venv314\Scripts\python.exe -m pip install -r requirements_314.txt pytest
+.venv314\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 CPU 环境安装 PyTorch 时，可按本机平台参考 PyTorch 官方 wheel 源，再安装 `stable-baselines3` 和 `gymnasium`。
@@ -211,6 +213,9 @@ Copy-Item .env.example .env
 | `OVERFIT_RESULTS_FILE` | 覆盖过拟合检测使用的结果文件 |
 
 不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
+
+本项目当前以环境变量作为运行时配置接口，`.env.example` 是公开配置模板；没有运行时
+`config.toml` 解析器，因此不提供一个会误导使用者的 `config.example.toml`。
 
 ## 常用命令
 
@@ -349,7 +354,7 @@ powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 | 9101 | metrics_server | `/metrics` 暴露端 |
 | 6379 | Redis | Celery broker/backend（看板“全量数据库更新”依赖） |
 | — | Celery worker | 全量数据更新任务（solo pool） |
-| — | sentinel daemon | 估值覆盖率哨兵，每日 18:30（见 `docs/patch-retirement-watch.md`） |
+| — | 估值补丁观察 | 当前公开 checkout 未包含自动哨兵；按 `docs/patch-retirement-watch.md` 验收 |
 
 各常驻服务日志在 `logs/`：`dashboard.log`、`sentinel_daemon.log`、`alert_hook.log`、`alerts.log`。
 
@@ -409,9 +414,33 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/preflight-verification.md`](docs/preflight-verification.md)：**上线前复验报告**
   （8 域逐项可验性映射 / 证据 / 阻塞项 / Go-No-Go）；
 - [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
+- [`docs/disciplines.md`](docs/disciplines.md)：DISC-1~4 等长期工程纪律；
+- [`docs/vulnerability-register.md`](docs/vulnerability-register.md)：漏洞、修复和验证台账；
+- [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建与回滚 Runbook；
+- [`docs/patch-retirement-watch.md`](docs/patch-retirement-watch.md)：估值补丁退役观察期与当前状态；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
-- [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建 Runbook；
 - [`ops/`](ops/)：Prometheus、Grafana 和告警配置。
+
+## 公开发布前检查
+
+仓库只上传可复现的代码、模板、文档、测试和工具脚本；行情原始数据、数据库、日志、
+密钥、缓存和模型权重均留在本地或通过数据源脚本生成。发布前建议在干净环境执行：
+
+```powershell
+# 代码安全、依赖漏洞、秘密信息
+bandit -r .\src -ll
+pip-audit -r requirements.txt
+detect-secrets scan
+
+# 回归与格式检查
+.venv310\Scripts\python.exe -m pytest tests -q --basetemp .pytest_tmp_release
+git diff --check
+git status --short
+```
+
+其中 `pip-audit` 报告的漏洞需要结合 Python 版本、实际导入路径和锁定版本判断，不能
+通过盲目升级破坏 h5i_db 原生扩展兼容性。提交前还应确认 `git ls-files` 不包含 `data/`、
+`logs/`、`.env`、数据库、模型权重或个人 IDE 文件。
 
 ## 开发约定
 

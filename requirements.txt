@@ -1,0 +1,6 @@
+# Public, portable runtime baseline.
+# The exact reproducible environment is recorded in requirements-lock.txt;
+# Python 3.10 + h5i_db is maintained separately by scripts/setup_py310_drl_venv.ps1.
+-r requirements_314.txt
+duckdb>=1.0
+polars>=1.0

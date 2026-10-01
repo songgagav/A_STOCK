@@ -33,7 +33,7 @@ python -m pytest tests/ -q        # 自检
 # 一次性/日频
 python src/run_daily.py                    # 收盘选股主流程
 python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
-python src/sentinel_daemon.py              # 估值覆盖率哨兵守护 (每日 18:30; 报缺口才补 pe_ttm)
+# 估值补丁观察：当前公开 checkout 未包含 sentinel_daemon.py，按 docs/patch-retirement-watch.md 人工验收
 python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘选股 **19:10** / 崩溃自动拉起
 python src/realtime_engine.py --once       # 盘中撮合单次
 python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i_db, 见 README)
@@ -42,9 +42,8 @@ python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i
 powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 ```
 
-`src/sentinel_daemon.py` 由 `ops/start_obs_stack.ps1` 拉起，日志
-`logs/sentinel_daemon.log`，状态 `data/sentinel_last.json`；手动补跑用 `--once`。
-背景见 `docs/patch-retirement-watch.md`（补丁退役观察期）。
+估值补丁退役的历史设计和当前公开仓库状态见 `docs/patch-retirement-watch.md`；在对应哨兵代码
+恢复并通过验收前，不得把“每日自动观察”当成已启用能力。
 
 ### 3.1 后台栈端口与自检
 
