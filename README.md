@@ -416,6 +416,8 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
 - [`docs/disciplines.md`](docs/disciplines.md)：DISC-1~4 等长期工程纪律；
 - [`docs/vulnerability-register.md`](docs/vulnerability-register.md)：漏洞、修复和验证台账；
+- [`docs/security-review.md`](docs/security-review.md)：历史伪造值的提交、文件、行号和判定依据；
+- [`docs/recovery-20260910-20260918.md`](docs/recovery-20260910-20260918.md)：目标 7 个交易日台账恢复核查；
 - [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建与回滚 Runbook；
 - [`docs/patch-retirement-watch.md`](docs/patch-retirement-watch.md)：估值补丁退役观察期与当前状态；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
