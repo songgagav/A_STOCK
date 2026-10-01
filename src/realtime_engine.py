@@ -36,6 +36,7 @@ from config import (
 from db import StockDB, is_a_share_symbol as _is_a_share_code
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
+from utils import atomic_write_json as _atomic_write_json
 
 LIVE_STATE = os.path.join(DATA_DIR, "live_state.json")
 
@@ -70,39 +71,6 @@ def _keep_a_share(items: list) -> list:
 def log(msg: str):
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
     print(line, flush=True)
-
-
-def _atomic_write_json(path: str, data: dict) -> None:
-    """P9: 原子写入 JSON. 先写同目录临时文件再 os.replace 替换,
-    避免进程中断时主文件被写坏(半截JSON).
-
-    Windows 文件锁竞态: Dashboard 每 3s 轮询读取 live_state.json 时,
-    os.replace 可能因文件被占用而触发 PermissionError.
-    增加重试+退避 (最多 3 次, 50/100/200ms), 覆盖绝大部分读锁窗口.
-    """
-    import tempfile
-    import time
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True) if d else None
-    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        for attempt in range(3):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                if attempt < 2:
-                    time.sleep(0.05 * (2 ** attempt))
-                else:
-                    raise
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def load_state():
