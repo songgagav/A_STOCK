@@ -1,0 +1,144 @@
+..............................................ssssssss.ss............... [  2%]
+........................................................................ [  5%]
+.............s....s..........................sss........................ [  8%]
+...................sss.................................................. [ 10%]
+........................................................................ [ 13%]
+........................................................................ [ 16%]
+........................................................................ [ 18%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+........................................................................ [ 29%]
+.............................................ssssssssssss............... [ 32%]
+........................................................................ [ 34%]
+........................................................................ [ 37%]
+........................................................................ [ 40%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 48%]
+........................................................................ [ 50%]
+........................................................................ [ 53%]
+..........................................sssss......................... [ 56%]
+.........................sssssssssssssss................................ [ 58%]
+........................................................................ [ 61%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 75%]
+........................................................................ [ 77%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 85%]
+........................................................................ [ 88%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+........................................................................ [ 96%]
+........................................................................ [ 99%]
+.......................                                                  [100%]
+============================== warnings summary ===============================
+tests/test_drl_factor_state_h5i.py::TestH5iMigration::test_symbol_present_only_one_day_excluded
+tests/test_drl_factor_state_h5i.py::TestH5iMigration::test_nan_rets_are_zeroed
+tests/test_logic_q.py::TestLogicQ::test_calibrate
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\lib\_function_base_impl.py:3036: RuntimeWarning: invalid value encountered in divide
+    c /= stddev[:, None]
+
+tests/test_drl_factor_state_h5i.py::TestH5iMigration::test_symbol_present_only_one_day_excluded
+tests/test_drl_factor_state_h5i.py::TestH5iMigration::test_nan_rets_are_zeroed
+tests/test_logic_q.py::TestLogicQ::test_calibrate
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\lib\_function_base_impl.py:3037: RuntimeWarning: invalid value encountered in divide
+    c /= stddev[None, :]
+
+tests/test_drl_factor_state_h5i.py::TestH5iMigration::test_nan_rets_are_zeroed
+  D:\��ƨͨ��A������ð��\A_stock_rotation\src\drl_train.py:531: RuntimeWarning: divide by zero encountered in divide
+    r = float(np.mean(j["close_b"].to_numpy(dtype=np.float64)
+
+tests/test_factor_weight_env_bounds.py::TestEpisodeTermination::test_sb3_learn_crosses_episode_boundary
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\stable_baselines3\ppo\ppo.py:155: UserWarning: You have specified a mini-batch size of 64, but because the `RolloutBuffer` is of size `n_steps * n_envs = 31`, after every 0 untruncated mini-batches, there will be a truncated mini-batch of size 31
+  We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.
+  Info: (n_steps=31 and n_envs=1)
+    warnings.warn(
+
+tests/test_integration_f68.py::TestFactorValueDRLIntegration::test_cvar_ppo_trains_factor_value_env
+tests/test_integration_f68.py::TestFactorValueDRLIntegration::test_run_factor_value_drl_end_to_end
+tests/test_run_factor_value_drl_risk.py::TestRunFactorValueDrlRiskObs::test_config_disabled_defaults_off
+tests/test_run_factor_value_drl_risk.py::TestRunFactorValueDrlRiskObs::test_default_enables_risk_factor_obs
+tests/test_run_factor_value_drl_risk.py::TestRunFactorValueDrlRiskObs::test_explicit_false_uses_base_env
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\stable_baselines3\ppo\ppo.py:155: UserWarning: You have specified a mini-batch size of 64, but because the `RolloutBuffer` is of size `n_steps * n_envs = 54`, after every 0 untruncated mini-batches, there will be a truncated mini-batch of size 54
+  We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.
+  Info: (n_steps=54 and n_envs=1)
+    warnings.warn(
+
+tests/test_regime_aware.py::TestComputeRegimeFeatures::test_extreme_values
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\_core\_methods.py:188: RuntimeWarning: invalid value encountered in subtract
+    x = um.subtract(arr, arrmean, out=...)
+
+tests/test_regime_aware.py::TestComputeRegimeFeatures::test_extreme_values
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\_core\_methods.py:49: RuntimeWarning: invalid value encountered in reduce
+    return umr_sum(a, axis, dtype, out, keepdims, initial, where)
+
+tests/test_regime_aware.py::TestComputeRegimeFeatures::test_extreme_values
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\_core\_methods.py:168: RuntimeWarning: invalid value encountered in reduce
+    arrmean = umr_sum(arr, axis, dtype, keepdims=True, where=where)
+
+tests/test_regime_aware.py::TestComputeRegimeFeatures::test_extreme_values
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\numpy\_core\_methods.py:132: RuntimeWarning: invalid value encountered in reduce
+    ret = umr_sum(arr, axis, dtype, out, keepdims, where=where)
+
+.venv314\Lib\site-packages\_pytest\cacheprovider.py:469
+  D:\��ƨͨ��A������ð��\A_stock_rotation\.venv314\Lib\site-packages\_pytest\cacheprovider.py:469: PytestCacheWarning: could not create cache path D:\��ƨͨ��A������ð��\A_stock_rotation\.pytest_cache\v\cache\nodeids: [WinError 183] ���ļ��Ѵ���ʱ���޷��������ļ���: 'D:\\��ƨͨ��A������ð��\\A_stock_rotation\\.pytest_cache\\v\\cache'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_alert_rules_single_source.py:112: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:131: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:158: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:197: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:224: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:247: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:261: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:276: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:347: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_alert_rules_single_source.py:363: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������) ���� �� alert_rules.yml �����������������ֹ���һ��
+SKIPPED [1] tests\test_baostock_adapter.py:271: baostock δ��װ
+SKIPPED [1] tests\test_baostock_adapter.py:342: baostock δ��װ
+SKIPPED [1] tests\test_baostock_backfill.py:380: ֻ������������/venv310 �� h5i_db
+SKIPPED [1] tests\test_baostock_backfill.py:392: ֻ������������/venv310 �� h5i_db
+SKIPPED [1] tests\test_baostock_backfill.py:401: ֻ������������/venv310 �� h5i_db
+SKIPPED [1] tests\test_bars_ingest.py:509: ��ʵ fetcher ������: ModuleNotFoundError: No module named 'baostock'
+SKIPPED [1] tests\test_bars_ingest.py:525: ��ʵ fetcher ������: ModuleNotFoundError: No module named 'baostock'
+SKIPPED [1] tests\test_bars_ingest.py:541: ��ʵ fetcher ������: ModuleNotFoundError: No module named 'baostock'
+SKIPPED [1] tests\test_engine_lag_alerting.py:124: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:136: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:146: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:156: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:183: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:194: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:204: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:251: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:262: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:272: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:281: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_engine_lag_alerting.py:291: ��Ҫ PyYAML; ����Ŀ .venv314/.venv310 ��û��(ֻ��������������)
+SKIPPED [1] tests\test_h5i_accel_equivalence.py:110: ��Ҫ h5i_db; .venv314 ûװ(������������ .venv310 ��)
+SKIPPED [1] tests\test_h5i_accel_equivalence.py:125: ��Ҫ h5i_db; .venv314 ûװ(������������ .venv310 ��)
+SKIPPED [1] tests\test_h5i_accel_equivalence.py:140: ��Ҫ h5i_db; .venv314 ûװ(������������ .venv310 ��)
+SKIPPED [1] tests\test_h5i_accel_equivalence.py:165: ��Ҫ h5i_db; .venv314 ûװ(������������ .venv310 ��)
+SKIPPED [1] tests\test_h5i_accel_equivalence.py:183: ��Ҫ h5i_db; .venv314 ûװ(������������ .venv310 ��)
+SKIPPED [1] tests\test_integration_f68.py:62: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:186: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:51: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:195: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:73: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:116: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:126: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:106: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:97: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:157: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:168: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:174: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:151: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:145: h5i-db ������, ����
+SKIPPED [1] tests\test_integration_f68.py:84: h5i-db ������, ����
+2637 passed, 50 skipped, 18 warnings in 106.30s (0:01:46)
