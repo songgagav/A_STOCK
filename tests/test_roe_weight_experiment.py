@@ -7,7 +7,7 @@ import sys
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 
-from scripts import roe_weight_experiment as R  # noqa: E402
+from scripts.research import roe_weight_experiment as R  # noqa: E402
 
 
 def _rows():
