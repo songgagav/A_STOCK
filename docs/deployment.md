@@ -94,3 +94,25 @@ python scripts/pbo_sweep.py              # PBO 参数扫描 + CSCV(约 50 分钟
   该过期描述曾直接导致一次误判: 把非交易日 15:06 的 `--maint` 产物当成了收盘选股产物。
 - 数据文件(`data/h5i/market.db`)被进程独占时,回测/重建脚本会因文件锁失败——请在收盘后或停止守护时执行批量任务。
 - 代码更新后重启顺序:`gate_refresh_daemon.py`(IC 门控)→ `daemon.py`(主调度)→ 视需要 `dashboard.py`。
+
+### 5.1 代码部署清单（强制）
+
+常驻 Python 进程会缓存已经导入的模块。**磁盘文件更新不代表运行时已经生效**；
+2026-10-01 实测自然发布到 16:31:44 仍在使用旧版 `health_state`，只有重启守护后
+16:33:52 的快照才与磁盘代码一致。因此本仓选择“重启并验证”，不采用运行中热重载
+（热重载会留下旧对象、旧线程和跨模块引用，无法保证进程状态整体一致）。
+
+每次修改 `src/`、运行入口或健康判据后，必须依次完成：
+
+1. 运行相关测试，确认退出码为 0；
+2. 仅重启守护（通常无需重启独立行情引擎）：
+   `pwsh -File ops/service_control.ps1 -Action restart -SkipStockdb`；
+3. 等待启动时健康快照发布，确认 `data/health/state.json` 的 `ts` 晚于重启时间；
+4. 确认 `observed.code_version.scope=src/**/*.py`、`matches=true`，并且
+   `loaded_sha256 == disk_sha256`；
+5. 运行 `python scripts/verify_runtime_code_version.py`，必须返回 0；
+6. 若本次涉及门禁，再确认快照 `gate_verdict` 与最近一轮
+   `daily_summary.json/steps.datasource_gate` 完全一致；
+7. 最后才能提交、推送或宣布部署完成。
+
+任一步失败都视为部署未完成。尤其不得把“周期快照已刷新”误当成“新代码已加载”。

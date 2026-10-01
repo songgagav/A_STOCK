@@ -54,6 +54,74 @@ function Step([string]$m) {
   Add-Content -Path $StepLog -Value $line -Encoding UTF8
   Write-Host $line
 }
+
+function VerifyRuntimeCodeVersion([datetime]$NotBefore, [bool]$RequireFresh) {
+  # 部署验收必须比较「运行时加载哈希」与「当前磁盘哈希」。只看服务 Running
+  # 会漏掉 Python import 缓存导致的“文件改了、进程仍跑旧代码”。
+  $statePath = Join-Path $RepoRoot 'data\health\state.json'
+  $t = 0
+  while ($t -lt $TimeoutSec) {
+    if (Test-Path $statePath) {
+      $item = Get-Item $statePath
+      if (-not $RequireFresh -or $item.LastWriteTime -ge $NotBefore) { break }
+    }
+    Start-Sleep -Seconds 2; $t += 2
+  }
+  if (-not (Test-Path $statePath)) {
+    Step '[FAIL] 代码版本验收: 健康快照不存在'
+    return $false
+  }
+  $item = Get-Item $statePath
+  if ($RequireFresh -and $item.LastWriteTime -lt $NotBefore) {
+    Step "[FAIL] 代码版本验收: 重启后没有新快照（最后写入 $($item.LastWriteTime)）"
+    return $false
+  }
+  try {
+    $j = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $cv = $j.observed.code_version
+    if (-not $cv) {
+      Step '[FAIL] 代码版本验收: 快照缺少 observed.code_version（仍可能在跑旧模块）'
+      return $false
+    }
+    # 不能只比较快照内的 loaded/disk：快照发布后、下一轮采集前再次改盘，
+    # 两个旧值仍会相等。验收脚本会重新计算“此刻”的 src 树哈希，封住该窗口。
+    $pyCandidates = @(
+      (Join-Path $RepoRoot '.venv310\Scripts\python.exe'),
+      (Join-Path $RepoRoot '.venv314\Scripts\python.exe')
+    )
+    $py = $pyCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $py) {
+      $cmd = Get-Command python -ErrorAction SilentlyContinue
+      if ($cmd) { $py = $cmd.Source }
+    }
+    if (-not $py) {
+      Step '[FAIL] 代码版本验收: 找不到 Python 解释器'
+      return $false
+    }
+    $verifyScript = Join-Path $RepoRoot 'scripts\verify_runtime_code_version.py'
+    if (-not (Test-Path $verifyScript)) {
+      Step '[FAIL] 代码版本验收: 缺少 scripts\verify_runtime_code_version.py'
+      return $false
+    }
+    $raw = & $py $verifyScript --snapshot $statePath 2>&1
+    $verifyExit = $LASTEXITCODE
+    $verified = ($raw -join "`n") | ConvertFrom-Json
+    $loaded = [string]$verified.runtime_sha256
+    $disk = [string]$verified.current_disk_sha256
+    $ok = ($verifyExit -eq 0) -and ($verified.ok -eq $true)
+    $loadedShort = if ($loaded) { $loaded.Substring(0, [Math]::Min(12, $loaded.Length)) } else { '<missing>' }
+    $diskShort = if ($disk) { $disk.Substring(0, [Math]::Min(12, $disk.Length)) } else { '<missing>' }
+    Step ("代码版本验收: matches={0} loaded={1} current_disk={2} snapshot_ts={3}" -f
+          $ok, $loadedShort, $diskShort, $j.ts)
+    if (-not $ok -and $verified.errors) {
+      Step ("[FAIL] 代码版本验收: " + ($verified.errors -join '; '))
+    }
+    return $ok
+  } catch {
+    Step "[FAIL] 代码版本验收异常: $($_.Exception.Message)"
+    return $false
+  }
+}
 function DaemonProcs() {
   @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'python' } | Where-Object {
       $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
@@ -117,6 +185,7 @@ function StopStockdbService() {
 }
 
 Step "================ Action=$Action Service=$ServiceName ================"
+$ActionStartedAt = Get-Date
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
              [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -154,7 +223,8 @@ if ($Action -eq 'status') {
   } else {
     Step "行情引擎 ${StockdbService}: 服务不存在（未托管）—— 跑 ops\install_stockdb_service.ps1 注册"
   }
-  exit 0
+  $codeOk = VerifyRuntimeCodeVersion -NotBefore $ActionStartedAt -RequireFresh $false
+  exit $(if ($codeOk) { 0 } else { 1 })
 }
 
 # ---- 诊断: 提权才能读到 LocalSystem 进程的命令行 (非提权下 CommandLine 为空) ----
@@ -343,6 +413,9 @@ Step '--- daemon.log 尾部 ---'
 Get-Content (Join-Path $LogDir 'daemon.log') -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue |
   ForEach-Object { Step "    | $_" }
 
-if ($svc.Status -eq 'Running' -and $procs.Count -gt 0) { Step '================ 成功 ================'; exit 0 }
+$codeOk = VerifyRuntimeCodeVersion -NotBefore $ActionStartedAt -RequireFresh ($Action -eq 'restart')
+if ($svc.Status -eq 'Running' -and $procs.Count -gt 0 -and $codeOk) {
+  Step '================ 成功 ================'; exit 0
+}
 Step '================ 未达预期 ================'
 exit 1

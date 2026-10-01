@@ -68,9 +68,78 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from datetime import datetime, timedelta
 
 HEALTH_STATES = ("NORMAL", "DEGRADED", "HALTED")
+
+
+def _sha256_file(path: str) -> str | None:
+    """返回文件内容 SHA-256；读不到时返回 None，由调用方显式报监测盲区。"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _sha256_source_tree(path: str) -> tuple[str | None, int]:
+    """对一个源码文件或目录下全部 `.py` 做确定性清单哈希。"""
+    source = os.path.abspath(path)
+    if os.path.isfile(source):
+        return _sha256_file(source), 1
+    try:
+        files = []
+        for root, dirs, names in os.walk(source):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            files.extend(os.path.join(root, n) for n in names if n.endswith(".py"))
+        files.sort(key=lambda p: os.path.relpath(p, source).replace("\\", "/"))
+        h = hashlib.sha256()
+        for fp in files:
+            rel = os.path.relpath(fp, source).replace("\\", "/")
+            h.update(rel.encode("utf-8"))
+            h.update(b"\0")
+            with open(fp, "rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(block)
+            h.update(b"\0")
+        return h.hexdigest(), len(files)
+    except Exception:  # noqa: BLE001
+        return None, 0
+
+
+# 进程加载模块时冻结的版本。之后即使磁盘文件被覆盖，这两个值也不会变化，
+# 因而能识别「代码已经改了，但常驻守护仍在执行旧模块」这一静默部署失败。
+_MODULE_SOURCE_PATH = os.path.dirname(os.path.abspath(__file__))
+_MODULE_LOADED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_MODULE_LOADED_SHA256, _MODULE_LOADED_FILE_COUNT = _sha256_source_tree(_MODULE_SOURCE_PATH)
+
+
+def module_code_version(path: str | None = None) -> dict:
+    """比较本进程已加载模块与磁盘源码版本（纯文件读，不 reload）。"""
+    source = os.path.abspath(path or _MODULE_SOURCE_PATH)
+    disk_sha, file_count = _sha256_source_tree(source)
+    error = None
+    if _MODULE_LOADED_SHA256 is None:
+        error = "模块加载时未能计算 src 源码树 SHA-256"
+    elif disk_sha is None:
+        error = f"当前磁盘源码不可读: {source}"
+    return {
+        "module": "src_tree",
+        "scope": "src/**/*.py",
+        "path": source,
+        "loaded_file_count": _MODULE_LOADED_FILE_COUNT,
+        "disk_file_count": file_count,
+        "loaded_at": _MODULE_LOADED_AT,
+        "loaded_sha256": _MODULE_LOADED_SHA256,
+        "disk_sha256": disk_sha,
+        "matches": (_MODULE_LOADED_SHA256 == disk_sha
+                    if _MODULE_LOADED_SHA256 and disk_sha else None),
+        "error": error,
+    }
 
 # ============================================================
 # [2026-09-28] 门禁结论: 快照只读**已落盘的权威结论**, 不再自己重算
@@ -255,11 +324,25 @@ def assemble(snap: dict) -> dict:
        'gate_verdict_label': str | None,
        'gate_verdict_age_hours': float | None,
        'gate_verdict_stale': bool,
-       'gate_verdict_error': str | None}   # **取不到结论**的原因(非结论本身)
+       'gate_verdict_error': str | None,
+       'code_version': {loaded_sha256, disk_sha256, matches, ...}}
     返回 {'state': NORMAL|DEGRADED|HALTED, 'reasons': [str]}。
     未知字段一律忽略（向前兼容）。
     """
     reasons: list = []
+
+    # 部署完整性：常驻进程不会自动重载已 import 的模块。磁盘与加载版本分叉时，
+    # 「代码已修改」不等于「生产已生效」，必须显式降级并要求重启守护。
+    code = snap.get("code_version")
+    if isinstance(code, dict):
+        if code.get("matches") is False:
+            reasons.append(
+                "运行时 src 源码树与磁盘代码版本不一致"
+                f"(loaded={str(code.get('loaded_sha256') or '')[:12]}, "
+                f"disk={str(code.get('disk_sha256') or '')[:12]}) —— 必须重启守护使代码生效")
+        elif code.get("matches") is None:
+            reasons.append("运行时模块版本无法判定: " +
+                           str(code.get("error") or "SHA-256 不可用"))
 
     t = snap.get("tick_ms") or {}
     p50 = t.get("p50")
@@ -495,6 +578,9 @@ def gather() -> dict:
     root = _repo_root()
     snap: dict = {"tick_ms": None, "freshness_ok": None,
                   "live_source": None, "l3_today": 0}
+
+    # -1) 部署版本指纹。必须最先采集，即使后续探针失败也能回答「当前跑的是哪版」。
+    snap["code_version"] = module_code_version()
 
     # 0) [2026-09-28 改] 数据源健康门禁: **读已落盘的权威结论, 不重算**。
     #

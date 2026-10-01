@@ -1787,6 +1787,44 @@ def check_backtest_paper_parity() -> dict:
 
 
 # ---- 总入口 ----
+def check_runtime_code_version() -> dict:
+    """已发布快照中的运行时模块哈希必须等于当前磁盘源码哈希。"""
+    t0 = time.time()
+    name = "runtime_code_version"
+    try:
+        import health_state as _HS
+        snapshot = os.path.join(DATA_DIR, "health", "state.json")
+        pub = _HS.read_published(snapshot)
+        disk = _HS.module_code_version()
+        loaded = ((pub.get("observed") or {}).get("code_version") or {})
+        detail = {
+            "snapshot_ts": pub.get("ts"),
+            "snapshot_stale": pub.get("stale"),
+            "module": loaded.get("module"),
+            "loaded_at": loaded.get("loaded_at"),
+            "loaded_sha256": loaded.get("loaded_sha256"),
+            "snapshot_disk_sha256": loaded.get("disk_sha256"),
+            "current_disk_sha256": disk.get("disk_sha256"),
+            "runtime_matches_snapshot_disk": loaded.get("matches"),
+            "runtime_matches_current_disk": bool(
+                loaded.get("loaded_sha256") and disk.get("disk_sha256") and
+                loaded.get("loaded_sha256") == disk.get("disk_sha256")),
+            "read_error": pub.get("error"),
+        }
+        if not pub.get("available"):
+            return _record(name, "WARN", detail, t0)
+        if not loaded:
+            detail["read_error"] = "健康快照缺少 observed.code_version（守护可能尚未重启）"
+            return _record(name, "WARN", detail, t0)
+        if loaded.get("matches") is not True or not detail["runtime_matches_current_disk"]:
+            return _record(name, "FAIL", detail, t0)
+        if pub.get("stale"):
+            return _record(name, "WARN", detail, t0)
+        return _record(name, "OK", detail, t0)
+    except Exception as e:  # noqa: BLE001
+        return _record(name, "FAIL", e, t0)
+
+
 def check_gate_verdict_consistency() -> dict:
     """门禁结论的**不变量检查**(冲突检测)。
 
@@ -1866,6 +1904,8 @@ CHECKS = [
     check_strategy_diagnostics,
     check_reflection_diagnostics,
     check_backtest_paper_parity,
+    # 部署完整性: 磁盘代码已变但常驻进程未重启时不得静默显示健康。
+    check_runtime_code_version,
     # [2026-09-28] 门禁结论不变量检查: 快照值必须 == 落盘值(防"读取侧又加了重算")
     check_gate_verdict_consistency,
 ]
