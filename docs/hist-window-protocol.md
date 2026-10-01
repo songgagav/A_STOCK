@@ -155,10 +155,10 @@
 
 | 环节 | 脚本 | 产物 |
 |---|---|---|
-| 方向一致性 / 环境外标记 | `scripts/hist_direction_consistency.py` | `data/hist_direction_consistency.json` |
+| 方向一致性 / 环境外标记 | `scripts/research/hist_direction_consistency.py` | `data/hist_direction_consistency.json` |
 | 历史 OOS 窗口 | `scripts/nonoverlap_rerun.py --ends …`（`OOS_OUT_SUFFIX=hist1017`） | `data/vnpy_backtest_nonoverlap_fwd_results_hist1017.json` |
-| 多口径离线复算 | `scripts/hist_six_grid.py` | `data/hist_six_grid.json` |
-| 市场状态分层 + 环境分层 | `scripts/hist_regime_report.py` | `data/hist_regime_report.json`、`data/hist_six_grid_by_envclass.json` |
+| 多口径离线复算 | `scripts/research/hist_six_grid.py` | `data/hist_six_grid.json` |
+| 市场状态分层 + 环境分层 | `scripts/research/hist_regime_report.py` | `data/hist_regime_report.json`、`data/hist_six_grid_by_envclass.json` |
 | **阈值敏感性（必报）** | 同上（自动执行） | `data/hist_envclass_rule_compare.json` |
 | 保真度新旧对账 | `scripts/fidelity_compare.py` | `data/fidelity_rebalance_compare.json` |
 | 引擎偏差探针（受控对照） | `scripts/engine_bias_probe.py` | `data/_engine_bias_experiment.json` |

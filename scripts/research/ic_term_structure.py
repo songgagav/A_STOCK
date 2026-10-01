@@ -5,7 +5,7 @@
 输出均值/中位/正比例, 并按决策树判定所属分支:
     短正长负 -> 信号有反转(改持有期)   全负 -> 信号无效(换信号源)   短负长正 -> 方向反了
 
-用法: python scripts/ic_term_structure.py
+用法: python scripts/research/ic_term_structure.py
 输出: data/ic_term_structure.json
 """
 from __future__ import annotations

@@ -14,9 +14,9 @@
   - 口径参数从 recompute_six_grid.MODES 直接复用, 保证"同一协议"。
 
 用法
-    python scripts/hist_six_grid.py                      # 探口径(秒级): 快照派生 top10 是否清晰
-    python scripts/hist_six_grid.py --write [--only t05] # 预置缓存 + 逐口径影子回测
-    python scripts/hist_six_grid.py --days-from data/vnpy_backtest_nonoverlap_fwd_results_hist1017.json
+    python scripts/research/hist_six_grid.py                      # 探口径(秒级): 快照派生 top10 是否清晰
+    python scripts/research/hist_six_grid.py --write [--only t05] # 预置缓存 + 逐口径影子回测
+    python scripts/research/hist_six_grid.py --days-from data/vnpy_backtest_nonoverlap_fwd_results_hist1017.json
 """
 from __future__ import annotations
 

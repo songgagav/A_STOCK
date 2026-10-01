@@ -9,7 +9,7 @@
   ④ 被丢弃的极端头部 vs 保留头部 vs 旧 score 头部 的因子画像对比
 
 输出: data/trim_sensitivity.json
-用法: python scripts/trim_sensitivity.py   (需带 h5i_db 的解释器, 见 README)
+用法: python scripts/research/trim_sensitivity.py   (需带 h5i_db 的解释器, 见 README)
 """
 from __future__ import annotations
 

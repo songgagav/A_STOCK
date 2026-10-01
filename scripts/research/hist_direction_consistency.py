@@ -26,8 +26,8 @@
     - 全部反向        -> 该窗口不可用于验证 (reverse), 仅作参考
 
 用法
-  python scripts/hist_direction_consistency.py                # 全量: 2010-2017 + 2018+ 参照
-  python scripts/hist_direction_consistency.py --days 2015-06-30 2015-12-31   # 指定日期自检
+  python scripts/research/hist_direction_consistency.py                # 全量: 2010-2017 + 2018+ 参照
+  python scripts/research/hist_direction_consistency.py --days 2015-06-30 2015-12-31   # 指定日期自检
 输出
   data/hist_direction_consistency.json
 """
