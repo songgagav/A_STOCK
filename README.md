@@ -442,6 +442,10 @@ git status --short
 通过盲目升级破坏 h5i_db 原生扩展兼容性。提交前还应确认 `git ls-files` 不包含 `data/`、
 `logs/`、`.env`、数据库、模型权重或个人 IDE 文件。
 
+同样的检查已固化在 [`.github/workflows/security.yml`](.github/workflows/security.yml)，
+每次 push 到 `main` 或创建 Pull Request 时自动执行。历史敏感配置路径也会被单独拦截；
+历史 diff 中的文档示例和测试夹具不应被误读为真实凭据。
+
 ## 开发约定
 
 1. 新增数据源时必须注明是否联网、数据时间口径和失败降级行为。

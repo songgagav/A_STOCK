@@ -1,0 +1,37 @@
+name: security-scans
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install scanning tools
+        run: python -m pip install --upgrade pip bandit pip-audit detect-secrets
+      - name: Bandit
+        run: bandit -r ./src -ll
+      - name: Dependency audit
+        run: pip-audit -r requirements.txt
+      - name: Detect secrets in current tree
+        run: detect-secrets scan --all-files
+      - name: Repository secret guard and history path check
+        shell: bash
+        run: |
+          python src/secret_scan.py
+          if git log --all --name-only --format= -- .env config.local.toml config_local.toml | grep -q .; then
+            echo "Sensitive configuration path found in Git history" >&2
+            exit 1
+          fi
