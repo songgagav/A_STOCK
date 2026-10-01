@@ -1787,6 +1787,59 @@ def check_backtest_paper_parity() -> dict:
 
 
 # ---- 总入口 ----
+def check_gate_verdict_consistency() -> dict:
+    """门禁结论的**不变量检查**(冲突检测)。
+
+    ## 为什么要单独一项, 而不是塞进健康快照
+
+    快照 `gather()` 每 ~5 分钟跑一次, 若在那里做交叉验证就等于每 5 分钟重算一次
+    (权威结论的重算需要**真实引擎探针**, 起子进程)—— 那正是本次修掉的"热路径重算"。
+    故把它放在**每天一次**的盘前体检里。
+
+    ## 这条检查在防什么
+
+    修好后, 快照读到的结论**就是**落盘的那一份, 同一个来源不可能给出两个值 ⇒
+    正常情况下**永不冲突**。报警可能意味着快照尚未按新路径刷新、
+    有人又在读取侧加了重算, 或改了来源。后两者是 2026-09-28 修掉的缺陷形态
+    (快照重算得 `DEGRADED/allow=True`, 而落盘权威结论是 `HALT/allow=False`)。
+    同时它也检查结论自身的自洽性(level↔allow、HALT 必有归因、时刻可解析)。
+    """
+    t0 = time.time()
+    name = "gate_verdict_consistency"
+    try:
+        import health_state as _HS
+        daily = os.path.join(DATA_DIR, "daily")
+        c = _HS.detect_gate_verdict_conflict(daily)
+        rec = _HS.read_gate_verdict(daily)
+        detail = {
+            "checked_rounds": c.get("checked"),
+            "conflict": c.get("conflict"),
+            "details": (c.get("details") or [])[:6],
+            "snapshot_compared": c.get("snapshot_compared"),
+            "snapshot_error": c.get("snapshot_error"),
+            "latest_round": rec.get("day"),
+            "latest_at": rec.get("at"),
+            "is_today": rec.get("is_today"),
+            "age_hours": (round(rec["age_hours"], 2)
+                          if isinstance(rec.get("age_hours"), (int, float)) else None),
+            "stale": rec.get("stale"),
+            "read_error": rec.get("error"),
+        }
+        if c.get("conflict"):
+            return _record(name, "FAIL", detail, t0)
+        if not c.get("ok"):
+            # 检测器自己没跑成 —— **不可判定不等于没问题**
+            return _record(name, "WARN", detail, t0)
+        if rec.get("value") is None or rec.get("error"):
+            # 从没落盘过结论: 门禁等于没在判定
+            return _record(name, "WARN", detail, t0)
+        if rec.get("stale") or not c.get("snapshot_compared") or c.get("snapshot_error"):
+            return _record(name, "WARN", detail, t0)
+        return _record(name, "OK", detail, t0)
+    except Exception as e:  # noqa: BLE001
+        return _record(name, "FAIL", e, t0)
+
+
 CHECKS = [
     check_disk,
     check_duckdb,
@@ -1813,6 +1866,8 @@ CHECKS = [
     check_strategy_diagnostics,
     check_reflection_diagnostics,
     check_backtest_paper_parity,
+    # [2026-09-28] 门禁结论不变量检查: 快照值必须 == 落盘值(防"读取侧又加了重算")
+    check_gate_verdict_consistency,
 ]
 
 

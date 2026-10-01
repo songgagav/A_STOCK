@@ -442,7 +442,9 @@ class TestWiring:
     def test_health_state_gather_collects_it(self):
         import inspect
         import health_state as H
-        assert "datasource_gate" in inspect.getsource(H.gather)
+        src = inspect.getsource(H.gather)
+        assert "read_gate_verdict(" in src
+        assert 'snap["datasource"] = _DG.evaluate(' not in src
 
     def test_run_daily_is_gated(self):
         """run_daily 必须在摄入前判定, 且 HALT 时**跳过摄入与选股**、保留持仓归档。"""
@@ -597,4 +599,3 @@ class TestLedgerChainIsNotSilentlyDegraded:
         assert "\nimport audit_chain as _AC" in src
         assert "sys.path.insert(0, _SRC_DIR)" in src
         assert G._AC.__name__ == "audit_chain"
-
