@@ -466,7 +466,9 @@ class TestBackfillTriggerToWriteSimulation:
         syms = [f"6{i:05d}" for i in range(1200)]
         provenance = tmp_path / "backfill_provenance.jsonl"
 
-        import h5i_db
+        # h5i_db 只在生产/专用回填解释器中提供；普通 CI 解释器应显式跳过，
+        # 不能把可选集成能力缺失伪装成回填逻辑失败。
+        h5i_db = pytest.importorskip("h5i_db", reason="h5i_db 仅在 .venv310 回填解释器中提供")
         import pyarrow as pa
 
         db = h5i_db.Database(str(tmp_path / "market.db"), create=True)
