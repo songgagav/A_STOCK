@@ -35,6 +35,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import realtime_engine as re  # noqa: E402
+import signal_freeze_watch as sfw  # noqa: E402
 
 from _calendar_support import install_if_missing  # noqa: E402
 
@@ -390,6 +391,20 @@ class TestLoadTargetsLadderWiring(unittest.TestCase):
             self.D, self.CONSUME, datetime.datetime(2026, 9, 25))
         self.assertIsNone(top_n, "供明天的 plan 不该在今天被第 1 档取用")
         self.assertIsNone(src)
+
+    def test_trace_passes_source_age_metadata_to_observer(self):
+        """来源日与消费日必须进入纯告警观察器，但不参与选池。"""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(re, "TARGETS_SRC_FP", str(Path(td) / "targets.jsonl")), \
+                mock.patch.object(sfw, "observe", return_value={}) as observe:
+            re._trace_targets(
+                "2026-09-08", "2026-09-04", "selection_cross_day", 10,
+                trading_days=["2026-09-04", "2026-09-07", "2026-09-08"],
+            )
+        assert observe.call_args.kwargs["source_day"] == "2026-09-04"
+        assert observe.call_args.kwargs["consume_day"] == "2026-09-08"
+        assert observe.call_args.kwargs["trading_days"] == [
+            "2026-09-04", "2026-09-07", "2026-09-08"]
 
 
 if __name__ == "__main__":

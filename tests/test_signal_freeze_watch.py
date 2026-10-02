@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(_REPO, "src"))
 
 from signal_freeze_watch import (  # noqa: E402
     BUDGET_S, DEADLINE, evaluate, events_path, observe, recent,
+    trading_day_distance,
 )
 
 
@@ -55,6 +56,50 @@ class TestRequirement1PoolGuarantee:
         r = evaluate("onsite_select", pool_size=0, elapsed_s=10, finished_at=_at(8, 40))
         assert r["worst"] == "CRITICAL"
         assert "pool_empty" in _codes(r)
+
+
+class TestFallbackAge:
+    TRADING_DAYS = ["2026-09-04", "2026-09-07", "2026-09-08", "2026-09-09"]
+
+    def test_same_day_source_has_zero_age_and_no_stale_alert(self):
+        assert trading_day_distance("2026-09-07", "2026-09-07", self.TRADING_DAYS) == 0
+        r = evaluate("selection_same_day", pool_size=10, source_day="2026-09-07",
+                      consume_day="2026-09-07", trading_days=self.TRADING_DAYS,
+                      finished_at=_at(8, 31))
+        assert r["fallback_age_days"] == 0
+        assert "stale_fallback" not in _codes(r)
+
+    def test_previous_trading_day_source_is_age_one_and_quiet(self):
+        r = evaluate("selection_cross_day", pool_size=10, source_day="2026-09-04",
+                      consume_day="2026-09-07", trading_days=self.TRADING_DAYS,
+                      finished_at=_at(8, 31))
+        assert r["fallback_age_days"] == 1
+        assert "pool_fallback" in _codes(r)
+        assert "stale_fallback" not in _codes(r)
+
+    def test_source_older_than_one_trading_day_alerts(self):
+        r = evaluate("selection_cross_day", pool_size=10, source_day="2026-09-04",
+                      consume_day="2026-09-08", trading_days=self.TRADING_DAYS,
+                      finished_at=_at(8, 31))
+        assert r["fallback_age_days"] == 2
+        assert "stale_fallback" in _codes(r)
+        assert "2 个交易日" in next(a["detail"] for a in r["alerts"]
+                                   if a["code"] == "stale_fallback")
+
+    def test_missing_calendar_does_not_guess_age_or_raise(self):
+        assert trading_day_distance("2026-09-04", "2026-09-08", None) is None
+        r = evaluate("selection_cross_day", pool_size=10, source_day="2026-09-04",
+                      consume_day="2026-09-08", trading_days=None,
+                      finished_at=_at(8, 31))
+        assert r["fallback_age_days"] is None
+        assert "stale_fallback" not in _codes(r)
+
+    def test_invalid_dates_do_not_raise_or_guess(self):
+        assert trading_day_distance("bad", "2026-09-08", self.TRADING_DAYS) is None
+        r = evaluate("selection_cross_day", pool_size=10, source_day="bad",
+                      consume_day="2026-09-08", trading_days=self.TRADING_DAYS,
+                      finished_at=_at(8, 31))
+        assert r["fallback_age_days"] is None
 
 
 class TestRequirement2Budget:
@@ -120,6 +165,16 @@ class TestObservationLedger:
                     path=str(tmp_path / "no" / "dir" / "x.jsonl"))
         assert isinstance(r, dict)
 
+    def test_observe_keeps_stale_age_in_ledger_record(self, tmp_path):
+        fp = str(tmp_path / "ev.jsonl")
+        observe("selection_cross_day", pool_size=10,
+                source_day="2026-09-04", consume_day="2026-09-08",
+                trading_days=TestFallbackAge.TRADING_DAYS,
+                finished_at=_at(8, 31), path=fp, now=_at(8, 31))
+        row = recent(path=fp)[0]
+        assert row["fallback_age_days"] == 2
+        assert "stale_fallback" in _codes(row)
+
     def test_recent_on_missing_file_is_empty(self, tmp_path):
         assert recent(path=str(tmp_path / "absent.jsonl")) == []
 
@@ -133,6 +188,6 @@ class TestNoBehaviorChange:
     def test_result_has_no_directive_fields(self):
         r = evaluate("onsite_select", pool_size=0, elapsed_s=999, finished_at=_at(9, 30))
         assert set(r) == {"alerts", "worst", "rung", "pool_size", "elapsed_s",
-                          "past_deadline", "finished_at"}
+                          "past_deadline", "fallback_age_days", "finished_at"}
         for a in r["alerts"]:
             assert set(a) == {"code", "severity", "detail"}

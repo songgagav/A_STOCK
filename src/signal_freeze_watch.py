@@ -38,7 +38,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 
 #: 信号冻结硬截止（设计给定, 见登记册 P0-FREEZE-0925）
 DEADLINE = dtime(9, 25)
@@ -58,6 +58,43 @@ _TRACE_HINT = {
 }
 
 
+def _parse_day(value) -> date | None:
+    """Parse a YYYY-MM-DD/compact date without guessing malformed values."""
+    if value is None:
+        return None
+    raw = str(value).strip().split(" ", 1)[0].replace("/", "-")
+    if len(raw) == 8 and raw.isdigit():
+        raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def trading_day_distance(consume_day, source_day, trading_days=None) -> int | None:
+    """Return source-to-consume distance in trading days.
+
+    A missing calendar is deliberately *not* replaced with a calendar-day
+    guess.  The fallback-age warning is diagnostic only, so an unknown age is
+    safer than a false alarm over weekends or holidays.
+    """
+    consume = _parse_day(consume_day)
+    source = _parse_day(source_day)
+    if consume is None or source is None or consume < source:
+        return None
+    if consume == source:
+        return 0
+    if trading_days is None:
+        return None
+    normalized = sorted({d for d in (_parse_day(x) for x in trading_days) if d is not None})
+    try:
+        source_idx = normalized.index(source)
+        consume_idx = normalized.index(consume)
+    except ValueError:
+        return None
+    return consume_idx - source_idx if consume_idx >= source_idx else None
+
+
 def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,13 +104,16 @@ def events_path(path: str | None = None) -> str:
 
 
 def evaluate(rung: str, pool_size=None, elapsed_s=None, finished_at=None,
-             deadline: dtime = DEADLINE, budget_s: float = BUDGET_S) -> dict:
+             deadline: dtime = DEADLINE, budget_s: float = BUDGET_S,
+             source_day=None, consume_day=None, trading_days=None) -> dict:
     """**纯函数**: 把一次目标池装载判成一串告警（不改变任何信号）。
 
     返回 {'alerts': [{'code','severity','detail'}], 'worst': 'OK'|'WARN'|'CRITICAL',
           'rung', 'pool_size', 'elapsed_s', 'past_deadline'}
     """
     alerts: list = []
+    fallback_age_days = trading_day_distance(
+        consume_day, source_day, trading_days=trading_days)
     finished_at = finished_at or datetime.now()
     past_deadline = False
     try:
@@ -87,6 +127,11 @@ def evaluate(rung: str, pool_size=None, elapsed_s=None, finished_at=None,
                        "detail": (f"目标池落到非当日同源档位: {rung}"
                                   f"（{_TRACE_HINT.get(rung, '未知档位')}）"
                                   f" —— 池必达失败, 当日无正式计划")})
+        if fallback_age_days is not None and fallback_age_days > 1:
+            alerts.append({"code": "stale_fallback", "severity": "WARN",
+                           "detail": (f"目标池来源落后消费日 {fallback_age_days} 个交易日"
+                                      f"（来源日 {source_day}, 消费日 {consume_day}）"
+                                      " —— 跨日回退超过正常 1 日窗口")})
     if pool_size is not None:
         try:
             if int(pool_size) <= 0:
@@ -115,15 +160,18 @@ def evaluate(rung: str, pool_size=None, elapsed_s=None, finished_at=None,
         worst = "WARN"
     return {"alerts": alerts, "worst": worst, "rung": rung, "pool_size": pool_size,
             "elapsed_s": elapsed_s, "past_deadline": past_deadline,
+            "fallback_age_days": fallback_age_days,
             "finished_at": finished_at.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 def observe(rung: str, pool_size=None, elapsed_s=None, finished_at=None,
-            path: str | None = None, now=None) -> dict:
+            path: str | None = None, now=None, source_day=None,
+            consume_day=None, trading_days=None) -> dict:
     """记录一次观测（含哈希链留痕）并返回裁决。**绝不抛异常** —— 选股主链路。"""
     try:
         r = evaluate(rung, pool_size=pool_size, elapsed_s=elapsed_s,
-                     finished_at=finished_at or now)
+                     finished_at=finished_at or now, source_day=source_day,
+                     consume_day=consume_day, trading_days=trading_days)
         try:
             import sys
             sys.path.insert(0, os.path.join(_repo_root(), "src"))

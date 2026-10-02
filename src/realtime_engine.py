@@ -423,6 +423,21 @@ _RUNG_SAME_DAY = ("drl_same_day", "selection_same_day")
 #: [2026-09-22] P0-FREEZE-0925 的"选股耗时预算"告警需要真实耗时, 此前只记档位与只数。
 _LT_T0 = 0.0
 
+
+def _trace_trading_days():
+    """Return the cached trading-day set for observability, or ``None``.
+
+    This helper is deliberately best-effort: the target ladder must continue
+    to work when the calendar cache is unavailable, while the watcher must not
+    guess a trading-day age from calendar days.
+    """
+    try:
+        from trading_calendar import _calendar_days
+        days = _calendar_days()
+        return sorted(days) if days else None
+    except Exception:  # noqa: BLE001
+        return None
+
 #: [2026-09-23 用户要求] 建仓停滞保护: 连续多少次"尝试建仓但目标内持仓数无增长"
 #: 之后**强制推进**调仓窗口。
 #:
@@ -438,7 +453,8 @@ _LT_T0 = 0.0
 CONSTRUCTION_STALL_LIMIT = 5
 
 
-def _trace_targets(day: str, sel_day: str, rung: str, n: int) -> None:
+def _trace_targets(day: str, sel_day: str, rung: str, n: int,
+                   trading_days=None) -> None:
     """记录目标池的实际来源档位。**绝不抛异常**(选股主链路)。"""
     _elapsed = (time.perf_counter() - _LT_T0) if _LT_T0 else None
     try:
@@ -459,7 +475,12 @@ def _trace_targets(day: str, sel_day: str, rung: str, n: int) -> None:
     # 故信号路径未变(dry-run 结果仍代表当前系统)。
     try:
         import signal_freeze_watch as _SFW
-        _r = _SFW.observe(rung=rung, pool_size=int(n), elapsed_s=_elapsed)
+        _r = _SFW.observe(
+            rung=rung, pool_size=int(n), elapsed_s=_elapsed,
+            source_day=sel_day, consume_day=day,
+            trading_days=(trading_days if trading_days is not None
+                          else _trace_trading_days()),
+        )
         for _a in (_r.get("alerts") or []):
             log(f"[signal-freeze/{_a['severity']}] {_a['detail']}")
     except Exception as _e:  # noqa: BLE001
