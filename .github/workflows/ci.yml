@@ -96,3 +96,27 @@ jobs:
             tests/test_cvar_config.py \
             tests/test_execution_decomposition.py \
             -q
+
+  regression-h5i:
+    name: h5i integration (Python 3.10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install h5i test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_314.txt pytest duckdb polars
+          # h5i_db 的原生扩展不在 Python 3.14 核心环境中；该 job
+          # 专门验证 h5i 临时库写入与等价性路径，避免 CI 只验证 skip 分支。
+          pip install "h5i-db>=0.1.6"
+      - name: Verify h5i_db is available
+        run: python -c "import h5i_db; print(h5i_db.__file__)"
+      - name: Run h5i integration regression
+        run: |
+          python -m pytest \
+            tests/test_baostock_backfill.py \
+            tests/test_h5i_accel_equivalence.py \
+            -q -rs
