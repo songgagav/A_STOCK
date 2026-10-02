@@ -12,7 +12,7 @@
   ③ 截尾试验: 去掉融合分最高 5% 后再取 top10, 与原始 top10 对比(验证"极端头部是毒")
 
 输出: data/selection_tail_diag.json
-用法: python scripts/selection_tail_diag.py   (需带 h5i_db 的解释器, 见 README)
+用法: python scripts/research/selection_tail_diag.py   (需带 h5i_db 的解释器, 见 README)
 """
 from __future__ import annotations
 

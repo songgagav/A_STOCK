@@ -71,7 +71,7 @@ DIRECTIONS: dict[str, int] = {  # 合成符号: +1 直接用 z, -1 取反
     # 全视界为正(5/10/20/60/120d = +0.0513/+0.0759/+0.0637/+0.0370/+0.0266,
     # 均值 +0.0509, 48/55 为正, 且残差对 size 正交 r_size≈0), 方向应为 +1。
     # 改回 +1 后融合 IC 由 +0.0549 提升到 +0.1167。
-    # 证据: scripts/ic_neutral_check.py / data/ic_neutral_check.json
+    # 证据: scripts/research/ic_neutral_check.py / data/ic_neutral_check.json
     "roe_yy_chg": 1,
 }
 MIN_CS_N = 30          # 单因子截面最小样本(不足则该日该因子置空)

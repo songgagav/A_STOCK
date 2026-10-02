@@ -16,8 +16,8 @@
   未来窗口达成); "环境外"窗口单列, 不参与同向统计。
 
 用法
-    python scripts/hist_regime_report.py
-    python scripts/hist_regime_report.py --alt data/vnpy_backtest_nonoverlap_fwd_results_h17t05fix.json --alt-label 截尾5%
+    python scripts/research/hist_regime_report.py
+    python scripts/research/hist_regime_report.py --alt data/vnpy_backtest_nonoverlap_fwd_results_h17t05fix.json --alt-label 截尾5%
 输出
     data/hist_regime_report.json
 """

@@ -31,12 +31,6 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json") # 运行状态(持仓/净值/�
 # 会被 duck_available() 判 False).
 DUCKDB_PATH = os.path.join(BASE, "data", "legacy_stockdb.duckdb")  # [已退役] 原全A日频数据湖, 本机已删除
 
-# ---- 数据源优先级 ----
-# 主数据源: h5i(全A日频, m4 起), 盘中/缺失校验: AKShare.
-# 下列标签仅为历史兼容保留, 实际取数由 BAR_STORE(默认 h5i) 与 duck_available() 决定.
-PRIMARY_SOURCE = "duckdb"      # 历史标签, 不再参与取数路由
-FALLBACK_SOURCE = "akshare"
-
 # ---- 资金与交易制度(A股: 只做多 / T+1 / 全额资金) ----
 INIT_CAPITAL = 100_000.0      # 起始虚拟资金 10万
 MAX_POS_RATIO = 0.95            # 单账户最大仓位比例(留5%现金)
@@ -140,15 +134,6 @@ LOGIC_Q = {
     "logic_q_enabled": os.environ.get("LOGIC_Q_ENABLED", "1") != "0",
 }
 
-# ---- PPO 动态因子权重优化 (2026-09-06 升级) ----
-# 模式: "ic_weight" (IC 序列 → 权重增量, 原有) |
-#       "factor_value" (因子值 → 权重, 动态复权)
-# 参考: DTLC_RL 框架的特征空间解耦
-DRL_FACTOR_OPT = {
-    "mode": os.environ.get("DRL_FACTOR_MODE", "ic_weight"),
-    "factor_lookback": int(os.environ.get("DRL_FACTOR_LOOKBACK", "5")),
-}
-
 # ---- 多尺度信号分解 + Hybrid-GRPO (2026-09-07 升级) ----
 # 参考: 2026 年框架用小波分解分离趋势和波动, 再结合组相对策略优化
 WAVELET = {
@@ -174,15 +159,6 @@ STOCKMARL = {
     "n_agents": int(os.environ.get("SMARL_N_AGENTS", "4")),
     "marl_signal_dim": int(os.environ.get("SMARL_SIGNAL_DIM", "4")),
     "marl_enabled": os.environ.get("SMARL_ENABLED", "1") != "0",
-}
-
-# ---- 可解释 RL + 自适应特征选择 (2026-09-07 升级) ----
-# 参考: 2025 A 股实证, 累计收益 88.80% 超越 DQN 基线 20.76%
-EXPLAINABLE_RL = {
-    "feature_ic_threshold": float(os.environ.get("XRL_IC_THRESH", "0.02")),
-    "feature_eval_interval": int(os.environ.get("XRL_EVAL_INTERVAL", "20")),
-    "min_features": int(os.environ.get("XRL_MIN_FEATURES", "3")),
-    "xrl_enabled": os.environ.get("XRL_ENABLED", "1") != "0",
 }
 
 # ---- 风险因子 PPO 动态优化 (2026-09-07 升级) ----
@@ -416,13 +392,6 @@ FACTOR_HYPOTHESIS_EVAL = {
     "min_icir": 0.30,
     "min_obs_days": 60,
     "min_abs_spread_pct": 0.0,   # 0 = 不启用多空价差门槛(初值阶段先不叠加约束)
-}
-
-# ---- 每日调度时间 ----
-SCHEDULE = {
-    "daily_select": "15:05",   # 收盘后选股(生成次日目标)
-    "intraday_bar": "02:00",   # 盘中定期价刷新间隔(测试用; 实盘可调到 9:35开始)
-    "close_time": "15:00",     # 收盘
 }
 
 # ---- 数据库每日补录 ----

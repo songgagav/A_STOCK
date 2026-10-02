@@ -33,9 +33,10 @@ from config import (
     STATE_FILE, DAILY_DIR, DATA_DIR, INIT_CAPITAL, MAX_POS_RATIO,
     MAX_STOCKS, PAPER, SIGNAL_PARAMS, TRADE_BROKER,
 )
-from db import StockDB
+from db import StockDB, is_a_share_symbol as _is_a_share_code
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
+from utils import atomic_write_json as _atomic_write_json
 
 LIVE_STATE = os.path.join(DATA_DIR, "live_state.json")
 
@@ -72,39 +73,6 @@ def log(msg: str):
     print(line, flush=True)
 
 
-def _atomic_write_json(path: str, data: dict) -> None:
-    """P9: 原子写入 JSON. 先写同目录临时文件再 os.replace 替换,
-    避免进程中断时主文件被写坏(半截JSON).
-
-    Windows 文件锁竞态: Dashboard 每 3s 轮询读取 live_state.json 时,
-    os.replace 可能因文件被占用而触发 PermissionError.
-    增加重试+退避 (最多 3 次, 50/100/200ms), 覆盖绝大部分读锁窗口.
-    """
-    import tempfile
-    import time
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True) if d else None
-    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        for attempt in range(3):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                if attempt < 2:
-                    time.sleep(0.05 * (2 ** attempt))
-                else:
-                    raise
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -113,30 +81,6 @@ def load_state():
         except Exception:
             pass
     return {}
-
-
-# ---- A 股代码段校验 (与 build_factor_views.A_SHARE_CODE_FILTER 等价) ----
-# daily_bars.symbol 为裸 6 位代码, symbols.name 未填充, 只能靠代码段辨识证券类型.
-# 有效 A 股段: 深主板 000/001/002/003, 创业板 300/301/302,
-#              沪主板 600/601/603/605, 科创板 688/689.
-# 剔除: 沪市可转债 110/111/113, 深市可转债 123/127/128,
-#       深B股 200, 沪B股 900, 北交所 920/8xx/4xx, 其它非A段.
-_A_SHARE_PREFIXES = {
-    "000", "001", "002", "003",
-    "300", "301", "302",
-    "600", "601", "603", "605",
-    "688", "689",
-}
-
-
-def _is_a_share_code(raw: str) -> bool:
-    """判断裸 6 位代码(或带 .SH/.SZ/.BJ 后缀)是否为 A 股."""
-    if not raw:
-        return False
-    code = str(raw).split(".")[0]
-    if len(code) < 3:
-        return False
-    return code[:3] in _A_SHARE_PREFIXES
 
 
 def _prev_trade_day(day: str, db=None) -> "datetime|None":

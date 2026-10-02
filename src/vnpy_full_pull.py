@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import logging
 import sys
 import time
 
@@ -26,6 +27,9 @@ from config import DATA_DIR, DUCKDB_PATH
 from arctic_store import get_store, LIB_BARS
 import duckdb
 import pandas as pd
+
+
+_LOG = logging.getLogger(__name__)
 
 
 def _s6_to_canon(s6: str) -> str:
@@ -77,8 +81,10 @@ def _read_full_daily_bars(symbols: list[str] | None = None,
             rows = con.execute(sql).fetchall()
         df = pd.DataFrame(rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "amount", "turnover"])
     finally:
-        try: con.close()
-        except Exception: pass
+        try:
+            con.close()
+        except Exception as exc:  # 连接已完成读取，关闭失败不应掩盖主结果
+            _LOG.debug("关闭 DuckDB 连接失败: %s", exc, exc_info=True)
     out = {}
     for sym, g in df.groupby("symbol"):
         canon = _s6_to_canon(str(sym))
@@ -96,7 +102,9 @@ def _existing_symbol_dates(store, symbol: str) -> tuple[pd.Timestamp | None, pd.
             return None, None
         idx = df.index
         return idx.min(), idx.max()
-    except Exception:
+    except Exception as exc:
+        _LOG.warning("读取 ArcticDB symbol 日期失败，增量判断将按无历史日期处理: %s: %s",
+                     symbol, exc, exc_info=True)
         return None, None
 
 

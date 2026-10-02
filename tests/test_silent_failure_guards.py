@@ -158,3 +158,18 @@ def test_load_ic_cache_warns_on_corrupt_file(monkeypatch, tmp_path):
     assert fg.load_ic_cache(str(tmp_path / "nope.json")) is None
     assert dataguard.warned_count("ic_cache_unreadable") == 0
     dataguard.reset_warnings()
+
+
+def test_vnpy_incremental_read_failure_is_logged(caplog):
+    """ArcticDB 增量日期读取失败 -> 按无历史日期降级，但必须留下告警。"""
+    import vnpy_full_pull
+
+    class BrokenStore:
+        def read_bars(self, _symbol):
+            raise RuntimeError("模拟 ArcticDB 读取故障")
+
+    with caplog.at_level("WARNING", logger="vnpy_full_pull"):
+        out = vnpy_full_pull._existing_symbol_dates(BrokenStore(), "600519.SH")
+
+    assert out == (None, None)
+    assert "读取 ArcticDB symbol 日期失败" in caplog.text

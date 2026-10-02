@@ -26,6 +26,8 @@ import time
 from datetime import datetime
 from urllib import error, request
 
+from proc_alive import alive as _process_alive
+
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(_BASE, "logs")
 KEEP_PID = os.path.join(LOG_DIR, "dashboard_keepalive.pid")
@@ -59,17 +61,8 @@ def _log(msg: str) -> None:
 
 
 def _proc_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(1, False, int(pid))
-        if not h:
-            return False
-        ctypes.windll.kernel32.CloseHandle(h)
-        return True
-    except Exception:
-        return False
+    """生命周期看护使用保守二值语义，未知状态按存活处理。"""
+    return _process_alive(pid, unknown_means_alive=True)
 
 
 def _read_pid(pid_file: str) -> int | None:

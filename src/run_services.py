@@ -17,7 +17,12 @@ import subprocess
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
+_SRC = os.path.join(_BASE, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 os.chdir(_BASE)
+
+from proc_alive import alive as _process_alive  # noqa: E402
 
 PY = sys.executable
 PID_DIR = os.path.join(_BASE, "logs")
@@ -38,20 +43,8 @@ def _read_pid(path):
 
 
 def _proc_alive(pid):
-    if not pid:
-        return False
-    try:
-        import ctypes
-        # PROCESS_QUERY_INFORMATION | SYNCHRONIZE 权限位, 进程结束后 OpenProcess 返回 NULL.
-        # 旧代码用 1 (PROCESS_TERMINATE) 会对已结束进程产生句柄误判为"存活",
-        # 导致 run_services/daemon 看护不重建崩溃的 dashboard.
-        h = ctypes.windll.kernel32.OpenProcess(0x0400, False, int(pid))
-        if not h:
-            return False
-        ctypes.windll.kernel32.CloseHandle(h)
-        return True
-    except Exception:
-        return False
+    """生命周期管理使用保守二值语义，未知状态按存活处理。"""
+    return _process_alive(pid, unknown_means_alive=True)
 
 
 def _write_pid(path, pid):

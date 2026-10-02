@@ -416,6 +416,13 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/pbo-cscv.md`](docs/pbo-cscv.md)：PBO/CSCV 口径与解读；
 - [`docs/disciplines.md`](docs/disciplines.md)：DISC-1~4 等长期工程纪律；
 - [`docs/vulnerability-register.md`](docs/vulnerability-register.md)：漏洞、修复和验证台账；
+- [`docs/security-review.md`](docs/security-review.md)：历史伪造值的提交、文件、行号和判定依据；
+- [`docs/recovery-20260910-20260918.md`](docs/recovery-20260910-20260918.md)：目标 7 个交易日台账恢复核查；
+- [`docs/cleanup/README.md`](docs/cleanup/README.md)：清理阶段调用图、模块边界和环境阻断记录；
+- [`docs/cleanup/duckdb-boundary.md`](docs/cleanup/duckdb-boundary.md)：DuckDB 兼容层边界与迁移判据；
+- [`docs/cleanup/fml-role.md`](docs/cleanup/fml-role.md)：`ml_fusion_bridge` 角色和退役条件；
+- [`docs/cleanup/service-lifecycle.md`](docs/cleanup/service-lifecycle.md)：服务入口、Celery 和进程探测边界；
+- [`docs/cleanup/env-blockers.md`](docs/cleanup/env-blockers.md)：安全扫描、覆盖率和依赖分析工具缺失时的替代证据；
 - [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建与回滚 Runbook；
 - [`docs/patch-retirement-watch.md`](docs/patch-retirement-watch.md)：估值补丁退役观察期与当前状态；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；
