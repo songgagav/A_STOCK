@@ -122,6 +122,7 @@ imports.txt
 config_usage.txt
 bandit.json
 pytest_verbose.txt
+skip_report.txt
 
 # ---- 11. 个人/一次性脚本与笔记 (本地保留, 不随公开仓库发布) ----
 **/_*.py
