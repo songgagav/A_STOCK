@@ -7,9 +7,9 @@ import os
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_REPO, "scripts"))
+sys.path.insert(0, os.path.join(_REPO, "scripts", "research"))
 
-import _p0_2_diagnose as diag  # noqa: E402
+import p0_2_diagnose as diag  # noqa: E402
 
 
 def test_trade_symbols_reads_current_dict_trade_records():

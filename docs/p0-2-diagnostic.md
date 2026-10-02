@@ -91,7 +91,7 @@
 
 本轮重新执行了两个只读入口：
 
-1. `scripts/_p0_2_diagnose.py` 首次执行发现诊断脚本把当前 `trades_history` 的字典记录
+1. `scripts/research/p0_2_diagnose.py` 首次执行发现诊断脚本把当前 `trades_history` 的字典记录
    当成二元组解包，已修复为同时兼容当前字典格式（`canon`/`symbol`）和旧二元组格式，
    并加入 `tests/test_p0_2_diagnose.py`。
 2. 修复后脚本正常完成，但当前 `state.json` 没有 09-02 独立交易记录，只能聚合 2026-09
