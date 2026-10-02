@@ -36,3 +36,35 @@
 ## 当前回归基线
 
 分类变更后的完整回归为 `2637 passed, 50 skipped, 18 warnings`。跳过项主要由当前环境缺少 PyYAML、baostock 或 h5i-db 引起，已由 pytest 显式记录。
+
+## 替代检查方案
+
+### 测试瘦身（Phase 10 替代）
+
+`coverage` 未安装时，先收集测试清单：
+
+    .venv314\Scripts\python.exe -m pytest tests --collect-only -q > tests_list.txt
+
+人工检查重复或重叠的命名模式：
+
+- `test_*_wiring.py`
+- `test_*_paths.py`
+- `test_*_all_paths.py`
+- `test_*_helpers.py`
+
+`tests_list.txt` 只作为本地审计产物，不纳入版本库。
+
+### 依赖瘦身（Phase 11 替代）
+
+`deptry` 未安装时，生成源码导入清单并与依赖文件人工对照：
+
+    rg -o "^(import|from) \S+" src/ | Sort-Object -Unique > imports.txt
+    Get-Content requirements.txt, requirements_314.txt, requirements-dev.txt
+
+该方法不能替代完整的包解析，只用于筛出待复核候选。
+
+### 工具恢复后
+
+    .venv314\Scripts\python.exe -m pip install coverage deptry
+
+安装成功后补正式报告；若安装失败，保持 `blocked` 标记，不将替代检查伪报为正式工具通过。
