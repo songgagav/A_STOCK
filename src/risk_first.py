@@ -262,7 +262,96 @@ class CircuitBreaker:
 
 
 # ===================================================================
-# 4. 综合 Risk-First 层
+# 4. 动态仓位 (波动率目标 + 保守 Kelly)
+# ===================================================================
+class DynamicPositionSizer:
+    """把波动率、预期收益和市场状态转成总仓位缩放系数.
+
+    这是显式的现金保留层: ``apply`` 只缩小目标权重, 不重新归一化, 因此
+    缩放出来的部分确实留在现金中。默认参数保守且不改变现有调用路径。
+    """
+
+    def __init__(
+        self,
+        target_vol: float = 0.15,
+        kelly_fraction: float = 0.25,
+        regime_multipliers: dict[str, float] | None = None,
+    ):
+        self.target_vol = max(float(target_vol), 1e-6)
+        self.kelly_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
+        self.regime_multipliers = dict(regime_multipliers or {
+            "bull": 1.0, "sideways": 0.9, "bear": 0.6,
+            "high_vol": 0.5, "unknown": 0.75,
+        })
+
+    def size(
+        self,
+        annualized_vol: float | None,
+        expected_return: float | None = None,
+        regime: str = "unknown",
+    ) -> dict[str, Any]:
+        """Return an auditable position scale in [0, 1]."""
+        reasons: list[str] = []
+        try:
+            vol = float(annualized_vol)
+        except (TypeError, ValueError):
+            vol = float("nan")
+        if np.isfinite(vol) and vol > 0:
+            vol_scale = float(np.clip(self.target_vol / vol, 0.0, 1.0))
+        else:
+            vol_scale = 1.0
+            reasons.append("波动率缺失, 使用不缩放基线")
+
+        kelly_scale = None
+        if expected_return is not None:
+            try:
+                er = float(expected_return)
+            except (TypeError, ValueError):
+                er = float("nan")
+            if np.isfinite(er) and er <= 0:
+                kelly_scale = 0.0
+                reasons.append("预期收益非正, Kelly 缩放为 0")
+            elif np.isfinite(er) and np.isfinite(vol) and vol > 0:
+                kelly = er / (vol * vol)
+                kelly_scale = float(np.clip(kelly * self.kelly_fraction, 0.0, 1.0))
+            else:
+                reasons.append("Kelly 输入不可用, 仅使用波动率缩放")
+
+        base = vol_scale if kelly_scale is None else min(vol_scale, kelly_scale)
+        regime_scale = float(np.clip(self.regime_multipliers.get(regime, 0.75), 0.0, 1.0))
+        scale = float(np.clip(base * regime_scale, 0.0, 1.0))
+        return {
+            "scale": scale,
+            "vol_scale": vol_scale,
+            "kelly_scale": kelly_scale,
+            "regime_scale": regime_scale,
+            "regime": regime,
+            "reasons": reasons,
+        }
+
+    def apply(
+        self,
+        target_weights: np.ndarray | list,
+        annualized_vol: float | None,
+        expected_return: float | None = None,
+        regime: str = "unknown",
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Scale target weights while preserving the residual as cash."""
+        info = self.size(annualized_vol, expected_return, regime)
+        weights = np.asarray(target_weights, dtype=float)
+        weights = np.where(np.isfinite(weights) & (weights > 0), weights, 0.0)
+        return weights * info["scale"], info
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "target_vol": self.target_vol,
+            "kelly_fraction": self.kelly_fraction,
+            "regime_multipliers": dict(self.regime_multipliers),
+        }
+
+
+# ===================================================================
+# 5. 综合 Risk-First 层
 # ===================================================================
 class RiskFirstLayer:
     """Risk-First 综合层: 方差过滤器 + 风险暴露惩罚 + 确定性熔断.
@@ -275,11 +364,13 @@ class RiskFirstLayer:
         variance_filter: LLMVarianceFilter | None = None,
         exposure_penalty: RiskExposurePenalty | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        position_sizer: DynamicPositionSizer | None = None,
         llm_signal_dim: int = 4,
     ):
         self.variance_filter = variance_filter or LLMVarianceFilter()
         self.exposure_penalty = exposure_penalty or RiskExposurePenalty()
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self.position_sizer = position_sizer or DynamicPositionSizer()
         self.llm_signal_dim = llm_signal_dim
         self._filter_history: list[float] = []
 
@@ -354,12 +445,24 @@ class RiskFirstLayer:
         return self.circuit_breaker.evaluate(
             portfolio_drawdown, annualized_vol, cvar_95, drawdown_5d_change)
 
+    def apply_dynamic_position_size(
+        self,
+        target_weights: np.ndarray | list,
+        annualized_vol: float | None,
+        expected_return: float | None = None,
+        regime: str = "unknown",
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Apply volatility/Kelly sizing without renormalizing away cash."""
+        return self.position_sizer.apply(
+            target_weights, annualized_vol, expected_return, regime)
+
     def state_dict(self) -> dict:
         return {
             "variance_filter": self.variance_filter.state_dict(),
             "filter_history": self._filter_history[-50:],
             "circuit_level": self.circuit_breaker.level,
             "circuit_triggers": self.circuit_breaker.triggered,
+            "position_sizer": self.position_sizer.state_dict(),
         }
 
     def apply_position_limit(self, target_weights: np.ndarray) -> np.ndarray:
