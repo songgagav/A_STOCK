@@ -311,6 +311,8 @@ def apply_dynamic_weights(
     static_weights: dict[str, float],
     dynamic_weights: dict[str, float] | None,
     blend_ratio: float = 0.3,
+    market_regime: str | None = None,
+    regime_multipliers: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """将动态权重与静态权重融合.
 
@@ -318,18 +320,25 @@ def apply_dynamic_weights(
         static_weights: 静态 ICIR 加权权重.
         dynamic_weights: PPO 动态权重 (可为 None).
         blend_ratio: 动态权重占比 [0, 1].
+        market_regime: 可选的规则市场状态; 提供时再应用因子路由.
+        regime_multipliers: 可选的状态->因子倍率覆盖.
 
     Returns:
         {factor: blended_weight}.
     """
     if dynamic_weights is None:
-        return static_weights
-
-    result = {}
-    for factor, sw in static_weights.items():
-        dw = dynamic_weights.get(factor, sw)
-        result[factor] = sw * (1 - blend_ratio) + dw * blend_ratio
+        result = dict(static_weights)
+    else:
+        result = {}
+        for factor, sw in static_weights.items():
+            dw = dynamic_weights.get(factor, sw)
+            result[factor] = sw * (1 - blend_ratio) + dw * blend_ratio
 
     # 归一化
     total = sum(result.values()) or 1.0
-    return {k: v / total for k, v in result.items()}
+    result = {k: v / total for k, v in result.items()}
+    if market_regime:
+        from regime_detector import route_factor_weights
+        result = route_factor_weights(result, market_regime,
+                                      multipliers=regime_multipliers)
+    return result
