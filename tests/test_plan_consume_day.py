@@ -28,11 +28,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 _SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import realtime_engine as re  # noqa: E402
+
+from _calendar_support import install_if_missing  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _calendar_is_deterministic_when_cache_is_absent(monkeypatch):
+    install_if_missing(monkeypatch)
 
 #: 供测试内的 exists 打桩透传用(见 TestLoadTargetsLadderWiring)
 _REAL_EXISTS = os.path.exists

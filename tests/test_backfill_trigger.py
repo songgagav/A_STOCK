@@ -29,12 +29,19 @@ import sys
 
 import pytest
 
+from _calendar_support import install_if_missing
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import backfill_trigger as BT  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _calendar_is_deterministic_when_cache_is_absent(monkeypatch):
+    install_if_missing(monkeypatch)
 
 
 class TestTheAcceptanceCriterion:

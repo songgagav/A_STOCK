@@ -36,7 +36,10 @@ jobs:
           # ImportError, pytest 以 exit code 2 中断(表现为"1 秒内失败", 而非测试失败)。
           # 实测 origin/main 基线 48ccf7f(不含任何本会话改动) 同样 exit 2 ⇒ 既有缺陷。
           # 此处补齐 author 已在 requirements-dev.txt 中标注的测试环境依赖。
-          pip install -r requirements_314.txt pytest duckdb polars
+          # metrics_server 的契约测试需要 Prometheus 客户端；它已在
+          # requirements-dev.txt/requirements-lock.txt 声明，这里显式安装
+          # 最小测试运行时依赖，避免把整套开发依赖带进 CI。
+          pip install -r requirements_314.txt pytest duckdb polars prometheus_client
       - name: Run full regression (excluding torch/DRL suites)
         run: |
           python -m pytest tests -q \

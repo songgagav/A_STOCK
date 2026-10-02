@@ -32,11 +32,17 @@ import sys
 import pytest
 
 from doc_section import code_block_bounds  # noqa: E402  按**结构**定界, 取代 src[i:i+N] 的魔数窗口
+from _calendar_support import install_if_missing
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+
+
+@pytest.fixture(autouse=True)
+def _calendar_is_deterministic_when_cache_is_absent(monkeypatch):
+    install_if_missing(monkeypatch)
 
 
 class TestSnapshotCarriesLag:
@@ -298,4 +304,3 @@ class TestDrlEnvMissingIsATrueAlertNotAFalsePositive:
         desc = str(rules["DrlEnvMissing"]["annotations"]["description"])
         assert "共用" in desc or "同一个解释器" in desc, (
             "必须点明 metrics_server 与训练共用解释器这一机制")
-

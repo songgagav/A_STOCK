@@ -25,6 +25,7 @@ import sys
 import time
 from datetime import datetime
 from urllib import error, request
+from urllib.parse import urlsplit
 
 from proc_alive import alive as _process_alive
 
@@ -104,8 +105,13 @@ def _check_port_in_use(port: int) -> int | None:
 
 def _health_check() -> bool:
     """GET DASH_URL/api/health, 200 OK 即认为 dashboard 健康."""
+    url = f"{DASH_URL}/api/health"
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        _log(f"拒绝非本机健康检查地址: {url}")
+        return False
     try:
-        with request.urlopen(f"{DASH_URL}/api/health", timeout=3) as r:
+        with request.urlopen(url, timeout=3) as r:  # nosec B310 - fixed local HTTP endpoint
             return r.status == 200
     except Exception:
         return False

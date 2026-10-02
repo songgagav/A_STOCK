@@ -590,7 +590,8 @@ def check_akshare() -> dict:
                 "User-Agent": "Mozilla/5.0 A_stock_rotation/premarket_healthcheck",
                 "Referer": "http://quote.eastmoney.com/",
             })
-            with request.urlopen(req, timeout=6) as r:
+            # Fixed Eastmoney HTTPS/HTTP API endpoint; no user-supplied URL.
+            with request.urlopen(req, timeout=6) as r:  # nosec B310
                 data = json.loads(r.read().decode("utf-8", errors="replace"))
             if not isinstance(data, dict) or "data" not in data:
                 return _record(name, "WARN",

@@ -14,9 +14,19 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlsplit
 
 
 _LOG = logging.getLogger("llm_commentary")
+
+
+def _http_urlopen(target, *, timeout: float):
+    """Open only HTTP(S) LLM endpoints; reject file/custom URL schemes."""
+    url = getattr(target, "full_url", target)
+    parsed = urlsplit(str(url))
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"不支持的 LLM URL scheme: {parsed.scheme or '<empty>'}")
+    return request.urlopen(target, timeout=timeout)  # nosec B310 - scheme allowlist above
 
 # .env 路径推断, **按优先级从高到低**:
 #   ① 环境变量 RESEARCH_TRADER_ENV 显式指定;
@@ -231,7 +241,7 @@ def _post_chat(base_url: str, api_key: str, model: str,
         url, data=json.dumps(payload).encode("utf-8"),
         headers=headers, method="POST")
     t0 = time.time()
-    with request.urlopen(req, timeout=timeout) as resp:
+    with _http_urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8"))
     return {"body": _to_anthropic_shape(body), "latency": time.time() - t0,
             "_api_type": api_type, "_url": url}
@@ -518,7 +528,7 @@ def _post_anthropic(messages_url: str, api_key: str, model: str,
         method="POST",
     )
     t0 = time.time()
-    with request.urlopen(req, timeout=timeout) as resp:
+    with _http_urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8"))
     return {"body": body, "latency": time.time() - t0}
 

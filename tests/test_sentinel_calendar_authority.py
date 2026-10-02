@@ -39,11 +39,18 @@ import sys
 
 import pytest
 
+from _calendar_support import install_if_missing
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
 import datasource_gate as G  # noqa: E402
 import engine_bars_sync as E  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _calendar_is_deterministic_when_cache_is_absent(monkeypatch):
+    install_if_missing(monkeypatch)
 
 
 def _fresh(**kw):
