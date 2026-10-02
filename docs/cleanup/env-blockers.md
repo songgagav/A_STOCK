@@ -35,4 +35,12 @@
 
 ## 当前回归基线
 
-旧基线为 `2637 passed, 50 skipped, 18 warnings`；本轮尚未重新声明全量回归通过。跳过项主要由当前环境缺少 PyYAML、baostock 或 h5i-db 引起，需以新一轮 pytest 输出为准。
+旧基线为 `2637 passed, 50 skipped, 18 warnings`。2026-10-02 `.venv314` 全量结果为 `2680 passed, 29 skipped, 18 warnings`；跳过明细为 24 项依赖 `h5i_db`、5 项依赖 `baostock`。此前的 50 与本轮 29 来自不同环境/测试状态，不能直接解释为 21 项因 `importorskip` 变成通过；后续比较必须保存同一解释器、依赖锁定和提交的 skip 清单。
+
+## h5i_db 双环境测试策略
+
+这不是“修复 h5i_db 未安装”，而是把可选集成能力缺失从失败变成显式跳过；真实 h5i 验证仍由专用解释器承担。
+
+- `.venv314`：日常单元/常规集成回归；h5i 相关测试通过 `pytest.importorskip("h5i_db")` 显式跳过，Baostock 真实 fetcher 在未安装 `baostock` 时同样跳过。
+- `.venv310`：h5i/回填专用验证环境；本轮 Baostock 触发→写入→留痕定向集为 `249 passed`，真实 h5i 写入测试在此环境执行。
+- CI 当前没有 h5i 专用 job；至少应增加一个能安装并运行 h5i 定向测试的 job，否则 CI 只会验证跳过分支，无法暴露 h5i 集成问题。

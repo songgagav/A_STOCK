@@ -76,3 +76,5 @@
 - 先前 `.venv310` 全量运行至约 7% 后无输出；本轮用 `.venv314 -v` 定位到新增 Baostock 端到端测试在缺少 `h5i_db` 时直接导入失败，并非网络/子进程挂死。
 - 修复后 `.venv314` 全量：`2680 passed, 29 skipped, 17 warnings`。
 - 修复后 `.venv310` 定向真实 h5i 回填集：`249 passed`；该解释器仍负责执行 h5i 写入测试。
+- 诚实口径：`pytest.importorskip` 是缺依赖时的显式降级，不是安装或修复 `h5i_db`；双环境职责已记录在 `docs/cleanup/env-blockers.md`。
+- `.venv314` 的 29 项 skip 已核对：24 项为 `h5i_db` 缺失，5 项为 `baostock` 缺失；CI 尚未配置 h5i 专用 job。
