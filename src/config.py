@@ -34,7 +34,6 @@ DUCKDB_PATH = os.path.join(BASE, "data", "legacy_stockdb.duckdb")  # [已退役]
 # ---- 数据源优先级 ----
 # 主数据源: h5i(全A日频, m4 起), 盘中/缺失校验: AKShare.
 # 下列标签仅为历史兼容保留, 实际取数由 BAR_STORE(默认 h5i) 与 duck_available() 决定.
-PRIMARY_SOURCE = "duckdb"      # 历史标签, 不再参与取数路由
 FALLBACK_SOURCE = "akshare"
 
 # ---- 资金与交易制度(A股: 只做多 / T+1 / 全额资金) ----
