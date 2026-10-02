@@ -1,17 +1,17 @@
 # 环境阻断与轻量替代检查
 
 记录日期：2026-10-02  
-适用分支：`cleanup/phase0-baseline`
+适用分支：`evolution/p0-regime-position`
 
 ## 当前状态
 
-以下工具在当前 Windows 工作环境中未发现，因而没有伪报扫描通过：
+本轮已重新探测工具并执行可运行的扫描。工具可用不等于扫描通过；超时或非零结果均保留为阻断：
 
 | 工具 | 用途 | 当前结果 | 替代证据 |
 | --- | --- | --- | --- |
-| `bandit` | Python 静态安全扫描 | 未安装，未运行 | 等离线 wheel/网络恢复后运行；当前保留历史秘密扫描和人工复核 |
-| `pip-audit` | 依赖漏洞扫描 | 未安装，未运行 | 先核对 `requirements*.txt` 与已知漏洞库；网络恢复后补跑 |
-| `detect-secrets` | 秘密扫描 | 未安装，未运行 | 已有项目秘密扫描结果；本阶段补充历史提交审计 |
+| `bandit` | Python 静态安全扫描 | 已运行但非零：0 high、126 medium、343 low；按 `-ll` 不通过 | 需对 B608 等动态 SQL 命中逐项分级，未将 0 high 误报为全通过 |
+| `pip-audit` | 依赖漏洞扫描 | 工具可用，但 `-r requirements.txt --no-deps` 等待外部源超过 90 秒后中断；无结论 | 保留为 blocked，网络/镜像可用后重跑 |
+| `detect-secrets` | 秘密扫描 | 工具可用，但当前工作树扫描超过 90 秒无输出后中断；无结论 | 保留历史人工扫描证据，并拆分工作树/历史提交扫描 |
 | `coverage` | 测试覆盖率 | 未安装 | 使用 pytest 收集清单和完整回归 |
 | `deptry` | 依赖使用分析 | 未安装 | 使用源码导入清单与 requirements 人工对照 |
 
@@ -19,20 +19,19 @@
 
 ## 已生成的替代证据
 
-- `tests_list.txt`：本地生成的 pytest 收集清单，共 2687 个测试；不纳入版本库，避免测试名称中的占位符触发秘密扫描；
-- `imports.txt`：本地生成的 `src/` 顶层 `import/from` 初步清单；不纳入版本库；
-- `config_usage.txt`：本地生成的 `src/config.py` 大写配置名命中候选计数；不纳入版本库。
+- `tests_list.txt`、`imports.txt`、`config_usage.txt`：本轮工作树均未找到，不能把它们当作当前证据；Phase 12 配置分级因此仍未执行。
+- 历史记录中的 pytest 回归数字只作为旧基线，不能替代本轮全量回归。
 
 这些文件是审计辅助材料，不是完整的依赖或安全证明。导入计数包含注释、字符串和兼容代码，配置命中也不能证明配置一定被运行时读取。
 
 ## 后续执行顺序
 
-1. 网络或本地 wheel 可用后，在隔离环境执行 `python -m bandit -r src -ll`；
+1. 对 Bandit 的中危 SQL 命中做输入边界审计并形成逐项例外/修复清单；
 2. 使用锁定依赖执行 `pip-audit -r requirements-lock.txt`，并记录包版本和例外；
-3. 使用 `detect-secrets scan` 同时覆盖工作树和 Git 历史，历史伪造测试值要保留提交/文件/原因留痕；
+3. 将 detect-secrets 拆成可在 Windows 完成的工作树分区扫描，再覆盖 Git 历史；历史伪造测试值要保留提交/文件/原因留痕；
 4. 将三项扫描加入 CI，工具缺失时必须返回显式 blocked，而不是成功；
 5. `coverage`、`deptry` 安装后再补完整报告，不删除当前替代证据。
 
 ## 当前回归基线
 
-分类变更后的完整回归为 `2637 passed, 50 skipped, 18 warnings`。跳过项主要由当前环境缺少 PyYAML、baostock 或 h5i-db 引起，已由 pytest 显式记录。
+旧基线为 `2637 passed, 50 skipped, 18 warnings`；本轮尚未重新声明全量回归通过。跳过项主要由当前环境缺少 PyYAML、baostock 或 h5i-db 引起，需以新一轮 pytest 输出为准。
