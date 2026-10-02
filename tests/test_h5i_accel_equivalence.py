@@ -37,6 +37,7 @@ import importlib.util
 import math
 import os
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -60,6 +61,138 @@ def _same(a: dict, b: dict):
         if x != y:
             return f"{k}: {x!r} vs {y!r}"
     return None
+
+
+def _fixture_symbols() -> list[str]:
+    """Return a complete, deterministic A-share-like universe for h5i tests."""
+    symbols = {f"6{i:05d}" for i in range(1500)}
+    symbols.update(f"{i:06d}" for i in range(1, 1506))
+    # The bars assertions below exercise these concrete exchange/code mappings.
+    symbols.update({"000001", "600000", "300750", "601318", "600519"})
+    return sorted(symbols)
+
+
+def _write_fixture_h5i(path, symbols: list[str]) -> None:
+    """Build the smallest complete h5i store required by the equivalence tests.
+
+    The production store and its ignored static parquet are deliberately never
+    consulted.  `valuation_snapshot` still has more than 3,000 rows because
+    the production universe reader correctly rejects incomplete snapshots.
+    """
+    import h5i_db
+    import pyarrow as pa
+
+    def schema(*fields):
+        return pa.schema([pa.field(name, dtype) for name, dtype in fields])
+
+    valuation_snapshot_schema = schema(
+        ("ts", pa.timestamp("us")), ("symbol", pa.string()), ("name", pa.string()),
+        ("price", pa.float64()), ("float_mv", pa.float64()),
+        ("total_mv", pa.float64()), ("turnover", pa.float64()),
+        ("pe_ttm", pa.float64()), ("pb", pa.float64()), ("amount", pa.float64()),
+        ("float_shares", pa.float64()),
+    )
+    valuation_schema = schema(
+        ("ts", pa.timestamp("us")), ("symbol", pa.string()),
+        ("pe_ttm", pa.float64()), ("pb", pa.float64()), ("ps_ttm", pa.float64()),
+        ("market_cap", pa.float64()),
+    )
+    financials_schema = schema(
+        ("ts", pa.timestamp("us")), ("symbol", pa.string()),
+        ("roe", pa.float64()), ("roe_diluted", pa.float64()), ("eps", pa.float64()),
+        ("np_yoy", pa.float64()), ("gross_margin", pa.float64()),
+        ("net_margin", pa.float64()), ("ocf_ps", pa.float64()),
+        ("debt_ratio", pa.float64()),
+    )
+    daily_bars_schema = schema(
+        ("ts", pa.timestamp("us")), ("symbol", pa.string()),
+        ("open", pa.float64()), ("high", pa.float64()), ("low", pa.float64()),
+        ("close", pa.float64()), ("volume", pa.float64()), ("amount", pa.float64()),
+        ("change_pct", pa.float64()), ("turnover", pa.float64()),
+    )
+
+    snap_time = datetime(2026, 9, 24)
+    db = h5i_db.Database(str(path), create=True)
+    try:
+        db.create_table("valuation_snapshot", valuation_snapshot_schema, time_column="ts")
+        db.create_table("valuation", valuation_schema, time_column="ts")
+        db.create_table("financials", financials_schema, time_column="ts")
+        db.create_table("daily_bars", daily_bars_schema, time_column="ts")
+
+        n = len(symbols)
+        db.append("valuation_snapshot", pa.Table.from_pydict({
+            "ts": [snap_time] * n, "symbol": symbols,
+            "name": [f"Fixture {symbol}" for symbol in symbols],
+            "price": [10.0] * n, "float_mv": [100.0] * n,
+            "total_mv": [120.0] * n, "turnover": [0.5] * n,
+            "pe_ttm": [12.0] * n, "pb": [1.5] * n,
+            "amount": [100_000_000.0] * n, "float_shares": [100_000_000.0] * n,
+        }, schema=valuation_snapshot_schema))
+        db.append("valuation", pa.Table.from_pydict({
+            "ts": [snap_time] * n, "symbol": symbols,
+            "pe_ttm": [12.0] * n, "pb": [1.5] * n,
+            "ps_ttm": [2.0] * n, "market_cap": [120.0] * n,
+        }, schema=valuation_schema))
+        db.append("financials", pa.Table.from_pydict({
+            "ts": [snap_time] * n, "symbol": symbols,
+            "roe": [0.12] * n, "roe_diluted": [0.11] * n,
+            "eps": [1.2] * n, "np_yoy": [0.08] * n,
+            "gross_margin": [0.35] * n, "net_margin": [0.15] * n,
+            "ocf_ps": [0.9] * n, "debt_ratio": [0.4] * n,
+        }, schema=financials_schema))
+
+        bar_symbols = ["000001", "600000", "300750", "601318", "600519"]
+        days = [datetime(2026, 3, 9) + timedelta(days=i) for i in range(200)]
+        bar_ts = [day for day in days for _ in bar_symbols]
+        bar_codes = [symbol for _ in days for symbol in bar_symbols]
+        rows = len(bar_codes)
+        db.append("daily_bars", pa.Table.from_pydict({
+            "ts": bar_ts, "symbol": bar_codes,
+            "open": [10.0] * rows, "high": [10.2] * rows,
+            "low": [9.8] * rows, "close": [10.1] * rows,
+            "volume": [1_000_000.0] * rows, "amount": [10_100_000.0] * rows,
+            "change_pct": [0.1] * rows, "turnover": [0.5] * rows,
+        }, schema=daily_bars_schema))
+    finally:
+        db.close()
+
+
+@pytest.fixture()
+def isolated_h5i_equivalence_store(tmp_path, monkeypatch):
+    """Inject an isolated h5i database and symbols parquet for h5i-only tests."""
+    pytest.importorskip("h5i_db", reason="需要 h5i_db 的真实等价验证")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import db as DB
+    from h5i_bar_store import H5iBarStore
+
+    symbols = _fixture_symbols()
+    assert len(symbols) >= 3000
+    store_path = tmp_path / "market.db"
+    symbols_path = tmp_path / "symbols.parquet"
+    _write_fixture_h5i(store_path, symbols)
+    pq.write_table(pa.Table.from_pydict({
+        "symbol": symbols,
+        "market": ["sh" if symbol.startswith("6") else "sz" for symbol in symbols],
+        "list_date": ["2010-01-01"] * len(symbols),
+        "is_active": [True] * len(symbols),
+    }), symbols_path)
+
+    store = H5iBarStore(str(store_path))
+    monkeypatch.setattr(DB, "_h5i_store", lambda: store)
+    monkeypatch.setattr(DB, "_SYM_PARQUET", str(symbols_path))
+    DB._SYM_DF_SLOT["df"] = None
+    DB._LATEST_SNAP["valuation"] = {}
+    DB._LATEST_SNAP["financials"] = {}
+    DB._H5I_BULK_SLOT.update({"key": None, "frame": None, "groups": None})
+    try:
+        yield
+    finally:
+        store.close()
+        DB._SYM_DF_SLOT["df"] = None
+        DB._LATEST_SNAP["valuation"] = {}
+        DB._LATEST_SNAP["financials"] = {}
+        DB._H5I_BULK_SLOT.update({"key": None, "frame": None, "groups": None})
 
 
 class TestNoLookaheadFreeze:
@@ -96,6 +229,7 @@ class TestNoLookaheadFreeze:
             "_select_hist 直接用了 get_valuation(无 as_of 形参, 恒为最新) => 前视风险"
 
 
+@pytest.mark.usefixtures("isolated_h5i_equivalence_store")
 class TestBulkSnapshotEquivalence:
     """批量快照与逐条 SQL **必须逐字段等价**。"""
 
@@ -159,6 +293,7 @@ class TestBulkSnapshotEquivalence:
             DB._LATEST_SNAP["financials"] = {}
 
 
+@pytest.mark.usefixtures("isolated_h5i_equivalence_store")
 class TestBarsSymbolIndexEquivalence:
     """`get_bars` 的 symbol 索引必须与布尔筛选**逐行等价**。"""
 
