@@ -78,3 +78,21 @@
 - 修复后 `.venv310` 定向真实 h5i 回填集：`249 passed`；该解释器仍负责执行 h5i 写入测试。
 - 诚实口径：`pytest.importorskip` 是缺依赖时的显式降级，不是安装或修复 `h5i_db`；双环境职责已记录在 `docs/cleanup/env-blockers.md`。
 - `.venv314` 的 29 项 skip 已核对：24 项为 `h5i_db` 缺失，5 项为 `baostock` 缺失；CI 尚未配置 h5i 专用 job。
+
+## CI #192 测试夹具修复（待远端复验）
+
+CI #192 暴露的是测试对本机被忽略数据产物的依赖，不是生产 `missing_days()`
+语义错误。本轮只改测试夹具，生产代码与真实 `market.db` 均未改动：
+
+- Baostock 触发→写入模拟在 `tmp_path` 中提供最小官方交易日历；生产侧在无日历时
+  仍返回 `[]`，不会擅自推断待回填日期。
+- 临时 h5i `daily_bars` fallback schema 改为扁平、已实例化的 `pa.float64()` 字段。
+- h5i 等价测试构建并注入临时数据库和 symbols parquet；该快照仍有超过 3,000 行，
+  因而真实执行 production universe reader 的完整性门槛，不读取
+  `data/h5i/market.db` 或 `data/h5i/static/symbols.parquet`。
+
+本地证据：`.venv310` h5i/Baostock 定向集 `32 passed`；`.venv314` 同一集
+`23 passed, 9 skipped`（全部是无 h5i_db 的预期跳过）；无运行时数据的隔离工作树
+全量为 `2663 passed, 46 skipped, 17 warnings`。后者不能与数据齐全工作树的
+`2680/29/17` 直接比较；额外跳过来自未复制的、被 `.gitignore` 排除的数据和部署产物。
+远端 h5i job 尚未重新运行，不能据此标记 CI 已通过。
