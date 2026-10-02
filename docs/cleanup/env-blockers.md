@@ -19,9 +19,9 @@
 
 ## 已生成的替代证据
 
-- [`tests_list.txt`](../../tests_list.txt)：`pytest --collect-only -q` 收集到 2687 个测试；
-- [`imports.txt`](../../imports.txt)：对 `src/` 的顶层 `import/from` 行做的初步清单；
-- [`config_usage.txt`](../../config_usage.txt)：`src/config.py` 大写配置名的源码命中候选计数。
+- `tests_list.txt`：本地生成的 pytest 收集清单，共 2687 个测试；不纳入版本库，避免测试名称中的占位符触发秘密扫描；
+- `imports.txt`：本地生成的 `src/` 顶层 `import/from` 初步清单；不纳入版本库；
+- `config_usage.txt`：本地生成的 `src/config.py` 大写配置名命中候选计数；不纳入版本库。
 
 这些文件是审计辅助材料，不是完整的依赖或安全证明。导入计数包含注释、字符串和兼容代码，配置命中也不能证明配置一定被运行时读取。
 
