@@ -354,13 +354,6 @@ FACTOR_HYPOTHESIS_EVAL = {
     "min_abs_spread_pct": 0.0,   # 0 = 不启用多空价差门槛(初值阶段先不叠加约束)
 }
 
-# ---- 每日调度时间 ----
-SCHEDULE = {
-    "daily_select": "15:05",   # 收盘后选股(生成次日目标)
-    "intraday_bar": "02:00",   # 盘中定期价刷新间隔(测试用; 实盘可调到 9:35开始)
-    "close_time": "15:00",     # 收盘
-}
-
 # ---- 数据库每日补录 ----
 # 收盘后统一补录的全表头清单, 与 DuckDB 表名一一对应. None 代表不存在或不需要同步.
 # 每行: 表名 -> (日期列名, 日期格式 "date"/"datetime", 同步函数名 in update_db)
