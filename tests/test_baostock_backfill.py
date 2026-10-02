@@ -354,10 +354,16 @@ class TestWritePathAgainstRealH5i:
             prod.close()
         else:
             import pyarrow as pa
-            sch = pa.schema([pa.field("ts", pa.timestamp("us")), ("symbol", pa.string())] +
-                            [(c, pa.float64) for c in
-                             ("open", "high", "low", "close", "volume", "amount",
-                              "change_pct", "turnover")])
+            fields = [
+                pa.field("ts", pa.timestamp("us")),
+                pa.field("symbol", pa.string()),
+            ]
+            fields += [
+                pa.field(column, pa.float64())
+                for column in ("open", "high", "low", "close", "volume", "amount",
+                               "change_pct", "turnover")
+            ]
+            sch = pa.schema(fields)
         db.create_table("daily_bars", sch, time_column="ts")
         yield db
         try:
