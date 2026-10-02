@@ -121,15 +121,6 @@ RISK_FIRST = {
     "risk_first_enabled": os.environ.get("RISK_FIRST_ENABLED", "1") != "0",
 }
 
-# ---- 可解释 RL + 自适应特征选择 (2026-09-07 升级) ----
-# 参考: 2025 A 股实证, 累计收益 88.80% 超越 DQN 基线 20.76%
-EXPLAINABLE_RL = {
-    "feature_ic_threshold": float(os.environ.get("XRL_IC_THRESH", "0.02")),
-    "feature_eval_interval": int(os.environ.get("XRL_EVAL_INTERVAL", "20")),
-    "min_features": int(os.environ.get("XRL_MIN_FEATURES", "3")),
-    "xrl_enabled": os.environ.get("XRL_ENABLED", "1") != "0",
-}
-
 # ---- 风险因子 PPO 动态优化 (2026-09-07 升级) ----
 # 参考: 2025 量化报告用 PPO 动态优化风险因子生成, 解释度提升至 35.3%,
 #       因子时序更稳定. 把波动率/CVaR/最大回撤风险因子并入 PPO 观测.
