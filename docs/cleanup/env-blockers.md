@@ -44,3 +44,4 @@
 - `.venv314`：日常单元/常规集成回归；h5i 相关测试通过 `pytest.importorskip("h5i_db")` 显式跳过，Baostock 真实 fetcher 在未安装 `baostock` 时同样跳过。
 - `.venv310`：h5i/回填专用验证环境；本轮 Baostock 触发→写入→留痕定向集为 `249 passed`，真实 h5i 写入测试在此环境执行。
 - CI 当前没有 h5i 专用 job；至少应增加一个能安装并运行 h5i 定向测试的 job，否则 CI 只会验证跳过分支，无法暴露 h5i 集成问题。
+- 本轮已在 `.github/workflows/ci.yml` 增加 `regression-h5i`（Python 3.10 + `h5i-db`），运行临时库回填和 h5i 等价性回归；该 job 仍需下一次 GitHub Actions 运行结果确认。
