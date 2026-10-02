@@ -121,15 +121,6 @@ RISK_FIRST = {
     "risk_first_enabled": os.environ.get("RISK_FIRST_ENABLED", "1") != "0",
 }
 
-# ---- Hi-DARTS 层次化多智能体 (2026-09-07 升级) ----
-# 参考: 2025 Hi-DARTS 框架, 元智能体分析市场波动, 动态激活子智能体
-HIDARTS = {
-    "vol_threshold_low": float(os.environ.get("HIDARTS_VOL_LOW", "0.15")),
-    "vol_threshold_high": float(os.environ.get("HIDARTS_VOL_HIGH", "0.30")),
-    "trend_threshold": float(os.environ.get("HIDARTS_TREND_THRESH", "0.02")),
-    "hidarts_enabled": os.environ.get("HIDARTS_ENABLED", "1") != "0",
-}
-
 # ---- StockMARL 多智能体模拟 (2026-09-07 升级) ----
 # 参考: 2025 StockMARL, 让 RL 观察模拟投资者行为学习
 STOCKMARL = {
