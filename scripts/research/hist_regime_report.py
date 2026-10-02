@@ -26,10 +26,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import statistics as st
 import sys
 
-_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Phase 9 moved this script from ``scripts/`` to ``scripts/research/``.
+# Resolve from the repository root rather than assuming a two-level layout;
+# otherwise every default data path silently points at ``scripts/data``.
+_BASE = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, _BASE)
 os.chdir(_BASE)
 
@@ -223,6 +227,11 @@ def main() -> None:
     cls = {x["day"]: x["judge"]["prod_neu"]["class"] for x in dirc.get("hist", [])
            if x.get("ok")}
     days = sorted(prod)
+
+    if not days:
+        raise SystemExit(
+            "未加载到有效历史窗口: 请检查 --prod 路径及 JSON 中的 ok=true 记录"
+        )
 
     print(f"历史窗口 {len(days)} 个 (生产排序: {os.path.basename(a.prod)})")
     if alt:

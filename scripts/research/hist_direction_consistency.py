@@ -38,8 +38,9 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
-_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BASE = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, _BASE)
 sys.path.insert(0, os.path.join(_BASE, "src"))
 os.chdir(_BASE)
