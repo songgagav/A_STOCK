@@ -95,4 +95,24 @@ CI #192 暴露的是测试对本机被忽略数据产物的依赖，不是生产
 `23 passed, 9 skipped`（全部是无 h5i_db 的预期跳过）；无运行时数据的隔离工作树
 全量为 `2663 passed, 46 skipped, 17 warnings`。后者不能与数据齐全工作树的
 `2680/29/17` 直接比较；额外跳过来自未复制的、被 `.gitignore` 排除的数据和部署产物。
-远端 h5i job 尚未重新运行，不能据此标记 CI 已通过。
+远端复验已完成：PR #4 的 `ci-regression #193` 与 `security-scans #13` 均成功；
+`evolution-p0-audit-v2` 标签记录该验证点。
+
+### 2026-10-03 skip 差异审计
+
+对同一提交、同一 `.venv314` 执行两次 `pytest tests -q -rs`：主工作树结果为
+`2680 passed, 29 skipped, 18 warnings`，隔离工作树为
+`2663 passed, 46 skipped, 17 warnings`。逐条集合比较确认：隔离树新增 **17** 个
+skip，且没有任何主工作树 skip 在隔离树中消失。
+
+新增项全部由主工作树已有、但隔离工作树刻意不复制的运行态/忽略产物解释：
+
+- 观测部署：Prometheus 配置两项；
+- 数据与日历：预检结果、symbols parquet、交易日历四项、IC 产物、views 产物；
+- 运行态：DRL 预检样例、factor gate 默认配置、live snapshot、target plan、daemon pid；
+- 生产登记：quality exclusions 两项。
+
+本轮三处测试夹具（`test_baostock_backfill.py` 与
+`test_h5i_accel_equivalence.py`）不在这 17 项中；它们仍分别在无 h5i_db 时显式跳过，
+并由 `.venv310` 的真实 h5i 定向集执行。因此该差异是测试环境可用输入的差异，
+**不是**把此前失败的测试降级为 skip，也不改变主工作树 `2680/29/18` 基线。
