@@ -134,15 +134,6 @@ LOGIC_Q = {
     "logic_q_enabled": os.environ.get("LOGIC_Q_ENABLED", "1") != "0",
 }
 
-# ---- PPO 动态因子权重优化 (2026-09-06 升级) ----
-# 模式: "ic_weight" (IC 序列 → 权重增量, 原有) |
-#       "factor_value" (因子值 → 权重, 动态复权)
-# 参考: DTLC_RL 框架的特征空间解耦
-DRL_FACTOR_OPT = {
-    "mode": os.environ.get("DRL_FACTOR_MODE", "ic_weight"),
-    "factor_lookback": int(os.environ.get("DRL_FACTOR_LOOKBACK", "5")),
-}
-
 # ---- 多尺度信号分解 + Hybrid-GRPO (2026-09-07 升级) ----
 # 参考: 2026 年框架用小波分解分离趋势和波动, 再结合组相对策略优化
 WAVELET = {
