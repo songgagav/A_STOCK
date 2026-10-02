@@ -121,14 +121,6 @@ RISK_FIRST = {
     "risk_first_enabled": os.environ.get("RISK_FIRST_ENABLED", "1") != "0",
 }
 
-# ---- StockMARL 多智能体模拟 (2026-09-07 升级) ----
-# 参考: 2025 StockMARL, 让 RL 观察模拟投资者行为学习
-STOCKMARL = {
-    "n_agents": int(os.environ.get("SMARL_N_AGENTS", "4")),
-    "marl_signal_dim": int(os.environ.get("SMARL_SIGNAL_DIM", "4")),
-    "marl_enabled": os.environ.get("SMARL_ENABLED", "1") != "0",
-}
-
 # ---- 可解释 RL + 自适应特征选择 (2026-09-07 升级) ----
 # 参考: 2025 A 股实证, 累计收益 88.80% 超越 DQN 基线 20.76%
 EXPLAINABLE_RL = {
