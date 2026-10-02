@@ -451,7 +451,15 @@ class TestDryRunWritesNothing:
 class TestBackfillTriggerToWriteSimulation:
     """用本地假源重放“触发 -> 回填 -> 写入 -> 留痕”，不联网、不碰生产库。"""
 
-    def test_triggered_days_are_written_and_provenance_is_complete(self, tmp_path):
+    def test_triggered_days_are_written_and_provenance_is_complete(self, tmp_path, monkeypatch):
+        # 触发判据需要官方交易日历；该模拟不能依赖被 .gitignore 排除的生产缓存。
+        # 用真实日历读取路径加载最小 fixture，保留生产侧「无日历不推断」的语义。
+        import trading_calendar as TC
+        calendar_fp = tmp_path / "trade_calendar.json"
+        calendar_fp.write_text(json.dumps({"days": ["20260922", "20260923", "20260924"]}),
+                               encoding="utf-8")
+        monkeypatch.setattr(TC, "CAL_FILE", str(calendar_fp))
+
         decision = BT.decide(
             engine_day="2026-09-22",
             h5i_watermark="2026-09-22",
