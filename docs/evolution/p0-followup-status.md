@@ -29,15 +29,15 @@
 
 ### 数据、运行与验收
 
-- h5i `drop_table → append` rebuild kill 窗口尚未验证。
-- PaperBook snapshot 的现金恢复仍有 `1.05e-4` 元精度差异。
-- Baostock 自动回填已接线，但 `run_daily → 自动触发 → 写入 → 留痕` 尚未真实跑通。
+- h5i `drop_table → append` rebuild kill 窗口：已在一次性临时库通过块粒度原子性验证；不等同于整次重建事务原子。
+- PaperBook snapshot 的 `1.05e-4` 元差异已关闭：小于 A 股 `0.01` 元最小价格单位，按预期浮点误差处理。
+- Baostock 已完成本地历史假源端到端模拟；真实联网/生产 `run_daily` 仍未执行。
 - DRL 的完整真实训练/target plan 生成仍需同时具备 `h5i_db` 与 `torch` 的解释器；经验回放、灾难性遗忘和奖励黑客防护仍未完成。
 - E2E 门控状态记录仍为 7/10 断言通过。
 
 ### 清理与安全
 
-- Phase 12 配置删除尚未执行；`config_usage.txt` 当前不存在，不能安全分级删除。
+- Phase 12 配置删除尚未执行；`config_usage.txt` 已生成（35 个配置键，标识符边界统计），但仍需外部引用复核，不能直接删除。
 - Bandit：0 high，但 `-ll` 扫描仍有 126 medium/343 low，需逐项分级，不能标记为全通过。
 - detect-secrets：工具可用但本轮扫描超过 90 秒无输出，中断，无结论。
 - pip-audit：工具可用但等待外部漏洞源超过 90 秒，中断，无结论。
@@ -60,3 +60,17 @@
 5. 通过上述验收后，再推进 regime 生产路由和 P1 因子挖掘。
 
 本轮没有 push、合并 PR 或修改真实行情/持仓数据。
+
+## 2026-10-02 blocker reclassification
+
+本轮将剩余事项分成四类：
+
+- **A 无法闭环**：09-02 原始台账、无解释点的 `fidelity_compare`、真实券商对账、当前离线环境的完整 DRL 真实训练，已归档至 `docs/evolution/known-gaps.md`。
+- **B 待策略决策**：P0-3 的 `-8%` 动作、CVaR/波动率熔断动作、09:25 硬冻结，已分别写入 `docs/evolution/decisions/`；未选择方案，不接生产代码。
+- **C 环境/扫描阻断**：Bandit 已生成 JSON 并分级；detect-secrets、pip-audit 仍按 `docs/cleanup/env-blockers.md` 记录为未完成，不伪报通过。
+- **D 可推进**：配置使用报告已生成；h5i 中断窗口、Baostock 本地端到端模拟和快照精度文档化仍在本轮继续核验。
+
+## 本轮验证记录
+
+- 定向回归：`249 passed`，覆盖本轮新增 Baostock 模拟、h5i 写入、触发器、冻结观察、P0-2 诊断和文档检查。
+- `.venv310` 全量 `pytest tests -q`：运行至约 7% 后长时间无新增输出，主动中断；无失败栈，不能记为全量通过。该长等待保留为环境/集成测试卡点，后续应按测试文件拆分定位。
