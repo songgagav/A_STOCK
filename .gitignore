@@ -65,6 +65,8 @@ __pycache__/
 # ⇒ 通配不到 ⇒ 每轮 `git status` 都多出一个未跟踪目录。改成 `.pytest_tmp*/`
 # 同时覆盖「无后缀」与「带后缀」两种写法。
 .pytest_tmp*/
+.pytest-basetemp*/
+.superpowers/
 .mypy_cache/
 .ruff_cache/
 .coverage
