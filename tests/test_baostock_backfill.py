@@ -31,6 +31,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import baostock_backfill as BF  # noqa: E402
+import backfill_trigger as BT  # noqa: E402
 
 
 def _rec(code, day, close=10.0, vol=100000):
@@ -445,6 +446,62 @@ class TestDryRunWritesNothing:
         rec = json.loads(open(prov, encoding="utf-8").read().strip().splitlines()[-1])
         assert rec["day"] == "2026-09-23" and rec["source"] == "baostock"
         assert rec["rows"] > 900
+
+
+class TestBackfillTriggerToWriteSimulation:
+    """用本地假源重放“触发 -> 回填 -> 写入 -> 留痕”，不联网、不碰生产库。"""
+
+    def test_triggered_days_are_written_and_provenance_is_complete(self, tmp_path):
+        decision = BT.decide(
+            engine_day="2026-09-22",
+            h5i_watermark="2026-09-22",
+            expected_day="2026-09-24",
+            enabled=True,
+        )
+        assert decision["action"] == "trigger"
+        assert decision["missing_days"] == ["20260923", "20260924"]
+
+        # 触发器输出是裸 YYYYMMDD；写入层契约是 ISO 日期，转换必须显式发生。
+        days = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in decision["missing_days"]]
+        syms = [f"6{i:05d}" for i in range(1200)]
+        provenance = tmp_path / "backfill_provenance.jsonl"
+
+        import h5i_db
+        import pyarrow as pa
+
+        db = h5i_db.Database(str(tmp_path / "market.db"), create=True)
+        schema = pa.schema([
+            ("ts", pa.timestamp("us")), ("symbol", pa.string()),
+            ("open", pa.float64()), ("high", pa.float64()),
+            ("low", pa.float64()), ("close", pa.float64()),
+            ("volume", pa.float64()), ("amount", pa.float64()),
+            ("change_pct", pa.float64()), ("turnover", pa.float64()),
+        ])
+        db.create_table("daily_bars", schema, time_column="ts")
+        old_provenance = BF.PROVENANCE_FP
+        BF.PROVENANCE_FP = str(provenance)
+        try:
+            result = BF.backfill_days(
+                days,
+                write=True,
+                symbols_df=_Symbols(syms),
+                fetch_range=_fake_fetch_range(len(syms), days),
+                db=db,
+            )
+            assert result["ok"] is True, result
+            assert result["written"] == days
+            stored = db.read("daily_bars")
+            assert stored.num_rows == 2400
+            stored_days = sorted({str(x)[:10] for x in stored.column("ts").to_pylist()})
+            assert stored_days == days
+        finally:
+            BF.PROVENANCE_FP = old_provenance
+            db.close()
+
+        records = [json.loads(line) for line in provenance.read_text(encoding="utf-8").splitlines()]
+        assert [r["day"] for r in records] == days
+        assert all(r["source"] == "baostock" for r in records)
+        assert all(r["affects_selection"] is False for r in records)
 
 
 class TestBeijingIsExplicitNotSilent:
