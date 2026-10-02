@@ -121,19 +121,6 @@ RISK_FIRST = {
     "risk_first_enabled": os.environ.get("RISK_FIRST_ENABLED", "1") != "0",
 }
 
-# ---- Logic-Q 神经符号化趋势分析 (2026-09-07 升级) ----
-# 参考: 2026 Logic-Q 框架, 通过符号化趋势规则动态调整策略网络参数
-# 配置项:
-#   ma_cross_threshold: 均线交叉阈值
-#   sr_breakout_threshold: 支撑阻力突破阈值
-#   volume_confirmation: 成交量确认权重
-LOGIC_Q = {
-    "ma_cross_threshold": float(os.environ.get("LQ_MA_CROSS", "0.02")),
-    "sr_breakout_threshold": float(os.environ.get("LQ_SR_BREAK", "0.015")),
-    "volume_confirmation": float(os.environ.get("LQ_VOL_CONF", "0.5")),
-    "logic_q_enabled": os.environ.get("LOGIC_Q_ENABLED", "1") != "0",
-}
-
 # ---- PPO 动态因子权重优化 (2026-09-06 升级) ----
 # 模式: "ic_weight" (IC 序列 → 权重增量, 原有) |
 #       "factor_value" (因子值 → 权重, 动态复权)
