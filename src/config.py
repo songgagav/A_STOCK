@@ -121,16 +121,6 @@ RISK_FIRST = {
     "risk_first_enabled": os.environ.get("RISK_FIRST_ENABLED", "1") != "0",
 }
 
-# ---- 多尺度信号分解 + Hybrid-GRPO (2026-09-07 升级) ----
-# 参考: 2026 年框架用小波分解分离趋势和波动, 再结合组相对策略优化
-WAVELET = {
-    "level": int(os.environ.get("WAVELET_LEVEL", "3")),
-    "window": int(os.environ.get("WAVELET_WINDOW", "60")),
-    "grpo_group_size": int(os.environ.get("GRPO_GROUP_SIZE", "4")),
-    "grpo_coef": float(os.environ.get("GRPO_COEF", "0.3")),
-    "wavelet_enabled": os.environ.get("WAVELET_ENABLED", "1") != "0",
-}
-
 # ---- Hi-DARTS 层次化多智能体 (2026-09-07 升级) ----
 # 参考: 2025 Hi-DARTS 框架, 元智能体分析市场波动, 动态激活子智能体
 HIDARTS = {
