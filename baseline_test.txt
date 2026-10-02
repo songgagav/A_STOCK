@@ -1115,3 +1115,5 @@ SKIPPED [1] tests\test_integration_f68.py:84: h5i-db ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½ï
 Phase 12 EXPLAINABLE_RL removal regression (2026-10-02): 2637 passed, 50 skipped, 18 warnings in 116.04s (0:01:56)
 
 Phase 12 SCHEDULE removal regression (2026-10-02): 2637 passed, 50 skipped, 18 warnings in 115.38s (0:01:55)
+
+Phase 12 audit hardening regression (2026-10-02): 2638 passed, 50 skipped, 18 warnings in 116.25s (0:01:56)
