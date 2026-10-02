@@ -43,4 +43,7 @@
 
 - `.venv314`：日常单元/常规集成回归；h5i 相关测试通过 `pytest.importorskip("h5i_db")` 显式跳过，Baostock 真实 fetcher 在未安装 `baostock` 时同样跳过。
 - `.venv310`：h5i/回填专用验证环境；本轮 Baostock 触发→写入→留痕定向集为 `249 passed`，真实 h5i 写入测试在此环境执行。
-- CI 已有 `regression-h5i`（Python 3.10 + `h5i-db`）；GitHub Actions Run 191 已确认依赖安装与 `import h5i_db` 成功，但 h5i 定向回归步骤退出码为 1，具体 pytest 日志当前无法从页面展开，不能标记为通过。
+- CI 已有 `regression-h5i`（Python 3.10 + `h5i-db`）。CI #192 的本地可复现原因已由
+  测试夹具修复：无日历 checkout、错误的临时 Arrow schema、以及对生产 h5i 数据库的
+  隐式依赖。`.venv310` 的自包含定向集为 `32 passed`；仍需 push 后等待远端 job，
+  在 GitHub Actions 给出成功退出码前不得标记为通过。
