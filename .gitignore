@@ -67,6 +67,7 @@ __pycache__/
 .pytest_tmp*/
 .pytest-basetemp*/
 .superpowers/
+.worktrees/
 .mypy_cache/
 .ruff_cache/
 .coverage
