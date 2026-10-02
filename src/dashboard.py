@@ -6793,13 +6793,16 @@ def main():
         class _ThreadingHTTPServer(ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
-        httpd = _ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+        # Dashboard is an operator-local surface; do not expose it on every
+        # interface by default.  Remote access should go through an explicit
+        # reverse proxy or tunnel with its own authentication.
+        httpd = _ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     else:
         # 单线程 HTTPServer: 避免 Python 3.14 + DuckDB 在 Threading 下的 selectors GIL 冲突
         class _SingleThreadHTTPServer(HTTPServer):
             """BaseHTTPServer 默认就单线程处理, 这里只是显式标注."""
             allow_reuse_address = True
-        httpd = _SingleThreadHTTPServer(("0.0.0.0", args.port), Handler)
+        httpd = _SingleThreadHTTPServer(("127.0.0.1", args.port), Handler)
     # 写 PID 文件 (供外部 keepalive 检测)
     try:
         os.makedirs(os.path.dirname(args.pidfile), exist_ok=True)

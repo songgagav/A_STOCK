@@ -943,7 +943,9 @@ class PriceFeed:
                 "User-Agent": "Mozilla/5.0",
             })
             try:
-                r = _ur.urlopen(req, timeout=4).read().decode("gbk", errors="replace")
+                # URL and host are fixed to Sina; only the symbol list is
+                # assembled from validated internal instrument identifiers.
+                r = _ur.urlopen(req, timeout=4).read().decode("gbk", errors="replace")  # nosec B310
             except Exception:
                 continue
             for line in r.splitlines():
