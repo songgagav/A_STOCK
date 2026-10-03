@@ -71,6 +71,30 @@ def _read_view_parquet(name: str, order_by: str = "", cols: list | None = None) 
         return None
 
 
+def _rows_to_named(rows: list | None, cols: list[str]) -> list[dict] | None:
+    """把查询行映射为字段名，避免调用方依赖 Parquet/SQL 列序。"""
+    if rows is None:
+        return None
+    if any(len(row) != len(cols) for row in rows):
+        return None
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def _read_view_parquet_named(
+    name: str,
+    order_by: str = "",
+    cols: list[str] | None = None,
+) -> list[dict] | None:
+    """读取物化视图并按显式列名返回字典行。
+
+    缺少快照、依赖不可用或列不完整时保持 ``None``，由调用方进入既有
+    DuckDB fallback；不把缺列错误伪装成空结果。
+    """
+    if not cols:
+        raise ValueError("named parquet reader requires explicit cols")
+    return _rows_to_named(_read_view_parquet(name, order_by, cols), cols)
+
+
 def _duckdb_query(sql: str, params: list | None = None):
     """线程安全执行 DuckDB 查询, 返回 fetchall() 或 df()."""
     import duckdb
@@ -107,6 +131,17 @@ def _duckdb_query_df(sql: str, params: list | None = None):
                 con.close()
             except Exception:
                 pass
+
+
+def _duckdb_query_named(
+    sql: str,
+    params: list | None = None,
+    cols: list[str] | None = None,
+) -> list[dict] | None:
+    """执行兼容查询并按与 Parquet reader 相同的字段名返回。"""
+    if not cols:
+        raise ValueError("named DuckDB reader requires explicit cols")
+    return _rows_to_named(_duckdb_query(sql, params), cols)
 
 
 # ---------------- h5i 读取路由 (BAR_STORE=duck|h5i, 默认 h5i) ----------------
@@ -2100,28 +2135,28 @@ def read_regime():
         "date", "total", "n_up", "n_down", "n_limit_up", "n_limit_dn",
         "total_amount", "avg_change_pct", "breadth_ratio",
     ]
-    rows = _read_view_parquet(
+    rows = _read_view_parquet_named(
         "v_market_breadth.parquet", "ORDER BY date DESC LIMIT 30", _BREADTH_COLS)
     src = "parquet"
     if rows is None:
         src = "duckdb"
         try:
-            rows = _duckdb_query("""
+            rows = _duckdb_query_named("""
                 SELECT date, total, n_up, n_down, n_limit_up, n_limit_dn,
                        total_amount, avg_change_pct, breadth_ratio
                 FROM v_market_breadth
                 ORDER BY date DESC
                 LIMIT 30
-            """)
+            """, cols=_BREADTH_COLS)
         except Exception as e:
             rows = None
             out["components"]["breadth_error"] = str(e)
     if rows:
         out["components"]["breadth"] = [
-            {"date": str(r[0]), "total": r[1], "n_up": r[2] or 0,
-             "n_down": r[3] or 0, "n_limit_up": r[4] or 0,
-             "n_limit_dn": r[5] or 0, "total_amount": r[6],
-             "avg_chg": r[7], "breadth_ratio": r[8]}
+            {"date": str(r["date"]), "total": r["total"], "n_up": r["n_up"] or 0,
+             "n_down": r["n_down"] or 0, "n_limit_up": r["n_limit_up"] or 0,
+             "n_limit_dn": r["n_limit_dn"] or 0, "total_amount": r["total_amount"],
+             "avg_chg": r["avg_change_pct"], "breadth_ratio": r["breadth_ratio"]}
             for r in rows
         ]
         out["components"]["breadth_source"] = src
@@ -2146,23 +2181,24 @@ def read_regime():
     _IC_COLS = [
         "factor", "ic_value", "mean_20", "std_20", "icir_20", "win_rate_20", "n_days",
     ]
-    ic_rows = _read_view_parquet(
+    ic_rows = _read_view_parquet_named(
         "v_factor_ic_latest.parquet", "ORDER BY factor", _IC_COLS)
     ic_src = "parquet" if ic_rows is not None else "duckdb"
     if ic_rows is None:
         try:
-            ic_rows = _duckdb_query(
+            ic_rows = _duckdb_query_named(
                 "SELECT factor, ic_value, mean_20, std_20, icir_20, win_rate_20, n_days "
-                "FROM v_factor_ic_latest ORDER BY factor"
+                "FROM v_factor_ic_latest ORDER BY factor",
+                cols=_IC_COLS,
             )
         except Exception as e:
             ic_rows = None
             out["components"]["factor_ic_error"] = str(e)
     if ic_rows:
         out["components"]["factor_ic"] = [
-            {"factor": r[0], "ic_value": r[1], "mean_20": r[2],
-             "std_20": r[3], "icir_20": r[4], "win_rate_20": r[5],
-             "n_days": r[6]}
+            {"factor": r["factor"], "ic_value": r["ic_value"], "mean_20": r["mean_20"],
+             "std_20": r["std_20"], "icir_20": r["icir_20"],
+             "win_rate_20": r["win_rate_20"], "n_days": r["n_days"]}
             for r in ic_rows
         ]
         out["components"]["factor_ic_source"] = ic_src

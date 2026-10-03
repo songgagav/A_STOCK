@@ -131,3 +131,101 @@ def test_source_etag_is_stable_and_changes_with_source_file(tmp_path):
     os.utime(source, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_001))
     assert dashboard.source_etag(str(source)) != first
     assert dashboard.source_etag(str(tmp_path / "missing.json")) is None
+
+
+def test_named_parquet_rows_follow_requested_columns_not_file_order(tmp_path, monkeypatch):
+    """物化视图列顺序变化时，读取结果仍按字段名对齐。"""
+    import duckdb
+
+    parquet_dir = Path(tmp_path) / "views" / "parquet"
+    parquet_dir.mkdir(parents=True)
+    parquet_path = parquet_dir / "v_market_breadth.parquet"
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(
+            "COPY (SELECT 2 AS n_down, '2026-10-03' AS date, 3 AS n_up) "
+            "TO ? (FORMAT PARQUET)",
+            [str(parquet_path)],
+        )
+    finally:
+        con.close()
+
+    monkeypatch.setattr(dashboard, "VIEWS_PARQUET", str(parquet_dir))
+
+    rows = dashboard._read_view_parquet_named(
+        "v_market_breadth.parquet",
+        cols=["date", "n_up", "n_down"],
+    )
+
+    assert rows == [{"date": "2026-10-03", "n_up": 3, "n_down": 2}]
+
+
+def test_named_parquet_rows_return_none_when_required_column_is_missing(tmp_path, monkeypatch):
+    """物化快照缺列时必须触发上游 fallback，不能返回错位数据。"""
+    import duckdb
+
+    parquet_dir = Path(tmp_path) / "views" / "parquet"
+    parquet_dir.mkdir(parents=True)
+    parquet_path = parquet_dir / "v_factor_ic_latest.parquet"
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(
+            "COPY (SELECT 'roe' AS factor, 0.1 AS ic_value) TO ? (FORMAT PARQUET)",
+            [str(parquet_path)],
+        )
+    finally:
+        con.close()
+
+    monkeypatch.setattr(dashboard, "VIEWS_PARQUET", str(parquet_dir))
+
+    rows = dashboard._read_view_parquet_named(
+        "v_factor_ic_latest.parquet",
+        cols=["factor", "ic_value", "mean_20"],
+    )
+
+    assert rows is None
+
+
+def test_named_duckdb_rows_use_the_same_field_contract(monkeypatch):
+    """Parquet 与 DuckDB fallback 必须向 read_regime 提供同一套字段名。"""
+    monkeypatch.setattr(
+        dashboard,
+        "_duckdb_query",
+        lambda sql, params=None: [("2026-10-03", 3, 2)],
+    )
+
+    rows = dashboard._duckdb_query_named(
+        "SELECT date, n_up, n_down FROM v_market_breadth",
+        cols=["date", "n_up", "n_down"],
+    )
+
+    assert rows == [{"date": "2026-10-03", "n_up": 3, "n_down": 2}]
+
+
+def test_named_rows_reject_width_mismatch_instead_of_silently_truncating():
+    """字段数不一致时必须触发 fallback，不能静默丢列。"""
+    assert dashboard._rows_to_named([("2026-10-03", 3)], ["date", "n_up", "n_down"]) is None
+
+
+def test_read_regime_consumes_named_rows_from_both_materialized_views(monkeypatch):
+    """read_regime 不应再通过位置索引读取宽度和因子 IC。"""
+    def named_reader(name, order_by="", cols=None):
+        if name == "v_market_breadth.parquet":
+            return [{
+                "date": "2026-10-03", "total": 2, "n_up": 1, "n_down": 1,
+                "n_limit_up": 0, "n_limit_dn": 0, "total_amount": 10.0,
+                "avg_change_pct": 0.0, "breadth_ratio": 0.0,
+            }]
+        return [{
+            "factor": "roe", "ic_value": 0.1, "mean_20": 0.1,
+            "std_20": 0.2, "icir_20": 0.5, "win_rate_20": 0.6,
+            "n_days": 20,
+        }]
+
+    monkeypatch.setattr(dashboard, "_read_view_parquet_named", named_reader)
+
+    result = dashboard.read_regime()
+
+    assert result["components"]["breadth_source"] == "parquet"
+    assert result["components"]["breadth"][0]["n_up"] == 1
+    assert result["components"]["factor_ic"][0]["factor"] == "roe"

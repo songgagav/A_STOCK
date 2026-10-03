@@ -40,7 +40,7 @@
 
 ## 后续清单（尚未在本批次实现）
 
-1. 将 parquet 读取改为按列名映射，并继续收敛 DuckDB 旧链路。
+1. **本批已完成第一步**：`read_regime()` 的物化 Parquet 与 DuckDB fallback 已统一为 named-row 字段契约；数据源边界见 [`dashboard-data-source-matrix.md`](dashboard-data-source-matrix.md)。DuckDB 旧链路仍保留，待后续迁移批次处理。
 2. 在 ETag 基础上评估 SSE，确认连接生命周期和守护重启语义后再实现。
 3. 抽离内联 HTML/CSS/JS，随后做增量 DOM 更新。
 4. 统一 API 错误 envelope、健康检查 TTL、结构化日志和看板进程纳管审计。
