@@ -9,6 +9,7 @@ import json
 from datetime import datetime, date
 import traceback
 
+import config as _config
 from config import (
     INIT_CAPITAL, MAX_POS_RATIO, MAX_STOCKS, PAPER,
     STATE_FILE, DAILY_DIR, DATA_DIR, DUCKDB_PATH,
@@ -55,6 +56,13 @@ class PaperBook:
         self._last_trailing_hits: list = []
 
     # ---------- 工具 ----------
+    @staticmethod
+    def _require_paper_broker() -> None:
+        """纸面账本只允许 paper；非 paper 是配置/调用错误，必须显式中止。"""
+        broker = getattr(_config, "TRADE_BROKER", "paper")
+        if broker != "paper":
+            raise RuntimeError(f"PaperBook 拒绝下单: TRADE_BROKER={broker!r}，仅允许 'paper'")
+
     def _commission(self, amount: float, is_sell: bool) -> float:
         """费用: 佣金(买卖) + 印花税(卖出单边) + 过户费"""
         comm = amount * PAPER["commission"]
@@ -119,6 +127,7 @@ class PaperBook:
         urgency_kappa : float
             执行紧迫度系数 (仅 execution_horizon_days>0 时生效).
         """
+        self._require_paper_broker()
         if qty <= 0 or price <= 0:
             return None
         # 动态滑点: Almgren-Chriss 模型 vs 固定费率
@@ -190,6 +199,7 @@ class PaperBook:
         urgency_kappa : float
             执行紧迫度系数 (仅 execution_horizon_days>0 时生效).
         """
+        self._require_paper_broker()
         if canon not in self.positions:
             return None
         p = self.positions[canon]

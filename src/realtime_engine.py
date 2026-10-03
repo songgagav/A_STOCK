@@ -37,6 +37,13 @@ from db import StockDB, is_a_share_symbol as _is_a_share_code
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
 from utils import atomic_write_json as _atomic_write_json
+from signal_snapshot import (
+    build_snapshot,
+    read_mode_control,
+    read_snapshot,
+    snapshot_path,
+    write_snapshot,
+)
 
 LIVE_STATE = os.path.join(DATA_DIR, "live_state.json")
 
@@ -638,6 +645,14 @@ class RealtimeEngine:
         self.pb.trade_date = _today().strftime("%Y-%m-%d")
         self.pb.day = self.pb.trade_date
         self.targets, self.sel, self.sel_day = load_targets(self.pb.trade_date)
+        # 09:25 冻结状态仅保存快照引用与完整性状态；候选池本身不写入实时 state。
+        self._freeze_attempted = False
+        self.snapshot_status = "pending"
+        self.snapshot_ref = None
+        self.snapshot_hash = None
+        self.snapshot_reason = None
+        self._snapshot_failure_status = None
+        self._snapshot_failure_reason = None
         # 策略层优化: 目标权重与配置对齐(DRL 等权 plan -> 现算 fml 激活预测加权)
         # 2026-09-13: 失败不再静默 pass —— 记录 degraded_mode/原因/降级策略, 写入
         # live_state 并在日志与页面显式提示, 避免"看似正常但策略行为已改变"。
@@ -691,6 +706,121 @@ class RealtimeEngine:
         #   本仓同类先例: `FAILS_TO_HALT` 也是"连续 N 次"而非"N 天"。
         self._construction_stall = 0      # 连续"尝试建仓但持仓数无增长"的次数
         self._construction_last_filled = -1   # 上次尝试时的"目标内持仓数"
+
+    # ---------- 09:25 信号冻结 ----------
+    @staticmethod
+    def _in_freeze_window(now: datetime) -> bool:
+        """09:25:00 至 09:25:59 是唯一允许生成当日冻结快照的窗口。"""
+        return now.hour == 9 and now.minute == 25
+
+    @staticmethod
+    def _after_freeze_cutoff(now: datetime) -> bool:
+        return (now.hour, now.minute, now.second) >= (9, 25, 0)
+
+    def _snapshot_artifacts(self, source_day: str, selection: dict) -> list[dict]:
+        """只枚举本轮实际读取的计划或选择产物，供构造器计算内容摘要。"""
+        day = str(source_day).replace("-", "")
+        is_drl = isinstance(selection, dict) and "consume_day" in selection
+        candidate = (
+            os.path.join(DATA_DIR, "drl", day, "target_plan.json")
+            if is_drl else os.path.join(DAILY_DIR, day, "selection.json")
+        )
+        if not os.path.isfile(candidate):
+            return []
+        return [{"path": os.path.relpath(candidate, _BASE)}]
+
+    def _snapshot_source_tier(self, selection: dict) -> str:
+        if isinstance(selection, dict) and "consume_day" in selection:
+            return "drl_plan"
+        return "selection"
+
+    def _set_snapshot_result(self, result: dict, day: str) -> dict:
+        """更新单向冻结状态，并返回供消费者/状态文件使用的最小元数据。"""
+        status = result.get("status", "invalid")
+        reason = result.get("reason")
+        if status != "ready":
+            self._snapshot_failure_status = status
+            self._snapshot_failure_reason = reason
+        snapshot = result.get("snapshot") if status == "ready" else None
+        self.snapshot_status = status
+        self.snapshot_ref = snapshot_path(DATA_DIR, day) if snapshot else None
+        self.snapshot_hash = snapshot.get("snapshot_hash") if snapshot else None
+        self.snapshot_reason = reason
+        return {
+            "snapshot_status": status,
+            "snapshot_ref": self.snapshot_ref,
+            "snapshot_hash": self.snapshot_hash,
+            "snapshot_reason": reason,
+        }
+
+    def _freeze_or_load_targets(self, now: datetime) -> tuple[list[dict], dict, str, dict]:
+        """冻结窗口写一次，窗口后只读已验证快照，绝不自动实时回退。"""
+        day = self.pb.trade_date.replace("-", "")
+        pending = {
+            "snapshot_status": "pending",
+            "snapshot_ref": None,
+            "snapshot_hash": None,
+            "snapshot_reason": None,
+        }
+        if not self._after_freeze_cutoff(now):
+            return self.targets, self.sel, self.sel_day, pending
+
+        # L1/L2/L3 一旦发生，当日绝不因人工补文件或上游恢复而自动恢复交易。
+        # 紧急调整须走独立人工流程，不得伪装成 09:25 的原始决策。
+        failure_status = getattr(self, "_snapshot_failure_status", None)
+        if failure_status:
+            result = {
+                "status": failure_status,
+                "snapshot": None,
+                "reason": getattr(self, "_snapshot_failure_reason", None),
+            }
+            return self.targets, self.sel, self.sel_day, self._set_snapshot_result(result, day)
+
+        if self._in_freeze_window(now) and not self._freeze_attempted:
+            self._freeze_attempted = True
+            try:
+                targets, selection, source_day = load_targets(self.pb.trade_date)
+                from target_weighting import ensure_target_weights
+                ensure_target_weights(targets, as_of=self.pb.trade_date)
+                source_day = str(source_day).replace("-", "")
+                snapshot = build_snapshot(
+                    day=day,
+                    targets=targets,
+                    source_tier=self._snapshot_source_tier(selection),
+                    source_date=source_day,
+                    source_artifacts=self._snapshot_artifacts(source_day, selection),
+                    generated_at=now,
+                    repo_root=_BASE,
+                )
+                write_snapshot(DATA_DIR, snapshot)
+                result = read_snapshot(DATA_DIR, day)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[signal-freeze/L2] 09:25 快照生成失败: {type(exc).__name__}: {exc}")
+                result = {"status": "invalid", "snapshot": None,
+                          "reason": f"snapshot_write_failed:{type(exc).__name__}"}
+            meta = self._set_snapshot_result(result, day)
+            if result.get("status") == "ready":
+                frozen = result["snapshot"]
+                return frozen["targets"], selection, frozen["source_date"], meta
+            return self.targets, self.sel, self.sel_day, meta
+
+        result = read_snapshot(DATA_DIR, day)
+        meta = self._set_snapshot_result(result, day)
+        if result.get("status") == "ready":
+            frozen = result["snapshot"]
+            return frozen["targets"], {
+                "source": "signal_snapshot",
+                "source_tier": frozen["source_tier"],
+            }, frozen["source_date"], meta
+        level = {"missing": "L1", "invalid": "L2", "tampered": "L3"}.get(
+            result.get("status"), "L2")
+        log(f"[signal-freeze/{level}] 快照不可用于调仓: {result.get('reason')}")
+        return self.targets, self.sel, self.sel_day, meta
+
+    @staticmethod
+    def _snapshot_allows_rebalance(mode: str, snapshot_status: str) -> bool:
+        """enforce 只允许已校验快照触发虚拟盘调仓；shadow 不改变旧消费路径。"""
+        return mode != "enforce" or snapshot_status == "ready"
 
     # ---------- 交易时段判定 (A股) ----------
     @staticmethod
@@ -750,9 +880,9 @@ class RealtimeEngine:
             import traceback; traceback.print_exc()
 
     # ---------- 一次 tick ----------
-    def run_tick(self):
+    def run_tick(self, now: datetime | None = None):
         self.tick += 1
-        now = datetime.now()
+        now = now or datetime.now()
         # [2026-09-22 修] Dead-Man's Switch: tick 落在**主循环的每一轮**, 而不是调仓那一刻。
         #
         # 原先这一 beat 在 `_rebalance_if_due()` 里、且位于"调仓间隔已到"之后 ——
@@ -773,6 +903,15 @@ class RealtimeEngine:
                       note=f"tick {self.tick} {self.pb.trade_date} {now:%H:%M:%S}")
         except Exception:  # noqa: BLE001
             pass
+        mode_control = read_mode_control(_BASE)
+        mode = mode_control["mode"]
+        frozen_targets, frozen_sel, frozen_day, snapshot_meta = self._freeze_or_load_targets(now)
+        if mode == "enforce" and snapshot_meta["snapshot_status"] == "ready":
+            self.targets, self.sel, self.sel_day = frozen_targets, frozen_sel, frozen_day
+        self.snapshot_status = snapshot_meta["snapshot_status"]
+        self.snapshot_ref = snapshot_meta["snapshot_ref"]
+        self.snapshot_hash = snapshot_meta["snapshot_hash"]
+        self.snapshot_reason = snapshot_meta.get("snapshot_reason")
         session = self.in_session(now)
         tgt_codes = [t["canon"] for t in self.targets]
         all_codes = list(dict.fromkeys(tgt_codes + list(self.pb.positions.keys())))
@@ -832,8 +971,10 @@ class RealtimeEngine:
             self._apply_corporate_actions()
 
         # 只在交易时段撮合; 非交易时段只刷新估值不动仓
-        if session:
+        if session and self._snapshot_allows_rebalance(mode, self.snapshot_status):
             self._rebalance(latest)
+        elif session:
+            log(f"[signal-freeze/{self.snapshot_status}] enforce 下仅估值，拒绝自动调仓")
         else:
             log(f"[{'交易时段' if session else '非交易时段'}] tick#{self.tick} 刷新价格, 不动仓")
 
@@ -1602,11 +1743,11 @@ class RealtimeEngine:
                 "cash_ratio": round(snap["cash"] / max(snap["equity"], 1), 4),
             },
             "positions": positions,
-            "targets": [
-                {"canon": t["canon"], "name": t.get("name", t["canon"]),
-                 "score": t.get("score"), "signal": t.get("signal")}
-                for t in self.targets
-            ],
+            # 目标池的唯一权威来源是冻结快照；实时状态只保留可审计引用。
+            "snapshot_status": self.snapshot_status,
+            "snapshot_ref": self.snapshot_ref,
+            "snapshot_hash": self.snapshot_hash,
+            "snapshot_reason": self.snapshot_reason,
             "trades_today": self.pb.trades_today,
             "trades_history": self.pb.trades_history,
             "tick": self.tick,
@@ -1669,7 +1810,8 @@ class RealtimeEngine:
             "sell_fees": snap["sell_fees"],
             "attributed_pnl": snap["attributed_pnl"],
             "positions": snap["positions"],
-            "top_targets": tgt(self.targets),
+            # 保留 legacy 字段以免旧读取方 KeyError，但不再写入候选/权威目标池。
+            "top_targets": None,
             # 历史成交: {date -> [trade, ...]}, 跨日累积, 引擎重启后从 state.json 恢复
             "trades_history": self.pb.trades_history,
             # P2: 已入账的分红/除权事件key (防重启重复记账)
