@@ -18,15 +18,20 @@ import glob
 import time
 import subprocess
 import argparse
+import logging
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
+from zoneinfo import ZoneInfo
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_BASE, "data")
 LIVE_STATE = os.path.join(DATA_DIR, "live_state.json")
 DAILY_DIR = os.path.join(DATA_DIR, "daily")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 sys.path.insert(0, _BASE)
 from config import INIT_CAPITAL, DUCKDB_PATH
+
+_LOG = logging.getLogger("dashboard")
 
 
 # ---------------- DuckDB 串行化锁 ----------------
@@ -126,8 +131,14 @@ def _h5i_store():
     """延迟导入 H5iBarStore (仅 h5i 分支用到, 避免无 h5i_db 环境启动失败)."""
     if not os.path.isdir(_H5I_PATH):
         return None
-    from h5i_bar_store import H5iBarStore  # noqa: 延迟导入
-    return H5iBarStore()
+    try:
+        from h5i_bar_store import H5iBarStore  # noqa: 延迟导入
+        return H5iBarStore()
+    except Exception as exc:  # noqa: BLE001
+        # h5i_db 只在 Python 3.10 环境提供；看板必须把它视为数据源降级，
+        # 不能让单个接口异常杀掉 HTTP 工作线程。
+        _LOG.warning("h5i 数据源不可用: %s", exc)
+        return None
 
 
 def _h5i_val(v):
@@ -223,6 +234,126 @@ def read_live():
         except Exception:
             pass
     return {}
+
+
+def source_etag(path: str) -> str | None:
+    """用源文件 mtime 与大小生成轻量 ETag；缺失源返回 None。"""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return f'W/"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _freeze_late_count(day: str) -> int:
+    """读取当日迟到信号归档数量；缺失或损坏时返回 0 并由状态栏呈现。"""
+    path = os.path.join(DATA_DIR, "daily", day, f"late_signals_{day}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        items = payload.get("items") if isinstance(payload, dict) else None
+        return len(items) if isinstance(items, list) else 0
+    except (OSError, json.JSONDecodeError, TypeError):
+        return 0
+
+
+def _freeze_unexplained_count(day: str) -> int:
+    """从冻结账本统计当日未解释差异，不把普通迟到候选误报为差异。"""
+    path = os.path.join(DATA_DIR, "signal_freeze_events.jsonl")
+    difference_kinds = {"shadow_difference", "freeze_difference", "signal_difference"}
+    count = 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = f.read().splitlines()
+    except OSError:
+        return 0
+    for line in rows:
+        try:
+            event = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        payload = event.get("payload") if isinstance(event, dict) else None
+        if not isinstance(payload, dict):
+            payload = event if isinstance(event, dict) else {}
+        event_day = str(payload.get("date") or payload.get("consume_day") or "")
+        if event_day not in {day, f"{day[:4]}-{day[4:6]}-{day[6:]}"}:
+            continue
+        kind = str(event.get("kind") or "") if isinstance(event, dict) else ""
+        category = (payload.get("difference_category")
+                    or payload.get("classification")
+                    or payload.get("category"))
+        if kind in difference_kinds and (payload.get("unexplained") is True
+                                         or category in (None, "", "unexplained")):
+            count += 1
+    return count
+
+
+def read_signal_freeze_status(day: str | None = None) -> dict:
+    """返回看板使用的冻结状态摘要；只读已落盘、已校验的权威快照。"""
+    now = datetime.now(_SHANGHAI)
+    consume_day = day or now.strftime("%Y%m%d")
+    try:
+        from signal_snapshot import read_mode_control, read_snapshot
+
+        mode = read_mode_control(_BASE).get("mode", "shadow")
+        verified = read_snapshot(DATA_DIR, consume_day)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "date": consume_day,
+            "status": "unavailable",
+            "reason": f"signal_freeze_unavailable: {type(exc).__name__}: {exc}",
+            "mode": "shadow",
+            "generated_at": None,
+            "generated_at_utc": None,
+            "snapshot_hash": None,
+            "late_count": _freeze_late_count(consume_day),
+            "unexplained_count": _freeze_unexplained_count(consume_day),
+            "is_today": consume_day == now.strftime("%Y%m%d"),
+            "freshness": "unavailable",
+        }
+
+    snapshot = verified.get("snapshot") if verified.get("status") == "ready" else None
+    generated_at = snapshot.get("generated_at") if snapshot else None
+    generated_at_utc = snapshot.get("generated_at_utc") if snapshot else None
+    freshness = "missing"
+    age_hours = None
+    if snapshot:
+        try:
+            generated = datetime.fromisoformat(str(generated_at))
+            if generated.tzinfo is None:
+                generated = generated.replace(tzinfo=_SHANGHAI)
+            age_hours = max(0.0, (now - generated.astimezone(_SHANGHAI)).total_seconds() / 3600)
+        except (TypeError, ValueError):
+            freshness = "unknown"
+        if freshness != "unknown":
+            if consume_day == now.strftime("%Y%m%d"):
+                freshness = "today"
+            else:
+                try:
+                    delta = datetime.strptime(now.strftime("%Y%m%d"), "%Y%m%d").date() - datetime.strptime(consume_day, "%Y%m%d").date()
+                    freshness = "yesterday" if delta.days == 1 else "stale"
+                except ValueError:
+                    freshness = "unknown"
+
+    return {
+        "ok": True,
+        "date": consume_day,
+        "status": verified.get("status", "invalid"),
+        "reason": verified.get("reason"),
+        "mode": mode,
+        "generated_at": generated_at,
+        "generated_at_utc": generated_at_utc,
+        "snapshot_hash": snapshot.get("snapshot_hash") if snapshot else None,
+        "source_tier": snapshot.get("source_tier") if snapshot else None,
+        "source_date": snapshot.get("source_date") if snapshot else None,
+        "target_count": len(snapshot.get("targets") or []) if snapshot else 0,
+        "late_count": _freeze_late_count(consume_day),
+        "unexplained_count": _freeze_unexplained_count(consume_day),
+        "is_today": consume_day == now.strftime("%Y%m%d"),
+        "freshness": freshness,
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
+    }
 
 
 def read_history(n: int = 10):
@@ -1821,6 +1952,13 @@ _DB_TABLE_ZH = {
 }
 
 
+def validate_dashboard_table_name(name: str) -> str | None:
+    """只接受已登记的精确表名，拒绝大小写/路径/SQL 片段绕过。"""
+    if not isinstance(name, str) or name not in _DB_TABLE_ZH:
+        return None
+    return name
+
+
 def _zh_for(t: str) -> dict:
     return _DB_TABLE_ZH.get(t, {"zh": t, "group": "其他", "desc": ""})
 
@@ -2329,6 +2467,9 @@ def _compute_db_meta():
 
 def read_db_table(name: str, limit: int = 50):
     """读单表样本行."""
+    name = validate_dashboard_table_name(name)
+    if name is None:
+        return {"ok": False, "error": "table not allowed", "code": "TABLE_NOT_ALLOWED"}
     if not os.path.exists(DUCKDB_PATH):
         return {"ok": False, "retired": True,
                 "error": "DuckDB 已退役删除(数据已迁 h5i); 该管理端点不再可用."}
@@ -3066,8 +3207,15 @@ def fallback_state():
         try:
             with open(sp, encoding="utf-8") as f:
                 st = json.load(f)
+            source_updated = st.get("updated") or st.get("timestamp")
+            if not source_updated:
+                source_updated = datetime.fromtimestamp(
+                    os.path.getmtime(sp), _SHANGHAI
+                ).strftime("%Y-%m-%d %H:%M:%S")
             return {
-                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "updated": source_updated,
+                "stale": True,
+                "stale_reason": "live_state_unavailable",
                 "day": st.get("day"),
                 "mode": "离线(显示最近快照)",
                 "in_session": False,
@@ -3100,12 +3248,21 @@ def fallback_state():
 
 # ---------------- HTTP Handler ----------------
 class Handler(BaseHTTPRequestHandler):
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, etag=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        if etag and self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache" if etag else "no-store")
+        if etag:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
 
@@ -3184,7 +3341,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_health_merged())
         if path == "/api/live":
             lv = read_live() or fallback_state()
-            return self._json(lv)
+            source_path = LIVE_STATE if os.path.exists(LIVE_STATE) else os.path.join(DATA_DIR, "state.json")
+            return self._json(lv, etag=source_etag(source_path))
+        if path == "/api/signal-freeze":
+            return self._json(read_signal_freeze_status())
         if path == "/api/history":
             return self._json(read_history())
         if path == "/api/backtest":
@@ -3406,6 +3566,9 @@ class Handler(BaseHTTPRequestHandler):
                     limit = int(params.get("limit", ["50"])[0])
                 except Exception:
                     limit = 50
+            if validate_dashboard_table_name(table) is None:
+                return self._json({"ok": False, "error": "table not allowed",
+                                   "code": "TABLE_NOT_ALLOWED"}, code=403)
             return self._json(read_db_table(table, limit=limit))
         if path in ("/", "/index.html"):
             return self._html(PAGE)
@@ -3439,6 +3602,8 @@ PAGE = r"""<!DOCTYPE html>
     --warn: 32 95% 50%;         /* #f79009  警告 */
     --danger: 4 87% 60%;        /* #f04438  危险 */
     --info: 217 91% 60%;
+    --freeze: 31 86% 60%;           /* 冻结刻度：铜橙 */
+    --freeze-cool: 183 62% 58%;     /* 数据就绪：冰青 */
     --p0: 4 87% 60%;            /* P0 严重 = 红 */
     --p1: 32 95% 50%;            /* P1 高 = 橙 */
     --p2: 217 91% 60%;           /* P2 中 = 蓝 */
@@ -3462,7 +3627,10 @@ PAGE = r"""<!DOCTYPE html>
   html,body{height:100%}
   body{
     font-family:'Inter','Segoe UI','Microsoft YaHei',system-ui,sans-serif;
-    background: hsl(var(--base));
+    background:
+      radial-gradient(900px 420px at 78% -12%, hsl(var(--freeze)/.08), transparent 68%),
+      radial-gradient(700px 320px at 8% 0%, hsl(var(--accent)/.07), transparent 72%),
+      hsl(var(--base));
     color: hsl(var(--fg-primary));
     padding: 0;
     font-feature-settings: 'cv02','cv03','cv04','cv11';
@@ -3502,6 +3670,51 @@ PAGE = r"""<!DOCTYPE html>
   }
   .topbar h1{font-size:16px; font-weight:600; letter-spacing:-.2px; margin:0}
   .topbar h1 .sub{color: hsl(var(--fg-muted)); font-weight:400; font-size:12px; margin-left:8px}
+  .freeze-rail{
+    min-width: 330px;
+    display: grid;
+    grid-template-columns: 48px 1fr;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px 7px 9px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 10px;
+    background: linear-gradient(110deg, hsl(var(--surface)/.92), hsl(var(--elevated)/.66));
+    box-shadow: inset 0 1px 0 hsl(0 0% 100% / .035), 0 8px 24px hsl(222 30% 2% / .18);
+  }
+  .freeze-rail__marker{
+    position: relative;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    color: hsl(var(--freeze));
+    font: 700 11px/1 'JetBrains Mono','Consolas',monospace;
+    letter-spacing: -.02em;
+  }
+  .freeze-rail__marker::before,
+  .freeze-rail__marker::after{
+    content:''; position:absolute; left:50%; transform:translateX(-50%);
+    width:1px; background: hsl(var(--freeze)/.42);
+  }
+  .freeze-rail__marker::before{top:0;height:8px}
+  .freeze-rail__marker::after{bottom:0;height:8px}
+  .freeze-rail__body{min-width:0;display:grid;gap:4px}
+  .freeze-rail__line{display:flex;align-items:center;gap:7px;min-width:0;white-space:nowrap}
+  .freeze-rail__kicker{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:hsl(var(--fg-muted))}
+  .freeze-rail__status{font-size:12px;font-weight:700;letter-spacing:.01em;color:hsl(var(--fg-primary));overflow:hidden;text-overflow:ellipsis}
+  .freeze-rail__meta{display:flex;gap:10px;align-items:center;color:hsl(var(--fg-muted));font:10px/1.1 'JetBrains Mono','Consolas',monospace;white-space:nowrap}
+  .freeze-rail__meta span{overflow:hidden;text-overflow:ellipsis}
+  .freeze-rail__dot{width:7px;height:7px;border-radius:99px;background:hsl(var(--fg-muted));box-shadow:0 0 0 3px hsl(var(--fg-muted)/.1);flex:0 0 auto}
+  .freeze-rail[data-state="ready"]{border-color:hsl(var(--freeze-cool)/.52);box-shadow:inset 0 1px 0 hsl(0 0% 100% / .035),0 0 0 1px hsl(var(--freeze-cool)/.08),0 8px 24px hsl(222 30% 2% / .18)}
+  .freeze-rail[data-state="ready"] .freeze-rail__dot{background:hsl(var(--freeze-cool));box-shadow:0 0 0 3px hsl(var(--freeze-cool)/.13),0 0 12px hsl(var(--freeze-cool)/.55)}
+  .freeze-rail[data-state="ready"] .freeze-rail__status{color:hsl(var(--freeze-cool))}
+  .freeze-rail[data-state="missing"],.freeze-rail[data-state="invalid"],.freeze-rail[data-state="tampered"],.freeze-rail[data-state="unavailable"]{border-color:hsl(var(--danger)/.5);background:linear-gradient(110deg,hsl(var(--danger)/.10),hsl(var(--surface)/.88))}
+  .freeze-rail[data-state="missing"] .freeze-rail__dot,.freeze-rail[data-state="invalid"] .freeze-rail__dot,.freeze-rail[data-state="tampered"] .freeze-rail__dot,.freeze-rail[data-state="unavailable"] .freeze-rail__dot{background:hsl(var(--danger));box-shadow:0 0 0 3px hsl(var(--danger)/.12),0 0 12px hsl(var(--danger)/.42)}
+  .freeze-rail[data-state="missing"] .freeze-rail__status,.freeze-rail[data-state="invalid"] .freeze-rail__status,.freeze-rail[data-state="tampered"] .freeze-rail__status,.freeze-rail[data-state="unavailable"] .freeze-rail__status{color:hsl(var(--danger))}
+  .freeze-rail[data-state="ready"] .freeze-rail__marker{color:hsl(var(--freeze-cool))}
+  @media(max-width:1080px){.freeze-rail{min-width:270px}.topbar{gap:10px}.topbar h1 .sub{display:none}}
+  @media(max-width:760px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:10px 16px}.topbar .brand{flex:1 1 auto}.freeze-rail{order:3;flex:1 1 100%;min-width:0}.topbar .badges{margin-left:auto}.wrap{padding:18px 16px 44px}}
+  @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
   .topbar .badges{display:flex; gap:6px; flex-wrap:wrap}
   .badge{
     display:inline-flex; align-items:center; gap:5px;
@@ -3859,9 +4072,26 @@ PAGE = r"""<!DOCTYPE html>
 
   <header class="topbar">
     <div class="brand">
-      <div class="logo">Q</div>
+      <div class="logo">A</div>
       <div>
         <h1>全A轮动 · 盘中模拟盘 <span class="sub">Tick Stock Panel · 实时投研终端</span></h1>
+      </div>
+    </div>
+    <div class="freeze-rail" id="freezeRail" data-state="missing" aria-live="polite">
+      <div class="freeze-rail__marker" aria-hidden="true">09:25</div>
+      <div class="freeze-rail__body">
+        <div class="freeze-rail__line">
+          <span class="freeze-rail__dot" aria-hidden="true"></span>
+          <span class="freeze-rail__kicker">SIGNAL FREEZE</span>
+          <strong class="freeze-rail__status" id="freezeStatus">读取中…</strong>
+          <span class="chip accent" id="freezeMode">SHADOW</span>
+        </div>
+        <div class="freeze-rail__meta">
+          <span id="freezeAt">—</span>
+          <span id="freezeHash">hash —</span>
+          <span id="freezeLate">迟到 —</span>
+          <span id="freezeUnexplained">未解释 —</span>
+        </div>
       </div>
     </div>
     <div class="badges">
@@ -3897,7 +4127,7 @@ PAGE = r"""<!DOCTYPE html>
   <!-- ===================== 市场看板 (Dashboard) ===================== -->
   <div id="view-dashboard" class="tabView">
     <div class="panel">
-      <h3>KPI 总览 <span class="muted" style="font-weight:400;font-size:12px">基于 DuckDB daily_bars 最新日</span></h3>
+      <h3>KPI 总览 <span class="muted" style="font-weight:400;font-size:12px">基于 h5i / parquet 最新日 · 数据源状态见上方冻结轨道</span></h3>
       <div id="mbKpi"><div class="muted">加载中...</div></div>
     </div>
     <div class="row2">
@@ -5043,6 +5273,35 @@ async function loadLogs(){
   }
 }
 
+function renderFreezeStatus(d){
+  const rail = document.getElementById('freezeRail');
+  if(!rail) return;
+  const state = (d && d.status) || 'unavailable';
+  const labels = {
+    ready: '冻结就绪',
+    missing: '未生成快照',
+    invalid: '快照格式异常',
+    tampered: '校验失败 · 拒绝使用',
+    unavailable: '状态不可用'
+  };
+  rail.dataset.state = state;
+  const set = (id, value) => { const el=document.getElementById(id); if(el) el.textContent=value; };
+  set('freezeStatus', labels[state] || state);
+  set('freezeMode', String((d && d.mode) || 'shadow').toUpperCase());
+  set('freezeAt', d && d.generated_at ? String(d.generated_at).replace('T',' ') : (d && d.reason ? String(d.reason) : '尚无已验证时间戳'));
+  set('freezeHash', d && d.snapshot_hash ? 'hash '+String(d.snapshot_hash).slice(0,8) : 'hash —');
+  set('freezeLate', '迟到 '+((d && d.late_count) == null ? '—' : d.late_count));
+  set('freezeUnexplained', '未解释 '+((d && d.unexplained_count) == null ? '—' : d.unexplained_count));
+}
+async function loadFreezeStatus(){
+  try{
+    const d = await fetch('/api/signal-freeze', {cache:'no-store'}).then(r=>r.json());
+    renderFreezeStatus(d);
+  }catch(e){
+    renderFreezeStatus({status:'unavailable', mode:'shadow', reason:'看板无法读取冻结状态'});
+  }
+}
+
 async function load(){
   try{
     const r = await fetch('/api/live'); const s = await r.json();
@@ -5062,6 +5321,7 @@ async function load(){
 }
 load(); setInterval(load, 3000);
 loadLogs(); setInterval(loadLogs, 3000);
+loadFreezeStatus(); setInterval(loadFreezeStatus, 10000);
 loadOverview(); setInterval(loadOverview, 15000);
 loadBacktestHistory();  // 回测历史面板首屏即加载 (与用户是否切 tab 无关)
 // 系统健康 · 门控 与 风控事件流 (对应规范"系统状态"与"风险风控"面板)

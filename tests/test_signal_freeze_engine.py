@@ -94,7 +94,11 @@ def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path):
     """09:25 仅此一次重新解析、加权、原子写入并复读校验。"""
     targets, _sel, _source_day, meta = engine._freeze_or_load_targets(_AT_0925)
 
-    assert targets == _TARGETS
+    # 冻结契约只约束标的与目标权重；ensure_target_weights 可能附带
+    # fml/fml_source 等融合诊断字段，不应让本测试耦合到融合实现。
+    assert len(targets) == 1
+    assert targets[0]["canon"] == "600000.SH"
+    assert targets[0]["target_weight"] == 1.0
     assert meta["snapshot_status"] == "ready"
     persisted = read_snapshot(str(tmp_path), "20261003")
     assert persisted["status"] == "ready"
