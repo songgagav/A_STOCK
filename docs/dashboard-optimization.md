@@ -66,3 +66,13 @@
 - `localhost:8000` 当前由 PID `14500` 提供，返回的是旧页面，不包含 `ticker`、`freezeTrack`、`sessionRail`。
 - 当前用户尝试停止该 PID 时收到“拒绝访问”；`src/daemon.py` 当前只提供守护进程 `--stop/--status`，没有独立的 dashboard restart 命令，且状态检查显示守护进程处于 HALTED，因此本轮不直接停止整个守护进程。
 - 新视觉已在独立的 8765 端口完成 HTTP 与浏览器验证；8000 的真实端口验证待管理员权限或服务管理入口重启后完成。
+
+## Visual V3：Hero 日收益序列
+
+- `/api/live` 新增向后兼容的 `daily_series` 字段，聚合 `data/daily/*/daily_summary.json` 中的有效净值记录，最多返回最近 20 个交易日。
+- 当前有效历史为 16 个交易日，前端诚实显示 16/20，不补零、不伪造历史。
+- 序列字段为 `day`、`equity`、`nav`、`dd`、`daily_return`；回撤和收益使用小数单位。
+- 保留 `#cards` 作为旧 JS 挂载点，新增 `#heroSeries`；无历史时显示“历史数据积累中”。
+- 后端和前端分别提交：`89cd995`、`f662403`。
+- `.venv314` 全量回归：`2754 passed, 29 skipped, 18 warnings`；临时 8766 端口 HTTP 验证返回 16 条 `daily_series`。
+- 8000 若仍运行旧进程，需要重启后才能加载 V3 静态资源；不改变交易消费路径。
