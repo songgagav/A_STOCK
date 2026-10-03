@@ -91,7 +91,10 @@ def test_dashboard_table_allowlist_accepts_canonical_name():
 def test_dashboard_page_contains_freeze_rail_contract():
     """视觉层必须保留冻结状态的可见锚点，避免后端已接入但页面无入口。"""
     for marker in ("freezeRail", "freezeStatus", "freezeLate", "freezeUnexplained", "/api/signal-freeze"):
-        assert marker in dashboard.PAGE
+        source = dashboard.PAGE
+        if marker == "/api/signal-freeze":
+            source += (Path(dashboard.STATIC_ROOT) / "dashboard.js").read_text(encoding="utf-8")
+        assert marker in source
 
 
 def test_fallback_state_uses_source_timestamp_not_now(tmp_path, monkeypatch):
@@ -233,6 +236,7 @@ def test_read_regime_consumes_named_rows_from_both_materialized_views(monkeypatc
 
 def test_dashboard_polling_is_visibility_aware_and_adaptive():
     """前端轮询应在隐藏页暂停，并在失败时退避，而不是固定打满请求。"""
+    source = (Path(dashboard.STATIC_ROOT) / "dashboard.js").read_text(encoding="utf-8")
     for marker in ("function adaptivePoll", "document.hidden", "visibilitychange", "setTimeout"):
-        assert marker in dashboard.PAGE
-    assert "setInterval(load, 3000)" not in dashboard.PAGE
+        assert marker in source
+    assert "setInterval(load, 3000)" not in source
