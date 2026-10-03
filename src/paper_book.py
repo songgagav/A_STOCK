@@ -749,10 +749,49 @@ class PriceFeed:
         self._last_error = None
         self._total_fetch = 0
         self.positions = {}  # 由外部 set_positions 注入, 用于构建 watchlist
+        self._snapshot_targets: set[str] = set()
+        self._snapshot_enforced = False
 
     def set_positions(self, positions: dict) -> None:
         """引擎每 tick 注入当前持仓, _fetch_spot 据此构建 watchlist."""
-        self.positions = positions or {}
+        self.positions = dict(positions or {})
+
+    def set_snapshot_targets(self, targets: list[dict] | None, *, enforce: bool = True) -> None:
+        """注入已验证快照目标；enforce 时它与当前持仓是唯一报价输入。"""
+        self._snapshot_targets = {
+            item["canon"] for item in (targets or [])
+            if isinstance(item, dict) and isinstance(item.get("canon"), str) and item["canon"]
+        }
+        self._snapshot_enforced = bool(enforce)
+
+    def watchlist_codes(self) -> set[str]:
+        """构造报价列表；enforce 不允许从可变选择文件补入目标。"""
+        watch = set(self.positions.keys())
+        if self._snapshot_enforced:
+            watch.update(self._snapshot_targets)
+            return watch
+        try:
+            wl_path = os.path.join(DATA_DIR, "watchlist.json")
+            if os.path.exists(wl_path):
+                with open(wl_path, encoding="utf-8") as f:
+                    watch.update(json.load(f))
+        except Exception:
+            pass
+        try:
+            if os.path.isdir(DAILY_DIR):
+                days = sorted(os.listdir(DAILY_DIR), reverse=True)
+                for d in days[:2]:
+                    sp = os.path.join(DAILY_DIR, d, "selection.json")
+                    if os.path.exists(sp):
+                        with open(sp, encoding="utf-8") as f:
+                            selection = json.load(f)
+                        for target in (selection.get("top_n") or selection.get("targets") or []):
+                            if "canon" in target:
+                                watch.add(target["canon"])
+                        break
+        except Exception:
+            pass
+        return watch
 
     def _suspended_set(self) -> set:
         """交易所停牌名单(当日), 返回 canon 集合。**取不到返回空集合**。
@@ -798,28 +837,7 @@ class PriceFeed:
 
         if not fetch_all:
             # watchlist 路径
-            watch = set(self.positions.keys())
-            try:
-                wl_path = os.path.join(DATA_DIR, "watchlist.json")
-                if os.path.exists(wl_path):
-                    with open(wl_path, encoding="utf-8") as f:
-                        watch.update(json.load(f))
-            except Exception:
-                pass
-            try:
-                if os.path.isdir(DAILY_DIR):
-                    days = sorted(os.listdir(DAILY_DIR), reverse=True)
-                    for d in days[:2]:
-                        sp = os.path.join(DAILY_DIR, d, "selection.json")
-                        if os.path.exists(sp):
-                            with open(sp, encoding="utf-8") as f:
-                                s = json.load(f)
-                            for t in (s.get("top_n") or s.get("targets") or []):
-                                if "canon" in t:
-                                    watch.add(t["canon"])
-                            break
-            except Exception:
-                pass
+            watch = self.watchlist_codes()
             # 1) 新浪单点
             if watch:
                 try:

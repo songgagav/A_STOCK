@@ -916,6 +916,10 @@ class RealtimeEngine:
         tgt_codes = [t["canon"] for t in self.targets]
         all_codes = list(dict.fromkeys(tgt_codes + list(self.pb.positions.keys())))
         # 同步持仓给 feed, 让 watchlist 路径生效 (避免每 tick 全A抓取)
+        self.feed.set_snapshot_targets(
+            frozen_targets if mode == "enforce" and self.snapshot_status == "ready" else None,
+            enforce=(mode == "enforce"),
+        )
         self.feed.set_positions(self.pb.positions)
 
         # 非交易时段且不允许盘中外拉取 -> 不拉实时行情, 仅用最近一个已知价刷新账面估值.

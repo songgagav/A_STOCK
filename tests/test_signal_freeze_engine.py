@@ -52,6 +52,7 @@ def engine(monkeypatch, tmp_path):
         last_error=None,
         quotes={},
         set_positions=Mock(),
+        set_snapshot_targets=Mock(),
         get_latest=Mock(return_value={"600000.SH": 10.0}),
     )
     instance._disk_ref_prices = Mock(return_value={})
