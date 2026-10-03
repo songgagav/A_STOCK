@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from utils import atomic_write_json
+
 
 SCHEMA_VERSION = 1
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -138,3 +140,94 @@ def build_snapshot(
     }
     snapshot["snapshot_hash"] = sha256_json(snapshot)
     return snapshot
+
+
+def snapshot_path(data_dir: str, day: str) -> str:
+    """返回指定交易日冻结快照的唯一权威路径。"""
+    day = _require_day(day, "date")
+    return str(Path(data_dir) / "daily" / day / f"signal_snapshot_{day}.json")
+
+
+def _invalid(reason: str) -> dict[str, Any]:
+    return {"status": "invalid", "snapshot": None, "reason": reason}
+
+
+def _tampered(reason: str) -> dict[str, Any]:
+    return {"status": "tampered", "snapshot": None, "reason": reason}
+
+
+def _required_snapshot_fields(snapshot: dict[str, Any]) -> bool:
+    required = {
+        "schema_version",
+        "date",
+        "targets",
+        "weights",
+        "source_tier",
+        "source_date",
+        "source_artifacts",
+        "generated_at",
+        "generated_at_utc",
+        "input_hash",
+        "snapshot_hash",
+    }
+    return required.issubset(snapshot)
+
+
+def _input_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": snapshot["date"],
+        "targets": snapshot["targets"],
+        "weights": snapshot["weights"],
+        "source_tier": snapshot["source_tier"],
+        "source_date": snapshot["source_date"],
+        "source_artifacts": snapshot["source_artifacts"],
+    }
+
+
+def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
+    """验证已落盘快照；绝不以实时目标池替代失败的快照。"""
+    if not isinstance(snapshot, dict) or not _required_snapshot_fields(snapshot):
+        return _invalid("missing_required_fields")
+    if snapshot["schema_version"] != SCHEMA_VERSION:
+        return _invalid("unsupported_schema_version")
+    if snapshot["date"] != day:
+        return _invalid("snapshot_day_mismatch")
+    if not isinstance(snapshot["input_hash"], str) or len(snapshot["input_hash"]) != 64:
+        return _invalid("invalid_input_hash")
+    if not isinstance(snapshot["snapshot_hash"], str) or len(snapshot["snapshot_hash"]) != 64:
+        return _invalid("invalid_snapshot_hash")
+
+    try:
+        if sha256_json(_input_payload_from_snapshot(snapshot)) != snapshot["input_hash"]:
+            return _tampered("input_hash_mismatch")
+        hash_payload = dict(snapshot)
+        hash_payload["snapshot_hash"] = None
+        if sha256_json(hash_payload) != snapshot["snapshot_hash"]:
+            return _tampered("snapshot_hash_mismatch")
+    except (TypeError, ValueError):
+        return _invalid("non_canonical_snapshot")
+    return {"status": "ready", "snapshot": snapshot, "reason": None}
+
+
+def write_snapshot(data_dir: str, snapshot: dict[str, Any]) -> str:
+    """以共享原子写入器落盘一个已验证的信号快照。"""
+    day = _require_day(snapshot.get("date"), "date")
+    result = _validate_snapshot(snapshot, day)
+    if result["status"] != "ready":
+        raise ValueError(f"拒绝写入无效快照: {result['reason']}")
+    path = snapshot_path(data_dir, day)
+    atomic_write_json(path, snapshot)
+    return path
+
+
+def read_snapshot(data_dir: str, day: str) -> dict[str, Any]:
+    """读取并验证权威快照，明确区分 L1/L2/L3，且不做实时回退。"""
+    day = _require_day(day, "date")
+    path = Path(snapshot_path(data_dir, day))
+    if not path.is_file():
+        return {"status": "missing", "snapshot": None, "reason": "snapshot_not_found"}
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid("invalid_json")
+    return _validate_snapshot(snapshot, day)
