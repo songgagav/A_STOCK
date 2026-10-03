@@ -10,36 +10,68 @@
 </head>
 <body>
 
+  <div class="ticker" id="ticker" aria-label="实时摘要">
+    <div class="ticker__item"><span>EQ</span><strong id="tickerEq">—</strong></div>
+    <div class="ticker__item"><span>PNL</span><strong id="tickerPnl">—</strong></div>
+    <div class="ticker__item"><span>PCT</span><strong id="tickerPct">—</strong></div>
+    <div class="ticker__item"><span>POS</span><strong id="tickerPos">—</strong></div>
+    <div class="ticker__item"><span>FREEZE</span><strong id="tickerFreeze">—</strong></div>
+    <div class="ticker__item"><span>LATE</span><strong id="tickerLate">—</strong></div>
+    <div class="ticker__item"><span>MODE</span><strong id="tickerMode">—</strong></div>
+    <div class="ticker__item"><span>DAY</span><strong id="tickerDay">—</strong></div>
+    <div class="ticker__item ticker__session"><span>SESSION</span><strong id="tickerSession">—</strong></div>
+  </div>
+
   <header class="topbar">
-    <div class="brand">
-      <div class="logo">A</div>
-      <div>
-        <h1>全A轮动 · 盘中模拟盘 <span class="sub">Tick Stock Panel · 实时投研终端</span></h1>
-      </div>
-    </div>
-    <div class="freeze-rail" id="freezeRail" data-state="missing" aria-live="polite">
-      <div class="freeze-rail__marker" aria-hidden="true">09:25</div>
-      <div class="freeze-rail__body">
-        <div class="freeze-rail__line">
-          <span class="freeze-rail__dot" aria-hidden="true"></span>
-          <span class="freeze-rail__kicker">SIGNAL FREEZE</span>
-          <strong class="freeze-rail__status" id="freezeStatus">读取中…</strong>
-          <span class="chip accent" id="freezeMode">SHADOW</span>
-        </div>
-        <div class="freeze-rail__meta">
-          <span id="freezeAt">—</span>
-          <span id="freezeHash">hash —</span>
-          <span id="freezeLate">迟到 —</span>
-          <span id="freezeUnexplained">未解释 —</span>
+    <div class="topbar__main">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">A</div>
+        <div>
+          <h1>全A轮动 · 盘中模拟盘 <span class="sub">Tick Stock Panel · 实时投研终端</span></h1>
         </div>
       </div>
+      <div class="freeze-rail" id="freezeRail" data-state="missing" aria-live="polite">
+        <div class="freeze-rail__marker" aria-hidden="true">09:25</div>
+        <div class="freeze-rail__body">
+          <div class="freeze-rail__line">
+            <span class="freeze-rail__dot" aria-hidden="true"></span>
+            <span class="freeze-rail__kicker">SIGNAL FREEZE</span>
+            <strong class="freeze-rail__status" id="freezeStatus">读取中…</strong>
+            <span class="chip accent" id="freezeMode">SHADOW</span>
+          </div>
+          <div class="freeze-rail__meta">
+            <span id="freezeAt">—</span>
+            <span id="freezeHash">hash —</span>
+            <span id="freezeLate">迟到 —</span>
+            <span id="freezeUnexplained">未解释 —</span>
+          </div>
+        </div>
+      </div>
+      <div class="badges">
+        <span class="badge" id="bDay"><span class="dot"></span>—</span>
+        <span class="badge" id="bMode"><span class="dot"></span>—</span>
+        <span class="badge" id="bSrc"><span class="dot"></span>—</span>
+        <span class="badge" id="bTick"><span class="dot"></span>—</span>
+        <span class="badge" id="sub"><span class="dot"></span>—</span>
+      </div>
     </div>
-    <div class="badges">
-      <span class="badge" id="bDay"><span class="dot"></span>—</span>
-      <span class="badge" id="bMode"><span class="dot"></span>—</span>
-      <span class="badge" id="bSrc"><span class="dot"></span>—</span>
-      <span class="badge" id="bTick"><span class="dot"></span>—</span>
-      <span class="badge" id="sub"><span class="dot"></span>—</span>
+    <div class="topbar__rails">
+      <div class="session-rail" id="sessionRail" aria-label="交易时段">
+        <span class="session-rail__label">SESSION</span>
+        <span class="session-rail__tick" data-session="preopen">09:15</span>
+        <span class="session-rail__tick session-rail__tick--freeze" data-session="freeze">09:25</span>
+        <span class="session-rail__tick" data-session="morning-end">11:30</span>
+        <span class="session-rail__tick" data-session="afternoon">13:00</span>
+        <span class="session-rail__tick" data-session="close">15:00</span>
+      </div>
+      <div class="freeze-track" id="freezeTrack" aria-label="冻结审计轨道">
+        <div class="freeze-track__cell"><span>SNAPSHOT</span><strong id="freezeTrackStatus">—</strong><small id="freezeTrackAt">—</small></div>
+        <div class="freeze-track__cell"><span>FROZEN</span><strong id="freezeTrackFrozen">09:25</strong><small>daily</small></div>
+        <div class="freeze-track__cell"><span>HASH</span><strong id="freezeTrackHash">—</strong><small>sha256</small></div>
+        <div class="freeze-track__cell"><span>LATE</span><strong id="freezeTrackLate">—</strong><small>review</small></div>
+        <div class="freeze-track__cell"><span>UNEXPL</span><strong id="freezeTrackUnexplained">—</strong><small>shadow</small></div>
+        <div class="freeze-track__cell"><span>MODE</span><strong id="freezeTrackMode">SHADOW</strong><small>paper</small></div>
+      </div>
     </div>
   </header>
 

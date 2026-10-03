@@ -648,6 +648,7 @@ function apply(s){
   // 安全写入: 任一元素不存在或缺数据时不中断整体渲染
   const _setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
   _setTxt('sub', '更新 ' + (s.updated||'—'));
+  renderTicker(s);
   _setTxt('bDay', '交易日 ' + (s.day||'—'));
   const m = s.mode||'';
   const bm = document.getElementById('bMode');
@@ -709,6 +710,44 @@ async function loadLogs(){
   return true;
 }
 
+function renderTicker(s){
+  const state = s || {};
+  const capital = state.capital || {};
+  const positions = Array.isArray(state.positions) ? state.positions : [];
+  const openPositions = capital.open_positions != null
+    ? capital.open_positions
+    : positions.filter(p => p && Number(p.qty || 0) > 0).length;
+  const signed = (value, digits) => {
+    if(value == null || isNaN(value)) return '—';
+    return (Number(value) > 0 ? '+' : '') + fmt(value, digits);
+  };
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if(el) el.textContent = value;
+  };
+  const setPnl = (id, value) => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.textContent = signed(value, 2);
+    el.classList.remove('up', 'down');
+    if(Number(value) > 0) el.classList.add('up');
+    if(Number(value) < 0) el.classList.add('down');
+  };
+  set('tickerEq', capital.equity == null ? '—' : fmt(capital.equity, 0));
+  setPnl('tickerPnl', capital.total_pnl);
+  const pct = capital.total_pnl_pct;
+  set('tickerPct', pct == null || isNaN(pct) ? '—' : signed(pct, 2) + '%');
+  const pctEl = document.getElementById('tickerPct');
+  if(pctEl){
+    pctEl.classList.remove('up', 'down');
+    if(Number(pct) > 0) pctEl.classList.add('up');
+    if(Number(pct) < 0) pctEl.classList.add('down');
+  }
+  set('tickerPos', openPositions == null ? '—' : String(openPositions));
+  set('tickerDay', state.day || '—');
+  set('tickerMode', String(state.mode || '—').toUpperCase());
+}
+
 function renderFreezeStatus(d){
   const rail = document.getElementById('freezeRail');
   if(!rail) return;
@@ -728,6 +767,19 @@ function renderFreezeStatus(d){
   set('freezeHash', d && d.snapshot_hash ? 'hash '+String(d.snapshot_hash).slice(0,8) : 'hash —');
   set('freezeLate', '迟到 '+((d && d.late_count) == null ? '—' : d.late_count));
   set('freezeUnexplained', '未解释 '+((d && d.unexplained_count) == null ? '—' : d.unexplained_count));
+  const track = document.getElementById('freezeTrack');
+  if(track) track.dataset.state = state;
+  const ticker = document.getElementById('ticker');
+  if(ticker) ticker.dataset.freezeState = state;
+  set('tickerFreeze', state.toUpperCase());
+  set('tickerLate', (d && d.late_count) == null ? '—' : String(d.late_count));
+  set('tickerMode', String((d && d.mode) || 'shadow').toUpperCase());
+  set('freezeTrackStatus', state.toUpperCase());
+  set('freezeTrackAt', d && d.generated_at ? String(d.generated_at).replace('T',' ') : '—');
+  set('freezeTrackHash', d && d.snapshot_hash ? String(d.snapshot_hash).slice(0,8) : '—');
+  set('freezeTrackLate', (d && d.late_count) == null ? '—' : String(d.late_count));
+  set('freezeTrackUnexplained', (d && d.unexplained_count) == null ? '—' : String(d.unexplained_count));
+  set('freezeTrackMode', String((d && d.mode) || 'shadow').toUpperCase());
 }
 async function loadFreezeStatus(){
   try{
@@ -738,6 +790,40 @@ async function loadFreezeStatus(){
     return false;
   }
   return true;
+}
+
+function updateSessionRail(){
+  const rail = document.getElementById('sessionRail');
+  if(!rail) return;
+  const now = new Date();
+  let hours;
+  let minutesPart;
+  try{
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false
+    }).formatToParts(now);
+    hours = Number(parts.find(p => p.type === 'hour').value);
+    minutesPart = Number(parts.find(p => p.type === 'minute').value);
+  }catch(_){
+    // 老旧浏览器不支持时区格式化时，退回浏览器本地时钟。
+    hours = now.getHours();
+    minutesPart = now.getMinutes();
+  }
+  const minutes = hours * 60 + minutesPart;
+  let key = '';
+  let label = 'CLOSED';
+  if(minutes >= 555 && minutes < 565){ key = 'preopen'; label = 'PREOPEN'; }
+  else if(minutes >= 565 && minutes < 570){ key = 'freeze'; label = 'FREEZE'; }
+  else if(minutes >= 570 && minutes < 690){ key = 'morning-end'; label = 'OPEN'; }
+  else if(minutes >= 690 && minutes < 780){ label = 'LUNCH'; }
+  else if(minutes >= 780 && minutes < 900){ key = 'afternoon'; label = 'OPEN'; }
+  else if(minutes >= 900){ key = 'close'; label = 'CLOSED'; }
+  rail.dataset.session = label.toLowerCase();
+  rail.querySelectorAll('.session-rail__tick').forEach(tick => {
+    tick.classList.toggle('is-active', tick.dataset.session === key);
+  });
+  const tickerSession = document.getElementById('tickerSession');
+  if(tickerSession) tickerSession.textContent = label;
 }
 
 async function load(){
@@ -804,6 +890,8 @@ adaptivePoll(load, 3000, 30000);
 adaptivePoll(loadLogs, 3000, 30000);
 adaptivePoll(loadFreezeStatus, 10000, 60000);
 adaptivePoll(loadOverview, 15000, 60000);
+updateSessionRail();
+setInterval(updateSessionRail, 1000);
 loadBacktestHistory();  // 回测历史面板首屏即加载 (与用户是否切 tab 无关)
 // 系统健康 · 门控 与 风控事件流 (对应规范"系统状态"与"风险风控"面板)
 async function loadOverview(){
