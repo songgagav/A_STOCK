@@ -231,3 +231,28 @@ def read_snapshot(data_dir: str, day: str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return _invalid("invalid_json")
     return _validate_snapshot(snapshot, day)
+
+
+def read_mode_control(repo_root: str) -> dict[str, str]:
+    """读取冻结消费模式；任何缺失或无效控制记录都保守回退 shadow。"""
+    default = {"mode": "shadow"}
+    path = Path(repo_root) / "config" / "signal_freeze_mode.json"
+    try:
+        control = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return default
+    if not isinstance(control, dict):
+        return default
+    if control.get("mode") == "shadow":
+        return default
+    if control.get("mode") != "enforce":
+        return default
+    required = ("promoted_at", "promoted_by", "evidence")
+    if not all(isinstance(control.get(field), str) and control[field].strip() for field in required):
+        return default
+    return {
+        "mode": "enforce",
+        "promoted_at": control["promoted_at"],
+        "promoted_by": control["promoted_by"],
+        "evidence": control["evidence"],
+    }
