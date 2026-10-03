@@ -1,4 +1,4 @@
-﻿const $ = s => document.querySelector(s);
+const $ = s => document.querySelector(s);
 function fmt(n, d=2){ if(n==null||isNaN(n)) return '—'; return Number(n).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
 function pnlCls(v){ return v>0?'up':(v<0?'down':''); }
 function esc(s){ return (s==null?'':String(s)); }
