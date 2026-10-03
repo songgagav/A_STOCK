@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from utils import atomic_write_json
 
 SCHEMA_VERSION = 1
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_LATE_SIGNAL_LOCK = threading.Lock()
 
 
 def canonical_json_bytes(value: dict[str, Any]) -> bytes:
@@ -256,3 +258,73 @@ def read_mode_control(repo_root: str) -> dict[str, str]:
         "promoted_by": control["promoted_by"],
         "evidence": control["evidence"],
     }
+
+
+def _late_signal_path(data_dir: str, day: str) -> str:
+    return str(Path(data_dir) / "daily" / day / f"late_signals_{day}.json")
+
+
+def _record_freeze_event(kind: str, payload: dict[str, Any]) -> None:
+    """审计失败不得阻断归档；账本自身负责哈希链与吞异常。"""
+    try:
+        from signal_freeze_watch import record_event
+        record_event(kind, payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def archive_late_signal(
+    data_dir: str,
+    day: str,
+    candidate: dict[str, Any],
+    arrived_at: datetime,
+    snapshot_status: str,
+) -> dict[str, Any]:
+    """归档迟到候选，绝不改变当日快照/目标池。"""
+    day = _require_day(day, "date")
+    if arrived_at.tzinfo is None or arrived_at.utcoffset() is None:
+        raise ValueError("arrived_at 必须带时区")
+    local_at = arrived_at.astimezone(SHANGHAI)
+    at_time = local_at.time()
+    start = local_at.replace(hour=9, minute=25, second=0, microsecond=0).time()
+    end = local_at.replace(hour=15, minute=0, second=0, microsecond=0).time()
+    if not (start < at_time <= end):
+        result = {"status": "out_of_window", "reason": "outside_0925_1500_window"}
+        _record_freeze_event("late_signal_out_of_window", {
+            "date": day, "arrived_at": local_at.isoformat(),
+            "snapshot_status": snapshot_status, **result,
+        })
+        return result
+    try:
+        payload_hash = sha256_json(candidate)
+        item = {
+            "candidate_id": hashlib.sha256(
+                canonical_json_bytes({"date": day, "arrived_at": local_at.isoformat(),
+                                      "payload_hash": payload_hash})
+            ).hexdigest(),
+            "payload_hash": payload_hash,
+            "late_for_consume_day": day,
+            "arrived_at": local_at.isoformat(),
+            "arrived_at_utc": _iso_utc(arrived_at),
+            "source": candidate.get("source", "unknown"),
+            "delay_reason": candidate.get("delay_reason", "unknown"),
+            "snapshot_status": snapshot_status,
+            "candidate": candidate,
+        }
+        path = _late_signal_path(data_dir, day)
+        with _LATE_SIGNAL_LOCK:
+            try:
+                current = json.loads(Path(path).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                current = {"schema_version": 1, "date": day, "items": []}
+            if not isinstance(current, dict) or current.get("date") != day or not isinstance(current.get("items"), list):
+                raise ValueError("late signal archive schema invalid")
+            current["items"].append(item)
+            atomic_write_json(path, current)
+        result = {"status": "archived", "path": path, "candidate_id": item["candidate_id"]}
+        _record_freeze_event("late_signal_archived", {"date": day, **result})
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result = {"status": "archive_failed", "reason": f"{type(exc).__name__}: {exc}"}
+        _record_freeze_event("late_signal_archive_failed", {"date": day, **result})
+        return result
