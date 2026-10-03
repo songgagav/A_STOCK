@@ -5306,7 +5306,9 @@ async function loadLogs(){
     if(d && d.pos){ logPos = d.pos; }
   }catch(e){
     logErrCnt++; $('#logDot').textContent='● 守护离线'; $('#logDot').className='sBadge bad';
+    return false;
   }
+  return true;
 }
 
 function renderFreezeStatus(d){
@@ -5335,14 +5337,18 @@ async function loadFreezeStatus(){
     renderFreezeStatus(d);
   }catch(e){
     renderFreezeStatus({status:'unavailable', mode:'shadow', reason:'看板无法读取冻结状态'});
+    return false;
   }
+  return true;
 }
 
 async function load(){
+  let liveOk = true;
   try{
     const r = await fetch('/api/live'); const s = await r.json();
     if(s){ apply(s); }
   }catch(e){
+    liveOk = false;
     const sub = document.getElementById('sub');
     if(sub) sub.textContent='连接失败: '+e;
     // 把诊断信息也写到面板上, 避免静默错误
@@ -5354,11 +5360,52 @@ async function load(){
     const rb = await fetch('/api/backtest'); const bt = await rb.json();
     renderBacktest(bt);
   }catch(e){ /* 忽略回放加载错误 */ }
+  return liveOk;
 }
-load(); setInterval(load, 3000);
-loadLogs(); setInterval(loadLogs, 3000);
-loadFreezeStatus(); setInterval(loadFreezeStatus, 10000);
-loadOverview(); setInterval(loadOverview, 15000);
+
+// 页面隐藏时停止轮询；接口失败时指数退避，恢复可见后立即刷新。
+// 这层只负责调度，不改变各 API 的刷新周期和数据契约。
+function adaptivePoll(task, baseMs, maxMs){
+  let timer = null;
+  let delay = baseMs;
+  let running = false;
+  let disposed = false;
+  const schedule = (ms) => {
+    if(disposed || document.hidden) return;
+    timer = setTimeout(run, ms);
+  };
+  const run = async () => {
+    timer = null;
+    if(disposed || document.hidden || running) return;
+    running = true;
+    let ok = false;
+    try{ ok = (await task()) !== false; }catch(e){ ok = false; }
+    running = false;
+    delay = ok ? baseMs : Math.min(maxMs, Math.max(baseMs, delay * 2));
+    schedule(delay);
+  };
+  const onVisibility = () => {
+    if(document.hidden){
+      if(timer !== null) clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    delay = baseMs;
+    if(timer === null && !running) run();
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+  run();
+  return () => {
+    disposed = true;
+    if(timer !== null) clearTimeout(timer);
+    document.removeEventListener('visibilitychange', onVisibility);
+  };
+}
+
+adaptivePoll(load, 3000, 30000);
+adaptivePoll(loadLogs, 3000, 30000);
+adaptivePoll(loadFreezeStatus, 10000, 60000);
+adaptivePoll(loadOverview, 15000, 60000);
 loadBacktestHistory();  // 回测历史面板首屏即加载 (与用户是否切 tab 无关)
 // 系统健康 · 门控 与 风控事件流 (对应规范"系统状态"与"风险风控"面板)
 async function loadOverview(){
@@ -5405,7 +5452,8 @@ async function loadOverview(){
         ).join('');
       }
     }
-  }catch(e){ /* 概览面板加载失败不阻塞主流程 */ }
+  }catch(e){ /* 概览面板加载失败不阻塞主流程 */ return false; }
+  return true;
 }
 
 // tab 徽章数: 启动后延迟 800ms 首次刷新, 此后每 15s 一次

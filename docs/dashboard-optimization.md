@@ -19,6 +19,13 @@
 - `/api/db_table/<name>` 只接受 `_DB_TABLE_ZH` 中的精确名称；合法表名返回 200，大小写变体、路径片段、百分号编码、SQL 注入片段、空值和超长输入均返回 HTTP 403 / `TABLE_NOT_ALLOWED`。
 - 缺少 `h5i_db` 时，h5i 读取降级为结构化错误，不再让 HTTP 工作线程抛出未处理异常。
 
+### 数据层与轮询调度（Batch 2）
+
+- `read_regime()` 的物化视图读取和 DuckDB fallback 统一为 named-row 字段契约；列顺序变化不会再通过 `row[0]` 静默错位。
+- 物化文件缺列或行宽异常时返回 `None`，继续进入既有 fallback，不返回截断字典。
+- 新增 [`dashboard-data-source-matrix.md`](dashboard-data-source-matrix.md)，记录主要 API 的主源、降级源和空数据语义。
+- 前端主轮询改为可见性敏感的自适应调度：隐藏页面暂停，失败指数退避，恢复可见后立即刷新；各接口原有基础周期保持不变。
+
 ## 验证
 
 - 看板契约测试：`15 passed`，覆盖合法表名 200、大小写绕过、路径穿越、SQL 注入、空值和 10000 字符超长输入 403。
@@ -29,6 +36,7 @@
 - 推送后需以新的 GitHub Actions run 作为 h5i 覆盖验收证据。Windows PowerShell 不展开 `tests/test_signal_*.py`，本地验证使用显式文件列表；GitHub Actions 的 Ubuntu shell 会正常展开该 glob。
 - 全量回归中的另一项已修正为测试环境隔离问题：`test_alert_rules_single_source` 现在排除仓库内注册的 `.worktrees`，避免把嵌套工作树中的同名配置误判为第二份生产配置。
 - `py_compile src/dashboard.py`：通过。
+- Batch 2 看板契约：`.venv314` `21 passed`；`.venv310` `21 passed`。
 - 真实 HTTP 烟测：冻结状态、h5i 降级、表名白名单均符合预期。
 - ETag HTTP 烟测：首请求 `200`，同 ETag 重复请求 `304`；算法为 O(1) 的 `mtime_ns + size`。
 

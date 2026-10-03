@@ -229,3 +229,10 @@ def test_read_regime_consumes_named_rows_from_both_materialized_views(monkeypatc
     assert result["components"]["breadth_source"] == "parquet"
     assert result["components"]["breadth"][0]["n_up"] == 1
     assert result["components"]["factor_ic"][0]["factor"] == "roe"
+
+
+def test_dashboard_polling_is_visibility_aware_and_adaptive():
+    """前端轮询应在隐藏页暂停，并在失败时退避，而不是固定打满请求。"""
+    for marker in ("function adaptivePoll", "document.hidden", "visibilitychange", "setTimeout"):
+        assert marker in dashboard.PAGE
+    assert "setInterval(load, 3000)" not in dashboard.PAGE
