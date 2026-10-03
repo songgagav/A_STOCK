@@ -38,6 +38,8 @@ from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
 from utils import atomic_write_json as _atomic_write_json
 from signal_snapshot import (
+    SHANGHAI,
+    archive_late_signal,
     build_snapshot,
     read_mode_control,
     read_snapshot,
@@ -1641,29 +1643,24 @@ class RealtimeEngine:
             if "top_n" not in sel:
                 log("午间重选: 选股失败, 沿用盘前目标池")
                 return
+            arrived_at = datetime.now(SHANGHAI)
+            archived = archive_late_signal(
+                DATA_DIR, self.cur_day.replace("-", ""),
+                {"source": "midday_reselect", "targets": sel["top_n"],
+                 "basket_signal": sel.get("basket_signal")},
+                arrived_at, getattr(self, "snapshot_status", "pending"),
+            )
             with self._resel_lock:
-                self.targets = sel["top_n"]
-                self.midday_targets = sel["top_n"]
+                # 午间结果只能作为次日人工审核候选，绝不替换当日 self.targets。
+                self.midday_targets = None
                 self.midday_result = {
-                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "time": arrived_at.strftime("%H:%M:%S"),
                     "scored": sel.get("scored"),
                     "basket_signal": sel.get("basket_signal"),
                     "top": [t["canon"] for t in sel["top_n"]],
+                    "late_archive": archived,
                 }
-            # 落盘午间快照, 便于审计
-            try:
-                d = os.path.join(DAILY_DIR, self.cur_day.replace("-", ""))
-                os.makedirs(d, exist_ok=True)
-                sheet = {
-                    "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "type": "midday_reselect",
-                    "basket_signal": sel.get("basket_signal"),
-                    "top_n": sel["top_n"],
-                }
-                _atomic_write_json(os.path.join(d, "midday_selection.json"), sheet)
-            except Exception as e:
-                log(f"午间重选落盘失败: {e}")
-            log(f"午间重选完成: {len(sel['top_n'])}只 | basket_signal={sel.get('basket_signal')}")
+            log(f"午间重选已归档: {len(sel['top_n'])}只 | status={archived['status']}（不影响当日目标池）")
         except Exception as e:
             log(f"午间重选异常: {type(e).__name__} {e}")
         finally:

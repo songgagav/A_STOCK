@@ -184,6 +184,18 @@ def observe(rung: str, pool_size=None, elapsed_s=None, finished_at=None,
         return {"alerts": [], "worst": "OK", "error": f"{type(e).__name__}: {e}"}
 
 
+def record_event(kind: str, payload: dict, path: str | None = None, now=None) -> dict:
+    """追加冻结治理事件至既有哈希链账本；失败不影响交易/归档主路径。"""
+    record = {"kind": str(kind), "payload": dict(payload or {})}
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(_repo_root(), "src"))
+        import audit_chain as AC
+        return AC.append(events_path(path), record, now=now)
+    except Exception:  # noqa: BLE001
+        return record
+
+
 def recent(n: int = 20, path: str | None = None) -> list:
     """读最近 n 条观测（含链校验结论, 供人核对账本是否被动过）。"""
     fp = events_path(path)
