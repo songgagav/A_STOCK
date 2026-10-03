@@ -271,19 +271,19 @@ CI 分为两部分：
 
 ```powershell
 # 单次模拟 tick，不启动常驻循环
-.venv314\Scripts\python.exe src/realtime_engine.py --once
+.venv310\Scripts\python.exe src/realtime_engine.py --once
 
 # 启动盘中 PaperBook 引擎和 Web 看板
-.venv314\Scripts\python.exe src/run_services.py start
+.venv310\Scripts\python.exe src/run_services.py start
 
 # 查看服务状态
-.venv314\Scripts\python.exe src/run_services.py status
+.venv310\Scripts\python.exe src/run_services.py status
 
 # 停止服务
-.venv314\Scripts\python.exe src/run_services.py stop
+.venv310\Scripts\python.exe src/run_services.py stop
 
 # 直接启动看板
-.venv314\Scripts\python.exe src/dashboard.py --port 8000
+.venv310\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
 > ⚠️ **解释器要求（2026-09-19 修正）**：`.venv314`（Python 3.14）**没有 `h5i_db`**

@@ -24,7 +24,34 @@ os.chdir(_BASE)
 
 from proc_alive import alive as _process_alive  # noqa: E402
 
-PY = sys.executable
+def _resolve_runtime_python(base=None, current_python=None, environ=None):
+    """Choose the interpreter used for spawned services.
+
+    The dashboard and live engine need the production data runtime.  On this
+    host that is ``.venv310`` because it is the environment containing
+    ``h5i_db``.  Keep an explicit ``TRAE_PYTHON`` override for deployments
+    that pin another interpreter, then fall back to the interpreter running
+    this launcher when the preferred environment is unavailable.
+    """
+    root = base or _BASE
+    current = current_python or sys.executable
+    env = os.environ if environ is None else environ
+
+    override = str(env.get("TRAE_PYTHON", "") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    preferred = os.path.join(root, ".venv310", "Scripts", "python.exe")
+    if os.path.isfile(preferred):
+        return preferred
+
+    return current
+
+
+# Keep run_services.py aligned with ops/start_daemon.ps1: the production
+# runtime is the interpreter with h5i_db, not whichever Python started this
+# compatibility launcher.
+PY = _resolve_runtime_python()
 PID_DIR = os.path.join(_BASE, "logs")
 ENGINE_PID = os.path.join(PID_DIR, "engine.pid")
 DASH_PID = os.path.join(PID_DIR, "dashboard.pid")
