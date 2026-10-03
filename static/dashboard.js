@@ -21,6 +21,34 @@ function renderCards(s){
     </div>`).join('');
 }
 
+function renderHeroSeries(s){
+  const root = document.getElementById('heroSeries');
+  if(!root) return;
+  const rows = Array.isArray(s && s.daily_series) ? s.daily_series : [];
+  const valid = rows.filter(row => row && Number.isFinite(Number(row.daily_return)));
+  if(!valid.length){
+    root.innerHTML = '<div class="hero-series__head"><span class="hero-series__kicker">20D RETURN PULSE</span><span class="hero-series__count">0/20 个有效交易日</span></div>'
+      + '<div class="hero-series__empty"><span>历史数据积累中</span><small>等待有效日收益序列</small></div>';
+    return;
+  }
+  const maxAbs = Math.max(...valid.map(row => Math.abs(Number(row.daily_return))), 0.000001);
+  const bars = valid.map(row => {
+    const value = Number(row.daily_return);
+    const cls = value > 0 ? 'is-up' : (value < 0 ? 'is-down' : 'is-flat');
+    const height = value === 0 ? 4 : Math.max(6, Math.round(Math.abs(value) / maxAbs * 44));
+    const day = esc(row.day || '—');
+    const text = (value > 0 ? '+' : '') + fmt(value * 100, 2) + '%';
+    return '<div class="hero-series__item" title="'+day+' '+text+'">'
+      + '<span class="hero-series__bar '+cls+'" style="height:'+height+'px"></span></div>';
+  }).join('');
+  const first = valid[0].day || '—';
+  const last = valid[valid.length - 1].day || '—';
+  root.innerHTML = '<div class="hero-series__head"><span class="hero-series__kicker">20D RETURN PULSE</span>'
+    + '<span class="hero-series__range">'+esc(first)+' → '+esc(last)+'</span>'
+    + '<span class="hero-series__count">'+valid.length+'/20 个有效交易日</span></div>'
+    + '<div class="hero-series__plot" aria-label="近20个有效交易日日收益柱状图">'+bars+'</div>';
+}
+
 function renderPos(positions){
   if(!positions||!positions.length){ $('#posBody').innerHTML='<tr><td colspan="10" class="empty">暂无持仓</td></tr>'; return; }
   const rows = positions.map(p=>{
@@ -660,6 +688,7 @@ function apply(s){
     if(s.feed_error){ if(bs) bs.textContent += ' ⚠'; _setTxt('sub', '更新 ' + (s.updated||'—') + ' · 实时告警:' + s.feed_error.slice(0,40)); }
     const _tryRender = (name, fn) => { try{ fn(); }catch(e){ console.error('render '+name+' err:', e); } };
     _tryRender('Cards',    () => renderCards(s));
+    _tryRender('HeroSeries', () => renderHeroSeries(s));
     _tryRender('Pos',      () => renderPos(s.positions));
     _tryRender('Trades',   () => renderTrades(s.trades_history, s.trades_today));
     _tryRender('Targets',  () => renderTargets(s.targets));
