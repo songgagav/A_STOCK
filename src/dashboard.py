@@ -282,6 +282,17 @@ def read_live():
     return {}
 
 
+def read_live_payload():
+    """读取实时状态，并为旧生产快照补齐可选的日序列字段。"""
+    payload = read_live() or fallback_state()
+    if not isinstance(payload, dict):
+        payload = {}
+    payload = dict(payload)
+    if not isinstance(payload.get("daily_series"), list):
+        payload["daily_series"] = read_daily_series()
+    return payload
+
+
 def source_etag(path: str) -> str | None:
     """用源文件 mtime 与大小生成轻量 ETag；缺失源返回 None。"""
     try:
@@ -1222,6 +1233,48 @@ def _equity_series():
             day = f"{day[:4]}-{day[4:6]}-{day[6:]}"
         seq[str(day)] = float(eq)
     return [{"day": k, "equity": v} for k, v in sorted(seq.items())]
+
+
+def read_daily_series(limit: int = 20):
+    """返回最近交易日的净值、回撤和日收益序列。"""
+    try:
+        rows = _equity_series()
+    except (OSError, TypeError, ValueError):
+        return []
+    if not rows:
+        return []
+
+    try:
+        base = float(rows[0]["equity"])
+    except (KeyError, TypeError, ValueError):
+        return []
+    if base <= 0:
+        return []
+
+    enriched = []
+    peak = 0.0
+    previous_equity = None
+    for row in rows:
+        try:
+            equity = float(row["equity"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        nav = equity / base
+        peak = max(peak, nav)
+        dd = nav / peak - 1.0 if peak else 0.0
+        daily_return = 0.0 if previous_equity is None else equity / previous_equity - 1.0
+        enriched.append({
+            "day": str(row["day"]),
+            "equity": round(equity, 2),
+            "nav": round(nav, 4),
+            "dd": round(dd, 4),
+            "daily_return": round(daily_return, 6),
+        })
+        previous_equity = equity
+
+    if limit <= 0:
+        return []
+    return enriched[-limit:]
 
 
 def read_curve():
@@ -3451,7 +3504,7 @@ class Handler(BaseHTTPRequestHandler):
             # "OK + 空表"。现统一走 read_health_merged()(运行期 + 盘前 + 阻塞项)。
             return self._json(read_health_merged())
         if path == "/api/live":
-            lv = read_live() or fallback_state()
+            lv = read_live_payload()
             source_path = LIVE_STATE if os.path.exists(LIVE_STATE) else os.path.join(DATA_DIR, "state.json")
             return self._json(lv, etag=source_etag(source_path))
         if path == "/api/signal-freeze":
