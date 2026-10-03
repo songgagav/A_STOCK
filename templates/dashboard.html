@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>全A轮动 · 模拟盘 · Tick Stock Panel</title>
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+
+  <div class="ticker" id="ticker" aria-label="实时摘要">
+    <div class="ticker__item"><span>EQ</span><strong id="tickerEq">—</strong></div>
+    <div class="ticker__item"><span>PNL</span><strong id="tickerPnl">—</strong></div>
+    <div class="ticker__item"><span>PCT</span><strong id="tickerPct">—</strong></div>
+    <div class="ticker__item"><span>POS</span><strong id="tickerPos">—</strong></div>
+    <div class="ticker__item"><span>FREEZE</span><strong id="tickerFreeze">—</strong></div>
+    <div class="ticker__item"><span>LATE</span><strong id="tickerLate">—</strong></div>
+    <div class="ticker__item"><span>MODE</span><strong id="tickerMode">—</strong></div>
+    <div class="ticker__item"><span>DAY</span><strong id="tickerDay">—</strong></div>
+    <div class="ticker__item ticker__session"><span>SESSION</span><strong id="tickerSession">—</strong></div>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar__main">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">A</div>
+        <div>
+          <h1>全A轮动 · 盘中模拟盘 <span class="sub">Tick Stock Panel · 实时投研终端</span></h1>
+        </div>
+      </div>
+      <div class="freeze-rail" id="freezeRail" data-state="missing" aria-live="polite">
+        <div class="freeze-rail__marker" aria-hidden="true">09:25</div>
+        <div class="freeze-rail__body">
+          <div class="freeze-rail__line">
+            <span class="freeze-rail__dot" aria-hidden="true"></span>
+            <span class="freeze-rail__kicker">SIGNAL FREEZE</span>
+            <strong class="freeze-rail__status" id="freezeStatus">读取中…</strong>
+            <span class="chip accent" id="freezeMode">SHADOW</span>
+          </div>
+          <div class="freeze-rail__meta">
+            <span id="freezeAt">—</span>
+            <span id="freezeHash">hash —</span>
+            <span id="freezeLate">迟到 —</span>
+            <span id="freezeUnexplained">未解释 —</span>
+          </div>
+        </div>
+      </div>
+      <div class="badges">
+        <span class="badge" id="bDay"><span class="dot"></span>—</span>
+        <span class="badge" id="bMode"><span class="dot"></span>—</span>
+        <span class="badge" id="bSrc"><span class="dot"></span>—</span>
+        <span class="badge" id="bTick"><span class="dot"></span>—</span>
+        <span class="badge" id="sub"><span class="dot"></span>—</span>
+      </div>
+    </div>
+    <div class="topbar__rails">
+      <div class="session-rail" id="sessionRail" aria-label="交易时段">
+        <span class="session-rail__label">SESSION</span>
+        <span class="session-rail__tick" data-session="preopen">09:15</span>
+        <span class="session-rail__tick session-rail__tick--freeze" data-session="freeze">09:25</span>
+        <span class="session-rail__tick" data-session="morning-end">11:30</span>
+        <span class="session-rail__tick" data-session="afternoon">13:00</span>
+        <span class="session-rail__tick" data-session="close">15:00</span>
+      </div>
+      <div class="freeze-track" id="freezeTrack" aria-label="冻结审计轨道">
+        <div class="freeze-track__cell"><span>SNAPSHOT</span><strong id="freezeTrackStatus">—</strong><small id="freezeTrackAt">—</small></div>
+        <div class="freeze-track__cell"><span>FROZEN</span><strong id="freezeTrackFrozen">09:25</strong><small>daily</small></div>
+        <div class="freeze-track__cell"><span>HASH</span><strong id="freezeTrackHash">—</strong><small>sha256</small></div>
+        <div class="freeze-track__cell"><span>LATE</span><strong id="freezeTrackLate">—</strong><small>review</small></div>
+        <div class="freeze-track__cell"><span>UNEXPL</span><strong id="freezeTrackUnexplained">—</strong><small>shadow</small></div>
+        <div class="freeze-track__cell"><span>MODE</span><strong id="freezeTrackMode">SHADOW</strong><small>paper</small></div>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+
+    <div class="tabs">
+      <button class="tabBtn active" data-tab="overview"><span class="ico">◎</span>概览</button>
+      <button class="tabBtn" data-tab="dashboard"><span class="ico">▦</span>市场看板<span class="badge-count" id="cnt-dashboard">·</span></button>
+      <button class="tabBtn" data-tab="market"><span class="ico">≋</span>市场情绪<span class="badge-count" id="cnt-market">·</span></button>
+      <button class="tabBtn" data-tab="deep"><span class="ico">◈</span>深度分析<span class="badge-count" id="cnt-deep">·</span></button>
+      <button class="tabBtn" data-tab="riskview"><span class="ico">⚠</span>风控告警<span class="badge-count" id="cnt-riskview">·</span></button>
+      <button class="tabBtn" data-tab="flab"><span class="ico">∷</span>因子实验室<span class="badge-count" id="cnt-flab">·</span></button>
+      <button class="tabBtn" data-tab="pscan"><span class="ico">⌬</span>参数扫描<span class="badge-count" id="cnt-pscan">·</span></button>
+      <button class="tabBtn" data-tab="perf"><span class="ico">⌬</span>绩效归因<span class="badge-count" id="cnt-perf">·</span></button>
+      <button class="tabBtn" data-tab="backtest"><span class="ico">↻</span>回测<span class="badge-count" id="cnt-backtest">·</span></button>
+      <button class="tabBtn" data-tab="concept"><span class="ico">◇</span>概念分析<span class="badge-count" id="cnt-concept">·</span></button>
+      <button class="tabBtn" data-tab="industry"><span class="ico">▤</span>行业分析<span class="badge-count" id="cnt-industry">·</span></button>
+      <button class="tabBtn" data-tab="monitor"><span class="ico">◉</span>监控中心<span class="badge-count" id="cnt-monitor">·</span></button>
+      <button class="tabBtn" data-tab="regime"><span class="ico">∿</span>市场环境<span class="badge-count" id="cnt-regime">·</span></button>
+      <button class="tabBtn" data-tab="abnormal"><span class="ico">⚡</span>异动监控<span class="badge-count" id="cnt-abnormal">·</span></button>
+      <button class="tabBtn" data-tab="dbpanel"><span class="ico">▥</span>数据板块<span class="badge-count" id="cnt-dbpanel">·</span></button>
+      <button class="tabBtn" data-tab="dbmon"><span class="ico">◉</span>DB监控<span class="badge-count" id="cnt-dbmon">·</span></button>
+    </div>
+
+  <!-- ===================== 市场看板 (Dashboard) ===================== -->
+  <div id="view-dashboard" class="tabView">
+    <div class="panel">
+      <h3>KPI 总览 <span class="muted" style="font-weight:400;font-size:12px">基于 h5i / parquet 最新日 · 数据源状态见上方冻结轨道</span></h3>
+      <div id="mbKpi"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>主流指数</h3>
+        <div id="mbIndices"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>市场情绪雷达</h3>
+        <div id="mbRadar"><div class="muted">加载中...</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>市场宽度 <span class="muted" style="font-weight:400;font-size:12px">涨/跌/平 + 涨停/跌停 + 宽度比</span></h3>
+      <div id="mbBreadth"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="panel">
+      <h3>涨跌幅分布 <span class="muted" style="font-weight:400;font-size:12px">10 段: <-9.5% ~ ≥9.5%</span></h3>
+      <div id="mbDist"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>连板梯队</h3>
+        <div id="mbLadder"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>北向资金 / 活跃 Top</h3>
+        <div id="mbActive"><div class="muted">加载中...</div></div>
+      </div>
+    </div>
+  </div><!-- /view-dashboard -->
+
+  <div id="view-overview" class="tabView active">
+  <section class="grid" id="cards"></section>
+
+  <div class="row2">
+    <div class="panel">
+      <h3>系统健康 · 门控 <span class="muted" style="font-weight:400;font-size:12px">进程 / 引擎心跳 / 数据水位 / IC门控档位</span></h3>
+      <div id="sysGate"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="panel">
+      <h3>风控事件流 <span class="muted" style="font-weight:400;font-size:12px">门控 / 熔断 / 止损 / 引擎异常 · 最近</span></h3>
+      <div id="riskEvents"><div class="muted">加载中...</div></div>
+    </div>
+  </div>
+
+  <div class="panel" id="rulesPanel">
+    <h3>交易规则面板 <span class="muted" style="font-weight:400;font-size:12px">(实时生效)</span></h3>
+    <div class="rulesGrid" id="rulesBody"><span class="muted">—</span></div>
+  </div>
+
+  <div class="row2">
+    <div class="panel">
+      <h3>持仓明细</h3>
+      <table class="tbl">
+        <thead><tr><th>名称/代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>盈亏%</th><th>仓位</th><th>可卖/T+1</th><th>距涨停/距跌停</th><th>状态</th></tr></thead>
+        <tbody id="posBody"><tr><td colspan="10" class="empty">暂无数据</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        成交历史
+        <select id="tradeDateFilter" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="all">全部</option>
+        </select>
+        <span class="muted" style="font-weight:400;font-size:12px" id="tradeCount"></span>
+        <span id="tradePager" style="display:flex;align-items:center;gap:6px;margin-left:auto"></span>
+      </h3>
+      <table class="tbl">
+        <thead><tr><th>日期</th><th>时间</th><th>方向</th><th>代码</th><th>数量</th><th>价格</th><th>费用</th><th>盈亏</th></tr></thead>
+        <tbody id="tradeBody"><tr><td colspan="8" class="empty">无成交</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>目标池 (选股结果) <span id="middayTag" style="font-weight:400;font-size:12px"></span></h3>
+    <table class="tbl">
+      <thead><tr><th>代码</th><th>名称</th><th>综合分</th><th>信号</th></tr></thead>
+      <tbody id="targetBody"><tr><td colspan="4" class="empty">—</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel" id="logPanel">
+    <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">实时运行日志
+      <span class="sBadge ok" id="logDot" style="font-size:10px">● 守护在线</span>
+      <span class="muted" style="font-weight:400;font-size:12px">(引擎/收盘/守护日志实时滚动 · 每3秒刷新)</span>
+    </h3>
+    <div id="logBox" class="logBox"><span class="muted">日志加载中…</span></div>
+  </div>
+
+  <div class="panel" id="btPanel">
+    <h3>连续交易日回放 <span class="muted" style="font-weight:400;font-size:12px" id="btRange"></span></h3>
+    <div id="btBody"><span class="empty">未运行回放</span></div>
+  </div>
+
+  </div><!-- /view-overview -->
+
+  <div id="view-market" class="tabView">
+    <div class="panel">
+      <h3>市场情绪趋势 <span class="muted" style="font-weight:400;font-size:12px" id="mkRange"></span></h3>
+      <div class="sentiBar" id="sentiBar"></div>
+      <div class="muted" style="margin-top:26px;font-size:12px">情绪分: 上涨占比+中位数涨幅+强上涨占比+涨停家数 加权合成 (0~100)。点击 tab 后自动加载, 每30秒刷新。</div>
+    </div>
+    <div class="grid3" id="mkCards"></div>
+    <div class="row2">
+      <div class="panel">
+        <h3>涨跌分布 (最新日)</h3>
+        <div class="donutRow">
+          <div class="donut" id="upDonut"></div>
+          <div id="upLegend" class="muted" style="font-size:13px"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>板块成交分布 (亿) <span class="muted" style="font-weight:400;font-size:12px" id="secDay"></span></h3>
+        <div id="secBody" class="muted" style="font-size:13px"></div>
+      </div>
+    </div>
+  </div><!-- /view-market -->
+
+  <div id="view-perf" class="tabView">
+    <div class="panel" id="pfCommentaryPanel">
+      <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        LLM 盘后点评
+        <span class="sBadge alpha" id="pfAiBadge" style="font-size:10px">MiniMax-M3</span>
+        <span class="muted" id="pfAiMeta" style="font-weight:400;font-size:12px"></span>
+      </h3>
+      <div id="pfCommentary"><div class="muted">等待 LLM 点评 (盘后 run_daily 自动生成)...</div></div>
+    </div>
+    <div class="panel">
+      <h3>绩效指标 <span class="muted" style="font-weight:400;font-size:12px" id="pfRange"></span></h3>
+      <div class="grid" id="pfMetrics"></div>
+    </div>
+    <div class="panel">
+      <h3>组合净值曲线 <span class="muted" style="font-weight:400;font-size:12px">(逐日回执权益)</span></h3>
+      <div class="perfEquity" id="pfEquity"></div>
+    </div>
+    <div class="panel">
+      <h3>持仓归因 (最新日, 按浮盈排序)</h3>
+      <table class="tbl">
+        <thead><tr><th>代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>权重</th><th>浮盈</th><th>浮盈%</th></tr></thead>
+        <tbody id="pfAttr"><tr><td colspan="8" class="empty">暂无持仓</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>因子 IC 监控 <span class="muted" style="font-weight:400;font-size:12px">(H20 前瞻, 联动 ic_curve)</span></h3>
+      <table class="tbl">
+        <thead><tr><th>因子</th><th>样本数</th><th>IC均值</th><th>ICIR</th><th>近20日IC均值</th></tr></thead>
+        <tbody id="pfIc"><tr><td colspan="5" class="empty">无 IC 数据</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>因子权重自适应 <span class="muted" style="font-weight:400;font-size:12px">(D反馈→B迭代: ICIR 强度驱动 alpha 再平衡)</span></h3>
+      <div class="grid" id="pfWeights"></div>
+      <div id="pfWmeta" class="muted" style="font-size:12px;margin-top:8px"></div>
+    </div>
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        DRL 微调
+        <span class="sBadge alpha" style="font-size:10px">LLM brief + PPO</span>
+        <span class="muted" style="font-weight:400;font-size:12px">(LLM 市场研判 + 情绪因子注入 obs / stance 调节扰动 / factor_recommendations 先验权重)</span>
+      </h3>
+      <div id="pfDrl"><div class="muted">DRL 训练历史加载中...</div></div>
+    </div>
+    <div class="panel">
+      <h3>
+        策略退化 + SPC 过程控制
+        <span class="chip accent" style="margin-left:4px">LLM+P3</span>
+        <small>(退化指数 / Shewhart 控制限 / CUSUM 漂移 / 增量学习闭环)</small>
+      </h3>
+      <div id="pfDegradation"><div class="muted">退化监控加载中...</div></div>
+    </div>
+
+    <!-- DRL 目标计划 (盘中 realtime_engine 优先消费) -->
+    <div class="panel">
+      <h3>DRL 目标计划 <span class="muted" style="font-weight:400;font-size:12px">盘中引擎优先消费, 缺失回退 selection.json</span></h3>
+      <div id="pfTargetPlan"><div class="muted">加载中...</div></div>
+    </div>
+
+    <!-- 盘前健康检查 -->
+    <div class="panel">
+      <h3>盘前健康检查 <span class="muted" style="font-weight:400;font-size:12px">磁盘 / DuckDB / ArcticDB / 行情 / 订单簿 / state_io</span></h3>
+      <div id="pfHealth"><div class="muted">加载中...</div></div>
+    </div>
+
+    <!-- 因子物化视图 -->
+    <div class="panel">
+      <h3>因子物化视图 <span class="muted" style="font-weight:400;font-size:12px">DuckDB 物化表 + Parquet 导出</span></h3>
+      <div id="pfViews"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-perf -->
+
+  <!-- ===================== 回测 ===================== -->
+  <div id="view-backtest" class="tabView">
+    <div class="panel">
+      <h3>回测历史 <span class="muted" style="font-weight:400;font-size:12px">所有 backtest_latest.json + data/backtest/*</span></h3>
+      <div id="btHistoryBody"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-backtest -->
+
+  <!-- ===================== 概念分析 ===================== -->
+  <div id="view-concept" class="tabView">
+    <div class="panel">
+      <h3>概念/题材分析 <span class="muted" style="font-weight:400;font-size:12px">数据源: <code style="color:#fff">ext_gn_ths</code> (同花顺概念, 5559 标的) + 当日行情聚合</span></h3>
+      <div id="conceptCtrl" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+        <input id="conceptSearch" placeholder="搜索概念名 (例: 人形机器人)" style="flex:1;padding:5px 8px;border:1px solid #334;border-radius:6px;background:#0f1420;color:#fff"/>
+        <select id="conceptSort" class="input-dark" style="padding:5px 8px">
+          <option value="strength">综合热度</option>
+          <option value="change_pct">平均涨幅</option>
+          <option value="amount">总成交额</option>
+          <option value="turnover">平均换手</option>
+          <option value="count">成分数</option>
+        </select>
+        <select id="conceptTop" class="input-dark" style="padding:5px 8px">
+          <option value="30">top 30</option>
+          <option value="50" selected>top 50</option>
+          <option value="100">top 100</option>
+          <option value="200">top 200</option>
+        </select>
+        <button class="tabBtn" id="conceptRefresh">刷新</button>
+      </div>
+      <div id="conceptBody"><div class="muted">加载中...</div></div>
+      <div id="conceptDetail" style="margin-top:10px"></div>
+    </div>
+  </div><!-- /view-concept -->
+
+  <!-- ===================== 行业分析 ===================== -->
+  <div id="view-industry" class="tabView">
+    <div class="panel">
+      <h3>行业分析 <span class="muted" style="font-weight:400;font-size:12px">数据源: <code style="color:#fff">ext_hy_ths</code> (同花顺行业三级分类, 5559 标的) + 当日行情聚合</span></h3>
+      <div id="industryCtrl" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+        <input id="industrySearch" placeholder="搜索行业名 (例: 汽车-汽车零部件)" style="flex:1;padding:5px 8px;border:1px solid #334;border-radius:6px;background:#0f1420;color:#fff"/>
+        <select id="industrySort" class="input-dark" style="padding:5px 8px">
+          <option value="strength">综合热度</option>
+          <option value="change_pct">平均涨幅</option>
+          <option value="amount">总成交额</option>
+          <option value="turnover">平均换手</option>
+          <option value="count">成分数</option>
+        </select>
+        <select id="industryTop" class="input-dark" style="padding:5px 8px">
+          <option value="30">top 30</option>
+          <option value="50" selected>top 50</option>
+          <option value="100">top 100</option>
+          <option value="200">top 200</option>
+        </select>
+        <button class="tabBtn" id="industryRefresh">刷新</button>
+      </div>
+      <div id="industryBody"><div class="muted">加载中...</div></div>
+      <div id="industryDetail" style="margin-top:10px"></div>
+    </div>
+  </div><!-- /view-industry -->
+
+  <!-- ===================== 监控中心 ===================== -->
+  <div id="view-monitor" class="tabView">
+    <div class="panel">
+      <h3>监控中心 <span class="muted" style="font-weight:400;font-size:12px">盘前健康 + 退化 + SPC + DRL plan ready</span></h3>
+      <div id="monitorBody"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-monitor -->
+
+  <!-- ===================== 市场环境 ===================== -->
+  <div id="view-regime" class="tabView">
+    <div class="panel">
+      <h3>市场环境 <span class="muted" style="font-weight:400;font-size:12px">市场宽度 + 情绪分位 + 阶段判别</span></h3>
+      <div id="regimeBody"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-regime -->
+
+  <!-- ===================== 异动监控 ===================== -->
+  <div id="view-abnormal" class="tabView">
+    <div class="panel">
+      <h3>异动监控 <span class="muted" style="font-weight:400;font-size:12px">涨幅/跌幅/成交额 Top, 涨停跌停统计</span></h3>
+      <div id="abnormalBody"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-abnormal -->
+
+  <!-- ===================== 数据板块 ===================== -->
+  <div id="view-deep" class="tabView">
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        组合净值 · 回撤
+        <span class="muted" style="font-weight:400;font-size:12px">(逐日回执权益; 悬停查看十字值)</span>
+        <span id="eqRange" class="btn" style="gap:0;padding:2px">
+          <button class="btn" data-r="all" style="padding:3px 9px">全部</button>
+          <button class="btn" data-r="120" style="padding:3px 9px">120日</button>
+          <button class="btn" data-r="60" style="padding:3px 9px">60日</button>
+          <button class="btn" data-r="20" style="padding:3px 9px">20日</button>
+        </span>
+      </h3>
+      <canvas id="eqCanvas" width="1200" height="330" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="eqTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+    </div>
+
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        K线 · 技术指标
+        <span class="muted" style="font-weight:400;font-size:12px">(h5i 日线; MA/MACD/RSI; ◀ ▶ 平移 · 放大/缩小 · 悬停十字)</span>
+        <select id="kSymSel" class="input-dark" style="font-size:12px;padding:2px 6px"></select>
+        <input id="kSymInput" class="input-dark" placeholder="代码 如 600519" style="width:120px;font-size:12px">
+        <button id="kGo" class="btn" style="padding:3px 9px">加载</button>
+        <select id="kInd" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="macd">MACD</option><option value="rsi">RSI</option>
+        </select>
+        <span style="margin-left:auto"></span>
+        <button id="kPrev" class="btn" style="padding:3px 9px">◀ 更早</button>
+        <button id="kNext" class="btn" style="padding:3px 9px">更新 ▶</button>
+        <button id="kZoomIn" class="btn" style="padding:3px 9px">+</button>
+        <button id="kZoomOut" class="btn" style="padding:3px 9px">−</button>
+      </h3>
+      <canvas id="kCanvas" width="1200" height="470" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="kTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+    </div>
+
+    <div class="row2">
+      <div class="panel">
+        <h3>月度收益热力图 <span class="muted" style="font-weight:400;font-size:12px">(月末回执环比)</span></h3>
+        <div id="mHeat"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>持仓分布 · 盈亏贡献 <span class="muted" style="font-weight:400;font-size:12px">(市值占比 / 浮盈贡献)</span></h3>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div id="holdPie" style="flex:1;min-width:230px"><div class="muted">加载中...</div></div>
+          <div id="holdBar" style="flex:1;min-width:200px"><div class="muted">加载中...</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row2">
+      <div class="panel">
+        <h3>持仓行业分布 <span class="muted" style="font-weight:400;font-size:12px">(同花顺一级行业 · 按持仓市值)</span></h3>
+        <div id="holdInd"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>持仓市值分布 <span class="muted" style="font-weight:400;font-size:12px">(公司总市值: 小盘&lt;100 / 中盘100-500 / 大盘≥500亿)</span></h3>
+        <div id="holdCap"><div class="muted">加载中...</div></div>
+      </div>
+    </div>
+
+    <div class="panel" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <h3 style="margin:0">一键复盘报告</h3>
+      <span class="muted" style="font-size:12px">聚合当前持仓/净值/绩效/门控/因子 为 Markdown, 便于复盘与分享</span>
+      <button id="btnExport" class="btn primary" style="margin-left:auto">导出复盘报告 (.md)</button>
+      <button id="btnPrintPDF" class="btn">导出 PDF (打印)</button>
+    </div>
+  </div>
+
+  <div id="view-riskview" class="tabView">
+    <div class="panel">
+      <h3>风险 · 绩效指标 <span class="muted" style="font-weight:400;font-size:12px">VaR / 单日盈亏 / 滚动夏普 / Sortino / 胜率盈亏比 / 运维计数 (回执日收益口径)</span></h3>
+      <div class="grid" id="riskKpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))"><div class="muted">加载中...</div></div>
+      <div id="riskNote" class="muted" style="font-size:12px;margin-top:6px"></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>告警中心 <span class="muted" style="font-weight:400;font-size:12px">门控 / 进程 / 心跳 / 数据滞后 / 回撤 / 单日亏损 · 15s 刷新</span></h3>
+        <div id="alertBox"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>告警推送 <span class="muted" style="font-weight:400;font-size:12px">可选扩展(当前无需外部推送, 不配置即可正常使用)</span></h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="pushChannel" class="input-dark"><option value="dingtalk">钉钉</option><option value="email">邮件</option></select>
+          <button id="btnPushTest" class="btn">发送测试告警</button>
+          <button id="btnPushNow" class="btn primary">推送当前告警</button>
+        </div>
+        <div id="pushResult" class="muted" style="font-size:12px;margin-top:8px"></div>
+        <div class="muted" style="font-size:11px;margin-top:6px">如需启用: 钉钉 <code>DINGTALK_WEBHOOK</code>; 邮件 <code>SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_TO</code>(均环境变量)</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-flab" class="tabView">
+    <div class="panel">
+      <h3 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        因子 IC 时序
+        <span class="muted" style="font-weight:400;font-size:12px">(2013~ 真实历史 IC · 悬停查看 · 点击因子隐藏/显示)</span>
+        <select id="flabHorizon" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="h5">5日IC</option><option value="h1">1日IC</option><option value="h3">3日IC</option>
+          <option value="h10">10日IC</option><option value="h20">20日IC</option>
+        </select>
+        <select id="flabRange" class="input-dark" style="font-size:12px;padding:2px 6px">
+          <option value="120">近120日</option><option value="300">近300日</option><option value="500">近500日</option>
+        </select>
+      </h3>
+      <canvas id="flabCanvas" width="1200" height="360" style="width:100%;background:hsl(var(--base));border-radius:var(--radius-sm)"></canvas>
+      <div id="flabTip" class="muted" style="font-size:12px;min-height:16px;margin-top:4px"></div>
+      <div id="flabStats" style="display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:6px"></div>
+    </div>
+    <div class="panel">
+      <h3>因子五分位 · 最新截面 <span class="muted" style="font-weight:400;font-size:12px">(v_factor_scores_daily 最新日 5 等分箱均值/区间 · 截面分布, 非未来收益)</span></h3>
+      <div id="flabQ"><div class="muted">加载中...</div></div>
+    </div>
+  </div>
+
+  <div id="view-dbpanel" class="tabView">
+    <div class="panel">
+      <h3>本地数据库表头情况 <span class="muted" style="font-weight:400;font-size:12px">DuckDB + ArcticDB 全部表</span></h3>
+      <div id="dbpanelBody"><div class="muted">加载中...</div></div>
+    </div>
+  </div><!-- /view-dbpanel -->
+
+  <div id="view-dbmon" class="tabView">
+    <div class="panel">
+      <h3>数据库监控 <span class="muted" style="font-weight:400;font-size:12px">h5i 表统计 · 质量指标 · 趋势快照 · Celery 异步全量更新</span></h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="btnDbStatsRefresh">⟳ 刷新统计</button>
+        <button class="btn" id="btnDbStatsManual">⏻ 手动全量更新</button>
+        <button class="btn" id="btnDbStatsRunDaily" title="Celery 后台异步执行 run_daily.py 完整收盘管道(数据+模型, 可能长达 1h); LLM 额度恢复后可用于重跑补点评">▶ 异步 run_daily</button>
+        <span id="dbmonUpd" class="muted" style="font-size:12px"></span>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:4px" id="dbmonRd"></div>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        Prometheus: <a href="http://localhost:9090/" target="_blank">localhost:9090</a> ·
+        /metrics 端点: <a href="http://localhost:9101/metrics" target="_blank">9101</a> ·
+        趋势快照 data/db_stats_history.jsonl · 24h 滞后由 Prometheus 规则 alert_rules.yml 告警
+      </div>
+    </div>
+    <div class="panel">
+      <h3>表状态 <span class="muted" style="font-weight:400;font-size:12px">行数 / 最后更新 / 空值率 / 重复对</span></h3>
+      <div id="dbmonTable"><div class="muted">加载中...</div></div>
+    </div>
+    <div class="row2">
+      <div class="panel">
+        <h3>行数趋势 <span class="muted" style="font-weight:400;font-size:12px">按历史快照(每60s)</span></h3>
+        <div id="dbmonTrend"><div class="muted">加载中...</div></div>
+      </div>
+      <div class="panel">
+        <h3>质量与告警 <span class="muted" style="font-weight:400;font-size:12px">空值率 / 重复 / 滞后&gt;24h</span></h3>
+        <div id="dbmonAlerts"><div class="muted">加载中...</div></div>
+      </div>
+    </div>
+  </div><!-- /view-dbmon -->
+
+  <footer>全A轮动模拟盘 · 只做多 / T+1 / 涨停不可买 跌停不可卖 停牌跳过 滑点万分5 · 数据源 AKShare+DuckDB · 每3秒刷新</footer>
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

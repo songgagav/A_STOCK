@@ -101,7 +101,9 @@ class TestSingleSourceOfTruthForAlertRules:
         """
         found = []
         for dp, dns, fns in os.walk(_REPO):
-            dns[:] = [d for d in dns if d not in ("__pycache__", ".git", "_merge_workspace")]
+            dns[:] = [d for d in dns if d not in (
+                "__pycache__", ".git", "_merge_workspace", ".worktrees"
+            )]
             for fn in fns:
                 if fn == "alert_rules.yml":
                     found.append(os.path.relpath(os.path.join(dp, fn), _REPO))
