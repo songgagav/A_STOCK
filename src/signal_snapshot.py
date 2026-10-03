@@ -328,3 +328,111 @@ def archive_late_signal(
         result = {"status": "archive_failed", "reason": f"{type(exc).__name__}: {exc}"}
         _record_freeze_event("late_signal_archive_failed", {"date": day, **result})
         return result
+
+
+def _late_review_path(data_dir: str, day: str) -> str:
+    return str(Path(data_dir) / "daily" / day / f"late_review_{day}.json")
+
+
+def write_late_review(data_dir: str, day: str, review: dict[str, Any]) -> dict[str, Any]:
+    """按日累积人工审核记录，并以原子替换保证文件完整。"""
+    day = _require_day(day, "date")
+    required = ("reviewer", "reviewed_at", "candidate_id", "payload_hash", "verdict", "comment")
+    if any(not review.get(field) for field in required):
+        return {"status": "invalid", "reason": "missing_review_field"}
+    if review.get("verdict") not in {"approved", "rejected"}:
+        return {"status": "invalid", "reason": "invalid_verdict"}
+    if not isinstance(review.get("payload_hash"), str) or len(review["payload_hash"]) != 64:
+        return {"status": "invalid", "reason": "invalid_payload_hash"}
+    reviewed_at = review["reviewed_at"]
+    if isinstance(reviewed_at, datetime):
+        if reviewed_at.tzinfo is None or reviewed_at.utcoffset() is None:
+            return {"status": "invalid", "reason": "reviewed_at_missing_timezone"}
+        reviewed_at = reviewed_at.astimezone(SHANGHAI).isoformat()
+    if not isinstance(reviewed_at, str):
+        return {"status": "invalid", "reason": "invalid_reviewed_at"}
+    item = {**review, "reviewed_at": reviewed_at}
+    path = _late_review_path(data_dir, day)
+    try:
+        with _LATE_SIGNAL_LOCK:
+            try:
+                current = json.loads(Path(path).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                current = {"schema_version": 1, "date": day, "reviews": []}
+            if not isinstance(current, dict) or current.get("date") != day or not isinstance(current.get("reviews"), list):
+                raise ValueError("late review archive schema invalid")
+            current["reviews"].append(item)
+            atomic_write_json(path, current)
+        result = {"status": "recorded", "path": path, "candidate_id": item["candidate_id"]}
+        _record_freeze_event("late_review_recorded", {"date": day, **result, "verdict": item["verdict"]})
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
+        _record_freeze_event("late_review_failed", {"date": day, **result})
+        return result
+
+
+def approved_late_candidate(data_dir: str, day: str) -> dict[str, Any] | None:
+    """仅当全部迟到候选均被完整批准且载荷哈希精确匹配时返回次日候选。"""
+    day = _require_day(day, "date")
+    try:
+        late = json.loads(Path(_late_signal_path(data_dir, day)).read_text(encoding="utf-8"))
+        reviews = json.loads(Path(_late_review_path(data_dir, day)).read_text(encoding="utf-8"))
+        items = late.get("items") if isinstance(late, dict) else None
+        review_items = reviews.get("reviews") if isinstance(reviews, dict) else None
+        if not items or not isinstance(review_items, list) or len(review_items) != len(items):
+            return None
+        by_id = {r.get("candidate_id"): r for r in review_items}
+        approved: list[dict[str, Any]] = []
+        for item in items:
+            review = by_id.get(item.get("candidate_id"))
+            if (not review or review.get("verdict") != "approved"
+                    or review.get("payload_hash") != item.get("payload_hash")):
+                _record_freeze_event("late_review_rejected", {
+                    "date": day, "candidate_id": item.get("candidate_id"),
+                    "reason": "partial_or_payload_hash_mismatch",
+                })
+                return None
+            candidate = item.get("candidate")
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("targets"), list):
+                return None
+            approved.append(candidate)
+        targets = [target for candidate in approved for target in candidate["targets"]]
+        return {"consume_day": day, "targets": targets, "items": items}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def cleanup_freeze_artifacts(
+    data_dir: str, trading_days: list[str] | None, keep_days: int = 90,
+) -> dict[str, Any]:
+    """只清理冻结专属文件；缺日历、最新快照无效或保留参数非法均不删除。"""
+    if not trading_days or keep_days <= 0 or len(trading_days) <= keep_days:
+        return {"deleted": 0, "reason": "calendar_missing_or_nothing_expired"}
+    try:
+        days = [_require_day(day, "trading_day") for day in trading_days]
+    except ValueError:
+        return {"deleted": 0, "reason": "invalid_calendar"}
+    latest = days[-1]
+    if read_snapshot(data_dir, latest).get("status") != "ready":
+        return {"deleted": 0, "reason": "latest_snapshot_not_verified"}
+    expired = days[:-keep_days]
+    names = (
+        "signal_snapshot_{day}.json",
+        "late_signals_{day}.json",
+        "late_review_{day}.json",
+    )
+    deleted: list[str] = []
+    for day in expired:
+        for pattern in names:
+            path = Path(data_dir) / "daily" / day / pattern.format(day=day)
+            try:
+                if path.is_file():
+                    path.unlink()
+                    deleted.append(str(path))
+            except OSError:
+                continue
+    _record_freeze_event("freeze_artifact_cleanup", {
+        "latest": latest, "keep_days": keep_days, "deleted": len(deleted),
+    })
+    return {"deleted": len(deleted), "paths": deleted, "reason": "ok"}
