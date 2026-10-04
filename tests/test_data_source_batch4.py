@@ -10,6 +10,7 @@ from src.data_sources.commit import (
     CommitResult,
     ProbeResult,
     commit_staged,
+    reconcile_staged,
 )
 from src.data_sources.metadata import build_metadata, deserialize_metadata
 from src.data_sources.staging import (
@@ -88,15 +89,20 @@ def test_hash_is_stable_for_repeated_serialization() -> None:
     assert content_hash(batch) == content_hash(batch)
 
 
-def _metadata_for(batch: list[dict[str, object]]) -> dict[str, object]:
+def _metadata_for(
+    batch: list[dict[str, object]],
+    *,
+    input_hash: str = "a" * 64,
+    retrieved_at: str = "2026-10-04T12:00:00Z",
+) -> dict[str, object]:
     return build_metadata(
         source="baostock",
         source_tier="backup",
         trade_day=str(batch[0]["trade_day"]),
         coverage=1.0,
-        retrieved_at="2026-10-04T12:00:00Z",
+        retrieved_at=retrieved_at,
         quality="passed",
-        input_hash="a" * 64,
+        input_hash=input_hash,
         execution_allowed=False,
         ingest_status="staged",
     )
@@ -280,3 +286,99 @@ def test_commit_exact_probe_match_is_idempotent_without_second_sink_call(tmp_pat
 
     assert outcome["status"] == "committed"
     assert len(second_sink.calls) == 0
+
+
+def test_reconcile_exact_probe_match_commits_orphaned_staging(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    probe = _FakeProbe(ProbeResult(True, len(batch), content_hash(batch)))
+
+    outcome = reconcile_staged(tmp_path, result["batch_id"], probe)
+
+    assert outcome["outcome"] == "committed"
+    assert outcome["content_hash"] == content_hash(batch)
+    assert result["manifest_path"].exists()
+    metadata = deserialize_metadata(result["metadata_path"].read_text(encoding="utf-8"))
+    assert metadata["ingest_status"].value == "committed"
+
+
+def test_reconcile_row_count_or_hash_mismatch_remains_staged(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    probe = _FakeProbe(ProbeResult(True, len(batch) + 1, content_hash(batch)))
+
+    outcome = reconcile_staged(tmp_path, result["batch_id"], probe)
+
+    assert outcome["outcome"] == "occupied_unknown"
+    assert not result["manifest_path"].exists()
+    assert deserialize_metadata(result["metadata_path"].read_text(encoding="utf-8"))["ingest_status"].value == "staged"
+
+
+def test_reconcile_without_existing_data_remains_staged(tmp_path) -> None:
+    result, _ = _stage_for_commit(tmp_path)
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+
+    outcome = reconcile_staged(tmp_path, result["batch_id"], probe)
+
+    assert outcome["outcome"] == "still_staged"
+    assert not result["manifest_path"].exists()
+
+
+def test_reconcile_same_batch_retry_is_idempotent(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    matching_probe = _FakeProbe(ProbeResult(True, len(batch), content_hash(batch)))
+
+    first = reconcile_staged(tmp_path, result["batch_id"], matching_probe)
+    second = reconcile_staged(tmp_path, result["batch_id"], matching_probe)
+
+    assert first["outcome"] == "committed"
+    assert second["outcome"] == "committed"
+    assert result["manifest_path"].exists()
+
+
+def test_reconcile_round_trip_probe_hash_matches_staged_batch(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    stored: list[dict[str, object]] = []
+
+    class RoundTripProbe:
+        def probe(self, trade_day: str, symbols: list[str]) -> ProbeResult:
+            stored.extend(load_staged(tmp_path, result["batch_id"])[1])
+            return ProbeResult(True, len(stored), content_hash(stored))
+
+    outcome = reconcile_staged(tmp_path, result["batch_id"], RoundTripProbe())
+
+    assert outcome["outcome"] == "committed"
+
+
+def test_reconcile_lock_is_released_after_sink_exception(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+
+    class RaisingSink:
+        def commit(self, staged_batch):
+            raise RuntimeError("simulated sink crash")
+
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+    first = commit_staged(tmp_path, result["batch_id"], RaisingSink(), probe)
+    assert first["status"] == "unknown"
+
+    second_sink = _FakeSink(CommitResult("committed", len(batch)))
+    second = commit_staged(tmp_path, result["batch_id"], second_sink, probe)
+    assert second["status"] == "committed"
+
+
+def test_reconcile_second_batch_for_same_trade_day_is_rejected(tmp_path) -> None:
+    first_batch = [_record("600000.SH")]
+    first_result = stage_batch(tmp_path, _metadata_for(first_batch), first_batch)
+    sink = _FakeSink(CommitResult("committed", 1))
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+    commit_staged(tmp_path, first_result["batch_id"], sink, probe)
+
+    second_batch = [_record("000001.SZ")]
+    second_metadata = _metadata_for(
+        second_batch,
+        input_hash="b" * 64,
+        retrieved_at="2026-10-04T13:00:00Z",
+    )
+    second_result = stage_batch(tmp_path, second_metadata, second_batch)
+    outcome = commit_staged(tmp_path, second_result["batch_id"], sink, probe)
+
+    assert outcome["status"] == "occupied_unknown"
+    assert len(sink.calls) == 1

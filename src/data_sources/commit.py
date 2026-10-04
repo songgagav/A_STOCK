@@ -324,3 +324,89 @@ def commit_staged(
         return _publish_committed(root, metadata, batch, reason="sink committed")
     finally:
         lock.release()
+
+
+def reconcile_staged(
+    root: str | Path,
+    batch_id: str,
+    probe: ContentProbe,
+) -> dict[str, Any]:
+    """Reconcile one staged batch against an authoritative content probe."""
+    metadata_file = metadata_path(root, batch_id)
+    metadata = deserialize_metadata(metadata_file.read_text(encoding="utf-8"))
+    if metadata["batch_id"] != batch_id:
+        raise ValueError("metadata batch_id does not match requested batch")
+
+    manifest_file = manifest_path(root, batch_id)
+    if metadata["ingest_status"] is IngestStatus.COMMITTED:
+        manifest = _read_manifest(manifest_file)
+        return {
+            "outcome": "committed",
+            "batch_id": batch_id,
+            "trade_day": metadata["trade_day"],
+            "row_count": int(manifest["row_count"]),
+            "content_hash": str(manifest["content_hash"]),
+            "reason": "already committed",
+        }
+    if metadata["ingest_status"] is not IngestStatus.STAGED:
+        raise ValueError("only staged metadata can be reconciled")
+
+    _, batch = load_staged(root, batch_id)
+    trade_day = metadata["trade_day"]
+    batch_hash = content_hash(batch)
+    row_count = len(batch)
+    lock = _day_lock(trade_day)
+    lock.acquire()
+    try:
+        conflict = _same_day_conflict(root, trade_day, batch_id)
+        if conflict is not None:
+            return {
+                "outcome": "occupied_unknown",
+                "batch_id": batch_id,
+                "trade_day": trade_day,
+                "row_count": row_count,
+                "content_hash": batch_hash,
+                "reason": conflict,
+            }
+
+        symbols = sorted({str(record["symbol"]) for record in batch})
+        probe_result = probe.probe(trade_day, symbols)
+        if not probe_result.exists:
+            return {
+                "outcome": "still_staged",
+                "batch_id": batch_id,
+                "trade_day": trade_day,
+                "row_count": row_count,
+                "content_hash": batch_hash,
+                "reason": "probe found no committed data",
+            }
+        if (
+            probe_result.row_count != row_count
+            or probe_result.content_hash != batch_hash
+        ):
+            return {
+                "outcome": "occupied_unknown",
+                "batch_id": batch_id,
+                "trade_day": trade_day,
+                "row_count": row_count,
+                "content_hash": batch_hash,
+                "reason": "probe found unmatched existing data",
+            }
+
+        published = _publish_committed(
+            root,
+            metadata,
+            batch,
+            reason="probe matched staged batch",
+        )
+        return {
+            "outcome": "committed" if published["status"] == "committed" else "still_staged",
+            "batch_id": batch_id,
+            "trade_day": trade_day,
+            "row_count": row_count,
+            "content_hash": batch_hash,
+            "reason": published["reason"],
+            **({"error": published["error"]} if "error" in published else {}),
+        }
+    finally:
+        lock.release()
