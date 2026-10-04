@@ -117,15 +117,17 @@ def _default_writer(frame: pd.DataFrame) -> Mapping[str, Any]:
 
     try:
         import bars_ingest
-
-        result = bars_ingest.write_bars(
-            frame,
-            "stockdb_sdk",  # frame is already canonical/h5i-shaped
-            dry_run=False,
-            min_rows_per_day=0,
-        )
-    except Exception as exc:  # noqa: BLE001 - sink caller records unknown outcome
+    except Exception as exc:  # noqa: BLE001 - local writer module is required
         raise H5IUnavailableError(f"h5i write path unavailable: {exc}") from exc
+
+    # Do not catch exceptions from this call: an append may have succeeded for
+    # an earlier chunk before a later chunk failed, which must remain unknown.
+    result = bars_ingest.write_bars(
+        frame,
+        "stockdb_sdk",  # frame is already canonical/h5i-shaped
+        dry_run=False,
+        min_rows_per_day=0,
+    )
 
     if not result.get("ok"):
         return result
@@ -165,7 +167,8 @@ class H5ICommitSink:
 
         appended = int(result.get("appended") or 0)
         if not result.get("ok"):
-            return CommitResult("failed", appended, str(result.get("error") or "h5i write failed"))
+            status = "unknown" if appended else "failed"
+            return CommitResult(status, appended, str(result.get("error") or "h5i write failed"))
         if appended != len(frame):
             return CommitResult(
                 "unknown",

@@ -117,6 +117,15 @@ def test_h5i_sink_maps_writer_failure_and_exception_explicitly() -> None:
     assert "lost connection" in (unknown.error or "")
 
 
+def test_h5i_sink_keeps_partial_write_as_unknown_for_reconciliation() -> None:
+    result = H5ICommitSink(
+        writer=lambda _frame: {"ok": False, "appended": 1, "error": "append interrupted"}
+    ).commit(_batch())
+
+    assert result.status == "unknown"
+    assert result.row_count == 1
+
+
 def test_h5i_probe_round_trip_uses_canonical_hash_and_closes_database() -> None:
     batch = _batch()
     db = _FakeDB(_h5i_frame(batch))
