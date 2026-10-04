@@ -2,6 +2,7 @@
 
 from .adapters import CanonicalBatch, CanonicalRecord, DataSourceAdapter, RawBatch, RawRecord
 from .batch_hash import canonical_serialize, content_hash
+from .commit import CommitResult, CommitSink, ContentProbe, ProbeResult, commit_staged
 from .metadata import (
     IngestStatus,
     QualityStatus,
@@ -21,6 +22,9 @@ __all__ = [
     "SourceTier",
     "CanonicalBatch",
     "CanonicalRecord",
+    "CommitResult",
+    "CommitSink",
+    "ContentProbe",
     "DataSourceAdapter",
     "QualityReport",
     "RawBatch",
@@ -36,6 +40,8 @@ __all__ = [
     "manifest_path",
     "metadata_path",
     "serialize_metadata",
+    "ProbeResult",
+    "commit_staged",
     "stage_batch",
     "staging_path",
     "transition_status",

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
 
 from src.data_sources.batch_hash import canonical_serialize, content_hash
-from src.data_sources.metadata import build_metadata
+from src.data_sources.commit import (
+    CommitResult,
+    ProbeResult,
+    commit_staged,
+)
+from src.data_sources.metadata import build_metadata, deserialize_metadata
 from src.data_sources.staging import (
     load_staged,
     manifest_path,
@@ -161,3 +167,116 @@ def test_staging_failure_leaves_no_final_file_or_metadata(tmp_path, monkeypatch)
     batch_id = metadata["batch_id"]
     assert not staging_path(tmp_path, batch_id).exists()
     assert not metadata_path(tmp_path, batch_id).exists()
+
+
+class _FakeSink:
+    def __init__(self, result: CommitResult) -> None:
+        self.result = result
+        self.calls: list[list[dict[str, object]]] = []
+
+    def commit(self, batch):
+        self.calls.append(batch)
+        return self.result
+
+
+class _FakeProbe:
+    def __init__(self, result: ProbeResult) -> None:
+        self.result = result
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def probe(self, trade_day: str, symbols: list[str]) -> ProbeResult:
+        self.calls.append((trade_day, symbols))
+        return self.result
+
+
+def _stage_for_commit(tmp_path, batch=None):
+    batch = batch or [_record("600000.SH"), _record("000001.SZ", close=12.5)]
+    result = stage_batch(tmp_path, _metadata_for(batch), batch)
+    return result, batch
+
+
+def test_commit_success_publishes_self_contained_manifest(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    sink = _FakeSink(CommitResult("committed", len(batch)))
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+
+    outcome = commit_staged(tmp_path, result["batch_id"], sink, probe)
+
+    manifest = json.loads(result["manifest_path"].read_text(encoding="utf-8"))
+    assert outcome["status"] == "committed"
+    assert manifest["batch_id"] == result["batch_id"]
+    assert manifest["trade_day"] == "2026-09-30"
+    assert manifest["source_tier"] == "backup"
+    assert manifest["row_count"] == len(batch)
+    assert manifest["content_hash"] == content_hash(batch)
+    assert deserialize_metadata(result["metadata_path"].read_text(encoding="utf-8"))["ingest_status"].value == "committed"
+    assert len(sink.calls) == 1
+    assert probe.calls == [("2026-09-30", ["000001.SZ", "600000.SH"])]
+
+
+def test_commit_failure_transitions_metadata_without_manifest(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    sink = _FakeSink(CommitResult("failed", 0, "write rejected"))
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+
+    outcome = commit_staged(tmp_path, result["batch_id"], sink, probe)
+
+    assert outcome["status"] == "failed"
+    assert outcome["error"] == "write rejected"
+    assert not result["manifest_path"].exists()
+    metadata = deserialize_metadata(result["metadata_path"].read_text(encoding="utf-8"))
+    assert metadata["ingest_status"].value == "failed"
+
+
+def test_commit_unknown_keeps_metadata_staged_and_no_manifest(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    sink = _FakeSink(CommitResult("unknown", len(batch), "connection lost after write"))
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+
+    outcome = commit_staged(tmp_path, result["batch_id"], sink, probe)
+
+    assert outcome["status"] == "unknown"
+    assert not result["manifest_path"].exists()
+    metadata = deserialize_metadata(result["metadata_path"].read_text(encoding="utf-8"))
+    assert metadata["ingest_status"].value == "staged"
+
+
+def test_commit_does_not_publish_manifest_before_sink_success(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+
+    class InspectingSink(_FakeSink):
+        def commit(self, staged_batch):
+            assert not result["manifest_path"].exists()
+            return super().commit(staged_batch)
+
+    sink = InspectingSink(CommitResult("committed", len(batch)))
+    probe = _FakeProbe(ProbeResult(False, 0, None))
+
+    commit_staged(tmp_path, result["batch_id"], sink, probe)
+    assert result["manifest_path"].exists()
+
+
+def test_commit_blocks_existing_unmatched_h5i_data(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    sink = _FakeSink(CommitResult("committed", len(batch)))
+    probe = _FakeProbe(ProbeResult(True, 1, "b" * 64))
+
+    outcome = commit_staged(tmp_path, result["batch_id"], sink, probe)
+
+    assert outcome["status"] == "occupied_unknown"
+    assert len(sink.calls) == 0
+    assert not result["manifest_path"].exists()
+
+
+def test_commit_exact_probe_match_is_idempotent_without_second_sink_call(tmp_path) -> None:
+    result, batch = _stage_for_commit(tmp_path)
+    sink = _FakeSink(CommitResult("committed", len(batch)))
+    first_probe = _FakeProbe(ProbeResult(False, 0, None))
+    commit_staged(tmp_path, result["batch_id"], sink, first_probe)
+
+    second_sink = _FakeSink(CommitResult("committed", len(batch)))
+    matching_probe = _FakeProbe(ProbeResult(True, len(batch), content_hash(batch)))
+    outcome = commit_staged(tmp_path, result["batch_id"], second_sink, matching_probe)
+
+    assert outcome["status"] == "committed"
+    assert len(second_sink.calls) == 0
