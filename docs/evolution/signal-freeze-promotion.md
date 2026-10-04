@@ -38,7 +38,7 @@ observation window; investigate and record the difference first.
 
 | Trading day | Snapshot status/hash | Late candidates | Differences | Classification(s) | Reviewer | Evidence path | Notes |
 |---|---|---:|---:|---|---|---|---|
-| YYYY-MM-DD |  |  |  |  |  |  |  |
+| 2026-10-08 |  |  |  |  |  |  |  |
 | YYYY-MM-DD |  |  |  |  |  |  |  |
 | YYYY-MM-DD |  |  |  |  |  |  |  |
 | YYYY-MM-DD |  |  |  |  |  |  |  |
