@@ -22,6 +22,7 @@ from .metadata import (
 from .normalize import normalize_baostock, normalize_baostock_batch
 from .quality import QualityReport, check_quality
 from .staging import load_staged, manifest_path, metadata_path, stage_batch, staging_path
+from .h5i import H5ICommitSink, H5IContentProbe, H5IUnavailableError
 
 __all__ = [
     "IngestStatus",
@@ -53,4 +54,7 @@ __all__ = [
     "stage_batch",
     "staging_path",
     "transition_status",
+    "H5ICommitSink",
+    "H5IContentProbe",
+    "H5IUnavailableError",
 ]
