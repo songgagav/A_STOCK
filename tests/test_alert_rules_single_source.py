@@ -34,8 +34,18 @@ import os
 import pytest
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-#: 仓库**外层**目录(obs-stack 与 A_stock_rotation 平级)
-_OUTER = os.path.dirname(_REPO)
+#: 仓库**外层**目录(obs-stack 与 A_stock_rotation 平级)。
+#: linked worktree 的父目录是 `.worktrees` 容器，不是部署外层；此时回到
+#: 共同主 checkout，再取其父目录，并在扫描时排除两个 checkout 根。
+_REPO_PARENT = os.path.dirname(_REPO)
+if os.path.basename(os.path.normpath(_REPO_PARENT)).lower() == ".worktrees":
+    _MAIN_REPO = os.path.dirname(_REPO_PARENT)
+else:
+    _MAIN_REPO = _REPO
+_OUTER = os.path.dirname(_MAIN_REPO)
+_CHECKOUT_ROOTS = tuple(
+    os.path.abspath(path).lower() for path in {_MAIN_REPO, _REPO_PARENT, _REPO}
+)
 _PROM_YML = os.path.join(_OUTER, "obs-stack", "prometheus.yml")
 
 #: 用 `find_spec` 而不是 `import yaml`: 这样**不需要 yaml 的那条用例仍会真跑**。
@@ -101,7 +111,9 @@ class TestSingleSourceOfTruthForAlertRules:
         """
         found = []
         for dp, dns, fns in os.walk(_REPO):
-            dns[:] = [d for d in dns if d not in ("__pycache__", ".git", "_merge_workspace")]
+            dns[:] = [d for d in dns if d not in (
+                "__pycache__", ".git", "_merge_workspace", ".worktrees"
+            )]
             for fn in fns:
                 if fn == "alert_rules.yml":
                     found.append(os.path.relpath(os.path.join(dp, fn), _REPO))
@@ -326,7 +338,11 @@ class TestSingleSourceOfTruthForAlertRules:
             dns[:] = [d for d in dns if d not in ("__pycache__", ".git", "node_modules")]
             # 仓内那份是**唯一合法**的; 其它 git checkout 副本(_merge_workspace)不算陷阱,
             # 因为它们不在 Prometheus 的搜索路径上 —— 但 obs-stack 下必须是空的。
-            if os.path.abspath(dp).lower().startswith(os.path.abspath(_REPO).lower()):
+            normalized_dp = os.path.abspath(dp).lower()
+            if any(
+                normalized_dp == root or normalized_dp.startswith(root + os.sep)
+                for root in _CHECKOUT_ROOTS
+            ):
                 continue
             for fn in fns:
                 if fn != "alert_rules.yml":
