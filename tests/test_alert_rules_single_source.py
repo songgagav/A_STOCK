@@ -368,7 +368,10 @@ class TestPrometheusActuallyReadsIt:
         d = yaml.safe_load(open(_PROM_YML, encoding="utf-8"))
         files = d.get("rule_files") or []
         assert files, "prometheus.yml 没有任何 rule_files => 一条告警都不会加载"
-        canonical = os.path.join(_REPO, "ops", "alert_rules.yml").replace("\\", "/").lower()
+        # The external Prometheus deployment points at the shared main
+        # checkout when this test runs from a linked worktree. In a normal
+        # checkout _MAIN_REPO and _REPO are identical.
+        canonical = os.path.join(_MAIN_REPO, "ops", "alert_rules.yml").replace("\\", "/").lower()
         hits = [f for f in files
                 if str(f).replace("\\", "/").lower() == canonical]
         assert hits, (
