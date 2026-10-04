@@ -49,9 +49,12 @@ H5IContentProbe.probe(trade_day, symbols) -> ProbeResult
 - `h5i`: `ready | unavailable`、路径和错误；
 - `sources`: 按 source、source tier 的批次数；
 - `batches`: ingest status 汇总、最近批次、无效 metadata 数；
+- `manifests` / `consistency`: manifest 数量、无效 manifest，以及 committed 与旁路
+  metadata 不一致的计数；
 - `staging.count`: 当前 JSONL staging 文件数。
 
-缺少 `h5i_db` 或数据库路径不可打开时，整体为 `blocked`，但 API 仍返回 HTTP 200
+缺少 `h5i_db` 或数据库路径不可打开时，整体为 `blocked`；旁路对账不一致时为
+`degraded`，但 API 仍返回 HTTP 200
 和结构化错误，避免看板空白或假绿。该状态只用于运维展示，不授予交易权限，
 不改变 signal snapshot、PaperBook 或 Phase E 行为。
 

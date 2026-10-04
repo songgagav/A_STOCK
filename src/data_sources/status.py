@@ -11,7 +11,7 @@ from typing import Any
 
 from .h5i import H5IUnavailableError, _default_db_factory, _default_h5i_path
 from .metadata import deserialize_metadata
-from .staging import _METADATA_RELATIVE, _STAGING_RELATIVE
+from .staging import _MANIFEST_RELATIVE, _METADATA_RELATIVE, _STAGING_RELATIVE
 
 
 def check_h5i(*, path: str | Path | None = None) -> dict[str, Any]:
@@ -62,6 +62,24 @@ def _load_metadata(root: Path) -> tuple[list[dict[str, Any]], int]:
     return records, invalid
 
 
+def _load_manifests(root: Path) -> tuple[dict[str, dict[str, Any]], int]:
+    records: dict[str, dict[str, Any]] = {}
+    invalid = 0
+    directory = root / _MANIFEST_RELATIVE
+    if not directory.exists():
+        return records, invalid
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not isinstance(raw.get("batch_id"), str):
+                raise ValueError("manifest must contain batch_id")
+        except Exception:  # noqa: BLE001 - preserve invalid artifacts in the report
+            invalid += 1
+            continue
+        records[raw["batch_id"]] = raw
+    return records, invalid
+
+
 def read_data_source_status(
     root: str | Path,
     *,
@@ -75,6 +93,7 @@ def read_data_source_status(
     """
     repo_root = Path(root).resolve()
     records, invalid = _load_metadata(repo_root)
+    manifests, invalid_manifests = _load_manifests(repo_root)
     checker = h5i_check or check_h5i
     try:
         h5i = dict(checker())
@@ -96,9 +115,36 @@ def read_data_source_status(
     staging_dir = repo_root / _STAGING_RELATIVE
     staging_count = len(list(staging_dir.glob("*.jsonl"))) if staging_dir.exists() else 0
 
+    metadata_by_id = {item["batch_id"]: item for item in records}
+    committed_missing_manifest = sum(
+        1
+        for item in records
+        if item["ingest_status"] == "committed" and item["batch_id"] not in manifests
+    )
+    manifest_missing_metadata = sum(
+        1 for batch_id in manifests if batch_id not in metadata_by_id
+    )
+    manifest_for_noncommitted = sum(
+        1
+        for batch_id in manifests
+        if batch_id in metadata_by_id and metadata_by_id[batch_id]["ingest_status"] != "committed"
+    )
+    consistency = {
+        "committed_missing_manifest": committed_missing_manifest,
+        "manifest_missing_metadata": manifest_missing_metadata,
+        "manifest_for_noncommitted": manifest_for_noncommitted,
+    }
+    inconsistent = sum(consistency.values())
+
     if not h5i.get("available"):
         overall = "blocked"
-    elif invalid or staged_count or any(item["ingest_status"] == "failed" for item in records):
+    elif (
+        invalid
+        or invalid_manifests
+        or staged_count
+        or inconsistent
+        or any(item["ingest_status"] == "failed" for item in records)
+    ):
         overall = "degraded"
     else:
         overall = "ok"
@@ -119,6 +165,8 @@ def read_data_source_status(
             "latest": latest,
             "recent": sorted(records, key=lambda item: item["retrieved_at"], reverse=True)[:20],
         },
+        "manifests": {"total": len(manifests), "invalid": invalid_manifests},
+        "consistency": consistency,
         "staging": {"count": staging_count},
     }
 

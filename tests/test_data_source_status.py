@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from src.data_sources.metadata import build_metadata, serialize_metadata
-from src.data_sources.staging import metadata_path, stage_batch
+from src.data_sources.staging import manifest_path, metadata_path, stage_batch
 from src.data_sources.status import read_data_source_status
 
 
@@ -62,6 +62,9 @@ def test_status_reports_ready_when_h5i_is_available_and_all_committed(tmp_path) 
     path = metadata_path(tmp_path, metadata["batch_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_metadata({**metadata, "ingest_status": "committed"}), encoding="utf-8")
+    manifest = manifest_path(tmp_path, metadata["batch_id"])
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"batch_id": metadata["batch_id"]}), encoding="utf-8")
 
     result = read_data_source_status(
         tmp_path,
@@ -87,3 +90,22 @@ def test_status_counts_invalid_metadata_without_hiding_it(tmp_path) -> None:
     assert result["status"] == "degraded"
     assert result["batches"]["invalid"] == 1
     assert result["batches"]["by_ingest_status"] == {}
+
+
+def test_status_detects_manifest_metadata_inconsistency(tmp_path) -> None:
+    metadata = _metadata(status="staged")
+    stage_batch(tmp_path, metadata, _batch())
+    manifest = manifest_path(tmp_path, metadata["batch_id"])
+    manifest.write_text(
+        json.dumps({"batch_id": metadata["batch_id"], "trade_day": "2026-09-30"}),
+        encoding="utf-8",
+    )
+
+    result = read_data_source_status(
+        tmp_path,
+        h5i_check=lambda: {"available": True, "path": "fake", "error": None},
+    )
+
+    assert result["status"] == "degraded"
+    assert result["manifests"]["total"] == 1
+    assert result["consistency"]["manifest_for_noncommitted"] == 1

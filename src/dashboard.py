@@ -5969,7 +5969,7 @@ function dbmonRender(d){
 function sourceHealthRender(d){
   const box=document.getElementById('sourceHealthBody');
   if(!box) return;
-  const h=d.h5i||{}, batches=d.batches||{}, sources=d.sources||{};
+  const h=d.h5i||{}, batches=d.batches||{}, sources=d.sources||{}, manifests=d.manifests||{}, consistency=d.consistency||{};
   const status=d.status||'unknown';
   const color=status==='ok'?'#3dd68c':(status==='blocked'?'#ff6b6b':'#f0b400');
   const hLabel=h.status==='ready'?'ready':'unavailable';
@@ -5978,6 +5978,7 @@ function sourceHealthRender(d){
     +'<span class="muted">h5i: <b style="color:'+color+'">'+esc(hLabel)+'</b></span>'
     +'<span class="muted">staging: '+fmt((d.staging||{}).count,0)+'</span>'
     +'<span class="muted">批次: '+fmt(batches.total,0)+'</span>'
+    +'<span class="muted">manifest: '+fmt(manifests.total,0)+'</span>'
     +'</div>';
   if(h.error) html+='<div style="color:#ff6b6b;font-size:12px;margin-bottom:6px">h5i 数据源不可用: '+esc(h.error)+'</div>';
   const tier=sources.by_tier||{}, src=sources.by_source||{}, ingest=batches.by_ingest_status||{};
@@ -5986,6 +5987,8 @@ function sourceHealthRender(d){
     +'<span>来源: '+esc(Object.entries(src).map(([k,v])=>k+' '+v).join(' · ')||'—')+'</span>'
     +'<span>入库: '+esc(Object.entries(ingest).map(([k,v])=>k+' '+v).join(' · ')||'—')+'</span>'
     +'</div>';
+  const mismatch=Object.values(consistency).reduce((a,v)=>a+Number(v||0),0);
+  if(mismatch) html+='<div style="color:#ff6b6b;font-size:12px;margin-top:6px">旁路一致性异常: '+fmt(mismatch,0)+' 项，请停止自动提交并人工对账</div>';
   if(batches.invalid) html+='<div style="color:#ff6b6b;font-size:12px;margin-top:6px">无效 metadata: '+fmt(batches.invalid,0)+' 个</div>';
   if(batches.latest) html+='<div class="muted" style="font-size:11px;margin-top:6px">最近批次: '+esc(batches.latest.batch_id)+' · '+esc(batches.latest.trade_day)+' · '+esc(batches.latest.ingest_status)+'</div>';
   box.innerHTML=html;
