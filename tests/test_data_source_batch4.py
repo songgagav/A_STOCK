@@ -121,6 +121,17 @@ def test_staging_writes_one_canonical_jsonl_record_per_line(tmp_path) -> None:
     assert result["content_hash"] == content_hash(batch)
 
 
+def test_staging_round_trip_preserves_canonical_numeric_types(tmp_path) -> None:
+    batch = [_record("600000.SH", close=7.32)]
+
+    result = stage_batch(tmp_path, _metadata_for(batch), batch)
+    _, loaded_batch = load_staged(tmp_path, result["batch_id"])
+
+    assert loaded_batch[0]["close"] == 7.32
+    assert isinstance(loaded_batch[0]["close"], float)
+    assert isinstance(loaded_batch[0]["volume"], int)
+
+
 def test_staging_creates_metadata_only_after_staging_succeeds(tmp_path) -> None:
     batch = [_record("600000.SH")]
 

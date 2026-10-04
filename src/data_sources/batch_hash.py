@@ -5,7 +5,6 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
-import math
 from typing import Any
 
 from .adapters import CanonicalBatch, CanonicalRecord

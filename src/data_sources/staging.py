@@ -67,12 +67,35 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _jsonl_for_batch(batch: CanonicalBatch) -> str:
-    # canonical_serialize validates and normalizes all hash fields before the
-    # records are persisted. The JSONL retains canonical record types for the
-    # later injected sink while excluding non-canonical metadata fields.
-    canonical_records = json.loads(canonical_serialize(batch))
+    # canonical_serialize validates the hash fields before persistence. Keep
+    # the canonical numeric types in JSONL for the later injected sink while
+    # excluding non-canonical metadata fields; hash normalization remains the
+    # responsibility of canonical_serialize/content_hash.
+    canonical_records = [
+        {
+            field: record[field]
+            for field in (
+                "symbol",
+                "trade_day",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "adj_factor",
+            )
+        }
+        for record in sorted(batch, key=lambda item: (item["trade_day"], item["symbol"]))
+    ]
     return "".join(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
         for record in canonical_records
     )
 
