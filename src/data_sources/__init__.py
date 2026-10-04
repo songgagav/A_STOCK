@@ -1,6 +1,7 @@
 """Data-source routing and pure ingestion-boundary primitives."""
 
 from .adapters import CanonicalBatch, CanonicalRecord, DataSourceAdapter, RawBatch, RawRecord
+from .batch_hash import canonical_serialize, content_hash
 from .metadata import (
     IngestStatus,
     QualityStatus,
@@ -24,7 +25,9 @@ __all__ = [
     "RawBatch",
     "RawRecord",
     "build_metadata",
+    "canonical_serialize",
     "check_quality",
+    "content_hash",
     "deserialize_metadata",
     "normalize_baostock",
     "normalize_baostock_batch",
