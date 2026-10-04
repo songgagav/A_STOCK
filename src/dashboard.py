@@ -1546,6 +1546,29 @@ def read_health():
         return {"ok": False, "error": str(e)}
 
 
+def read_data_source_health():
+    """Read-only data-source router status for the DB monitor panel.
+
+    The status collector deliberately keeps the dashboard available when the
+    optional h5i runtime is missing; its payload says ``blocked`` explicitly
+    instead of presenting an empty data table as a healthy result.
+    """
+    try:
+        from data_sources.status import read_data_source_status
+
+        return read_data_source_status(_BASE)
+    except Exception as exc:  # noqa: BLE001 - UI health endpoint must stay up
+        return {
+            "ok": True,
+            "status": "blocked",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "h5i": {"available": False, "status": "unavailable", "error": str(exc)},
+            "sources": {"by_source": {}, "by_tier": {}},
+            "batches": {"total": 0, "invalid": 0, "by_ingest_status": {}, "latest": None, "recent": []},
+            "staging": {"count": 0},
+        }
+
+
 #: 漏洞清单单一事实源 (committed; 由 scripts/render_vulnerability_register.py 渲染成 md)
 ACCEPTANCE_FP = os.path.join(_BASE, "ops", "acceptance_status.json")
 
@@ -3182,6 +3205,8 @@ class Handler(BaseHTTPRequestHandler):
             # 而前端 renderHealth 期望 {level,summary,checks[]} ⇒ 卡片渲染成
             # "OK + 空表"。现统一走 read_health_merged()(运行期 + 盘前 + 阻塞项)。
             return self._json(read_health_merged())
+        if path == "/api/data-sources":
+            return self._json(read_data_source_health())
         if path == "/api/live":
             lv = read_live() or fallback_state()
             return self._json(lv)
@@ -4299,6 +4324,10 @@ PAGE = r"""<!DOCTYPE html>
   </div><!-- /view-dbpanel -->
 
   <div id="view-dbmon" class="tabView">
+    <div class="panel">
+      <h3>数据源路由 <span class="muted" style="font-weight:400;font-size:12px">主源/备源批次 · h5i 落盘状态 · 不触发交易</span></h3>
+      <div id="sourceHealthBody"><div class="muted">加载中...</div></div>
+    </div>
     <div class="panel">
       <h3>数据库监控 <span class="muted" style="font-weight:400;font-size:12px">h5i 表统计 · 质量指标 · 趋势快照 · Celery 异步全量更新</span></h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -5937,10 +5966,39 @@ function dbmonRender(d){
     _dbmTimer=setInterval(loadDbmon,5000);
   } else if(!busy&&_dbmTimer){ clearInterval(_dbmTimer); _dbmTimer=null; }
 }
+function sourceHealthRender(d){
+  const box=document.getElementById('sourceHealthBody');
+  if(!box) return;
+  const h=d.h5i||{}, batches=d.batches||{}, sources=d.sources||{};
+  const status=d.status||'unknown';
+  const color=status==='ok'?'#3dd68c':(status==='blocked'?'#ff6b6b':'#f0b400');
+  const hLabel=h.status==='ready'?'ready':'unavailable';
+  let html='<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+    +'<span class="badge" style="color:'+color+';border-color:'+color+'">● '+esc(status.toUpperCase())+'</span>'
+    +'<span class="muted">h5i: <b style="color:'+color+'">'+esc(hLabel)+'</b></span>'
+    +'<span class="muted">staging: '+fmt((d.staging||{}).count,0)+'</span>'
+    +'<span class="muted">批次: '+fmt(batches.total,0)+'</span>'
+    +'</div>';
+  if(h.error) html+='<div style="color:#ff6b6b;font-size:12px;margin-bottom:6px">h5i 数据源不可用: '+esc(h.error)+'</div>';
+  const tier=sources.by_tier||{}, src=sources.by_source||{}, ingest=batches.by_ingest_status||{};
+  html+='<div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px">'
+    +'<span>source tier: '+esc(Object.entries(tier).map(([k,v])=>k+' '+v).join(' · ')||'—')+'</span>'
+    +'<span>来源: '+esc(Object.entries(src).map(([k,v])=>k+' '+v).join(' · ')||'—')+'</span>'
+    +'<span>入库: '+esc(Object.entries(ingest).map(([k,v])=>k+' '+v).join(' · ')||'—')+'</span>'
+    +'</div>';
+  if(batches.invalid) html+='<div style="color:#ff6b6b;font-size:12px;margin-top:6px">无效 metadata: '+fmt(batches.invalid,0)+' 个</div>';
+  if(batches.latest) html+='<div class="muted" style="font-size:11px;margin-top:6px">最近批次: '+esc(batches.latest.batch_id)+' · '+esc(batches.latest.trade_day)+' · '+esc(batches.latest.ingest_status)+'</div>';
+  box.innerHTML=html;
+}
+async function loadSourceHealth(){
+  try{ const d=await dbmFetch('/api/data-sources'); sourceHealthRender(d); }
+  catch(e){ const b=document.getElementById('sourceHealthBody'); if(b) b.innerHTML='<div style="color:#ff6b6b">状态读取失败: '+esc(String(e).slice(0,160))+'</div>'; }
+}
 async function loadDbmon(){
   try{
     const d=await dbmFetch('/api/db_stats/latest');
     if(d.ok) dbmonRender(d);
+    await loadSourceHealth();
   }catch(e){ const b=document.getElementById('dbmonTable'); if(b) b.innerHTML='<div class="muted">加载失败 '+esc(String(e).slice(0,80))+'</div>'; }
 }
 function initDbmon(){
