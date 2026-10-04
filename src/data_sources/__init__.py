@@ -13,6 +13,7 @@ from .metadata import (
 )
 from .normalize import normalize_baostock, normalize_baostock_batch
 from .quality import QualityReport, check_quality
+from .staging import load_staged, manifest_path, metadata_path, stage_batch, staging_path
 
 __all__ = [
     "IngestStatus",
@@ -31,6 +32,11 @@ __all__ = [
     "deserialize_metadata",
     "normalize_baostock",
     "normalize_baostock_batch",
+    "load_staged",
+    "manifest_path",
+    "metadata_path",
     "serialize_metadata",
+    "stage_batch",
+    "staging_path",
     "transition_status",
 ]
