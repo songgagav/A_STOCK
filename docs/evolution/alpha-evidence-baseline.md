@@ -23,6 +23,12 @@
 | `data/vnpy_backtest_nonoverlap_fwd_results.json` | `scripts/nonoverlap_rerun.py` | `window_mode=forward`，非 fallback，窗口起点不早于决策日 |
 | `data/attribution_b1.json` | `scripts/attribution_forward.py` | 至少 5 条窗口归因记录 |
 
+注意：`ic_term_structure.json` 和 `factor_ic_forward.py` 当前读取的是
+`data/pit/xsec/<day>.parquet` 中 selector 的 `signal` 字段。它不是
+`factor_fusion.cross_section_scores()` 的四因子融合分，也不是最终 selector
+`score`。三者必须分开解释，详见
+[`alpha-pipeline-reconciliation-2026-10-05.md`](alpha-pipeline-reconciliation-2026-10-05.md)。
+
 输入存在时会记录 SHA-256；输入缺失、读取失败和结构错误均保留在报告中。
 
 ## 默认门槛
