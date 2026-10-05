@@ -54,3 +54,23 @@ def test_enforce_requires_explicit_confirmation(monkeypatch, tmp_path) -> None:
     )
 
     assert result == {"status": "blocked", "reason": "enforce requires explicit confirmation"}
+
+
+def test_router_reports_missing_symbols_when_coverage_rejects_a_batch(tmp_path) -> None:
+    class _EmptyAdapter:
+        def fetch(self, trade_day: str, symbols: list[str]) -> RawBatch:
+            return RawBatch([], "2026-10-04T12:00:00Z", "mootdx")
+
+    result = run_daily_source_router(
+        tmp_path,
+        "2026-09-30",
+        symbols=["600000.SH"],
+        source_names=["mootdx"],
+        mode="shadow",
+        adapters={"mootdx": _EmptyAdapter()},
+    )
+
+    assert result["status"] == "blocked"
+    assert result["attempts"][0]["reasons"] == [
+        "coverage_below_expected:0.000000;missing_symbols=600000.SH",
+    ]

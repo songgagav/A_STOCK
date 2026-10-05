@@ -96,11 +96,23 @@ def run_daily_source_router(
                 expected_trade_day=trade_day,
             )
             if report.status is not QualityStatus.PASSED or report.coverage < 0.99:
+                reasons = list(report.reasons)
+                if report.coverage < 0.99:
+                    seen_symbols = {
+                        str(row.get("symbol"))
+                        for row in canonical
+                        if row.get("symbol") is not None
+                    }
+                    missing_symbols = sorted(set(requested_symbols) - seen_symbols)
+                    reasons.append(
+                        "coverage_below_expected:"
+                        f"{report.coverage:.6f};missing_symbols={','.join(missing_symbols)}"
+                    )
                 attempts.append({
                     "source": source,
                     "status": "rejected",
                     "coverage": report.coverage,
-                    "reasons": list(report.reasons),
+                    "reasons": reasons,
                 })
                 continue
             metadata = build_metadata(
