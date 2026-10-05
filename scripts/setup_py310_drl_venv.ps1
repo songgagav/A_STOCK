@@ -90,6 +90,8 @@ Say "安装 duckdb / polars / pytest（db.py 与 vnpy_backtest.py 的顶层依�
 & $py -m pip install duckdb polars pytest --quiet
 Say "安装 h5i-db（3.10-only 原生扩展）"
 & $py -m pip install 'h5i-db>=0.1.6' --quiet
+Say "安装 vn.py 4.4（执行 shadow 与 vnpy_backtest 运行时）"
+& $py -m pip install 'vnpy==4.4.0' --quiet
 if (-not $SkipTorch) {
   # 必须走 pytorch 的 CPU 索引: 默认 PyPI 的 torch 会拉 CUDA 版(约 2.5GB)
   Say "安装 torch (CPU wheel, 约 200MB)"
@@ -99,10 +101,10 @@ if (-not $SkipTorch) {
 }
 
 # ---------------------------------------------------------------- 4. 验收
-Say "验收: 四项依赖必须在**同一解释器**里齐备"
+Say "验收: 完整运行时依赖必须在**同一解释器**里齐备"
 & $py -c @"
 import importlib.util as u, sys
-need = ('h5i_db','torch','gymnasium','stable_baselines3')
+need = ('h5i_db','torch','gymnasium','stable_baselines3','vnpy')
 got = {m: bool(u.find_spec(m)) for m in need}
 print('  python:', '.'.join(map(str, sys.version_info[:3])))
 for k, v in got.items(): print(f'  {k} = {v}')
