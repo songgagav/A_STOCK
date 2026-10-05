@@ -95,3 +95,6 @@ python -m data_sources.reconcile `
 - staging 清理不负责人工解除 `occupied_unknown`，两者必须分开审计。
 - `src/arctic_store.py` 是兼容层，不是当前 Router/h5i 路径的必需依赖；旧退化
   消费者的替代存储收口另列任务，未完成前不得把 ArcticDB 缺包当作无退化。
+
+第 5 点以下任务的最新扫描、ArcticDB 消费者盘点和 Phase E/F 边界见
+`docs/evolution/post-point5-status-2026-10-05.md`。
