@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,9 @@ _COLUMNS = ["summary_json", "equity"]
 class FileHistoryStore:
     """Read daily history from an injected ``data/daily``-like directory."""
 
-    def __init__(self, daily_root: str | Path):
+    def __init__(self, daily_root: str | Path, ic_root: str | Path | None = None):
         self.daily_root = Path(daily_root)
+        self.ic_root = Path(ic_root) if ic_root is not None else self.daily_root.parent / "ic"
 
     def read_daily_summaries(self, days: int = 60) -> pd.DataFrame:
         """Return recent summaries with the first migration-compatible schema.
@@ -73,14 +75,110 @@ class FileHistoryStore:
         frame.index.name = "day"
         return frame[_COLUMNS]
 
+    def read_trade_records(
+        self, days: int = 30, symbol: str | None = None
+    ) -> pd.DataFrame:
+        """Read normalized paper trades from per-day ``trades.json`` files.
+
+        The adapter deliberately returns a flat, read-only view.  It does not
+        infer PnL, rewrite records, or use current market data.  Missing
+        optional fields remain null so a future consumer can compare this
+        result with ``ArcticStore.read_trades`` before cutover.
+        """
+        core = ["day", "time", "type", "canon", "qty", "price", "fee", "pnl"]
+        if days <= 0 or not self.daily_root.is_dir():
+            return pd.DataFrame(columns=core)
+
+        day_dirs = [
+            p for p in self.daily_root.iterdir()
+            if p.is_dir() and self._is_day(p.name)
+        ]
+        selected = sorted(day_dirs, key=lambda p: p.name)[-days:]
+        rows: list[dict[str, Any]] = []
+        for day_dir in selected:
+            path = day_dir / "trades.json"
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, list):
+                    raise ValueError("trades root is not a list")
+                for item in payload:
+                    if not isinstance(item, dict):
+                        _LOG.warning("skip non-object trade: %s", path)
+                        continue
+                    canon = item.get("canon") or item.get("symbol")
+                    if symbol is not None and canon != symbol:
+                        continue
+                    row = dict(item)
+                    row["day"] = self._iso_day(
+                        item.get("date") or item.get("day") or day_dir.name
+                    )
+                    row["canon"] = canon
+                    rows.append(row)
+            except Exception as exc:  # malformed artifacts remain visible in logs
+                _LOG.warning("read trades failed: %s: %s", path, exc)
+
+        if not rows:
+            return pd.DataFrame(columns=core)
+        extras = sorted({key for row in rows for key in row if key not in core and key != "date"})
+        columns = core + extras
+        frame = pd.DataFrame(rows)
+        for col in columns:
+            if col not in frame:
+                frame[col] = None
+        sort_columns = [col for col in ("day", "time", "ts") if col in frame]
+        if sort_columns:
+            frame = frame.sort_values(sort_columns, kind="stable")
+        return frame[columns].reset_index(drop=True)
+
+    def read_factor_ic(self, factor: str, days: int = 60) -> pd.DataFrame:
+        """Read a bounded factor IC curve from the existing CSV artifact.
+
+        Factor names are restricted to filename-safe identifiers before any
+        filesystem access.  The returned ``day`` column is canonicalized to
+        YYYYMMDD and rows are sorted ascending; all other CSV columns are
+        preserved for later equivalence testing.
+        """
+        if days <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]+", factor or ""):
+            if factor:
+                raise ValueError(f"invalid factor name: {factor!r}")
+            return pd.DataFrame(columns=["day"])
+        path = (self.ic_root / f"ic_curve_{factor}_k20.csv").resolve()
+        root = self.ic_root.resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            return pd.DataFrame(columns=["day"])
+        try:
+            frame = pd.read_csv(path)
+        except Exception as exc:
+            _LOG.warning("read factor IC failed: %s: %s", path, exc)
+            return pd.DataFrame(columns=["day"])
+        day_col = "day" if "day" in frame.columns else "date" if "date" in frame.columns else None
+        if day_col is None:
+            _LOG.warning("factor IC has no day/date column: %s", path)
+            return pd.DataFrame(columns=["day"])
+        if day_col != "day":
+            frame = frame.rename(columns={day_col: "day"})
+        frame["day"] = frame["day"].map(self._day_value)
+        frame = frame[frame["day"].str.len() == 8]
+        return frame.sort_values("day").tail(days).reset_index(drop=True)
+
     @staticmethod
     def _is_day(value: str) -> bool:
         return len(value) == 8 and value.isdigit()
 
     @staticmethod
-    def _day_value(value: Any, fallback: str) -> str:
+    def _day_value(value: Any, fallback: str = "") -> str:
         text = str(value or fallback).strip().replace("-", "")
         return text[:8] if len(text) >= 8 and text[:8].isdigit() else fallback
+
+    @staticmethod
+    def _iso_day(value: Any) -> str:
+        text = str(value or "").strip().replace("/", "-")
+        compact = text.replace("-", "")
+        if len(compact) >= 8 and compact[:8].isdigit():
+            return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+        return text
 
     @staticmethod
     def _equity(summary: dict[str, Any]) -> float | int | None:

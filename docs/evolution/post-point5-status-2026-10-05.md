@@ -53,6 +53,9 @@ Bandit 当前的 125 个 medium 命中全部属于 `B608`（SQL 字符串构造�
 双环境 3 项契约测试。它目前不接入任何生产消费者，属于可回滚的 M1 基础，不代表
 ArcticDB 已迁移或可以卸载。
 
+随后补充了同一适配器的 `trade_records` 与 `factor_ic` 只读视图，并覆盖日期排序、
+最近 N 日、标的过滤及因子名路径穿越防护；这些视图同样尚未切换生产消费者。
+
 ### 数据源 Router
 
 Baostock、ZZShare 的隔离 shadow 样本已完成；mootdx 因真实 bars 为空且备用服务器

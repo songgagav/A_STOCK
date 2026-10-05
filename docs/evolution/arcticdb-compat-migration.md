@@ -46,8 +46,11 @@
 
 ### M2：迁移 `trade_records` 与 `factor_ic`
 
-- 统一 `trades.json` 字段和时间排序；
-- 固化 IC CSV 的因子名、窗口、日期和版本字段；
+- 已在 dormant 文件适配器中加入只读 `trades.json` 归一化视图和
+  `ic_curve_<factor>_k20.csv` 读取视图；
+- 已加入标的过滤、最近 N 日限制、日期排序和因子名路径穿越防护测试；
+- 当前仍未接入退化检测、dashboard 或 run_daily；
+- 下一步是与 ArcticDB 做字段/排序/空结果双读对比，再逐个切换消费者；
 - 在退化计算和诊断工具中逐个切换，禁止批量替换。
 
 ### M3：补齐 `perf_report` 与 `reward_curve`
