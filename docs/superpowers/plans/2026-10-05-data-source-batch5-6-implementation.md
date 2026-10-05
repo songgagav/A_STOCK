@@ -16,7 +16,7 @@
 - [x] Batch 6 implementation and focused dashboard contract verification.
 - [x] Full regression in both interpreters (focused regression; full-suite counts recorded
   in the PR update after execution).
-- [ ] Self-review, commit, push, and update Draft PR #13.
+- [x] Self-review, commit, push, and update Draft PR #13 with the verified local baseline.
 
 ## Follow-up completion ledger
 
@@ -26,8 +26,14 @@
 - [x] Shadow mode stages only; enforce requires an explicit confirmation string.
 - [x] `occupied_unknown` creates an audit marker and has a CLI/manual resolution path.
 - [x] Staging cleanup defaults to 30 days and preserves staged/uncertain/orphaned data.
-- [ ] Real network gray run with each source: blocked until the corresponding runtime
-  dependency/credentials and a safe isolated target are available.
+- [x] Baostock: five historical trading days in isolated shadow returned
+  `shadow_staged`, coverage `1.0`.
+- [x] ZZShare: five historical trading days in isolated shadow returned
+  `shadow_staged`, coverage `1.0`.
+- [ ] mootdx: dependency is installed, but the real client returned no rows for the
+  sampled historical symbol; Router correctly returned `blocked`. Do not promote.
+- [ ] Continuous production five-day shadow observation and manual promotion remain
+  external operational work; the daemon switch stays disabled by default.
 
 ## Review focus
 

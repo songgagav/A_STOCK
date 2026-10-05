@@ -89,5 +89,9 @@ python -m data_sources.reconcile `
 
 - 真实线上灰度只能在依赖和数据源可用后由运维显式执行；本分支的自动化测试不
   伪造真实网络通过。
+- 真实验证记录见 `docs/evolution/data-source-router-shadow-2026-10-05.md`：
+  Baostock 和 ZZShare 完成了隔离历史样本，mootdx 因真实返回空数据保持 blocked。
 - `enforce` 不是默认配置，当前不接实盘。
 - staging 清理不负责人工解除 `occupied_unknown`，两者必须分开审计。
+- `src/arctic_store.py` 是兼容层，不是当前 Router/h5i 路径的必需依赖；旧退化
+  消费者的替代存储收口另列任务，未完成前不得把 ArcticDB 缺包当作无退化。

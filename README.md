@@ -157,6 +157,7 @@ A_stock_rotation/
 ├── conftest.py                        # 测试路径初始化
 ├── requirements.txt                   # 标准运行时依赖入口
 ├── requirements_314.txt               # 核心依赖
+├── requirements-data-sources.txt      # 可选：Python 3.10 数据源 shadow 依赖
 ├── requirements-dev.txt               # 测试、DRL 与观测栈依赖
 ├── requirements-lock.txt              # 锁定依赖清单
 ├── LICENSE                            # MIT 许可证
@@ -187,6 +188,23 @@ py -3.14 -m venv .venv314
 ```powershell
 .venv314\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+需要验证 Baostock、mootdx 或 ZZShare 的真实 shadow 适配器时，使用单独的
+Python 3.10 环境安装可选依赖；这不会自动启用生产 Router：
+
+```powershell
+py -3.10 -m venv .venv310
+.venv310\Scripts\python.exe -m pip install -r requirements-data-sources.txt
+```
+
+数据源 Router 默认关闭，且默认只写隔离 staging。使用说明、人工审核、
+`occupied_unknown` 和 30 日清理见
+`docs/evolution/data-source-router-operations.md`；真实 shadow 证据见
+`docs/evolution/data-source-router-shadow-2026-10-05.md`。
+
+`src/arctic_store.py` 保留为历史兼容层，不是当前 h5i 数据源 Router 的必需
+依赖。ArcticDB 的旧退化消费者仍需独立完成替代存储收口，不能把缺包状态
+当作“没有退化”。
 
 CPU 环境安装 PyTorch 时，可按本机平台参考 PyTorch 官方 wheel 源，再安装 `stable-baselines3` 和 `gymnasium`。
 

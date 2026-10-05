@@ -1,0 +1,6 @@
+# Optional Python 3.10 data-source shadow environment.
+# These packages are intentionally separate from the core runtime: the router
+# keeps their imports lazy and production scheduling remains opt-in.
+baostock==0.9.4
+mootdx==0.11.7
+zzshare==0.4.12
