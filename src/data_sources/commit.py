@@ -96,6 +96,38 @@ def _outcome(
     return result
 
 
+def _mark_occupied_unknown(root: str | Path, batch_id: str, reason: str) -> None:
+    """Persist an audit marker without importing reconcile at module load time."""
+    try:
+        from .reconcile import mark_occupied_unknown
+
+        mark_occupied_unknown(root, batch_id, reason=reason)
+    except Exception:
+        # The original outcome remains visible to the caller; a missing audit
+        # sidecar must never turn an h5i write result into a false success.
+        return
+
+
+def _occupied_outcome(
+    root: str | Path,
+    *,
+    batch_id: str,
+    trade_day: str,
+    row_count: int,
+    batch_hash: str,
+    reason: str,
+) -> dict[str, Any]:
+    _mark_occupied_unknown(root, batch_id, reason)
+    return _outcome(
+        status="occupied_unknown",
+        batch_id=batch_id,
+        trade_day=trade_day,
+        row_count=row_count,
+        batch_hash=batch_hash,
+        reason=reason,
+    )
+
+
 def _read_manifest(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -157,8 +189,8 @@ def _publish_committed(
             "content_hash": batch_hash,
         }
         if any(manifest.get(key) != value for key, value in expected.items()):
-            return _outcome(
-                status="occupied_unknown",
+            return _occupied_outcome(
+                root,
                 batch_id=batch_id,
                 trade_day=trade_day,
                 row_count=row_count,
@@ -246,8 +278,8 @@ def commit_staged(
     try:
         conflict = _same_day_conflict(root, trade_day, batch_id)
         if conflict is not None:
-            return _outcome(
-                status="occupied_unknown",
+            return _occupied_outcome(
+                root,
                 batch_id=batch_id,
                 trade_day=trade_day,
                 row_count=row_count,
@@ -265,8 +297,8 @@ def commit_staged(
                 return _publish_committed(
                     root, metadata, batch, reason="probe matched staged batch"
                 )
-            return _outcome(
-                status="occupied_unknown",
+            return _occupied_outcome(
+                root,
                 batch_id=batch_id,
                 trade_day=trade_day,
                 row_count=row_count,
@@ -360,6 +392,7 @@ def reconcile_staged(
     try:
         conflict = _same_day_conflict(root, trade_day, batch_id)
         if conflict is not None:
+            _mark_occupied_unknown(root, batch_id, conflict)
             return {
                 "outcome": "occupied_unknown",
                 "batch_id": batch_id,
@@ -384,6 +417,7 @@ def reconcile_staged(
             probe_result.row_count != row_count
             or probe_result.content_hash != batch_hash
         ):
+            _mark_occupied_unknown(root, batch_id, "probe found unmatched existing data")
             return {
                 "outcome": "occupied_unknown",
                 "batch_id": batch_id,

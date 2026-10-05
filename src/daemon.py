@@ -83,6 +83,8 @@ _state = {
     "last_maint_day": None,     # 最后一次非交易日维护的日期
     "last_p08_close_day": None,  # 最后一次 P08 收盘汇总已执行的交易日
     "last_health_day": None,     # 最后一次盘前健康检查已执行的交易日
+    "last_source_router_day": None,  # 最后一次数据源路由尝试日期
+    "last_staging_cleanup_day": None,  # 最后一次 staging 清理日期
     "last_error": None,
 }
 
@@ -674,6 +676,51 @@ def _run_p08_close_summary(day: date):
     _write_state()
 
 
+def _source_router_enabled() -> bool:
+    """生产数据源路由必须显式 opt-in，避免合并代码即改变数据链路。"""
+    return os.environ.get("DATA_SOURCE_ROUTER_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _run_data_source_router(day: date) -> dict:
+    """Run one opt-in source-router attempt and leave an auditable daemon log."""
+    day_str = day.strftime("%Y-%m-%d")
+    if not _source_router_enabled():
+        return {"status": "disabled", "trade_day": day_str}
+    try:
+        from data_sources.production import run_daily_source_router
+
+        result = run_daily_source_router(_BASE, day_str)
+    except Exception as exc:  # noqa: BLE001 - daemon must continue and report
+        result = {"status": "failed", "trade_day": day_str, "reason": f"{type(exc).__name__}: {exc}"}
+    _log(f"{day_str} 数据源路由结果: {json.dumps(result, ensure_ascii=False, default=str)}", "source-router")
+    _state["last_source_router_day"] = day_str
+    _write_state()
+    return result
+
+
+def _run_staging_cleanup(day: date) -> dict:
+    """Clean only old terminal staging payloads once per day."""
+    day_str = day.strftime("%Y-%m-%d")
+    if os.environ.get("DATA_SOURCE_ROUTER_CLEANUP_ENABLED", "1").strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return {"status": "disabled", "trade_day": day_str}
+    try:
+        from data_sources.reconcile import cleanup_staging
+
+        retention = int(os.environ.get("DATA_SOURCE_ROUTER_STAGING_RETENTION_DAYS", "30"))
+        result = cleanup_staging(_BASE, retention_days=retention)
+        result = {"status": "ok", "trade_day": day_str, **result}
+    except Exception as exc:  # noqa: BLE001 - maintenance cannot stop daemon
+        result = {"status": "failed", "trade_day": day_str, "reason": f"{type(exc).__name__}: {exc}"}
+    _log(f"{day_str} staging 清理: {json.dumps(result, ensure_ascii=False, default=str)}", "source-router")
+    _state["last_staging_cleanup_day"] = day_str
+    _write_state()
+    return result
+
+
 # -------------------------------------------------------------------------
 # 主调度循环
 # -------------------------------------------------------------------------
@@ -726,6 +773,8 @@ def run_loop():
             _ensure_stockdb()          # [P0-DATASRC-STOCKDB] 行情引擎运行期巡检
             _ensure_dashboard()
             _ensure_obs_stack()
+            if _state.get("last_staging_cleanup_day") != day_str:
+                _run_staging_cleanup(today)
             _publish_health_state()
         # 死手开关判定: **放在看护块之外**, 每个自然分钟都问一次。
         #
@@ -824,6 +873,9 @@ def run_loop():
                 _state["running_day"] = None
                 _state["engine_done"] = True
                 _write_state()
+            if (cur_time >= MARKET_CLOSE and cur_time <= DONE_WINDOW
+                    and _state.get("last_source_router_day") != day_str):
+                _run_data_source_router(today)
             if (cur_time >= MARKET_CLOSE and cur_time <= DONE_WINDOW
                     and _state["last_close_day"] != day_str):
                 _run_daily(today)
