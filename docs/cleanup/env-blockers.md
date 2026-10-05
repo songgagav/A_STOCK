@@ -47,3 +47,16 @@
   测试夹具修复：无日历 checkout、错误的临时 Arrow schema、以及对生产 h5i 数据库的
   隐式依赖。`.venv310` 的自包含定向集为 `32 passed`；仍需 push 后等待远端 job，
   在 GitHub Actions 给出成功退出码前不得标记为通过。
+
+## 2026-10-05 扫描复核
+
+在 `feature/data-source-router-v2` 的 `.venv314` 中重新执行：
+
+- `pip-audit -r requirements.txt --format columns`：退出码 0，`No known vulnerabilities found`；
+- `detect-secrets scan --force-use-all-plugins .`：退出码 0，结果为空；
+- `bandit -r src -ll -f txt`：退出码 1，0 high、125 medium、346 low，仍按未通过处理；
+  125 个 medium 全部为 `B608`，其中 32 个 medium-confidence、93 个 low-confidence。
+
+`detect-secrets --all-files` 会包含运行时数据、缓存和日志，并产生高熵伪阳性，
+因此不能用它替代默认仓库扫描的清洁结果。完整任务状态和 ArcticDB 兼容层边界见
+`docs/evolution/post-point5-status-2026-10-05.md`。
