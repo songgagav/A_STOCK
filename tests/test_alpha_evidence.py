@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 
 import pytest
 
@@ -98,6 +99,30 @@ def test_forward_gate_rejects_malformed_dates():
     assert result["excluded"][0]["reason"] == "invalid_date"
 
 
+def test_immature_forward_window_is_pending_not_failed():
+    mature = _windows(1)[0]
+    pending = {
+        "day": "2026-09-04",
+        "ok": False,
+        "window_mode": "forward",
+        "fallback": False,
+        "stats": {},
+    }
+
+    result = summarize_forward_windows(
+        [mature, pending],
+        min_valid_windows=1,
+        as_of_date=date(2026, 10, 6),
+        horizon_days=120,
+    )
+
+    assert result["status"] == "pass"
+    assert result["valid_window_count"] == 1
+    assert result["pending_maturity_count"] == 1
+    assert result["excluded_count"] == 0
+    assert result["pending_maturity"][0]["day"] == "2026-09-04"
+
+
 def test_negative_ic_is_not_promotable_even_with_positive_oos():
     report = evaluate_alpha_evidence(
         _ic_payload(mean=-0.06, positive=3), _windows(), _attribution()
@@ -107,6 +132,29 @@ def test_negative_ic_is_not_promotable_even_with_positive_oos():
     assert report["next_action"] == "inspect_signal"
     assert report["checks"]["ic_term_structure"]["status"] == "fail"
     assert report["checks"]["forward_windows"]["status"] == "pass"
+
+
+def test_evidence_report_exposes_pending_maturity_without_downgrading_status():
+    pending = {
+        "day": "2026-09-04",
+        "ok": False,
+        "window_mode": "forward",
+        "fallback": False,
+        "stats": {},
+    }
+
+    report = evaluate_alpha_evidence(
+        _ic_payload(),
+        [*_windows(), pending],
+        _attribution(),
+        as_of_date=date(2026, 10, 6),
+        forward_horizon_days=120,
+    )
+
+    forward = report["checks"]["forward_windows"]
+    assert report["status"] == "evidence_ready"
+    assert forward["pending_maturity_count"] == 1
+    assert forward["excluded_count"] == 0
 
 
 def test_complete_positive_evidence_is_only_eligible_for_human_review():

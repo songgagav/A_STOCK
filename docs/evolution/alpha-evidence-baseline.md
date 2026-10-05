@@ -39,6 +39,7 @@
 - 前向窗口：至少 10 个有效窗口；
 - 归因：至少 5 条记录；
 - backward、fallback、窗口起点早于决策日的记录不计入有效窗口。
+- 尚未达到 horizon 的最近窗口标记为 `pending_maturity`，不计入失败；成熟度判断必须带明确的 `as_of` 日期和 horizon。
 
 阈值写入报告，未来若调整必须单独记录研究决策，不能静默修改。
 
@@ -50,17 +51,18 @@
 | `invalid` | 产物结构或关键字段错误 | 检查研究运行/输入 |
 | `not_promotable` | 产物完整，但证据未达到门槛 | 检查信号或重新设计实验 |
 | `evidence_ready` | 仅表示可以人工复核 | 人工审阅，不自动启用 |
+| `pending_maturity` | 未来观察期尚未发生完 | 等待成熟后重新运行，不补造结果 |
 
 任何状态都不会改变执行权限；报告固定包含 `execution_change=false`。
 
 ## 使用
 
 ```powershell
-.venv314\Scripts\python.exe scripts\research\ic_term_structure.py
-.venv314\Scripts\python.exe scripts\nonoverlap_rerun.py
-.venv314\Scripts\python.exe scripts\attribution_forward.py
+.venv310\Scripts\python.exe scripts\research\ic_term_structure.py
+.venv310\Scripts\python.exe scripts\nonoverlap_rerun.py
+.venv310\Scripts\python.exe scripts\attribution_forward.py
 
-.venv314\Scripts\python.exe scripts\research\alpha_evidence_report.py `
+.venv310\Scripts\python.exe scripts\research\alpha_evidence_report.py `
   --output reports\alpha_evidence.json `
   --strict
 ```
@@ -69,7 +71,10 @@
 
 ## 当前基线判断
 
-历史 PIT 研究记录在 [`docs/pit-valuation.md`](../pit-valuation.md) 中已经记录过前向 RankIC 偏弱/为负的证据。当前代码 checkout 不携带上述三个 `data/` 研究产物，因此本次工具运行应报告 `unavailable`，不能据此声称策略通过或失败。
+历史 PIT 研究记录在 [`docs/pit-valuation.md`](../pit-valuation.md) 中已经记录过前向 RankIC 偏弱/为负的证据。
+2026-10-06 的重跑仍为 `not_promotable`；其中 2026-09-04 的 120d 窗口是
+`pending_maturity`，不是失败。当前报告不会因为 vn.py 缺失而伪造窗口结果；完整执行
+shadow 使用 `.venv310` 的 `vnpy==4.4.0`。
 
 后续重新生成产物后，报告应与原始 IC/OOS/归因文件一起归档，并关联：
 

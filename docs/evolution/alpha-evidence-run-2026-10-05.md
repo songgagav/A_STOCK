@@ -9,7 +9,7 @@
 ## 运行环境与数据
 
 - IC 重算使用 `.venv310`，因为 `.venv314` 未安装 `h5i_db`。
-- `.venv310` 可导入 `h5i_db`，IC 期限结构重算成功。
+- `.venv310` 可导入 `h5i_db`，IC 期限结构重算成功；本次记录生成时尚未安装 vn.py。
 - h5i 最新视图文件时间约为 `2026-10-05 15:06`。
 - `data/daily/20261005/` 已存在。
 - 研究结果文件未纳入 Git，仅记录 SHA-256 供复核。
@@ -31,7 +31,15 @@
 
 - 前向窗口：12 个记录，11 个成功；成功记录均为 `forward` 口径。
 - 归因：11 条记录，达到最低样本数要求。
-- `2026-09-04` 窗口仍未计入有效样本。尝试用 `.venv310` 补跑时被 `ModuleNotFoundError: vnpy` 阻断，未伪造结果、未覆盖已有成功窗口。
+- `2026-09-04` 窗口仍未计入有效样本。记录生成时补跑被 `ModuleNotFoundError: vnpy` 阻断，未伪造结果、未覆盖已有成功窗口；后续应按 `pending_maturity` 处理，而不是把它算作失败。
+
+## 2026-10-06 口径更正
+
+- `.venv310` 已安装并验收 `vnpy==4.4.0`、`h5i_db`、`torch` 和 `stable_baselines3`。
+- `.venv314` 仍缺 `h5i_db` 与 `vnpy`，不作为完整运行时。
+- 报告使用 `--as-of 2026-10-06 --forward-horizon-days 120` 后，前向检查为
+  `valid_window_count=11`、`pending_maturity_count=1`、`excluded_count=0`。
+- 总状态仍为 `not_promotable`；没有调整生产排序、权重或交易链路。
 
 ## 输入指纹
 

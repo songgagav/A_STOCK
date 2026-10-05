@@ -14,9 +14,10 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,7 @@ DEFAULT_INPUTS = {
     "forward_windows": ROOT / "data" / "vnpy_backtest_nonoverlap_fwd_results.json",
     "attribution": ROOT / "data" / "attribution_b1.json",
 }
+DEFAULT_FORWARD_HORIZON_DAYS = 120
 
 
 def _read_json(path: Path) -> tuple[Any | None, dict[str, Any]]:
@@ -53,13 +55,26 @@ def _read_json(path: Path) -> tuple[Any | None, dict[str, Any]]:
         }
 
 
-def build_report(paths: dict[str, Path] | None = None) -> dict[str, Any]:
+def build_report(
+    paths: dict[str, Path] | None = None,
+    *,
+    as_of_date: date | None = None,
+    forward_horizon_days: int = DEFAULT_FORWARD_HORIZON_DAYS,
+) -> dict[str, Any]:
     paths = paths or DEFAULT_INPUTS
     ic, ic_meta = _read_json(paths["ic_term_structure"])
     windows, windows_meta = _read_json(paths["forward_windows"])
     attribution, attribution_meta = _read_json(paths["attribution"])
-    report = evaluate_alpha_evidence(ic, windows, attribution)
+    effective_as_of = as_of_date or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    report = evaluate_alpha_evidence(
+        ic,
+        windows,
+        attribution,
+        as_of_date=effective_as_of,
+        forward_horizon_days=forward_horizon_days,
+    )
     report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    report["as_of_date"] = effective_as_of.isoformat()
     report["inputs"] = {
         "ic_term_structure": ic_meta,
         "forward_windows": windows_meta,
@@ -73,6 +88,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ic", type=Path, default=DEFAULT_INPUTS["ic_term_structure"])
     parser.add_argument("--windows", type=Path, default=DEFAULT_INPUTS["forward_windows"])
     parser.add_argument("--attribution", type=Path, default=DEFAULT_INPUTS["attribution"])
+    parser.add_argument(
+        "--as-of",
+        type=date.fromisoformat,
+        help="成熟度判断使用的上海日期；默认取当前上海日期",
+    )
+    parser.add_argument(
+        "--forward-horizon-days",
+        type=int,
+        default=DEFAULT_FORWARD_HORIZON_DAYS,
+    )
     parser.add_argument("--output", type=Path, help="可选：写入报告 JSON")
     parser.add_argument("--strict", action="store_true", help="非 evidence_ready 返回退出码 2")
     return parser.parse_args(argv)
@@ -85,7 +110,9 @@ def main(argv: list[str] | None = None) -> int:
             "ic_term_structure": args.ic,
             "forward_windows": args.windows,
             "attribution": args.attribution,
-        }
+        },
+        as_of_date=args.as_of,
+        forward_horizon_days=args.forward_horizon_days,
     )
     payload = json.dumps(report, ensure_ascii=False, indent=2)
     print(payload)

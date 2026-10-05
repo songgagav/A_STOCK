@@ -114,8 +114,16 @@ def summarize_forward_windows(
     rows: Sequence[Mapping[str, Any]] | None,
     *,
     min_valid_windows: int = 10,
+    as_of_date: date | None = None,
+    horizon_days: int | None = None,
 ) -> dict[str, Any]:
-    """只接受真正的前向、非 fallback 窗口，并检查日期方向。"""
+    """只接受真正的前向、非 fallback 窗口，并检查日期方向。
+
+    当窗口尚未达到指定的 ``horizon_days`` 观察期时，显式标记为
+    ``pending_maturity``，而不是把“未来还没有发生”误报为数据失败。
+    这是保守的日历无关下界：日历日尚未达到 horizon 时，一定不可能
+    已经拥有足够的交易日；达到下界后仍应由实际窗口结果决定。
+    """
 
     if rows is None:
         return _status("forward_windows", "unavailable", reasons=["artifact_missing"])
@@ -124,14 +132,27 @@ def summarize_forward_windows(
 
     valid: list[Mapping[str, Any]] = []
     excluded: list[dict[str, str]] = []
+    pending_maturity: list[dict[str, str]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             excluded.append({"index": str(index), "reason": "row_not_an_object"})
             continue
         day = str(row.get("day") or "")
+        day_date = _iso_date(day)
         stats = row.get("stats")
         if row.get("ok") is not True:
-            excluded.append({"day": day, "reason": "window_not_ok"})
+            error = str(row.get("error") or row.get("reason") or "")
+            if (
+                not error
+                and as_of_date is not None
+                and horizon_days is not None
+                and horizon_days > 0
+                and day_date is not None
+                and (as_of_date - day_date).days < horizon_days
+            ):
+                pending_maturity.append({"day": day, "reason": "pending_maturity"})
+            else:
+                excluded.append({"day": day, "reason": "window_not_ok"})
         elif row.get("window_mode") != "forward":
             excluded.append({"day": day, "reason": "wrong_window_mode"})
         elif bool(row.get("fallback")):
@@ -180,6 +201,8 @@ def summarize_forward_windows(
         valid_window_count=len(valid),
         excluded_count=len(excluded),
         excluded=excluded,
+        pending_maturity_count=len(pending_maturity),
+        pending_maturity=pending_maturity,
         mean_total_return=mean(numeric_returns) if numeric_returns else None,
         mean_sharpe=mean(numeric_sharpe) if numeric_sharpe else None,
         worst_drawdown=min(numeric_drawdown) if numeric_drawdown else None,
@@ -235,6 +258,8 @@ def evaluate_alpha_evidence(
     min_ic_days: int = 10,
     min_forward_windows: int = 10,
     min_attribution_rows: int = 5,
+    as_of_date: date | None = None,
+    forward_horizon_days: int | None = None,
 ) -> dict[str, Any]:
     """构建 Alpha 证据报告；``evidence_ready`` 只代表可人工复核。"""
 
@@ -246,7 +271,10 @@ def evaluate_alpha_evidence(
             min_days=min_ic_days,
         ),
         "forward_windows": summarize_forward_windows(
-            forward_windows, min_valid_windows=min_forward_windows
+            forward_windows,
+            min_valid_windows=min_forward_windows,
+            as_of_date=as_of_date,
+            horizon_days=forward_horizon_days,
         ),
         "attribution": summarize_attribution(attribution, min_rows=min_attribution_rows),
     }
@@ -275,6 +303,7 @@ def evaluate_alpha_evidence(
             "min_ic_days": min_ic_days,
             "min_forward_windows": min_forward_windows,
             "min_attribution_rows": min_attribution_rows,
+            "forward_horizon_days": forward_horizon_days,
         },
         "checks": checks,
     }
