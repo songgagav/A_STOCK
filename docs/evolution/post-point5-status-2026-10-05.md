@@ -17,8 +17,10 @@
 | `detect-secrets scan --all-files --force-use-all-plugins` | 不作为通过依据 | 会扫描运行时数据、缓存和日志，出现高熵伪阳性；需分区扫描时再使用。 |
 | `bandit -r src -ll -f txt` | 未通过，但无 high | 0 high、125 medium、346 low；不能将“无 high”表述为扫描全通过。 |
 
-Bandit 命中需要按 SQL 输入边界、子进程调用、断言和非密码学随机数等类别继续
-分批审计；本轮不批量添加 `# nosec`，也不把未审计命中静默关闭。
+Bandit 当前的 125 个 medium 命中全部属于 `B608`（SQL 字符串构造），其中
+32 个为 medium-confidence、93 个为 low-confidence；没有 high 命中。本轮不批量
+添加 `# nosec`，而是继续按 SQL 输入边界逐项审计，确认参数化、固定白名单或
+仅内部生成值后再分别记录例外。
 
 ### ArcticDB 兼容层盘点
 

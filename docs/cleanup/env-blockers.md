@@ -54,7 +54,8 @@
 
 - `pip-audit -r requirements.txt --format columns`：退出码 0，`No known vulnerabilities found`；
 - `detect-secrets scan --force-use-all-plugins .`：退出码 0，结果为空；
-- `bandit -r src -ll -f txt`：退出码 1，0 high、125 medium、346 low，仍按未通过处理。
+- `bandit -r src -ll -f txt`：退出码 1，0 high、125 medium、346 low，仍按未通过处理；
+  125 个 medium 全部为 `B608`，其中 32 个 medium-confidence、93 个 low-confidence。
 
 `detect-secrets --all-files` 会包含运行时数据、缓存和日志，并产生高熵伪阳性，
 因此不能用它替代默认仓库扫描的清洁结果。完整任务状态和 ArcticDB 兼容层边界见
