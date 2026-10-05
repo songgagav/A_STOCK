@@ -27,6 +27,11 @@ class _IngestSkipped(Exception):
     pass
 
 
+def format_console_json(payload) -> str:
+    """将日报安全地输出到 Windows 控制台代码页。"""
+    return json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+
+
 def self_closed_loop(day: str, day_dir: str, db) -> dict:
     """D->B 反馈闭环: 当日信号 IC 回算(幂等写 ic_history.csv) + ICIR 驱动因子权重刷新.
 
@@ -1547,4 +1552,4 @@ if __name__ == "__main__":
     a = ap.parse_args()
     day = a.date or a.day
     r = run_daily(day, mode="maint" if a.maint else "full")
-    print(json.dumps(r, ensure_ascii=False, indent=2, default=str))
+    print(format_console_json(r))
