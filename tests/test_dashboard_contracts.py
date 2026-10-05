@@ -56,7 +56,9 @@ def test_signal_freeze_status_reads_verified_snapshot_and_late_count(tmp_path, m
         encoding="utf-8",
     )
 
-    result = dashboard.read_signal_freeze_status("20261003")
+    result = dashboard.read_signal_freeze_status(
+        "20261003", now=datetime(2026, 10, 3, 12, 0, tzinfo=_SHANGHAI)
+    )
 
     assert result["status"] == "ready"
     assert result["is_today"] is True

@@ -345,9 +345,12 @@ def _freeze_unexplained_count(day: str) -> int:
     return count
 
 
-def read_signal_freeze_status(day: str | None = None) -> dict:
-    """返回看板使用的冻结状态摘要；只读已落盘、已校验的权威快照。"""
-    now = datetime.now(_SHANGHAI)
+def read_signal_freeze_status(day: str | None = None, now: datetime | None = None) -> dict:
+    """返回看板使用的冻结状态摘要；只读已落盘、已校验的权威快照。
+
+    ``now`` 仅用于测试/回放注入时钟；生产调用默认使用上海时区当前时间。
+    """
+    now = now or datetime.now(_SHANGHAI)
     consume_day = day or now.strftime("%Y%m%d")
     try:
         from signal_snapshot import read_mode_control, read_snapshot
