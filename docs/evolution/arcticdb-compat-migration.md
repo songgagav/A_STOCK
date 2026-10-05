@@ -1,6 +1,6 @@
 # ArcticDB 兼容层迁移计划
 
-状态：设计与盘点完成；`daily_summary` 只读适配器已实现，但尚未切换任何生产消费者。
+状态：替代 schema 与 dormant 只读适配器已实现第一版，但尚未切换任何生产消费者。
 
 `src/arctic_store.py` 目前是历史/兼容访问层，不是数据源 Router 或 h5i 主路径的
 依赖。两个本地运行环境均未安装 `arcticdb`，但仍有多个旧消费者直接调用它，
@@ -25,6 +25,23 @@
 3. 旧 ArcticDB 读路径在替代源通过等价测试前保持不变。
 4. 写路径先双写或旁路验证，不能直接停止旧写入；任何写入失败都必须留痕。
 5. Router、09:25 快照、PaperBook 和真实/虚拟交易闸门不依赖本迁移的中间状态。
+
+## 替代 schema v1
+
+以下契约只约束文件适配器和双读比较，不代表历史数据已经补齐：
+
+| 数据集 | 权威文件契约 | 主键/排序 | 空结果语义 |
+| --- | --- | --- | --- |
+| `bars` | `data/h5i/market.db`，由 h5i 适配层读取 | `symbol + trade_day` | 数据源不可用时为 `unavailable`，不能伪造空表 |
+| `trade_records` | `data/daily/<YYYYMMDD>/trades.json` | `day,time,ts` 升序 | 无文件返回显式空 schema |
+| `daily_summary` | `data/daily/<YYYYMMDD>/daily_summary.json` | `day` 升序、最近 N 日 | 无文件返回显式空 schema |
+| `perf_report` | `data/daily/<YYYYMMDD>/performance_report.json` | `day` 升序、最近 N 日 | 根目录最新快照不视为历史 |
+| `factor_ic` | `data/ic/ic_curve_<factor>_k20.csv` | `day` 升序、最近 N 日 | 因子文件缺失返回显式空 schema |
+| `reward_curve` | `data/drl/<YYYYMMDD>/reward_curve.jsonl` | `day,step` 升序 | `train_meta.json`/PNG 不视为逐步曲线 |
+
+公共约定：日期规范化为 `YYYYMMDD`（成交记录的展示列为
+`YYYY-MM-DD`），JSON 使用 UTF-8，读取器只读不补推导字段；生产读取失败必须由上层
+区分 `unavailable` 与“确实没有行”。
 
 ## 分阶段执行
 
@@ -55,10 +72,17 @@
 
 ### M3：补齐 `perf_report` 与 `reward_curve`
 
-- 为绩效报告建立按日不可变归档；
-- 为 DRL reward 建立包含 `day/model_version/step/reward` 的 JSONL 或 Parquet
-  产物；
-- 在真实训练环境可用前，只完成 schema 和 fake round-trip 测试，不伪造历史数据。
+- 已定义按日不可变归档和 JSONL 逐步曲线 schema；
+- dormant 适配器已读取 `performance_report.json` 和 `reward_curve.jsonl`，并明确
+  不把根目录最新快照、`train_meta.json` 或 PNG 当成历史；
+- 已加入 fake round-trip/空结果契约测试；
+- 仍未补写生产产物、未切换真实训练或退化消费者。
+
+### 双读比较基础
+
+`src/history_equivalence.py` 提供无副作用的 `compare_history_frames()`：
+`None` 被报告为 `unavailable`，不会与空 DataFrame 混淆；字段缺失、行数差异、排序后
+内容差异均返回 `mismatch`。它目前只用于 shadow/测试，不自动替换任何 ArcticDB 读取。
 
 ### M4：双读观察与退役
 

@@ -81,3 +81,74 @@ def test_factor_ic_adapter_reads_sorted_bounded_curve(tmp_path):
 def test_factor_ic_adapter_rejects_path_traversal_factor_name(tmp_path):
     with pytest.raises(ValueError):
         FileHistoryStore(tmp_path).read_factor_ic("../secrets")
+
+
+def test_perf_report_adapter_reads_daily_immutable_artifacts(tmp_path):
+    day_dir = tmp_path / "20261002"
+    day_dir.mkdir()
+    (day_dir / "performance_report.json").write_text(
+        json.dumps({
+            "period": {"end": "2026-10-02"},
+            "metrics": {
+                "total_return": 0.02,
+                "annual_return": 0.12,
+                "max_drawdown": -0.03,
+                "sharpe_annual": 1.1,
+                "calmar": 2.0,
+            },
+            "benchmark": {"excess_total": 0.01},
+        }),
+        encoding="utf-8",
+    )
+
+    out = FileHistoryStore(tmp_path).read_perf_reports()
+
+    assert list(out.index) == ["20261002"]
+    assert out.loc["20261002", "total_return"] == 0.02
+    assert out.loc["20261002", "excess_total"] == 0.01
+    assert json.loads(out.loc["20261002", "summary_json"])["period"]["end"] == "2026-10-02"
+
+
+def test_perf_report_adapter_returns_explicit_empty_schema(tmp_path):
+    out = FileHistoryStore(tmp_path).read_perf_reports()
+
+    assert out.empty
+    assert list(out.columns) == [
+        "summary_json",
+        "total_return",
+        "annual_return",
+        "max_drawdown",
+        "sharpe_annual",
+        "calmar",
+        "excess_total",
+    ]
+
+
+def test_reward_curve_adapter_reads_jsonl_bounded_by_training_days(tmp_path):
+    drl_dir = tmp_path / "drl" / "20261002"
+    drl_dir.mkdir(parents=True)
+    (drl_dir / "reward_curve.jsonl").write_text(
+        "{\"model_version\": \"m2\", \"step\": 1, \"reward\": 0.2}\n"
+        "{\"model_version\": \"m2\", \"step\": 0, \"reward\": 0.1}\n",
+        encoding="utf-8",
+    )
+
+    out = FileHistoryStore(tmp_path, drl_root=tmp_path / "drl").read_reward_curve()
+
+    assert list(out["day"]) == ["20261002", "20261002"]
+    assert list(out["step"]) == [0, 1]
+    assert list(out["reward"]) == [0.1, 0.2]
+    assert list(out["model_version"]) == ["m2", "m2"]
+
+
+def test_reward_curve_adapter_does_not_treat_train_meta_as_curve(tmp_path):
+    drl_dir = tmp_path / "drl" / "20261002"
+    drl_dir.mkdir(parents=True)
+    (drl_dir / "train_meta.json").write_text(
+        json.dumps({"mean_reward": 0.2}), encoding="utf-8"
+    )
+
+    out = FileHistoryStore(tmp_path, drl_root=tmp_path / "drl").read_reward_curve()
+
+    assert out.empty
+    assert list(out.columns) == ["day", "model_version", "step", "reward", "weights_json"]

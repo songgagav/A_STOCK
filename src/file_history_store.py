@@ -18,14 +18,30 @@ import pandas as pd
 
 _LOG = logging.getLogger("file_history_store")
 _COLUMNS = ["summary_json", "equity"]
+_PERF_COLUMNS = [
+    "summary_json",
+    "total_return",
+    "annual_return",
+    "max_drawdown",
+    "sharpe_annual",
+    "calmar",
+    "excess_total",
+]
+_REWARD_COLUMNS = ["day", "model_version", "step", "reward", "weights_json"]
 
 
 class FileHistoryStore:
     """Read daily history from an injected ``data/daily``-like directory."""
 
-    def __init__(self, daily_root: str | Path, ic_root: str | Path | None = None):
+    def __init__(
+        self,
+        daily_root: str | Path,
+        ic_root: str | Path | None = None,
+        drl_root: str | Path | None = None,
+    ):
         self.daily_root = Path(daily_root)
         self.ic_root = Path(ic_root) if ic_root is not None else self.daily_root.parent / "ic"
+        self.drl_root = Path(drl_root) if drl_root is not None else self.daily_root.parent / "drl"
 
     def read_daily_summaries(self, days: int = 60) -> pd.DataFrame:
         """Return recent summaries with the first migration-compatible schema.
@@ -163,6 +179,103 @@ class FileHistoryStore:
         frame = frame[frame["day"].str.len() == 8]
         return frame.sort_values("day").tail(days).reset_index(drop=True)
 
+    def read_perf_reports(self, days: int = 60) -> pd.DataFrame:
+        """Read immutable per-day performance report artifacts.
+
+        The adapter intentionally requires ``performance_report.json`` under
+        each daily directory.  The current root-level
+        ``data/performance_report.json`` is a latest-snapshot artifact, not a
+        historical series, so it is never treated as history here.
+        """
+        if days <= 0 or not self.daily_root.is_dir():
+            return self._empty_perf()
+        rows: list[dict[str, Any]] = []
+        for day_dir in sorted(self.daily_root.iterdir()):
+            if not day_dir.is_dir() or not self._is_day(day_dir.name):
+                continue
+            path = day_dir / "performance_report.json"
+            if not path.is_file():
+                continue
+            try:
+                report = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(report, dict):
+                    raise ValueError("performance report root is not an object")
+                metrics = report.get("metrics") or {}
+                benchmark = report.get("benchmark") or {}
+                day = self._day_value(
+                    report.get("day")
+                    or (report.get("period") or {}).get("end"),
+                    day_dir.name,
+                )
+                rows.append(
+                    {
+                        "day": day,
+                        "summary_json": json.dumps(
+                            report, ensure_ascii=False, default=str
+                        ),
+                        "total_return": metrics.get("total_return"),
+                        "annual_return": metrics.get("annual_return"),
+                        "max_drawdown": metrics.get("max_drawdown"),
+                        "sharpe_annual": metrics.get("sharpe_annual"),
+                        "calmar": metrics.get("calmar"),
+                        "excess_total": benchmark.get("excess_total"),
+                    }
+                )
+            except Exception as exc:
+                _LOG.warning("read performance report failed: %s: %s", path, exc)
+        if not rows:
+            return self._empty_perf()
+        frame = pd.DataFrame(rows, columns=["day", *_PERF_COLUMNS])
+        frame = frame.drop_duplicates(subset=["day"], keep="last")
+        frame = frame.sort_values("day").tail(days).set_index("day")
+        frame.index.name = "day"
+        return frame[_PERF_COLUMNS]
+
+    def read_reward_curve(self, days: int = 30) -> pd.DataFrame:
+        """Read the dormant per-training-day ``reward_curve.jsonl`` contract.
+
+        ``train_meta.json`` and ``reward_curve.png`` are deliberately not
+        interpreted as a step-level history.  A producer must explicitly
+        write one JSON object per line with ``step`` and ``reward``.
+        """
+        if days <= 0 or not self.drl_root.is_dir():
+            return self._empty_reward()
+        day_dirs = [
+            p for p in self.drl_root.iterdir()
+            if p.is_dir() and self._is_day(p.name)
+        ]
+        selected = sorted(day_dirs, key=lambda p: p.name)[-days:]
+        rows: list[dict[str, Any]] = []
+        for day_dir in selected:
+            path = day_dir / "reward_curve.jsonl"
+            if not path.is_file():
+                continue
+            try:
+                for line_no, line in enumerate(
+                    path.read_text(encoding="utf-8").splitlines(), start=1
+                ):
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise ValueError(f"line {line_no}: root is not an object")
+                    if "step" not in item or "reward" not in item:
+                        raise ValueError(f"line {line_no}: missing step/reward")
+                    row = {
+                        "day": self._day_value(item.get("day"), day_dir.name),
+                        "model_version": item.get("model_version"),
+                        "step": int(item["step"]),
+                        "reward": float(item["reward"]),
+                        "weights_json": item.get("weights_json"),
+                    }
+                    rows.append(row)
+            except Exception as exc:
+                _LOG.warning("read reward curve failed: %s: %s", path, exc)
+        if not rows:
+            return self._empty_reward()
+        frame = pd.DataFrame(rows, columns=_REWARD_COLUMNS)
+        return frame.sort_values(["day", "step"], kind="stable").reset_index(drop=True)
+
     @staticmethod
     def _is_day(value: str) -> bool:
         return len(value) == 8 and value.isdigit()
@@ -197,3 +310,13 @@ class FileHistoryStore:
         frame = pd.DataFrame(columns=_COLUMNS)
         frame.index.name = "day"
         return frame
+
+    @staticmethod
+    def _empty_perf() -> pd.DataFrame:
+        frame = pd.DataFrame(columns=_PERF_COLUMNS)
+        frame.index.name = "day"
+        return frame
+
+    @staticmethod
+    def _empty_reward() -> pd.DataFrame:
+        return pd.DataFrame(columns=_REWARD_COLUMNS)

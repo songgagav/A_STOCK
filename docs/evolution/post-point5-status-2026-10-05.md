@@ -56,6 +56,10 @@ ArcticDB 已迁移或可以卸载。
 随后补充了同一适配器的 `trade_records` 与 `factor_ic` 只读视图，并覆盖日期排序、
 最近 N 日、标的过滤及因子名路径穿越防护；这些视图同样尚未切换生产消费者。
 
+本轮继续补齐了 `perf_report` 按日 JSON 和 `reward_curve` JSONL 的 dormant 读取契约，
+并增加双读 DataFrame 比较器；根目录最新绩效快照、`train_meta.json` 和曲线 PNG 均未被
+误当成历史序列，生产消费者仍保持原 ArcticDB 路径。
+
 ### 数据源 Router
 
 Baostock、ZZShare 的隔离 shadow 样本已完成；mootdx 因真实 bars 为空且备用服务器
