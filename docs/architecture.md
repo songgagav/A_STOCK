@@ -5,7 +5,8 @@
 系统按"数据 → 因子 → 决策 → 风控 → 执行/评估"组织,源码当前为扁平演进布局,下表给出逻辑归属(与 README 结构树一致)。
 
 ```text
-[数据层]  h5i/ArcticDB/free-stockdb  -> 因子宽表(daily_bars/valuation/financials)
+[数据层]  h5i/free-stockdb -> 因子宽表(daily_bars/valuation/financials)
+                 └─ ArcticDB 兼容层（旧消费者，迁移中，不是 Router 主路径）
    │
 [因子层]  基本面/反转因子 + 融合(ICIR) + GP挖掘 + 逐日截面 IC 曲线
    │

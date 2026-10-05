@@ -14,7 +14,7 @@
 
 - `db.py`: `StockDB` 统一入口;h5i 优先,退役 duckdb 自动降级。
 - `h5i_bar_store.py`: 全 A 日频/财务/估值读取;`duck_available()` 探测。
-- `arctic_store.py`: `get_store()`/`ArcticStore`;库:`bars`/`trade_records`/`daily_summary`/`perf_report`/`factor_ic`/`reward_curve`;append-only。
+- `arctic_store.py`: 兼容层 `get_store()`/`ArcticStore`;库:`bars`/`trade_records`/`daily_summary`/`perf_report`/`factor_ic`/`reward_curve`;append-only。当前 Router/h5i 主路径不依赖 ArcticDB，替代存储迁移见 `docs/evolution/arcticdb-compat-migration.md`。
 
 ## 因子与选股
 

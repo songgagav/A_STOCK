@@ -3,6 +3,10 @@
 扫描日期：2026-10-02  
 命令：`.venv314\Scripts\python.exe -m bandit -r .\src -f json -o bandit.json -q`
 
+2026-10-05 复核：`bandit -r src -ll -f json` 返回 0 high、125 medium、346 low；
+125 个 medium 全部为 `B608`，其中 32 个 medium-confidence、93 个
+low-confidence。下表的 2026-10-02 数字保留为历史记录，不与本次结果混算。
+
 ## 结果
 
 - 退出码：`1`，因此不是通过。

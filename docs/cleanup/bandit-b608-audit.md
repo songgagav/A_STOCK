@@ -1,7 +1,8 @@
 # Bandit B608 第一批审计标注
 
-审计日期：2026-10-02  
-范围：本轮 `bandit.json` 中 126 条 B608；本批优先处理 Bandit 标为 `MEDIUM` confidence 的 34 条。只标注，不修改源代码，不批量添加 `# nosec`。
+审计日期：2026-10-05（更新）
+范围：当前 `bandit -r src -ll` 中 125 条 B608 medium；其中 32 条为 MEDIUM
+confidence、93 条为 LOW confidence。只标注，不修改源代码，不批量添加 `# nosec`。
 
 ## 审计结论
 
@@ -66,7 +67,9 @@ Bandit 的 B608 是“SQL 字符串含动态片段”的启发式规则，不等
 
 ## 后续批次
 
-剩余 92 条为 Bandit `LOW` confidence 的 B608。下一批按实际入口优先：dashboard/服务入口 → 数据同步入口 → 因子研究脚本。每个批次只补审计标注和证据，不在没有单独修复任务时改 SQL。
+当前 93 条为 Bandit `LOW` confidence 的 B608。下一批按实际入口优先：
+dashboard/服务入口 → 数据同步入口 → 因子研究脚本。每个批次只补审计标注和
+证据，不在没有单独修复任务时改 SQL。
 
 ## 当前状态
 
