@@ -49,6 +49,10 @@ Bandit 当前的 125 个 medium 命中全部属于 `B608`（SQL 字符串构造�
 - 不删除旧调用方；
 - 迁移必须先为每个库定义替代 schema、读写契约和回读等价测试。
 
+本轮已先完成 `daily_summary` 的只读文件适配器 `src/file_history_store.py` 和
+双环境 3 项契约测试。它目前不接入任何生产消费者，属于可回滚的 M1 基础，不代表
+ArcticDB 已迁移或可以卸载。
+
 ### 数据源 Router
 
 Baostock、ZZShare 的隔离 shadow 样本已完成；mootdx 因真实 bars 为空且备用服务器

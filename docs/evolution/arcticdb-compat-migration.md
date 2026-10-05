@@ -1,6 +1,6 @@
 # ArcticDB 兼容层迁移计划
 
-状态：设计与盘点完成，代码切换未开始。
+状态：设计与盘点完成；`daily_summary` 只读适配器已实现，但尚未切换任何生产消费者。
 
 `src/arctic_store.py` 目前是历史/兼容访问层，不是数据源 Router 或 h5i 主路径的
 依赖。两个本地运行环境均未安装 `arcticdb`，但仍有多个旧消费者直接调用它，
@@ -37,7 +37,9 @@
 
 ### M1：先迁移 `daily_summary`
 
-- 新增只读文件适配器，读取按日目录；
+- 已新增 `src/file_history_store.py`，通过注入的 `data/daily` 根目录读取按日目录；
+- 已新增双环境契约测试，验证排序、最近 N 日限制、空 schema 和 JSON 保留；
+- 当前适配器仍是 dormant/side-by-side 组件，不改变 ArcticStore 或生产读写路径；
 - 与 ArcticStore 读取结果做双读对比；
 - 连续通过固定夹具和历史样本对比后，先切 dashboard/报表只读路径；
 - 保留旧写入和回滚开关。
