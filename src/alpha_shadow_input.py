@@ -129,6 +129,7 @@ def build_normalized_payload(
     factor_weights: Mapping[str, Any],
     factor_directions: Mapping[str, Any],
     previous_symbols: Sequence[str] = (),
+    strict_fusion: bool = True,
 ) -> dict[str, Any]:
     """Merge materialized PIT rows into the normalized shadow input contract."""
 
@@ -153,7 +154,11 @@ def build_normalized_payload(
             if value is None:
                 factor_maps[field][sym6] = None
             else:
-                factor_maps[field][sym6] = _number(value, field=field, symbol=sym6)
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid {field} for symbol {sym6!r}") from exc
+                factor_maps[field][sym6] = parsed if math.isfinite(parsed) else None
 
     z_maps = {field: _zscore(values) for field, values in factor_maps.items()}
     for field in FACTOR_FIELDS:
@@ -161,6 +166,7 @@ def build_normalized_payload(
             raise ValueError(f"missing fusion configuration for {field}")
 
     rows: list[dict[str, Any]] = []
+    excluded_missing_fusion: list[str] = []
     seen: set[str] = set()
     for raw in xsec_rows:
         symbol = _symbol(raw.get("canon", raw.get("symbol")))
@@ -169,7 +175,10 @@ def build_normalized_payload(
             raise ValueError(f"duplicate xsec symbol: {symbol}")
         seen.add(sym6)
         if sym6 not in fusion_by_sym6:
-            raise ValueError(f"fusion row missing for symbol: {symbol}")
+            if strict_fusion:
+                raise ValueError(f"fusion row missing for symbol: {symbol}")
+            excluded_missing_fusion.append(symbol)
+            continue
         old_score = _old_selector_score(raw, selector_weights, symbol)
         fusion_score = 0.0
         for field in FACTOR_FIELDS:
@@ -206,6 +215,11 @@ def build_normalized_payload(
         "trade_day": str(trade_day),
         "rows": rows,
         "previous_symbols": previous,
+        "coverage": {
+            "xsec_rows": len(xsec_rows),
+            "included_rows": len(rows),
+            "excluded_missing_fusion": excluded_missing_fusion,
+        },
         "score_metadata": {
             "selector_weights": {str(k): float(v) for k, v in selector_weights.items()},
             "factor_weights": {str(k): float(v) for k, v in factor_weights.items()},

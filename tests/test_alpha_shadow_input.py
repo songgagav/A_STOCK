@@ -90,6 +90,46 @@ def test_build_normalized_payload_rejects_missing_required_xsec_field():
         )
 
 
+def test_build_normalized_payload_treats_nan_factor_as_missing():
+    fusion = _fusion_rows()
+    fusion[0]["ep"] = float("nan")
+    payload = build_normalized_payload(
+        trade_day="2026-09-01",
+        xsec_rows=_xsec_rows(),
+        fusion_rows=fusion,
+        forward_returns={},
+        selector_weights={"signal": 0.34},
+        factor_weights={field: 1.0 for field in ("pb_inv", "ep", "ocf_ps", "roe_yy_chg")},
+        factor_directions={field: 1 for field in ("pb_inv", "ep", "ocf_ps", "roe_yy_chg")},
+    )
+
+    assert payload["rows"][0]["scores"]["fusion_A"] == pytest.approx(
+        payload["rows"][0]["scores"]["fusion_rank_on"]
+    )
+
+
+def test_build_normalized_payload_records_symbols_without_fusion_coverage():
+    xsec = _xsec_rows()
+    xsec.append({**xsec[0], "canon": "300146.SZ"})
+    payload = build_normalized_payload(
+        trade_day="2026-09-01",
+        xsec_rows=xsec,
+        fusion_rows=_fusion_rows(),
+        forward_returns={},
+        selector_weights={"signal": 0.34},
+        factor_weights={field: 1.0 for field in ("pb_inv", "ep", "ocf_ps", "roe_yy_chg")},
+        factor_directions={field: 1 for field in ("pb_inv", "ep", "ocf_ps", "roe_yy_chg")},
+        strict_fusion=False,
+    )
+
+    assert [row["symbol"] for row in payload["rows"]] == ["600001.SH", "000002.SZ"]
+    assert payload["coverage"] == {
+        "xsec_rows": 3,
+        "included_rows": 2,
+        "excluded_missing_fusion": ["300146.SZ"],
+    }
+
+
 def test_aggregate_shadow_results_preserves_missing_values():
     results = [
         {
