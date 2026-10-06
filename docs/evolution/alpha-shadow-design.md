@@ -35,6 +35,20 @@ Top-N 过程中被稀释或反转。
 输入行必须显式提供 `symbol` 和 `scores`。缺字段、非数值或非有限值直接报错，
 不静默删除股票。
 
+如果要计算前向指标，行中再提供：
+
+```json
+{
+  "symbol": "600001.SH",
+  "scores": {"score": 0.9, "signal": 0.2, "fusion_A": 0.7},
+  "forward_returns": {"1": 0.01, "5": 0.03}
+}
+```
+
+`forward_returns` 的值是小数收益率；缺失或非有限值会被明确记为
+`null`，不会补零。上一期持仓通过独立的 `previous_symbols` 参数传入，避免
+从 PaperBook 或生产状态文件读取。
+
 ## 实验身份与缓存
 
 `build_experiment_manifest()` 记录：
@@ -64,6 +78,12 @@ manifest 通过同目录临时文件加 `os.replace` 原子落盘。原始行情
 - 共同标的数；
 - Top-N Jaccard；
 - 全排名 Spearman 相关。
+- 每个 horizon 的 Top-N 平均前向收益；
+- 每个 horizon 的全样本 RankIC；
+- 相对上一期显式持仓的替换率 `turnover = 1 - overlap / max(|target|, |previous|)`。
+
+没有上一期持仓时，`turnover` 为 `null`；没有足够的前向收益时，平均收益和
+RankIC 为 `null`。这些是不可计算，不是零表现。
 
 后续真实数据 runner 再追加 RankIC（1/5/10/20/60/120d）、Q1-Q5 单调性、前向
 收益/超额、换手、缺失率、fallback 次数和 universe size。没有这些共同输入和

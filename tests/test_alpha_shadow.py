@@ -111,3 +111,59 @@ def test_manifest_is_written_under_hash_directory(tmp_path: Path):
     assert path == tmp_path / manifest["experiment_hash"] / "manifest.json"
     assert path.exists()
     assert path.read_text(encoding="utf-8").startswith("{")
+
+
+def _metric_rows():
+    rows = []
+    values = [
+        ("600001.SH", 0.90, 0.10, 0.03, 0.05),
+        ("600002.SH", 0.80, 0.20, 0.02, 0.01),
+        ("600003.SH", 0.70, 0.30, 0.04, -0.01),
+        ("600004.SH", 0.60, 0.40, 0.01, 0.03),
+    ]
+    for symbol, score, signal, return_1d, return_5d in values:
+        rows.append(
+            {
+                "symbol": symbol,
+                "scores": {
+                    "score": score,
+                    "signal": signal,
+                    "fusion_A": score,
+                    "selector_score": score,
+                    "fusion_rank_on": score,
+                },
+                "forward_returns": {"1": return_1d, "5": return_5d},
+            }
+        )
+    return rows
+
+
+def test_shadow_metrics_report_forward_returns_rank_ic_and_turnover():
+    result = evaluate_shadow_arms(
+        _metric_rows(),
+        top_n=2,
+        previous_symbols=["600002.SH", "600004.SH"],
+        forward_horizons=(1, 5, 10),
+    )
+
+    control = result["arms"]["control_prod"]
+
+    assert control["forward_return_mean"]["1"] == pytest.approx(0.025)
+    assert control["forward_return_mean"]["5"] == pytest.approx(0.03)
+    assert control["forward_return_mean"]["10"] is None
+    assert control["rank_ic"]["1"] is not None
+    assert control["rank_ic"]["5"] is not None
+    assert control["turnover"] == pytest.approx(0.5)
+
+
+def test_shadow_metrics_mark_missing_previous_holdings_and_returns_explicitly():
+    rows = _metric_rows()
+    for row in rows:
+        row.pop("forward_returns")
+
+    result = evaluate_shadow_arms(rows, top_n=2, forward_horizons=(1, 5))
+    control = result["arms"]["control_prod"]
+
+    assert control["forward_return_mean"] == {"1": None, "5": None}
+    assert control["rank_ic"] == {"1": None, "5": None}
+    assert control["turnover"] is None

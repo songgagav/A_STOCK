@@ -14,6 +14,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
+from statistics import mean
 from typing import Any, Mapping, Sequence
 
 
@@ -147,11 +148,64 @@ def _top_n_jaccard(reference: Sequence[str], candidate: Sequence[str], top_n: in
     return len(reference_set & candidate_set) / len(union)
 
 
+def _forward_value(row: Mapping[str, Any], horizon: int) -> float | None:
+    values = row.get("forward_returns")
+    if not isinstance(values, Mapping):
+        return None
+    raw = values.get(str(horizon), values.get(horizon))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _turnover(selected: Sequence[str], previous: Sequence[str] | None) -> float | None:
+    if previous is None:
+        return None
+    selected_set = set(selected)
+    previous_set = {str(symbol) for symbol in previous}
+    denominator = max(len(selected_set), len(previous_set))
+    if denominator == 0:
+        return None
+    return 1.0 - len(selected_set & previous_set) / denominator
+
+
+def _rank_ic(
+    arm_rows: Sequence[Mapping[str, Any]],
+    horizon: int,
+) -> float | None:
+    valid = [
+        (str(row["symbol"]), value)
+        for row in arm_rows
+        if (value := _forward_value(row, horizon)) is not None
+    ]
+    if len(valid) < 2:
+        return None
+    score_order = [symbol for symbol, _ in valid]
+    return_order = [symbol for symbol, _ in sorted(valid, key=lambda item: (-item[1], item[0]))]
+    return _rank_correlation(score_order, return_order)
+
+
+def _forward_return_mean(
+    arm_rows: Sequence[Mapping[str, Any]],
+    horizon: int,
+) -> float | None:
+    values = [
+        value
+        for row in arm_rows
+        if (value := _forward_value(row, horizon)) is not None
+    ]
+    return mean(values) if values else None
+
+
 def evaluate_shadow_arms(
     rows: Sequence[Mapping[str, Any]],
     *,
     top_n: int = 10,
     score_fields: Mapping[str, str] | None = None,
+    previous_symbols: Sequence[str] | None = None,
+    forward_horizons: Sequence[int] = (1, 5, 10, 20, 60, 120),
 ) -> dict[str, Any]:
     """Rank all diagnostic arms and compare each with ``control_prod``."""
 
@@ -187,6 +241,15 @@ def evaluate_shadow_arms(
                 "symbols": ranked_symbols[arm][:top_n],
                 "ranked_symbols": ranked_symbols[arm],
                 "field": _score_field(arm, score_fields),
+                "forward_return_mean": {
+                    str(horizon): _forward_return_mean(ranked[arm][:top_n], horizon)
+                    for horizon in forward_horizons
+                },
+                "rank_ic": {
+                    str(horizon): _rank_ic(ranked[arm], horizon)
+                    for horizon in forward_horizons
+                },
+                "turnover": _turnover(ranked_symbols[arm][:top_n], previous_symbols),
             }
             for arm in ARM_NAMES
         },
