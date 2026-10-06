@@ -257,27 +257,20 @@ def evaluate_shadow_arms(
     }
 
 
-def write_manifest(cache_root: str | os.PathLike[str], manifest: Mapping[str, Any]) -> Path:
-    """Atomically write ``manifest.json`` under its experiment hash directory."""
-
-    experiment_hash = str(manifest.get("experiment_hash") or "")
-    if len(experiment_hash) != 64:
-        raise ValueError("manifest must contain a SHA-256 experiment_hash")
-    target_dir = Path(cache_root) / experiment_hash
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / "manifest.json"
-    payload = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+def _atomic_write_json(target: Path, payload: Mapping[str, Any], prefix: str) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     temp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=target_dir,
-            prefix="manifest.",
+            dir=target.parent,
+            prefix=prefix,
             suffix=".tmp",
             delete=False,
         ) as handle:
-            handle.write(payload)
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
             temp_path = handle.name
@@ -290,3 +283,29 @@ def write_manifest(cache_root: str | os.PathLike[str], manifest: Mapping[str, An
             except FileNotFoundError:
                 pass
     return target
+
+
+def write_manifest(cache_root: str | os.PathLike[str], manifest: Mapping[str, Any]) -> Path:
+    """Atomically write ``manifest.json`` under its experiment hash directory."""
+
+    experiment_hash = str(manifest.get("experiment_hash") or "")
+    if len(experiment_hash) != 64:
+        raise ValueError("manifest must contain a SHA-256 experiment_hash")
+    target = Path(cache_root) / experiment_hash / "manifest.json"
+    return _atomic_write_json(target, manifest, "manifest.")
+
+
+def write_result(
+    cache_root: str | os.PathLike[str],
+    manifest: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Path:
+    """Atomically write one shadow result beside its manifest."""
+
+    experiment_hash = str(manifest.get("experiment_hash") or "")
+    if len(experiment_hash) != 64:
+        raise ValueError("manifest must contain a SHA-256 experiment_hash")
+    if result.get("experiment_hash") != experiment_hash:
+        raise ValueError("result experiment_hash does not match manifest")
+    target = Path(cache_root) / experiment_hash / "result.json"
+    return _atomic_write_json(target, result, "result.")

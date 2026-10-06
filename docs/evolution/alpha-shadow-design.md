@@ -70,6 +70,39 @@ data/shadow_alpha/<experiment_hash>/manifest.json
 manifest 通过同目录临时文件加 `os.replace` 原子落盘。原始行情和研究产物仍留在
 本地数据目录，不进入 Git。
 
+## 离线 runner 输入与运行
+
+`scripts/research/alpha_shadow_compare.py` 只接受调用方已经准备好的规范化 PIT
+JSON，不负责取数。最小结构如下：
+
+```json
+{
+  "schema_version": 1,
+  "trade_day": "2026-09-01",
+  "rows": [{"symbol": "600001.SH", "scores": {}, "forward_returns": {"1": 0.01}}],
+  "previous_symbols": ["600002.SH"],
+  "input_hashes": {"pit": "...", "forward": "..."}
+}
+```
+
+示例：
+
+```powershell
+.venv310\Scripts\python.exe scripts\research\alpha_shadow_compare.py `
+  --input data\research\shadow_input_20260901.json `
+  --cache-root data\shadow_alpha `
+  --code-sha <已审计代码提交> `
+  --factor-version factor-v1 `
+  --direction-version direction-a `
+  --weight-version weights-v1 `
+  --selector-variant production-default `
+  --env-flag RANK_BY_FUSION=0
+```
+
+runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自动将结果写入
+`selection.json`、`target_plan.json`、PaperBook 或任何交易输入；真实 PIT 适配器需在
+独立批次中生成上述输入，并提供其来源哈希。
+
 ## 输出指标
 
 `evaluate_shadow_arms()` 当前输出每个 arm 的完整排名、Top-N 标的，并相对
