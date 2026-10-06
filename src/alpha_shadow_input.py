@@ -215,6 +215,59 @@ def build_normalized_payload(
     }
 
 
+def forward_returns_from_bars(
+    *,
+    trading_days: Sequence[str],
+    bars: Sequence[Mapping[str, Any]],
+    trade_day: str,
+    symbols: Sequence[str],
+    horizons: Sequence[int],
+) -> dict[str, dict[str, float]]:
+    """Compound ``change_pct`` over mature forward windows.
+
+    Missing or immature windows are omitted instead of being converted to zero.
+    The caller may therefore distinguish an unavailable observation from a flat
+    return.  ``bars`` is expected to contain rows from the same canonical bar
+    source and is intentionally a plain sequence for easy fixture injection.
+    """
+
+    calendar = [str(day)[:10] for day in trading_days]
+    try:
+        start_index = calendar.index(str(trade_day)[:10])
+    except ValueError as exc:
+        raise ValueError(f"trade_day is not in the trading calendar: {trade_day}") from exc
+    grouped: dict[str, list[tuple[str, float]]] = {}
+    for raw in bars:
+        day = str(raw.get("d", raw.get("date", "")))[:10]
+        symbol = _sym6(raw.get("symbol", raw.get("canon")))
+        value = _number(raw.get("change_pct"), field="change_pct", symbol=symbol)
+        grouped.setdefault(symbol, []).append((day, value))
+
+    output: dict[str, dict[str, float]] = {}
+    for raw_symbol in symbols:
+        symbol = _sym6(raw_symbol)
+        observations = grouped.get(symbol, [])
+        values: dict[str, float] = {}
+        for horizon in horizons:
+            horizon = int(horizon)
+            if horizon <= 0:
+                raise ValueError("forward horizons must be positive")
+            end_index = start_index + horizon
+            if end_index >= len(calendar):
+                continue
+            end_day = calendar[end_index]
+            product = 1.0
+            count = 0
+            for day, change_pct in observations:
+                if str(trade_day)[:10] < day <= end_day:
+                    product *= 1.0 + change_pct / 100.0
+                    count += 1
+            if count:
+                values[str(horizon)] = product - 1.0
+        output[symbol] = values
+    return output
+
+
 def _finite_values(values: Sequence[Any]) -> list[float]:
     result = []
     for value in values:

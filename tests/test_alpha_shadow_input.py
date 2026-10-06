@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from alpha_shadow_input import aggregate_shadow_results, build_normalized_payload
+from alpha_shadow_input import (
+    aggregate_shadow_results,
+    build_normalized_payload,
+    forward_returns_from_bars,
+)
 
 
 def _xsec_rows():
@@ -122,3 +126,22 @@ def test_aggregate_shadow_results_preserves_missing_values():
     assert arm["rank_ic"]["5"] == {"mean": 0.2, "n": 1}
     assert arm["forward_return_mean"]["1"] == {"mean": 0.03, "n": 2}
     assert arm["turnover"] == {"mean": 0.5, "n": 1}
+
+
+def test_forward_returns_from_bars_compounds_change_pct_and_marks_immature_horizon():
+    values = forward_returns_from_bars(
+        trading_days=["2026-09-01", "2026-09-02", "2026-09-03"],
+        bars=[
+            {"d": "2026-09-02", "symbol": "600001", "change_pct": 10.0},
+            {"d": "2026-09-03", "symbol": "600001", "change_pct": -5.0},
+            {"d": "2026-09-02", "symbol": "000002", "change_pct": 2.0},
+        ],
+        trade_day="2026-09-01",
+        symbols=["600001", "000002"],
+        horizons=(1, 2, 5),
+    )
+
+    assert values["600001"]["1"] == pytest.approx(0.10)
+    assert values["600001"]["2"] == pytest.approx(1.10 * 0.95 - 1.0)
+    assert "5" not in values["600001"]
+    assert values["000002"]["1"] == pytest.approx(0.02)
