@@ -103,6 +103,29 @@ runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自�
 `selection.json`、`target_plan.json`、PaperBook 或任何交易输入；真实 PIT 适配器需在
 独立批次中生成上述输入，并提供其来源哈希。
 
+### 真实 PIT 批量适配器
+
+`scripts/research/alpha_shadow_batch.py` 负责把已有的 `xsec`、`fusion_x` parquet
+和 h5i 日线只读合成为规范化输入，再调用同一个离线 runner。它要求显式提供：
+
+```powershell
+.venv310\Scripts\python.exe scripts\research\alpha_shadow_batch.py `
+  --xsec-dir data\pit\xsec `
+  --fusion-dir data\pit\fusion_x `
+  --bar-db data\h5i\market.db `
+  --factor-config data\fusion_decompose.json `
+  --input-root data\shadow_alpha_inputs `
+  --cache-root data\shadow_alpha `
+  --report data\shadow_alpha_report.json `
+  --code-sha <审计提交> `
+  --factor-version <版本> `
+  --direction-version <版本> `
+  --weight-version <版本>
+```
+
+适配器只读取 h5i，不修改生产数据；`fusion_x` 覆盖不足时写入 `coverage` 和排除
+清单。真实运行记录见 [`alpha-shadow-run-2026-10-06.md`](alpha-shadow-run-2026-10-06.md)。
+
 ## 输出指标
 
 `evaluate_shadow_arms()` 当前输出每个 arm 的完整排名、Top-N 标的，并相对
