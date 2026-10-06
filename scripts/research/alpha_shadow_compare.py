@@ -40,6 +40,8 @@ def _load_payload(path: Path) -> dict[str, Any]:
         raise ValueError(f"cannot read normalized shadow input: {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError("normalized shadow input must be a JSON object")
+    if payload.get("schema_version") != 1:
+        raise ValueError("unsupported normalized shadow input schema_version")
     rows = payload.get("rows")
     if not isinstance(rows, list):
         raise ValueError("normalized shadow input must contain a rows list")
@@ -160,7 +162,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    print(json.dumps({key: str(value) for key, value in output.items() if key.endswith("_path")}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "trade_day": output["trade_day"],
+                "experiment_hash": output["experiment_hash"],
+                **{
+                    key: str(value)
+                    for key, value in output.items()
+                    if key.endswith("_path")
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

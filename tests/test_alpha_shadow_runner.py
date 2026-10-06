@@ -83,3 +83,22 @@ def test_run_shadow_file_rejects_missing_normalized_rows(tmp_path: Path):
             selector_variant="production-default",
             env_flags={},
         )
+
+
+def test_run_shadow_file_rejects_unknown_input_schema(tmp_path: Path):
+    payload = _input_payload()
+    payload["schema_version"] = 2
+    input_path = tmp_path / "future.json"
+    input_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        run_shadow_file(
+            input_path,
+            tmp_path / "cache",
+            code_sha="abc123",
+            factor_version="factor-v1",
+            direction_version="direction-a",
+            weight_version="weights-v1",
+            selector_variant="production-default",
+            env_flags={},
+        )
