@@ -49,6 +49,20 @@ Top-N 过程中被稀释或反转。
 `null`，不会补零。上一期持仓通过独立的 `previous_symbols` 参数传入，避免
 从 PaperBook 或生产状态文件读取。
 
+如果需要超额收益，输入必须显式提供基准：
+
+```json
+{
+  "benchmark": {
+    "name": "equal_weight_xsec_available",
+    "returns": {"1": 0.01, "5": 0.03},
+    "n": {"1": 1200, "5": 1195}
+  }
+}
+```
+
+缺少基准时超额收益保持 `null`，不把“没有基准”伪装成零超额。
+
 ## 实验身份与缓存
 
 `build_experiment_manifest()` 记录：
@@ -121,6 +135,7 @@ runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自�
   --factor-version <版本> `
   --direction-version <版本> `
   --weight-version <版本>
+  --cost-bps 9.6
 ```
 
 适配器只读取 h5i，不修改生产数据；`fusion_x` 覆盖不足时写入 `coverage` 和排除
@@ -136,13 +151,26 @@ runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自�
 - 全排名 Spearman 相关。
 - 每个 horizon 的 Top-N 平均前向收益；
 - 每个 horizon 的全样本 RankIC；
+- 显式基准下的每个 horizon 超额收益；
+- 指定成本假设下的成本敏感性收益；
 - 相对上一期显式持仓的替换率 `turnover = 1 - overlap / max(|target|, |previous|)`。
 
 没有上一期持仓时，`turnover` 为 `null`；没有足够的前向收益时，平均收益和
-RankIC 为 `null`。这些是不可计算，不是零表现。
+RankIC、超额收益和成本敏感性收益为 `null`。这些是不可计算，不是零表现。
 
-后续真实数据 runner 再追加 RankIC（1/5/10/20/60/120d）、Q1-Q5 单调性、前向
-收益/超额、换手、缺失率、fallback 次数和 universe size。没有这些共同输入和
+`--cost-bps` 只用于研究敏感性：
+
+```text
+cost_adjusted_forward_return_mean
+  = gross_forward_return_mean - turnover_proxy * cost_bps / 10000
+```
+
+它不是成交回放，也不替代 PaperBook 的逐笔费用计算；报告必须同时记录成本假设和
+换手代理的来源。批量适配器使用 `equal_weight_xsec_available` 作为“当日有观测股票的
+等权截面”诊断基准，并按 horizon 记录有效样本数。
+
+后续仍需追加 RankIC（1/5/10/20/60/120d）、Q1-Q5 单调性、真实持仓换手、缺失率、
+fallback 次数和 universe size。没有这些共同输入和
 完整指标前，不得把 shadow 结果称为策略提升。
 
 ## 环境边界
