@@ -73,6 +73,7 @@ def run_shadow_file(
     env_flags: Mapping[str, Any] | None = None,
     top_n: int = 10,
     forward_horizons: Sequence[int] = DEFAULT_HORIZONS,
+    cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     """Evaluate one normalized artifact and atomically cache its evidence."""
 
@@ -84,6 +85,11 @@ def run_shadow_file(
         raise ValueError("input_hashes must be an object")
     hashes = {str(key): str(value) for key, value in input_hashes.items()}
     hashes["normalized_input"] = _sha256_file(input_path)
+    benchmark = payload.get("benchmark")
+    if benchmark is not None and not isinstance(benchmark, Mapping):
+        raise ValueError("benchmark must be an object")
+    benchmark_returns = benchmark.get("returns") if benchmark else None
+    benchmark_name = benchmark.get("name") if benchmark else None
 
     manifest = build_experiment_manifest(
         code_sha=code_sha,
@@ -94,16 +100,22 @@ def run_shadow_file(
         weight_version=weight_version,
         selector_variant=selector_variant,
         env_flags=_validate_env_flags(env_flags),
+        cost_bps=cost_bps,
     )
     result = evaluate_shadow_arms(
         rows,
         top_n=top_n,
         previous_symbols=payload["previous_symbols"],
         forward_horizons=forward_horizons,
+        benchmark_returns=benchmark_returns,
+        benchmark_name=str(benchmark_name) if benchmark_name is not None else None,
+        cost_bps=cost_bps,
     )
     result["trade_day"] = payload.get("trade_day")
     result["experiment_hash"] = manifest["experiment_hash"]
     result["input_hashes"] = hashes
+    if benchmark and "n" in benchmark and "benchmark" in result:
+        result["benchmark"]["n"] = benchmark["n"]
 
     manifest_path = write_manifest(cache_root, manifest)
     result_path = write_result(cache_root, manifest, result)
@@ -139,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--selector-variant", required=True)
     parser.add_argument("--env-flag", action="append", default=[])
     parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--cost-bps", type=float, default=0.0)
     parser.add_argument(
         "--horizon",
         dest="horizons",
@@ -159,6 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             env_flags=_parse_env_flags(args.env_flag),
             top_n=args.top_n,
             forward_horizons=tuple(args.horizons or DEFAULT_HORIZONS),
+            cost_bps=args.cost_bps,
         )
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

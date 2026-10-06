@@ -4,6 +4,7 @@ import pytest
 
 from alpha_shadow_input import (
     aggregate_shadow_results,
+    benchmark_from_forward_returns,
     build_normalized_payload,
     forward_returns_from_bars,
 )
@@ -166,6 +167,59 @@ def test_aggregate_shadow_results_preserves_missing_values():
     assert arm["rank_ic"]["5"] == {"mean": 0.2, "n": 1}
     assert arm["forward_return_mean"]["1"] == {"mean": 0.03, "n": 2}
     assert arm["turnover"] == {"mean": 0.5, "n": 1}
+
+
+def test_aggregate_shadow_results_includes_excess_and_cost_metrics():
+    results = [
+        {
+            "trade_day": "2026-09-01",
+            "result": {
+                "benchmark": {
+                    "name": "equal_weight_xsec_available",
+                    "returns": {"1": 0.01},
+                },
+                "arms": {
+                    "control_prod": {
+                        "rank_ic": {"1": 0.1},
+                        "forward_return_mean": {"1": 0.02},
+                        "excess_return_mean": {"1": 0.01},
+                        "cost_adjusted_forward_return_mean": {"1": 0.019},
+                        "turnover": 0.1,
+                    }
+                },
+                "comparisons": {},
+            },
+        }
+    ]
+
+    report = aggregate_shadow_results(results, horizons=(1,))
+    arm = report["arms"]["control_prod"]
+    assert arm["excess_return_mean"]["1"] == {"mean": 0.01, "n": 1}
+    assert arm["cost_adjusted_forward_return_mean"]["1"] == {
+        "mean": 0.019,
+        "n": 1,
+    }
+    assert report["benchmark"] == {
+        "name": "equal_weight_xsec_available",
+        "returns": {"1": {"mean": 0.01, "n": 1}},
+    }
+
+
+def test_benchmark_from_forward_returns_uses_available_finite_observations():
+    benchmark = benchmark_from_forward_returns(
+        {
+            "600001": {"1": 0.01, "5": 0.05},
+            "600002": {"1": 0.03, "5": None},
+            "600003": {"1": "bad"},
+        },
+        horizons=(1, 5, 10),
+    )
+
+    assert benchmark == {
+        "name": "equal_weight_xsec_available",
+        "returns": {"1": 0.02, "5": 0.05},
+        "n": {"1": 2, "5": 1},
+    }
 
 
 def test_forward_returns_from_bars_compounds_change_pct_and_marks_immature_horizon():

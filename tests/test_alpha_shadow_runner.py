@@ -36,6 +36,10 @@ def _input_payload():
         "rows": rows,
         "previous_symbols": ["600002.SH", "600004.SH"],
         "input_hashes": {"pit": "a" * 64, "forward": "b" * 64},
+        "benchmark": {
+            "name": "equal_weight_xsec_available",
+            "returns": {"1": 0.02},
+        },
     }
 
 
@@ -56,6 +60,7 @@ def test_run_shadow_file_writes_manifest_and_result_atomically(tmp_path: Path):
         env_flags={"RANK_BY_FUSION": "0"},
         top_n=2,
         forward_horizons=(1,),
+        cost_bps=10.0,
     )
 
     assert output["trade_day"] == "2026-09-01"
@@ -65,6 +70,10 @@ def test_run_shadow_file_writes_manifest_and_result_atomically(tmp_path: Path):
     assert result["experiment_hash"] == output["experiment_hash"]
     assert result["arms"]["control_prod"]["forward_return_mean"]["1"] == pytest.approx(
         0.015
+    )
+    assert result["benchmark"]["name"] == "equal_weight_xsec_available"
+    assert result["arms"]["control_prod"]["excess_return_mean"]["1"] == pytest.approx(
+        -0.005
     )
 
 

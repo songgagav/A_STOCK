@@ -130,6 +130,7 @@ def build_normalized_payload(
     factor_directions: Mapping[str, Any],
     previous_symbols: Sequence[str] = (),
     strict_fusion: bool = True,
+    benchmark: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge materialized PIT rows into the normalized shadow input contract."""
 
@@ -210,7 +211,7 @@ def build_normalized_payload(
         if symbol not in seen_previous:
             previous.append(symbol)
             seen_previous.add(symbol)
-    return {
+    payload = {
         "schema_version": 1,
         "trade_day": str(trade_day),
         "rows": rows,
@@ -227,6 +228,11 @@ def build_normalized_payload(
             "fusion_rank_on": "pure_fusion_alpha_1.0",
         },
     }
+    if benchmark is not None:
+        if not isinstance(benchmark, Mapping):
+            raise ValueError("benchmark must be an object")
+        payload["benchmark"] = dict(benchmark)
+    return payload
 
 
 def forward_returns_from_bars(
@@ -299,6 +305,44 @@ def _summary(values: Sequence[Any]) -> dict[str, Any]:
     return {"mean": mean(finite), "n": len(finite)} if finite else {"mean": None, "n": 0}
 
 
+def benchmark_from_forward_returns(
+    forward_returns: Mapping[str, Mapping[Any, Any]],
+    *,
+    horizons: Sequence[int],
+) -> dict[str, Any]:
+    """Build an explicitly named available-cross-section equal-weight benchmark.
+
+    This is a diagnostic benchmark only. Missing or immature observations are
+    excluded and their per-horizon counts are recorded instead of being zeroed.
+    """
+
+    if not isinstance(forward_returns, Mapping):
+        raise ValueError("forward_returns must be an object")
+    returns: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for horizon in horizons:
+        values = []
+        for row in forward_returns.values():
+            if not isinstance(row, Mapping):
+                continue
+            raw = row.get(str(horizon), row.get(horizon))
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        if values:
+            key = str(horizon)
+            returns[key] = mean(values)
+            counts[key] = len(values)
+    return {
+        "name": "equal_weight_xsec_available",
+        "returns": returns,
+        "n": counts,
+    }
+
+
 def aggregate_shadow_results(
     results: Sequence[Mapping[str, Any]],
     *,
@@ -315,6 +359,36 @@ def aggregate_shadow_results(
         "arms": {},
         "comparisons": {},
     }
+    benchmark_specs = [
+        ((item.get("result") or {}).get("benchmark"))
+        for item in results
+        if ((item.get("result") or {}).get("benchmark"))
+    ]
+    if benchmark_specs:
+        names = {str(spec.get("name") or "") for spec in benchmark_specs}
+        benchmark_report = {
+            "name": next(iter(names)) if len(names) == 1 else "mixed",
+            "returns": {
+                str(horizon): _summary(
+                    [
+                        (spec.get("returns") or {}).get(str(horizon))
+                        for spec in benchmark_specs
+                    ]
+                )
+                for horizon in horizons
+            },
+        }
+        if any("n" in spec for spec in benchmark_specs):
+            benchmark_report["n"] = {
+                str(horizon): _summary(
+                    [
+                        (spec.get("n") or {}).get(str(horizon))
+                        for spec in benchmark_specs
+                    ]
+                )
+                for horizon in horizons
+            }
+        report["benchmark"] = benchmark_report
     for arm in ARM_NAMES:
         report["arms"][arm] = {
             "rank_ic": {
@@ -330,6 +404,24 @@ def aggregate_shadow_results(
                 str(horizon): _summary(
                     [
                         ((item.get("result") or {}).get("arms") or {}).get(arm, {}).get("forward_return_mean", {}).get(str(horizon))
+                        for item in results
+                    ]
+                )
+                for horizon in horizons
+            },
+            "excess_return_mean": {
+                str(horizon): _summary(
+                    [
+                        ((item.get("result") or {}).get("arms") or {}).get(arm, {}).get("excess_return_mean", {}).get(str(horizon))
+                        for item in results
+                    ]
+                )
+                for horizon in horizons
+            },
+            "cost_adjusted_forward_return_mean": {
+                str(horizon): _summary(
+                    [
+                        ((item.get("result") or {}).get("arms") or {}).get(arm, {}).get("cost_adjusted_forward_return_mean", {}).get(str(horizon))
                         for item in results
                     ]
                 )

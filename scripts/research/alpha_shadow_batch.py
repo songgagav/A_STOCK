@@ -25,6 +25,7 @@ from alpha_shadow import _atomic_write_json  # noqa: E402
 from alpha_shadow_compare import run_shadow_file  # noqa: E402
 from alpha_shadow_input import (  # noqa: E402
     aggregate_shadow_results,
+    benchmark_from_forward_returns,
     build_normalized_payload,
     forward_returns_from_bars,
 )
@@ -165,6 +166,7 @@ def run_batch(
     horizons: Sequence[int] = (1, 5, 10, 20, 60, 120),
     limit: int | None = None,
     env_flags: Mapping[str, str] | None = None,
+    cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     factor_weights, factor_directions = load_factor_config(factor_config)
     days = select_common_days(xsec_dir, fusion_dir)
@@ -189,6 +191,10 @@ def run_batch(
             symbols=symbols,
             horizons=horizons,
         )
+        benchmark = benchmark_from_forward_returns(
+            forward_returns,
+            horizons=horizons,
+        )
         payload = build_normalized_payload(
             trade_day=day,
             xsec_rows=xsec_rows,
@@ -199,6 +205,7 @@ def run_batch(
             factor_directions=factor_directions,
             previous_symbols=previous_symbols,
             strict_fusion=False,
+            benchmark=benchmark,
         )
         input_path = _write_input(input_root / f"{day}.json", payload)
         output = run_shadow_file(
@@ -212,6 +219,7 @@ def run_batch(
             env_flags=flags,
             top_n=top_n,
             forward_horizons=tuple(horizons),
+            cost_bps=cost_bps,
         )
         result = output["result"]
         results.append({"trade_day": day, "result": result})
@@ -233,6 +241,8 @@ def run_batch(
         "bar_db": str(Path(bar_db)),
         "factor_config": str(Path(factor_config)),
         "turnover_basis": "previous shadow control_prod top_n",
+        "cost_bps": float(cost_bps),
+        "cost_model": "turnover proxy * cost_bps / 10000; sensitivity only",
     }
     report["experiments"] = experiments
     report_path = _atomic_write_json(Path(report_path), report, "shadow-report.")
@@ -268,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--selector-variant", default="production-default")
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--cost-bps", type=float, default=0.0)
     parser.add_argument("--horizon", dest="horizons", type=int, action="append")
     parser.add_argument("--env-flag", action="append", default=[])
     args = parser.parse_args(argv)
@@ -289,6 +300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             horizons=tuple(args.horizons or (1, 5, 10, 20, 60, 120)),
             limit=args.limit,
             env_flags=_parse_env_flags(args.env_flag),
+            cost_bps=args.cost_bps,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))

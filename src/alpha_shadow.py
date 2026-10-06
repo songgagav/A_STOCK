@@ -58,10 +58,17 @@ def build_experiment_manifest(
     weight_version: str,
     selector_variant: str,
     env_flags: Mapping[str, str],
+    cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     """Build a stable cache identity for one shadow experiment."""
 
     symbols = sorted({str(symbol) for symbol in universe_symbols})
+    try:
+        normalized_cost_bps = float(cost_bps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cost_bps must be a finite non-negative number") from exc
+    if not math.isfinite(normalized_cost_bps) or normalized_cost_bps < 0:
+        raise ValueError("cost_bps must be a finite non-negative number")
     config = {
         "schema_version": 1,
         "arms": list(ARM_NAMES),
@@ -70,6 +77,7 @@ def build_experiment_manifest(
         "weight_version": str(weight_version),
         "selector_variant": str(selector_variant),
         "env_flags": dict(sorted((str(k), str(v)) for k, v in env_flags.items())),
+        "cost_bps": normalized_cost_bps,
     }
     manifest = {
         "schema_version": 1,
@@ -82,6 +90,7 @@ def build_experiment_manifest(
         "weight_version": config["weight_version"],
         "selector_variant": config["selector_variant"],
         "env_flags": config["env_flags"],
+        "cost_bps": config["cost_bps"],
         "arms": list(ARM_NAMES),
         "experiment_config_hash": _sha256(config),
     }
@@ -199,6 +208,67 @@ def _forward_return_mean(
     return mean(values) if values else None
 
 
+def _benchmark_value(
+    benchmark_returns: Mapping[Any, Any] | None,
+    horizon: int,
+) -> float | None:
+    if benchmark_returns is None:
+        return None
+    raw = benchmark_returns.get(str(horizon), benchmark_returns.get(horizon))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _normalize_benchmark_returns(
+    benchmark_returns: Mapping[Any, Any] | None,
+) -> dict[str, float] | None:
+    if benchmark_returns is None:
+        return None
+    if not isinstance(benchmark_returns, Mapping):
+        raise ValueError("benchmark_returns must be an object")
+    normalized: dict[str, float] = {}
+    for horizon, raw in benchmark_returns.items():
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid benchmark return for horizon {horizon!r}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite benchmark return for horizon {horizon!r}")
+        normalized[str(horizon)] = value
+    return normalized
+
+
+def _excess_return_mean(
+    arm_rows: Sequence[Mapping[str, Any]],
+    horizon: int,
+    benchmark_returns: Mapping[Any, Any] | None,
+) -> float | None:
+    gross = _forward_return_mean(arm_rows, horizon)
+    benchmark = _benchmark_value(benchmark_returns, horizon)
+    if gross is None or benchmark is None:
+        return None
+    return gross - benchmark
+
+
+def _cost_adjusted_forward_return_mean(
+    arm_rows: Sequence[Mapping[str, Any]],
+    selected_symbols: Sequence[str],
+    previous_symbols: Sequence[str] | None,
+    horizon: int,
+    cost_bps: float,
+) -> float | None:
+    gross = _forward_return_mean(arm_rows, horizon)
+    turnover = _turnover(selected_symbols, previous_symbols)
+    if gross is None or turnover is None:
+        return None
+    # This is a sensitivity proxy, not a realized A-share transaction-cost
+    # calculation. The assumption is recorded in the batch report.
+    return gross - turnover * cost_bps / 10000.0
+
+
 def evaluate_shadow_arms(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -206,8 +276,19 @@ def evaluate_shadow_arms(
     score_fields: Mapping[str, str] | None = None,
     previous_symbols: Sequence[str] | None = None,
     forward_horizons: Sequence[int] = (1, 5, 10, 20, 60, 120),
+    benchmark_returns: Mapping[Any, Any] | None = None,
+    benchmark_name: str | None = None,
+    cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     """Rank all diagnostic arms and compare each with ``control_prod``."""
+
+    try:
+        normalized_cost_bps = float(cost_bps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cost_bps must be a finite non-negative number") from exc
+    if not math.isfinite(normalized_cost_bps) or normalized_cost_bps < 0:
+        raise ValueError("cost_bps must be a finite non-negative number")
+    benchmark_returns = _normalize_benchmark_returns(benchmark_returns)
 
     ranked = {
         arm: rank_arm(rows, arm, score_fields=score_fields)
@@ -232,10 +313,11 @@ def evaluate_shadow_arms(
                 ranked_symbols["control_prod"], ranked_symbols[arm]
             ),
         }
-    return {
+    result = {
         "schema_version": 1,
         "row_count": len(rows),
         "top_n": top_n,
+        "cost_bps": normalized_cost_bps,
         "arms": {
             arm: {
                 "symbols": ranked_symbols[arm][:top_n],
@@ -249,12 +331,40 @@ def evaluate_shadow_arms(
                     str(horizon): _rank_ic(ranked[arm], horizon)
                     for horizon in forward_horizons
                 },
+                "excess_return_mean": {
+                    str(horizon): _excess_return_mean(
+                        ranked[arm][:top_n], horizon, benchmark_returns
+                    )
+                    for horizon in forward_horizons
+                },
+                "cost_adjusted_forward_return_mean": {
+                    str(horizon): _cost_adjusted_forward_return_mean(
+                        ranked[arm][:top_n],
+                        ranked_symbols[arm][:top_n],
+                        previous_symbols,
+                        horizon,
+                        normalized_cost_bps,
+                    )
+                    for horizon in forward_horizons
+                },
                 "turnover": _turnover(ranked_symbols[arm][:top_n], previous_symbols),
             }
             for arm in ARM_NAMES
         },
         "comparisons": comparisons,
     }
+    if benchmark_returns is not None:
+        benchmark = {
+            "name": str(benchmark_name or "explicit"),
+            "returns": {
+                str(horizon): value
+                for horizon in forward_horizons
+                if (value := _benchmark_value(benchmark_returns, horizon)) is not None
+            },
+        }
+        if benchmark["returns"]:
+            result["benchmark"] = benchmark
+    return result
 
 
 def _atomic_write_json(target: Path, payload: Mapping[str, Any], prefix: str) -> Path:

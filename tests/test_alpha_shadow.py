@@ -167,3 +167,35 @@ def test_shadow_metrics_mark_missing_previous_holdings_and_returns_explicitly():
     assert control["forward_return_mean"] == {"1": None, "5": None}
     assert control["rank_ic"] == {"1": None, "5": None}
     assert control["turnover"] is None
+
+
+def test_shadow_metrics_report_explicit_excess_and_cost_sensitivity():
+    result = evaluate_shadow_arms(
+        _metric_rows(),
+        top_n=2,
+        previous_symbols=["600002.SH", "600004.SH"],
+        benchmark_returns={"1": 0.01, "5": 0.02},
+        benchmark_name="equal_weight_xsec_available",
+        cost_bps=10.0,
+        forward_horizons=(1, 5),
+    )
+
+    control = result["arms"]["control_prod"]
+    assert result["benchmark"] == {
+        "name": "equal_weight_xsec_available",
+        "returns": {"1": 0.01, "5": 0.02},
+    }
+    assert control["excess_return_mean"] == {"1": pytest.approx(0.015), "5": pytest.approx(0.01)}
+    assert control["cost_adjusted_forward_return_mean"] == {
+        "1": pytest.approx(0.0245),
+        "5": pytest.approx(0.0295),
+    }
+
+
+def test_shadow_metrics_leave_excess_and_cost_null_without_required_inputs():
+    result = evaluate_shadow_arms(_metric_rows(), top_n=2, forward_horizons=(1,))
+
+    control = result["arms"]["control_prod"]
+    assert "benchmark" not in result
+    assert control["excess_return_mean"] == {"1": None}
+    assert control["cost_adjusted_forward_return_mean"] == {"1": None}
