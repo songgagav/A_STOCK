@@ -153,6 +153,8 @@ runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自�
 - 每个 horizon 的全样本 RankIC；
 - 显式基准下的每个 horizon 超额收益；
 - 指定成本假设下的成本敏感性收益；
+- 全截面 Q1–Q5 前向收益、Q5-Q1 spread 和逐日单调通过率；
+- forward 观测覆盖率、PIT 排除率和明确的 fallback 计数；
 - 相对上一期显式持仓的替换率 `turnover = 1 - overlap / max(|target|, |previous|)`。
 
 没有上一期持仓时，`turnover` 为 `null`；没有足够的前向收益时，平均收益和
@@ -168,6 +170,11 @@ cost_adjusted_forward_return_mean
 它不是成交回放，也不替代 PaperBook 的逐笔费用计算；报告必须同时记录成本假设和
 换手代理的来源。批量适配器使用 `equal_weight_xsec_available` 作为“当日有观测股票的
 等权截面”诊断基准，并按 horizon 记录有效样本数。
+
+Q1–Q5 的定义是全截面按当前 arm 分数排序后，Q1 为最低分组、Q5 为最高分组；分组
+只使用该 horizon 已成熟且有 forward return 的股票。分组不足五组时，未观测组保持
+`null`。`is_non_decreasing` 是单个决策日的严格审计结果，多日报告中的
+`monotonic_rate` 是通过日数比例，不是把多日均值排序后得出的结论。
 
 后续仍需追加 RankIC（1/5/10/20/60/120d）、Q1-Q5 单调性、真实持仓换手、缺失率、
 fallback 次数和 universe size。没有这些共同输入和
