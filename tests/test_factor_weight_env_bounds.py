@@ -154,7 +154,7 @@ class TestDataSourceFailureIsNotSilent:
 
     def test_source_call_is_inside_try(self):
         src = self._src()
-        i = src.index("ic, rets, dates = _load_factor_state(day_dt, 60)")
+        i = src.index("ic, rets, dates = _load_true_factor_state(day_dt, 60)")
         # 往前找最近的 try: / except
         head = src[:i]
         assert head.rindex("try:") > head.rindex("except "), \
@@ -170,7 +170,7 @@ class TestDataSourceFailureIsNotSilent:
         """行为验证: 源抛异常时 `run_drl_train` 必须**正常返回**并带上降级决策。"""
         def _boom(*a, **k):
             raise OSError("legacy duckdb 不存在")
-        monkeypatch.setattr(T, "_load_factor_state", _boom)
+        monkeypatch.setattr(T, "_load_true_factor_state", _boom)
         # drl_train 用的是 `from config import DATA_DIR` 的**模块级绑定**,
         # 故只 monkeypatch config.DATA_DIR 不够, 必须同时改 drl_train.DATA_DIR
         # （Heartbeat 会写 <DATA_DIR>/drl/<day>/）—— 指到 tmp_path 避免污染 /tmp。
