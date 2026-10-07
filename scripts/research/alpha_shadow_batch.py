@@ -222,7 +222,13 @@ def run_batch(
             cost_bps=cost_bps,
         )
         result = output["result"]
-        results.append({"trade_day": day, "result": result})
+        results.append(
+            {
+                "trade_day": day,
+                "result": result,
+                "coverage": payload["coverage"],
+            }
+        )
         experiments.append(
             {
                 "trade_day": day,

@@ -208,6 +208,72 @@ def _forward_return_mean(
     return mean(values) if values else None
 
 
+def _forward_observation_coverage(
+    arm_rows: Sequence[Mapping[str, Any]],
+    horizon: int,
+) -> float | None:
+    if not arm_rows:
+        return None
+    observed = sum(
+        1 for row in arm_rows if _forward_value(row, horizon) is not None
+    )
+    return observed / len(arm_rows)
+
+
+def _quantile_forward_return_mean(
+    arm_rows: Sequence[Mapping[str, Any]],
+    horizon: int,
+    *,
+    bucket_count: int = 5,
+) -> dict[str, float | None]:
+    if bucket_count <= 0:
+        raise ValueError("bucket_count must be positive")
+    valid = [
+        row for row in arm_rows if _forward_value(row, horizon) is not None
+    ]
+    quantiles: dict[str, float | None] = {
+        f"q{index}": None for index in range(1, bucket_count + 1)
+    }
+    if not valid:
+        return quantiles
+    effective_buckets = min(bucket_count, len(valid))
+    buckets: dict[int, list[float]] = {index: [] for index in range(effective_buckets)}
+    # ``arm_rows`` is score-descending; reverse it so Q1 is lowest score and
+    # Q5 is highest score, which makes the direction explicit in the report.
+    for index, row in enumerate(reversed(valid)):
+        bucket = min(index * effective_buckets // len(valid), effective_buckets - 1)
+        value = _forward_value(row, horizon)
+        assert value is not None
+        buckets[bucket].append(value)
+    for bucket, values in buckets.items():
+        quantiles[f"q{bucket + 1}"] = mean(values)
+    return quantiles
+
+
+def _quantile_monotonicity(
+    quantiles: Mapping[str, float | None],
+) -> dict[str, Any]:
+    values = [
+        float(value)
+        for key, value in quantiles.items()
+        if key.startswith("q") and value is not None and math.isfinite(float(value))
+    ]
+    if not values:
+        return {
+            "spread_q5_q1": None,
+            "is_non_decreasing": None,
+            "observed_buckets": 0,
+        }
+    monotonic = len(values) >= 2 and all(
+        left <= right for left, right in zip(values, values[1:])
+    )
+    return {
+        "spread_q5_q1": values[-1] - values[0] if len(values) >= 2 else None,
+        "is_non_decreasing": monotonic if len(values) >= 2 else None,
+        "observed_buckets": len(values),
+    }
+
+
 def _benchmark_value(
     benchmark_returns: Mapping[Any, Any] | None,
     horizon: int,
@@ -325,6 +391,24 @@ def evaluate_shadow_arms(
                 "field": _score_field(arm, score_fields),
                 "forward_return_mean": {
                     str(horizon): _forward_return_mean(ranked[arm][:top_n], horizon)
+                    for horizon in forward_horizons
+                },
+                "forward_observation_coverage": {
+                    str(horizon): _forward_observation_coverage(
+                        ranked[arm], horizon
+                    )
+                    for horizon in forward_horizons
+                },
+                "quantile_forward_return_mean": {
+                    str(horizon): _quantile_forward_return_mean(
+                        ranked[arm], horizon
+                    )
+                    for horizon in forward_horizons
+                },
+                "quantile_monotonicity": {
+                    str(horizon): _quantile_monotonicity(
+                        _quantile_forward_return_mean(ranked[arm], horizon)
+                    )
                     for horizon in forward_horizons
                 },
                 "rank_ic": {

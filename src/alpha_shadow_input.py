@@ -220,6 +220,8 @@ def build_normalized_payload(
             "xsec_rows": len(xsec_rows),
             "included_rows": len(rows),
             "excluded_missing_fusion": excluded_missing_fusion,
+            "fallback_count": 0,
+            "fallback_policy": "exclude_missing_fusion",
         },
         "score_metadata": {
             "selector_weights": {str(k): float(v) for k, v in selector_weights.items()},
@@ -409,6 +411,86 @@ def aggregate_shadow_results(
                 )
                 for horizon in horizons
             },
+            "forward_observation_coverage": {
+                str(horizon): _summary(
+                    [
+                        ((item.get("result") or {}).get("arms") or {}).get(arm, {}).get("forward_observation_coverage", {}).get(str(horizon))
+                        for item in results
+                    ]
+                )
+                for horizon in horizons
+            },
+            "quantile_forward_return_mean": {
+                str(horizon): {
+                    f"q{bucket}": _summary(
+                        [
+                            (
+                                ((item.get("result") or {}).get("arms") or {})
+                                .get(arm, {})
+                                .get("quantile_forward_return_mean", {})
+                                .get(str(horizon), {})
+                                .get(f"q{bucket}")
+                            )
+                            for item in results
+                        ]
+                    )
+                    for bucket in range(1, 6)
+                }
+                for horizon in horizons
+            },
+            "quantile_monotonicity": {
+                str(horizon): {
+                    "spread_q5_q1": _summary(
+                        [
+                            (
+                                ((item.get("result") or {}).get("arms") or {})
+                                .get(arm, {})
+                                .get("quantile_monotonicity", {})
+                                .get(str(horizon), {})
+                                .get("spread_q5_q1")
+                            )
+                            for item in results
+                        ]
+                    ),
+                    "monotonic_rate": _summary(
+                        [
+                            (
+                                1.0
+                                if (
+                                    ((item.get("result") or {}).get("arms") or {})
+                                    .get(arm, {})
+                                    .get("quantile_monotonicity", {})
+                                    .get(str(horizon), {})
+                                    .get("is_non_decreasing")
+                                ) is True
+                                else 0.0
+                                if (
+                                    ((item.get("result") or {}).get("arms") or {})
+                                    .get(arm, {})
+                                    .get("quantile_monotonicity", {})
+                                    .get(str(horizon), {})
+                                    .get("is_non_decreasing")
+                                ) is False
+                                else None
+                            )
+                            for item in results
+                        ]
+                    ),
+                    "observed_buckets": _summary(
+                        [
+                            (
+                                ((item.get("result") or {}).get("arms") or {})
+                                .get(arm, {})
+                                .get("quantile_monotonicity", {})
+                                .get(str(horizon), {})
+                                .get("observed_buckets")
+                            )
+                            for item in results
+                        ]
+                    ),
+                }
+                for horizon in horizons
+            },
             "excess_return_mean": {
                 str(horizon): _summary(
                     [
@@ -433,6 +515,37 @@ def aggregate_shadow_results(
                     for item in results
                 ]
             ),
+        }
+    coverage_rows = []
+    exclusion_rates = []
+    fallback_count = 0
+    for item in results:
+        coverage = item.get("coverage")
+        if not isinstance(coverage, Mapping):
+            continue
+        xsec_rows = int(coverage.get("xsec_rows") or 0)
+        included_rows = int(coverage.get("included_rows") or 0)
+        excluded_rows = len(coverage.get("excluded_missing_fusion") or [])
+        exclusion_rate = excluded_rows / xsec_rows if xsec_rows else None
+        if exclusion_rate is not None:
+            exclusion_rates.append(exclusion_rate)
+        fallback_count += int(coverage.get("fallback_count") or 0)
+        coverage_rows.append(
+            {
+                "trade_day": str(item.get("trade_day")),
+                "xsec_rows": xsec_rows,
+                "included_rows": included_rows,
+                "excluded_rows": excluded_rows,
+                "exclusion_rate": exclusion_rate,
+                "fallback_count": int(coverage.get("fallback_count") or 0),
+                "fallback_policy": str(coverage.get("fallback_policy") or "unknown"),
+            }
+        )
+    if coverage_rows:
+        report["coverage"] = {
+            "daily": coverage_rows,
+            "mean_exclusion_rate": mean(exclusion_rates) if exclusion_rates else None,
+            "fallback_count": fallback_count,
         }
     comparison_names = set()
     for item in results:

@@ -128,6 +128,8 @@ def test_build_normalized_payload_records_symbols_without_fusion_coverage():
         "xsec_rows": 3,
         "included_rows": 2,
         "excluded_missing_fusion": ["300146.SZ"],
+        "fallback_count": 0,
+        "fallback_policy": "exclude_missing_fusion",
     }
 
 
@@ -182,12 +184,30 @@ def test_aggregate_shadow_results_includes_excess_and_cost_metrics():
                     "control_prod": {
                         "rank_ic": {"1": 0.1},
                         "forward_return_mean": {"1": 0.02},
+                        "forward_observation_coverage": {"1": 0.5},
+                        "quantile_forward_return_mean": {
+                            "1": {"q1": 0.01, "q2": 0.02}
+                        },
+                        "quantile_monotonicity": {
+                            "1": {
+                                "spread_q5_q1": 0.03,
+                                "is_non_decreasing": True,
+                                "observed_buckets": 2,
+                            }
+                        },
                         "excess_return_mean": {"1": 0.01},
                         "cost_adjusted_forward_return_mean": {"1": 0.019},
                         "turnover": 0.1,
                     }
                 },
                 "comparisons": {},
+            },
+            "coverage": {
+                "xsec_rows": 10,
+                "included_rows": 9,
+                "excluded_missing_fusion": ["x"],
+                "fallback_count": 0,
+                "fallback_policy": "exclude_missing_fusion",
             },
         }
     ]
@@ -199,9 +219,34 @@ def test_aggregate_shadow_results_includes_excess_and_cost_metrics():
         "mean": 0.019,
         "n": 1,
     }
+    assert arm["forward_observation_coverage"]["1"] == {"mean": 0.5, "n": 1}
+    assert arm["quantile_forward_return_mean"]["1"]["q1"] == {
+        "mean": 0.01,
+        "n": 1,
+    }
+    assert arm["quantile_monotonicity"]["1"] == {
+        "spread_q5_q1": {"mean": 0.03, "n": 1},
+        "monotonic_rate": {"mean": 1.0, "n": 1},
+        "observed_buckets": {"mean": 2.0, "n": 1},
+    }
     assert report["benchmark"] == {
         "name": "equal_weight_xsec_available",
         "returns": {"1": {"mean": 0.01, "n": 1}},
+    }
+    assert report["coverage"] == {
+        "daily": [
+            {
+                "trade_day": "2026-09-01",
+                "xsec_rows": 10,
+                "included_rows": 9,
+                "excluded_rows": 1,
+                "exclusion_rate": 0.1,
+                "fallback_count": 0,
+                "fallback_policy": "exclude_missing_fusion",
+            }
+        ],
+        "mean_exclusion_rate": 0.1,
+        "fallback_count": 0,
     }
 
 

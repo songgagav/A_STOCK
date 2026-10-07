@@ -199,3 +199,44 @@ def test_shadow_metrics_leave_excess_and_cost_null_without_required_inputs():
     assert "benchmark" not in result
     assert control["excess_return_mean"] == {"1": None}
     assert control["cost_adjusted_forward_return_mean"] == {"1": None}
+
+
+def test_shadow_metrics_report_forward_coverage_and_q1_q5_monotonicity():
+    rows = []
+    for index in range(10):
+        score = 1.0 - index * 0.1
+        rows.append(
+            {
+                "symbol": f"6000{index:02d}.SH",
+                "scores": {
+                    "score": score,
+                    "signal": score,
+                    "fusion_A": score,
+                    "selector_score": score,
+                    "fusion_rank_on": score,
+                },
+                "forward_returns": {"1": 0.10 - index * 0.01},
+            }
+        )
+
+    result = evaluate_shadow_arms(rows, top_n=2, forward_horizons=(1, 5))
+
+    control = result["arms"]["control_prod"]
+    assert control["forward_observation_coverage"] == {"1": 1.0, "5": 0.0}
+    assert control["quantile_forward_return_mean"]["1"] == {
+        "q1": pytest.approx(0.015),
+        "q2": pytest.approx(0.035),
+        "q3": pytest.approx(0.055),
+        "q4": pytest.approx(0.075),
+        "q5": pytest.approx(0.095),
+    }
+    assert control["quantile_monotonicity"]["1"] == {
+        "spread_q5_q1": pytest.approx(0.08),
+        "is_non_decreasing": True,
+        "observed_buckets": 5,
+    }
+    assert control["quantile_monotonicity"]["5"] == {
+        "spread_q5_q1": None,
+        "is_non_decreasing": None,
+        "observed_buckets": 0,
+    }
