@@ -26,6 +26,10 @@ sys.path.insert(0, _BASE)
 
 from config import DATA_DIR  # noqa: E402
 from drl_train import CVaR_PPO, FactorValueEnv, _compute_regime_features, _log  # noqa: E402
+from drl_v2_contract import (  # noqa: E402
+    cross_sectional_rank_ic,
+    factor_long_short_return,
+)
 
 _LOG = logging.getLogger("factor_dynamic_weights")
 
@@ -33,8 +37,46 @@ _LOG = logging.getLogger("factor_dynamic_weights")
 DYNAMIC_FACTORS = ["pb_inv", "ep", "ocf_ps", "roe_yy_chg", "gp4"]
 
 
+def compute_factor_day_metrics(
+    factor_scores: dict[str, dict[str, float]],
+    forward_returns: dict[str, float],
+    *,
+    directions: dict[str, int] | None = None,
+    min_samples: int = 20,
+    quantile: float = 0.2,
+) -> dict[str, dict[str, float]]:
+    """Compute PIT factor metrics from one aligned cross-section.
+
+    The score maps are formed at the decision date.  ``forward_returns`` are
+    labels only; callers must not expose them in the decision-date state.
+    Missing labels remain missing and therefore make a day unusable when a
+    factor cannot meet ``min_samples``.
+    """
+    directions = directions or {}
+    result: dict[str, dict[str, float]] = {}
+    for name, score_map in factor_scores.items():
+        symbols = sorted(set(score_map) | set(forward_returns))
+        scores = np.array([score_map.get(s, np.nan) for s in symbols], dtype=float)
+        labels = np.array([forward_returns.get(s, np.nan) for s in symbols], dtype=float)
+        ic = cross_sectional_rank_ic(scores, labels, min_samples=min_samples)
+        ls = factor_long_short_return(
+            scores,
+            labels,
+            direction=int(directions.get(name, 1)),
+            quantile=quantile,
+            min_samples=min_samples,
+        )
+        coverage = int((np.isfinite(scores) & np.isfinite(labels)).sum())
+        result[name] = {
+            "rank_ic": float(ic),
+            "long_short_return": float(ls),
+            "n_labeled": coverage,
+        }
+    return result
+
+
 # ===================================================================
-# 数据加载: 从 h5i-db 获取因子截面 z-score + 未来收益
+# 数据加载: 从 h5i-db 获取 PIT 因子截面 + 成熟未来收益
 # ===================================================================
 def load_factor_snapshot(
     as_of: str,
@@ -49,8 +91,8 @@ def load_factor_snapshot(
     Returns:
         dict: {
             "ok": bool,
-            "factor_history": ndarray (T, n_factors), z-score 因子值
-            "future_returns": ndarray (T, n_factors), 未来收益
+            "factor_history": ndarray (T, n_factors), matured PIT factor Rank IC state
+            "future_returns": ndarray (T, n_factors), directional factor long-short returns
             "returns": ndarray (T,), 全 A 平均收益
             "dates": list[str], 交易日列表
             "factor_names": list[str],
@@ -107,10 +149,16 @@ def load_factor_snapshot(
     snap = _Snap(fin, val)
 
     # 逐日截面出分
-    factor_hist = []
-    fwd_returns = []
+    raw_factor_ic = []
+    factor_ls_returns = []
     all_rets = []
     date_labels = []
+    forward_by_day = {
+        (d, s): float(v)
+        for d, s, v in bars[["d", "symbol", "fwd5"]].itertuples(index=False, name=None)
+        if np.isfinite(v)
+    }
+    factor_directions = {f: int(DIRECTIONS.get(f, 1)) for f in DYNAMIC_FACTORS}
 
     for D in hist:
         snap.advance(D)
@@ -131,66 +179,74 @@ def load_factor_snapshot(
         # 计算 gp4 z-score
         gp4_sc, gp4_md = gp4_watch_scores(df)
 
-        # 取当日所有标的的公共交集
-        common = set.union(*[set(z.keys()) for z in z_by_factor.values()])
+        factor_scores = {f: dict(z_by_factor.get(f, {})) for f in DYNAMIC_FACTORS}
         if gp4_sc:
-            common = common & set(gp4_sc.keys())
-        common = sorted(common)
-        if len(common) < 20:
+            factor_scores["gp4"] = dict(gp4_sc)
+        else:
+            factor_scores.pop("gp4", None)
+        if set(factor_scores) != set(DYNAMIC_FACTORS):
             continue
 
-        # 当日因子向量 (截面均值)
-        fv = np.zeros(len(DYNAMIC_FACTORS), dtype=np.float32)
-        for i, f in enumerate(DYNAMIC_FACTORS):
-            if f in z_by_factor and f != "gp4":
-                vals = [z_by_factor[f].get(s, np.nan) for s in common]
-                vals = [v for v in vals if np.isfinite(v)]
-                fv[i] = float(np.mean(vals)) if vals else 0.0
-            elif f == "gp4" and gp4_sc:
-                vals = [gp4_sc.get(s, np.nan) for s in common]
-                vals = [v for v in vals if np.isfinite(v)]
-                fv[i] = float(np.mean(vals)) if vals else 0.0
+        forward_map = {
+            s: forward_by_day.get((D, s), np.nan)
+            for scores in factor_scores.values()
+            for s in scores
+        }
+        metrics = compute_factor_day_metrics(
+            factor_scores,
+            forward_map,
+            directions=factor_directions,
+            min_samples=20,
+        )
+        if any(
+            not np.isfinite(metrics[f]["rank_ic"])
+            or not np.isfinite(metrics[f]["long_short_return"])
+            for f in DYNAMIC_FACTORS
+        ):
+            # The last `fwd5` rows are not mature.  Do not replace them with
+            # zeros: they are excluded from the training sample entirely.
+            continue
 
-        # 当日未来收益向量 (截面均值)
-        fr = np.zeros(len(DYNAMIC_FACTORS), dtype=np.float32)
-        for i, f in enumerate(DYNAMIC_FACTORS):
-            if f in z_by_factor and f != "gp4":
-                syms_with_fwd = []
-                for s in common:
-                    hit = bars[(bars["d"] == D) & (bars["symbol"] == s)]
-                    if not hit.empty and pd.notna(hit["fwd5"].iloc[0]):
-                        syms_with_fwd.append(hit["fwd5"].iloc[0])
-                fr[i] = float(np.nanmean(syms_with_fwd)) if syms_with_fwd else 0.0
-            elif f == "gp4" and gp4_sc:
-                syms_with_fwd = []
-                for s in common:
-                    hit = bars[(bars["d"] == D) & (bars["symbol"] == s)]
-                    if not hit.empty and pd.notna(hit["fwd5"].iloc[0]):
-                        syms_with_fwd.append(hit["fwd5"].iloc[0])
-                fr[i] = float(np.nanmean(syms_with_fwd)) if syms_with_fwd else 0.0
+        day_ic = [metrics[f]["rank_ic"] for f in DYNAMIC_FACTORS]
+        day_ls = [metrics[f]["long_short_return"] for f in DYNAMIC_FACTORS]
 
         # 全 A 平均收益
         day_rets = day_bars["change_pct"].to_numpy(dtype=float)
         day_rets = day_rets[np.isfinite(day_rets)]
         avg_ret = float(np.mean(day_rets)) / 100.0 if len(day_rets) > 0 else 0.0
 
-        factor_hist.append(fv)
-        fwd_returns.append(fr)
+        raw_factor_ic.append(day_ic)
+        factor_ls_returns.append(day_ls)
         all_rets.append(avg_ret)
         date_labels.append(dstr)
 
-    if len(factor_hist) < 20:
-        return {"ok": False, "error": f"有效截面数不足 ({len(factor_hist)} < 20)"}
+    # An IC observed on D only becomes available after the five-day label
+    # matures.  Align each decision row with the IC from D-5, then discard
+    # the first five rows whose state cannot yet be known.
+    label_horizon = 5
+    if len(raw_factor_ic) <= label_horizon:
+        return {"ok": False, "error": f"有效成熟截面数不足 ({len(raw_factor_ic)} <= {label_horizon})"}
+    state_ic = np.asarray(raw_factor_ic[:-label_horizon], dtype=np.float32)
+    factor_returns = np.asarray(factor_ls_returns[label_horizon:], dtype=np.float32)
+    aligned_returns = np.asarray(all_rets[label_horizon:], dtype=np.float64)
+    aligned_dates = date_labels[label_horizon:]
+    if len(state_ic) < 20:
+        return {"ok": False, "error": f"有效成熟截面数不足 ({len(state_ic)} < 20)"}
 
     return {
         "ok": True,
-        "factor_history": np.array(factor_hist, dtype=np.float32),
-        "future_returns": np.array(fwd_returns, dtype=np.float32),
-        "returns": np.array(all_rets, dtype=np.float64),
-        "dates": date_labels,
+        "factor_history": state_ic,
+        "future_returns": factor_returns,
+        "returns": aligned_returns,
+        "dates": aligned_dates,
         "factor_names": DYNAMIC_FACTORS,
-        "n_days": len(factor_hist),
-        "coverage": round(len(factor_hist) / len(hist), 4),
+        "n_days": len(state_ic),
+        "coverage": round(len(state_ic) / len(hist), 4),
+        "factor_state_semantics": "matured_pit_rank_ic",
+        "factor_label_semantics": "five_day_directional_long_short_return",
+        "label_horizon_trading_days": label_horizon,
+        "factor_directions": factor_directions,
+        "raw_factor_ic": np.asarray(raw_factor_ic, dtype=np.float32),
     }
 
 
@@ -260,10 +316,14 @@ def run_dynamic_weight_drl(
         total_timesteps=total_timesteps,
         n_epochs=n_epochs,
         lookback=lookback,
+        factor_names=DYNAMIC_FACTORS,
     )
 
     meta["factor_names"] = DYNAMIC_FACTORS
-    meta["note"] = "PPO 动态因子权重: 融合因子(pb_inv/ep/ocf_ps/roe_yy_chg) + gp4"
+    meta["note"] = (
+        "PPO 动态因子权重: matured PIT Rank IC state + directional long-short "
+        "returns for pb_inv/ep/ocf_ps/roe_yy_chg/gp4"
+    )
     meta["data_days"] = data["n_days"]
     meta["data_coverage"] = data["coverage"]
 

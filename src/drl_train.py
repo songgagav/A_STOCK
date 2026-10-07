@@ -33,6 +33,7 @@ from config import DATA_DIR, MAX_STOCKS  # noqa: E402
 import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 torch)
 import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
 import drl_metrics  # noqa: E402  (学习中断指标 DRL-2; 轻量模块, 不拖入 torch)
+from drl_v2_contract import combine_reward_components  # noqa: E402
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -178,11 +179,17 @@ def _compute_regime_features(rets: np.ndarray) -> np.ndarray:
     """
     T = len(rets)
     out = np.zeros((T, 3), dtype=np.float64)
+    safe_rets = np.asarray(rets, dtype=np.float64)
+    safe_rets = np.where(np.isfinite(safe_rets), safe_rets, 0.0)
+    # Build a synthetic price level before measuring trend growth.  A ratio of
+    # mean returns is not a stable price trend signal and can flip when the
+    # return denominator changes sign.
+    levels = np.cumprod(np.maximum(1.0 + safe_rets, 1e-6))
 
     for t in range(T):
         # ---- market_regime: 20 日滚动收益符号 ----
         lo = max(0, t - 19)
-        ret_20 = float(rets[lo:t + 1].sum()) if t >= 19 else 0.0
+        ret_20 = float(safe_rets[lo:t + 1].sum()) if t >= 19 else 0.0
         # 阈值 ±2%
         if ret_20 > 0.02:
             regime = 1.0
@@ -193,22 +200,22 @@ def _compute_regime_features(rets: np.ndarray) -> np.ndarray:
 
         # ---- volatility_quantile: 20 日波动率在 252 日历史中的分位 ----
         if t >= 19:
-            vol_20 = float(rets[lo:t + 1].std(ddof=1))
+            vol_20 = float(safe_rets[lo:t + 1].std(ddof=1))
         else:
             vol_20 = 0.0
         hist_lo = max(0, t - 251)
-        hist_vols = np.array([float(rets[max(0, i - 19):i + 1].std(ddof=1))
+        hist_vols = np.array([float(safe_rets[max(0, i - 19):i + 1].std(ddof=1))
                               for i in range(hist_lo + 19, t + 1)])
         if len(hist_vols) > 5 and vol_20 > 1e-12:
             vol_quantile = float(np.mean(hist_vols <= vol_20))
         else:
             vol_quantile = 0.5
 
-        # ---- trend_strength: 20日/60日均线比 ----
+        # ---- trend_strength: 20-day / 60-day geometric price growth ----
         if t >= 59:
-            ma20 = float(rets[t - 19:t + 1].mean())
-            ma60 = float(rets[t - 59:t + 1].mean())
-            trend = ma20 / ma60 if abs(ma60) > 1e-12 else 1.0
+            short_growth = (levels[t] / levels[t - 20]) ** (1.0 / 20.0) - 1.0
+            long_growth = (levels[t] / levels[t - 60]) ** (1.0 / 60.0) - 1.0
+            trend = (1.0 + short_growth) / max(1e-12, 1.0 + long_growth)
             # 归一化到 [0, 1]: 比值为 1 时 trend_strength = 0.5
             trend_strength = float(np.clip((trend - 0.95) / 0.1, 0.0, 1.0))
         else:
@@ -228,7 +235,10 @@ class FactorWeightEnv(gymnasium.Env):
                  lookback: int = 10, day: dt.date | None = None,
                  brief: dict | None = None,
                  tuning: dict | None = None,
-                 regime_features: np.ndarray | None = None):
+                 regime_features: np.ndarray | None = None,
+                 reward_components: dict[str, np.ndarray] | None = None,
+                 reward_weights: dict[str, float] | None = None,
+                 episode_end: int | None = None):
         super().__init__()
         from gymnasium import spaces
 
@@ -239,6 +249,16 @@ class FactorWeightEnv(gymnasium.Env):
         self.t = self.lookback
         self.weights = base_weights.copy()
         self.day = day
+        self.episode_end = len(self.ic_history) if episode_end is None else int(episode_end)
+        if self.episode_end < self.lookback or self.episode_end > len(self.ic_history):
+            raise ValueError("episode_end must be within [lookback, len(ic_history)]")
+        self._external_reward = np.zeros(len(self.ic_history), dtype=np.float32)
+        if reward_components is not None:
+            self._external_reward = combine_reward_components(
+                reward_components,
+                reward_weights or {},
+                expected_length=len(self.ic_history),
+            )
 
         # 市场状态特征 (Regime-Aware): [market_regime, vol_quantile, trend_strength]
         if regime_features is not None:
@@ -286,8 +306,7 @@ class FactorWeightEnv(gymnasium.Env):
         )
 
     def reset(self, *, seed=None, options=None):
-        if seed is not None:
-            np.random.random.seed(seed)
+        super().reset(seed=seed)
         self.t = self.lookback
         self.weights = self.base_weights.copy()
         return self._state(), {}
@@ -303,7 +322,10 @@ class FactorWeightEnv(gymnasium.Env):
         # (见 scripts/preflight_drl_metrics_realrun.py)。
         # 这里 clamp 到最后一个可用行: 该值只用于返回值, 返回后 SB3 即自动 reset,
         # 故不改变任何非终止步的行为。
-        _rt = min(self.t, len(self.regime_features) - 1)
+        # ``t`` is the reward timestamp.  The observation must stop at t-1;
+        # exposing regime_features[t] would leak same-step market results
+        # into the action that receives that result as reward.
+        _rt = min(max(self.t - 1, 0), len(self.regime_features) - 1)
         return np.concatenate(
             [ic_part, self.sentiment_vec, self.stance_scalar,
              self.regime_features[_rt]]
@@ -312,7 +334,8 @@ class FactorWeightEnv(gymnasium.Env):
     def step(self, action):
         action = np.asarray(action, dtype=np.float32)
         # NeSy-TA 动态调优: delta_scale 控制幅度, temperature 控制噪声
-        noise = np.random.randn(self.n_factors).astype(np.float32) * (self.temperature - 1.0) * 0.02
+        noise = self.np_random.normal(size=self.n_factors).astype(np.float32) \
+            * (self.temperature - 1.0) * 0.02
         delta = (np.tanh(action) + noise) * 0.05 * self.delta_scale
         new_w = self.weights + delta
         lo = max(0.01, 0.02 - (self.weight_clip - 0.3) * 0.05)
@@ -338,10 +361,19 @@ class FactorWeightEnv(gymnasium.Env):
             reward = ic_diff * 10.0 * vol_scaling
         else:
             reward = 0.0
+        external_reward = float(self._external_reward[self.t]) \
+            if self.t < len(self._external_reward) else 0.0
+        reward += external_reward
         self.t += 1
-        done = self.t >= len(self.ic_history)
+        done = self.t >= self.episode_end
         truncated = False
-        info = {"weights": new_w.tolist()}
+        info = {
+            "weights": new_w.tolist(),
+            "reward_components": {
+                "ic": float(reward - external_reward),
+                "external": external_reward,
+            },
+        }
         return self._state(), float(reward), bool(done), bool(truncated), info
 
 
@@ -377,6 +409,7 @@ class FactorValueEnv(gymnasium.Env):
         regime_features: np.ndarray | None = None,
         risk_first_layer: RiskFirstLayer | None = None,
         factor_names: list[str] | None = None,
+        episode_end: int | None = None,
     ):
         super().__init__()
         self.factor_history = factor_history.astype(np.float32)
@@ -384,6 +417,11 @@ class FactorValueEnv(gymnasium.Env):
         self.n_factors = factor_history.shape[1]
         self.lookback = lookback
         self.t = self.lookback
+        self.episode_end = (
+            len(self.factor_history) - 1 if episode_end is None else int(episode_end)
+        )
+        if self.episode_end < self.lookback or self.episode_end > len(self.factor_history):
+            raise ValueError("episode_end must be within [lookback, len(factor_history)]")
 
         # Risk-First 约束层 (可选)
         self.risk_first_layer = risk_first_layer
@@ -419,25 +457,32 @@ class FactorValueEnv(gymnasium.Env):
         )
 
     def reset(self, *, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
+        super().reset(seed=seed)
         self.t = self.lookback
         return self._state(), {}
 
     def _state(self) -> np.ndarray:
-        lo = self.t - self.lookback
-        fv_part = self.factor_history[lo:self.t].flatten()
+        state_end = min(max(self.t, self.lookback), len(self.factor_history))
+        lo = state_end - self.lookback
+        fv_part = self.factor_history[lo:state_end].flatten()
         return np.concatenate([
             fv_part, self.sentiment_vec, self.stance_scalar,
-            self.regime_features[self.t],
+            # ``t`` is the reward/label timestamp.  The action may only use
+            # market information through t-1.
+            self.regime_features[min(max(self.t - 1, 0), len(self.regime_features) - 1)],
         ]).astype(np.float32)
+
+    def action_to_weights(self, action: np.ndarray) -> np.ndarray:
+        """Convert a policy action using the same mapping as ``step``."""
+        action = np.asarray(action, dtype=np.float32)
+        weights = np.tanh(action) * 0.45 + 0.5
+        weights = np.clip(weights, 0.05, 0.95)
+        return weights / weights.sum()
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32)
         # 动作: tanh 归一化到 [-1, 1], 再映射到 [0.05, 0.95] → softmax 归一化
-        weights = np.tanh(action) * 0.45 + 0.5  # [0.05, 0.95]
-        weights = np.clip(weights, 0.05, 0.95)
-        weights = weights / weights.sum()
+        weights = self.action_to_weights(action)
 
         # 奖励: 加权未来收益 × 波动率自适应缩放
         if self.t < len(self.future_returns):
@@ -472,7 +517,7 @@ class FactorValueEnv(gymnasium.Env):
             reward -= risk_penalty
 
         self.t += 1
-        done = self.t >= len(self.factor_history) - 1
+        done = self.t >= self.episode_end
         truncated = False
         info: dict = {"weights": weights.tolist()}
         if self.risk_first_layer is not None:
@@ -481,7 +526,8 @@ class FactorValueEnv(gymnasium.Env):
 
 
 # ============================================================
-# 数据: 从 DuckDB 取近 N 日 daily_bars, 计算 6 维近似 IC 序列
+# Legacy migration data helper: h5i market returns only.  The production
+# runner uses _load_true_factor_state below and never treats this as factor IC.
 # ============================================================
 def _load_factor_state(day: dt.date, lookback_days: int = 60):
     """从 **h5i** 取近 N 日 `daily_bars`, 计算 6 维近似 IC 序列。
@@ -554,6 +600,152 @@ def _load_factor_state(day: dt.date, lookback_days: int = 60):
     # 最终兜底: 全矩阵 NaN/Inf 归一化 (防御后续 np.concatenate 污染观测)
     ic = np.where(np.isfinite(ic), ic, 0.0)
     return ic, np.array(arr, dtype=np.float64), dates
+
+
+def _load_true_factor_state(day: dt.date, lookback_days: int = 60):
+    """Load matured PIT factor IC state from historical selection snapshots.
+
+    The production DRL path must not infer factor IC from market-average
+    returns.  A usable input therefore requires ``pool_snapshot`` records
+    containing per-symbol values for every ``SCORE_FACTORS`` member.  The
+    five-day label is shifted out of the decision-date state before return.
+    Missing snapshots or immature labels return ``(None, None, None)`` so the
+    caller enters the explicit DRL degradation path.
+    """
+    from drl_v2_contract import cross_sectional_rank_ic, factor_long_short_return
+    from h5i_bar_store import H5iBarStore
+
+    day8 = day.strftime("%Y%m%d")
+    daily_root = os.path.join(DATA_DIR, "daily")
+    if not os.path.isdir(daily_root):
+        return None, None, None
+    try:
+        cutoff = dt.datetime.strptime(day8, "%Y%m%d").date()
+    except ValueError:
+        return None, None, None
+
+    snapshot_days = []
+    for name in os.listdir(daily_root):
+        if len(name) != 8 or not name.isdigit():
+            continue
+        try:
+            d = dt.datetime.strptime(name, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if d <= cutoff and os.path.isfile(os.path.join(daily_root, name, "selection.json")):
+            snapshot_days.append(d)
+    snapshot_days = sorted(snapshot_days)
+    if not snapshot_days:
+        return None, None, None
+    first = cutoff - dt.timedelta(days=int(lookback_days))
+    snapshot_days = [d for d in snapshot_days if d >= first]
+    if len(snapshot_days) < 20:
+        return None, None, None
+
+    # The end date is derived from the explicit requested day only.  It is
+    # deliberately not replaced by today/latest-data discovery.
+    store = H5iBarStore()
+    try:
+        bars = store.closes_window(
+            str(first), str(cutoff + dt.timedelta(days=10)),
+        )
+    finally:
+        store.close()
+    if bars is None or len(bars) == 0:
+        return None, None, None
+    bars = bars.copy()
+    bars["d"] = bars["d"].astype(str).str[:10]
+    bars["symbol"] = bars["symbol"].astype(str).str.split(".").str[0].str.zfill(6)
+    bars["close"] = np.asarray(bars["close"], dtype=float)
+    bars = bars[np.isfinite(bars["close"]) & (bars["close"] > 0)]
+    bars = bars.drop_duplicates(["symbol", "d"], keep="last")
+    bars = bars.sort_values(["symbol", "d"]).reset_index(drop=True)
+
+    # A label is valid only when the fifth subsequent trading bar exists.
+    forward_by_day: dict[tuple[str, str], float] = {}
+    market_by_day: dict[str, list[float]] = {}
+    for symbol, group in bars.groupby("symbol", sort=False):
+        group = group.reset_index(drop=True)
+        dates = group["d"].tolist()
+        closes = group["close"].to_numpy(dtype=float)
+        for i, dstr in enumerate(dates):
+            if i + 5 < len(closes):
+                forward_by_day[(dstr, symbol)] = float(closes[i + 5] / closes[i] - 1.0)
+            if i > 0:
+                r = float(closes[i] / closes[i - 1] - 1.0)
+                if np.isfinite(r):
+                    market_by_day.setdefault(dstr, []).append(r)
+
+    raw_ic: list[list[float]] = []
+    market_returns: list[float] = []
+    dates_out: list[str] = []
+    for date_value in snapshot_days:
+        dstr = date_value.strftime("%Y-%m-%d")
+        path = os.path.join(daily_root, date_value.strftime("%Y%m%d"), "selection.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, ValueError, TypeError):
+            continue
+        records = payload.get("pool_snapshot")
+        if not isinstance(records, list) or not records:
+            # Top-N is not a full cross-section and is not accepted as a
+            # replacement for the PIT evidence required by this loader.
+            continue
+        score_maps = {name: {} for name in SCORE_FACTORS}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            symbol = str(record.get("canon") or record.get("symbol") or "")
+            symbol = symbol.split(".")[0].zfill(6)
+            if not symbol or symbol == "000000":
+                continue
+            for name in SCORE_FACTORS:
+                value = record.get(name)
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if np.isfinite(value):
+                    score_maps[name][symbol] = value
+        forward = {
+            symbol: forward_by_day.get((dstr, symbol), np.nan)
+            for values in score_maps.values() for symbol in values
+        }
+        day_ic = []
+        valid = True
+        for name in SCORE_FACTORS:
+            scores = np.array(
+                [score_maps[name].get(symbol, np.nan) for symbol in forward],
+                dtype=float,
+            )
+            labels = np.array(list(forward.values()), dtype=float)
+            ic_value = cross_sectional_rank_ic(scores, labels, min_samples=5)
+            ls_value = factor_long_short_return(
+                scores, labels, direction=1, quantile=0.2, min_samples=5,
+            )
+            if not np.isfinite(ic_value) or not np.isfinite(ls_value):
+                valid = False
+                break
+            day_ic.append(float(ic_value))
+        if not valid:
+            continue
+        raw_ic.append(day_ic)
+        market_values = market_by_day.get(dstr, [])
+        market_returns.append(float(np.mean(market_values)) if market_values else 0.0)
+        dates_out.append(dstr)
+
+    label_horizon = 5
+    if len(raw_ic) <= label_horizon:
+        return None, None, None
+    # ``raw_ic[i]`` is only observable at decision row i+5.  This alignment
+    # removes the maturity window instead of replacing it with zero.
+    ic_state = np.asarray(raw_ic[:-label_horizon], dtype=np.float64)
+    aligned_returns = np.asarray(market_returns[label_horizon:], dtype=np.float64)
+    aligned_dates = dates_out[label_horizon:]
+    if len(ic_state) < 15:
+        return None, None, None
+    return ic_state, aligned_returns, aligned_dates
 
 
 def _load_base_weights() -> np.ndarray:
@@ -870,18 +1062,22 @@ class CVaR_PPO(PPO):
                 # ---- Risk-First 约束项 (2026-09-07 升级) ----
                 risk_loss = 0.0
                 if self.risk_first_coef > 0 and self._risk_first_layer is not None:
-                    # 从 rollout 数据中近似计算暴露惩罚
-                    obs_np = rollout_data.observations.cpu().numpy()
-                    if obs_np.ndim == 2 and obs_np.shape[1] >= 6:
-                        # 假设观测前 6 维近似代表因子权重
-                        approx_weights = np.abs(obs_np[:, :6]).mean(axis=0)
-                        approx_weights = approx_weights / (approx_weights.sum() + 1e-8)
-                        risk_penalty = self._risk_first_layer.step_reward_penalty(
-                            approx_weights,
-                            factor_names=["signal", "trend", "govern",
-                                          "liquidity", "vol", "mom_rev"],
-                        )
-                        risk_loss = risk_penalty
+                    # Rollout observations are temporal factor state, not
+                    # portfolio weights.  Use an explicit environment action
+                    # mapping; never infer exposure from observation columns.
+                    try:
+                        base_env = self.get_env().envs[0]
+                        mapper = getattr(base_env, "action_to_weights", None)
+                        factor_names = list(getattr(base_env, "factor_names", []))
+                        if callable(mapper) and factor_names:
+                            action_np = rollout_data.actions.detach().cpu().numpy()
+                            risk_loss = float(np.mean([
+                                self._risk_first_layer.step_reward_penalty(
+                                    mapper(row), factor_names=factor_names)
+                                for row in action_np
+                            ]))
+                    except Exception:  # noqa: BLE001
+                        risk_loss = 0.0
                 risk_loss_t = th.tensor(risk_loss, device=rollout_data.returns.device,
                                         dtype=th.float32)
 
@@ -999,7 +1195,10 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                   use_vnpy_reward: bool = True,
                   brief: dict | None = None,
                   cvar_alpha: float | None = None,
-                  cvar_coef: float | None = None) -> dict:
+                  cvar_coef: float | None = None,
+                  validation_days: int = 5,
+                  purge_days: int = 5,
+                  reward_components: dict[str, np.ndarray] | None = None) -> dict:
     """DRL 微调 (CVaR-PPO).
 
     Args:
@@ -1010,6 +1209,9 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         brief: LLM pre_drl_brief 的 dict.
         cvar_alpha: CVaR 尾部百分位 (默认从 config.CVAR_PPO 读取, 最终回退到 0.05).
         cvar_coef:  CVaR 约束项权重 (默认从 config.CVAR_PPO 读取, 最终回退到 0.1).
+        validation_days: 严格时间尾部验证集长度.
+        purge_days: 验证集前的时间隔离长度, 不参与训练.
+        reward_components: 可选的、按训练序列逐时间步对齐的外部 reward 组件.
 
     brief: 可选, LLM pre_drl_brief 的 dict (含 sentiment_factors / stance /
            factor_recommendations / market_summary / confidence). 若不传则自动
@@ -1027,7 +1229,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     _dec = None  # [DRL-4] 降级链决策占位: 外层 except 据此判断"是否已决策过"
 
     try:
-        ic, rets, dates = _load_factor_state(day_dt, 60)
+        ic, rets, dates = _load_true_factor_state(day_dt, 60)
     except Exception as e:
         # [DRL-4] 数据源不可用同样是"训练失败", 必须走降级链, 而不是让异常逃出本函数。
         # 原先这个调用在**外层 try 之外** → 异常直接冒泡给 run_daily 的 except,
@@ -1044,6 +1246,19 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         hb.stop(phase="data_insufficient", ok=False, error=_reason)
         # [DRL-4] 提前 return 也必须走降级链 —— 否则是"当天无 plan 且无告警"的静默路径
         return {"ok": False, "error": "数据不足 (<15 日)", "rows": 0,
+                "degrade": _degrade_on_failure(day, _reason)}
+
+    from drl_v2_contract import build_temporal_split
+    temporal_split = build_temporal_split(
+        len(ic), lookback=10, val_days=validation_days, purge_days=purge_days)
+    if not temporal_split.train or not temporal_split.validation:
+        _reason = (
+            "严格 OOS 切分失败: "
+            f"rows={len(ic)}, train={len(temporal_split.train)}, "
+            f"purge={len(temporal_split.purge)}, validation={len(temporal_split.validation)}"
+        )
+        hb.stop(phase="temporal_split_failed", ok=False, error=_reason)
+        return {"ok": False, "error": _reason, "rows": len(rets),
                 "degrade": _degrade_on_failure(day, _reason)}
 
     # [2026-09-22, DRL-1] 学习**前**的独立检查点: 最小样本量断言 + 净值连续性。
@@ -1113,10 +1328,6 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     except Exception as e:
         _log("NeSy-TA tuning 不可用, 回退 stance 固定模式: " + str(e))
 
-    env = FactorWeightEnv(ic, prior_w, day=day_dt, brief=brief or {},
-                           tuning=nesy_tuning,
-                           regime_features=regime_features)
-
     vnpy_stats = _load_vnpy_signal(day_dir) if use_vnpy_reward else {}
     vnpy_reward = _vnpy_reward(vnpy_stats)
     # 改造②: 绩效归因报告写回奖励. 报告为前一交易日版本 (run_daily 顺序所致),
@@ -1134,6 +1345,33 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     vnpy_w = reward_weights["vnpy_weight"]
     ic_w = reward_weights["ic_weight"]
     attr_w = reward_weights["attr_weight"]
+    aligned_reward_weights = None
+    if reward_components is not None:
+        # The persisted config uses legacy ``*_weight`` names, while the
+        # aligned schedule is keyed by its component names.  Passing the
+        # legacy payload directly would make a valid schedule fail validation
+        # because none of those keys exist in ``reward_components``.
+        component_weight_map = {
+            "vnpy": vnpy_w,
+            "attr": attr_w,
+            "ic": ic_w,
+        }
+        aligned_reward_weights = {
+            name: float(component_weight_map.get(name, 0.0))
+            for name in reward_components
+        }
+
+    env = FactorWeightEnv(
+        ic,
+        prior_w,
+        day=day_dt,
+        brief=brief or {},
+        tuning=nesy_tuning,
+        regime_features=regime_features,
+        reward_components=reward_components,
+        reward_weights=aligned_reward_weights,
+        episode_end=temporal_split.train_end,
+    )
 
     try:
         hb.ping(phase="building_env")
@@ -1146,7 +1384,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         _log(f"DRL 自适应: entropy_threshold={_ADAPT_CFG['entropy_threshold']}, "
              f"lr_decay={_ADAPT_CFG['lr_decay_factor']}, ent_boost={_ADAPT_CFG['ent_coef_boost']}")
         model = CVaR_PPO("MlpPolicy", env,
-                         n_steps=min(64, len(rets) - 10),
+                         n_steps=min(64, len(temporal_split.train)),
                          learning_rate=3e-4, n_epochs=n_epochs, verbose=0,
                          cvar_alpha=_cvar_alpha, cvar_coef=_cvar_coef,
                          entropy_threshold=_ADAPT_CFG["entropy_threshold"],
@@ -1163,23 +1401,13 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         obs, _ = env.reset()
         rewards = []
         weights_trace = []
-        for _ in range(len(rets) - env.lookback):
+        for _ in range(len(temporal_split.train)):
             action, _ = model.predict(obs, deterministic=True)
             obs, r, done, truncated, info = env.step(action)
             rewards.append(r)
             weights_trace.append(info["weights"])
             if done or truncated:
                 break
-
-        # 叠加 vnpy 主链路真实回测信号: 把 vnpy_reward 作为最后一步的额外奖励
-        # (代表: 若用最终值最终行权重去跑 vnpy 回测, 结果有多好).
-        # 权重由 incremental_learn 写入 reward_config.json 动态控制.
-        if vnpy_stats and not vnpy_stats.get("fallback") and rewards:
-            # IC 内部奖励 + vnpy 真实奖励 + 绩效归因奖励 加权组合
-            # (替代裸加, 避免真实信号被冲掉). attr 项缺失时为 0 不影响组合.
-            ic_step = rewards[-1]
-            rewards[-1] = (ic_step * ic_w + vnpy_reward * vnpy_w
-                           + attr_reward * attr_w)
 
         # 保存产物
         out_dir = os.path.join(DATA_DIR, "drl", day_dir)
@@ -1200,6 +1428,8 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                 duration_s=_learn_seconds, requested_timesteps=total_timesteps),
             "n_epochs": n_epochs,
             "n_obs_steps": len(rewards),
+            "temporal_split": temporal_split.as_dict(),
+            "aligned_reward_schedule": reward_components is not None,
             "base_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, base_w)},
             "prior_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, prior_w)},
             "final_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)},
@@ -1320,6 +1550,19 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         # 触发条件全是**结构性**的(训练失败 / 模型文件不可用 / 无有效版本), 不含统计阈值,
         # 故 METHOD-1 在此不直接适用（"验证不通过"的阈值按用户要求只记录、不定）。
         _trained_weights = {k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)}
+        # Capture the incumbent before resolve() advances the pointer to the
+        # candidate.  Reading the pointer after resolve() would compare the
+        # challenger with itself and silently erase the incumbent baseline.
+        _incumbent_day = None
+        _incumbent_weights = None
+        try:
+            _incumbent_pointer = drl_degrade.load_pointer()
+            _incumbent_day = str(_incumbent_pointer.get("day") or "") or None
+            if _incumbent_day and _incumbent_day != day_dir:
+                _incumbent_weights = drl_degrade.version_weights(_incumbent_day)
+        except Exception:  # noqa: BLE001
+            _incumbent_day = None
+            _incumbent_weights = None
         try:
             _dec = drl_degrade.resolve(day, train_ok=bool(meta.get("ok", True)),
                                        final_weights=_trained_weights, out_dir=out_dir)
@@ -1328,6 +1571,11 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                     "effective_weights": _trained_weights, "source_day": day,
                     "error": f"{type(e).__name__}: {e}"}
         meta["degrade"] = _dec
+        meta["model_roles"] = {
+            "challenger_day": day_dir,
+            "incumbent_day": _incumbent_day,
+            "incumbent_captured_before_resolve": True,
+        }
 
         # ===== DRL 目标计划生成: 用 final_weights × v_universe_snapshot 重打分 -> TopN =====
         # 这是"信号就绪"的关键产物: 盘中 realtime_engine 优先消费此文件.
@@ -1391,19 +1639,14 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         # 以免同一天写两条（见 drl_post.validation_from_train_meta 的说明）。
         try:
             import drl_post as _post
-            _old_w = None
-            try:
-                _prev = drl_degrade.load_pointer()
-                _pd8 = str(_prev.get("day") or "")
-                if _pd8 and _pd8 != day_dir:
-                    _w = drl_degrade.version_weights(_pd8)
-                    if _w:
-                        _old_w = [float(_w.get(k, 0.0)) for k in SCORE_FACTORS]
-            except Exception:  # noqa: BLE001
-                _old_w = None
+            _old_w = (
+                [float(_incumbent_weights.get(k, 0.0)) for k in SCORE_FACTORS]
+                if _incumbent_weights else None
+            )
             meta["post_train_validation"] = _post.validation_compare(
                 ic, base_w, np.asarray(env.weights, dtype=np.float64), _old_w,
-                lookback=int(getattr(env, "lookback", 10)))
+                lookback=int(getattr(env, "lookback", 10)),
+                val_days=validation_days, purge_days=purge_days)
             _v = meta["post_train_validation"]
             _log(f"DRL-3 学习后验证: val_new={(_v['new'] or {}).get('mean')} "
                  f"val_old={(_v['old'] or {}).get('mean') if _v.get('old') else None} "
@@ -1451,13 +1694,18 @@ def run_factor_value_drl(
     n_epochs: int = 5,
     lookback: int = 5,
     use_risk_factors: bool | None = None,
+    validation_days: int = 5,
+    purge_days: int = 5,
+    factor_names: list[str] | None = None,
 ) -> dict:
     """训练 FactorValueEnv 学习动态因子权重.
 
     Parameters
     ----------
     factor_history : np.ndarray
-        (T, n_factors) z-score 因子值历史.
+        (T, n_factors) time-ordered factor state history.  For the PIT
+        dynamic loader this is matured Rank IC state, not a cross-sectional
+        mean or a future label.
     future_returns : np.ndarray
         (T, n_factors) 各因子的未来收益.
     returns : np.ndarray
@@ -1472,6 +1720,12 @@ def run_factor_value_drl(
         是否把风险因子观测 (波动率/CVaR95/最大回撤/下行波动) 并入环境.
         None = 取 config RISK_FACTOR_PPO.rfp_enabled (默认开启);
         True/False 显式覆盖.
+    validation_days : int
+        严格时间尾部验证集长度.
+    purge_days : int
+        验证集前的隔离长度, 不参与训练.
+    factor_names : list[str] | None
+        与输入列一一对应的因子名; 未提供时只对 6 维旧入口使用默认名.
 
     Returns
     -------
@@ -1483,6 +1737,25 @@ def run_factor_value_drl(
     day_dt = dt.date(int(day[:4]), int(day[4:6]), int(day[6:8]))
     day_dir = day
 
+    from drl_v2_contract import build_temporal_split
+    temporal_split = build_temporal_split(
+        len(factor_history),
+        lookback=int(lookback),
+        val_days=int(validation_days),
+        purge_days=int(purge_days),
+    )
+    if not temporal_split.train or not temporal_split.validation:
+        return {
+            "ok": False,
+            "day": day,
+            "error": (
+                "严格 OOS 切分失败: "
+                f"rows={len(factor_history)}, train={len(temporal_split.train)}, "
+                f"purge={len(temporal_split.purge)}, "
+                f"validation={len(temporal_split.validation)}"
+            ),
+        }
+
     out_dir = os.path.join(DATA_DIR, "drl_factor_value", day_dir)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1491,7 +1764,14 @@ def run_factor_value_drl(
 
     # Risk-First 约束层 (可选, 从环境变量启用)
     risk_first_layer = None
-    factor_names = ["signal", "trend", "govern", "liquidity", "vol", "mom_rev"]
+    if factor_names is None:
+        factor_names = (
+            list(SCORE_FACTORS)
+            if factor_history.shape[1] == len(SCORE_FACTORS)
+            else [f"factor_{i}" for i in range(factor_history.shape[1])]
+        )
+    if len(factor_names) != factor_history.shape[1]:
+        return {"ok": False, "day": day, "error": "factor_names 与输入维度不一致"}
     if _RISK_FIRST_AVAILABLE and os.environ.get("RISK_FIRST_ENABLED", "1") != "0":
         try:
             from config import RISK_FIRST as _RF_CFG
@@ -1523,6 +1803,7 @@ def run_factor_value_drl(
         regime_features=regime_features,
         risk_first_layer=risk_first_layer,
         factor_names=factor_names,
+        episode_end=temporal_split.train_end,
     )
     _rf_applied = False
     _use_rf = use_risk_factors
@@ -1552,7 +1833,7 @@ def run_factor_value_drl(
 
     model = CVaR_PPO(
         "MlpPolicy", env,
-        n_steps=min(64, len(factor_history) - lookback - 1),
+        n_steps=min(64, len(temporal_split.train)),
         learning_rate=3e-4, n_epochs=n_epochs, verbose=0,
         cvar_alpha=0.05, cvar_coef=0.1,
         entropy_threshold=_ADAPT_CFG["entropy_threshold"],
@@ -1598,6 +1879,8 @@ def run_factor_value_drl(
         "n_epochs": n_epochs,
         "n_factors": factor_history.shape[1],
         "lookback": lookback,
+        "temporal_split": temporal_split.as_dict(),
+        "factor_names": list(factor_names),
         "obs_steps": len(rewards),
         "final_weights": final_weights,
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,

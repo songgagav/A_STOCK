@@ -521,14 +521,14 @@ class TestNoSilentFailurePathsInTrain:
         # 1 处定义 + 4 处调用。第 4 条是 2026-09-22 新增的 **DRL-1 学习前检查未通过**
         # (drl_precheck: 最小样本量 + 净值连续性) —— 它同样携带 degrade 走同一条链,
         # 故本不变量(『每条失败路径都走降级链, 不留静默路径』)的本意未被破坏。
-        assert src.count("_degrade_on_failure(") == 5, \
-            "1 处定义 + 4 处调用（数据源不可用 / 数据不足 / 学习前检查未通过(DRL-1) / 外层 except）"
+        assert src.count("_degrade_on_failure(") == 6, \
+            "1 处定义 + 5 处调用（含严格 OOS 切分失败）"
 
     def test_every_failure_return_carries_degrade(self):
         src = self._src()
-        assert src.count('"degrade": _degrade_on_failure') == 3   # 数据源 + 数据不足 + 学习前检查
+        assert src.count('"degrade": _degrade_on_failure') == 4   # 含严格 OOS 切分失败
         assert src.count('"degrade": _dec}') == 1                 # 外层 except
-        assert src.count('"degrade": ') == 4
+        assert src.count('"degrade": ') == 5
 
     def test_data_source_path_goes_through_chain(self):
         """`_load_factor_state` 抛异常也必须走降级链（原先在外层 try 之外 -> 逃出函数）。"""
@@ -552,6 +552,13 @@ class TestNoSilentFailurePathsInTrain:
         src = self._src()
         assert src.index("_dec = drl_degrade.resolve(") < src.index(
             "plan = _build_target_plan(")
+
+    def test_incumbent_is_captured_before_pointer_advances(self):
+        src = self._src()
+        capture = src.index("Capture the incumbent before resolve()")
+        resolve = src.index("_dec = drl_degrade.resolve(")
+        assert capture < resolve
+        assert "_incumbent_weights" in src[resolve:]
 
     def test_halt_skips_plan_construction(self):
         src = self._src()
