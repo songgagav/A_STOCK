@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from strategy_contract import TargetContractError, normalize_target_contract
+
 from utils import atomic_write_json
 
 
@@ -78,25 +80,12 @@ def _relative_artifacts(artifacts: list[dict[str, Any]], repo_root: str) -> list
 
 
 def _normalized_targets(targets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    if not isinstance(targets, list):
-        raise ValueError("targets 必须为列表")
-    normalized: list[dict[str, Any]] = []
-    weights: dict[str, float] = {}
-    for target in targets:
-        if not isinstance(target, dict):
-            raise ValueError("target 必须为对象")
-        canon = target.get("canon")
-        if not isinstance(canon, str) or not canon:
-            raise ValueError("target 缺少 canon")
-        if canon in weights:
-            raise ValueError(f"target 重复: {canon}")
-        weight = target.get("target_weight")
-        if not isinstance(weight, (int, float)) or isinstance(weight, bool) or not math.isfinite(weight):
-            raise ValueError(f"target_weight 非有限: {canon}")
-        copied = dict(target)
-        copied["target_weight"] = float(weight)
-        normalized.append(copied)
-        weights[canon] = float(weight)
+    try:
+        normalized = normalize_target_contract(targets, require_weights=True)
+    except TargetContractError as exc:
+        raise ValueError(str(exc)) from exc
+    weights = {str(target["canon"]): float(target["target_weight"])
+               for target in normalized}
     return normalized, weights
 
 
@@ -200,12 +189,17 @@ def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
         return _invalid("invalid_snapshot_hash")
 
     try:
+        normalized_targets, normalized_weights = _normalized_targets(snapshot["targets"])
+        if normalized_targets != snapshot["targets"]:
+            return _invalid("non_canonical_targets")
         if sha256_json(_input_payload_from_snapshot(snapshot)) != snapshot["input_hash"]:
             return _tampered("input_hash_mismatch")
         hash_payload = dict(snapshot)
         hash_payload["snapshot_hash"] = None
         if sha256_json(hash_payload) != snapshot["snapshot_hash"]:
             return _tampered("snapshot_hash_mismatch")
+        if normalized_weights != snapshot["weights"]:
+            return _invalid("target_weights_mismatch")
     except (TypeError, ValueError):
         return _invalid("non_canonical_snapshot")
     return {"status": "ready", "snapshot": snapshot, "reason": None}

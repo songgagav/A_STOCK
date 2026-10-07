@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from config import TARGET_WEIGHT
+from strategy_contract import average_rank, fusion_weight_mode
 
 _LOG = logging.getLogger("target_weighting")
 
@@ -57,6 +58,11 @@ def allocate_target_weights(items: list[dict],
     """
     cfg = dict(TARGET_WEIGHT or {})
     mode = mode or cfg.get("mode", "fml")
+    # Fusion-derived target weights are opt-in.  Shadow is allowed to compute
+    # a candidate elsewhere, but this authoritative allocator remains equal
+    # weight until an explicit enforce mode is promoted.
+    if mode == "fml" and fusion_weight_mode() != "enforce":
+        mode = "equal"
     n = len(items)
     if n == 0:
         return items
@@ -76,11 +82,11 @@ def allocate_target_weights(items: list[dict],
             it["target_weight"] = round(w, 6)
         return items
 
-    # fml 降序排名 (NaN 垫底 -> 最小权重)
-    order = sorted(range(n), key=lambda i: (-vals[i] if np.isfinite(vals[i])
-                                            else float("inf")))
-    rank = {idx: r for r, idx in enumerate(order)}       # 0=最强 .. n-1=最弱
-    raw = np.array([lo + (hi - lo) * (1.0 - rank[i] / (n - 1.0))
+    # fml 降序 average rank (NaN 垫底 -> 最小权重), 与 selector 的横截面
+    # 排名口径一致；并列值不再因为原始列表顺序而得到不同目标权重。
+    descending = [-v if np.isfinite(v) else float("nan") for v in vals]
+    rank_pct = average_rank(descending, missing=1.0)
+    raw = np.array([lo + (hi - lo) * (1.0 - rank_pct[i])
                     for i in range(n)])                  # rank线性: 强->hi
 
     # 迭代 clip+归一, 使 sum=1 且每项落在 [lo, hi]
@@ -102,23 +108,43 @@ def allocate_target_weights(items: list[dict],
     return items
 
 
-def normalize_weights(items: list[dict]) -> float:
-    """返回权重和(消费侧兜底归一用); 缺 target_weight 的项按等权补 1/n."""
-    n = max(len(items), 1)
-    s = 0.0
-    for it in items:
-        w = it.get("target_weight")
+def normalize_weights(items: list[dict], *, allow_missing: bool = False) -> float:
+    """Validate and normalize target weights in-place.
+
+    Missing values are a contract error by default.  Legacy callers that have
+    explicitly chosen an equal-weight fallback may pass ``allow_missing``;
+    even then the resulting vector is normalized and never silently filled
+    with zero.
+    """
+    if not items:
+        return 0.0
+    n = len(items)
+    values: list[float] = []
+    missing = []
+    for index, item in enumerate(items):
+        if "target_weight" not in item or item.get("target_weight") is None:
+            missing.append(index)
+            values.append(float("nan"))
+            continue
         try:
-            f = float(w)
-            if np.isfinite(f) and f > 0:
-                it["target_weight"] = f
-                s += f
-                continue
-        except (TypeError, ValueError):
-            pass
-        it["target_weight"] = 1.0 / n      # 缺省项补等权
-        s += 1.0 / n
-    return float(s)
+            value = float(item.get("target_weight"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid target_weight at index {index}") from exc
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"invalid target_weight at index {index}")
+        values.append(value)
+    if missing:
+        if not allow_missing:
+            raise ValueError("missing target_weight")
+        equal = 1.0 / n
+        for index in missing:
+            values[index] = equal
+    total = float(sum(values))
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("target_weight sum must be positive and finite")
+    for item, value in zip(items, values):
+        item["target_weight"] = float(value / total)
+    return 1.0
 
 
 def _already_nonuniform(items: list[dict], tol: float = 1e-6) -> bool:
@@ -153,9 +179,22 @@ def ensure_target_weights(targets: list[dict], as_of: str | None = None,
     if not targets:
         return targets
     n = len(targets)
+    fusion_mode = fusion_weight_mode()
     if mode != "fml":
         for it, w in zip(targets, [1.0 / n] * n):
             it["target_weight"] = round(w, 6)
+        return targets
+    if fusion_mode != "enforce":
+        # Existing target weights are authoritative when present; otherwise
+        # shadow/off deliberately use the baseline equal-weight contract.
+        if _already_nonuniform(targets) or all(
+                isinstance(it.get("target_weight"), (int, float))
+                and np.isfinite(float(it.get("target_weight")))
+                and float(it.get("target_weight")) > 0 for it in targets):
+            normalize_weights(targets)
+        else:
+            for it, w in zip(targets, [1.0 / n] * n):
+                it["target_weight"] = round(w, 6)
         return targets
     if not _already_nonuniform(targets):
         # DRL/旧 selection 等权路径: 现算预测打分以激活预测加权.
@@ -182,6 +221,8 @@ def ensure_target_weights(targets: list[dict], as_of: str | None = None,
         except Exception:  # noqa: BLE001
             _LOG.warning("ensure_target_weights: 现算打分失败, 退化为等权",
                          exc_info=True)
+            if fusion_mode == "enforce":
+                raise
     allocate_target_weights(targets)       # 无有效 fml 自动等权
     normalize_weights(targets)
     return targets
