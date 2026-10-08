@@ -49,6 +49,41 @@ function renderHeroSeries(s){
     + '<div class="hero-series__plot" aria-label="近20个有效交易日日收益柱状图">'+bars+'</div>';
 }
 
+function renderTradingCalendar(d){
+  const rail = document.getElementById('calendarRail');
+  const status = document.getElementById('calendarStatus');
+  const day = document.getElementById('calendarDate');
+  const next = document.getElementById('calendarNext');
+  if(!rail || !status || !day || !next) return;
+  const state = d && d.ok ? (d.status || 'unknown') : 'unknown';
+  rail.dataset.state = state;
+  if(!d || !d.ok){
+    status.textContent = '日历不可用';
+    day.textContent = '—';
+    next.textContent = '不作交易判断';
+    return;
+  }
+  const today = d.today || {};
+  const label = state === 'authoritative' ? (today.is_trading_day ? '交易日' : '休市日')
+    : (state === 'degraded' ? '降级日历' : '未知');
+  status.textContent = label;
+  day.textContent = today.date || d.as_of || '—';
+  next.textContent = d.next_trading_day ? ('下个交易日 '+d.next_trading_day) : '下个交易日 —';
+  rail.title = state === 'unknown' ? '交易日历不可确认，不自动推断'
+    : ('来源 '+((d.provenance||{}).source||'unknown'));
+}
+
+async function loadTradingCalendar(){
+  try{
+    const r = await fetch('/api/trading-calendar');
+    renderTradingCalendar(await r.json());
+    return r.ok;
+  }catch(e){
+    renderTradingCalendar({ok:false});
+    return false;
+  }
+}
+
 function renderPos(positions){
   if(!positions||!positions.length){ $('#posBody').innerHTML='<tr><td colspan="10" class="empty">暂无持仓</td></tr>'; return; }
   const rows = positions.map(p=>{
@@ -919,6 +954,7 @@ adaptivePoll(load, 3000, 30000);
 adaptivePoll(loadLogs, 3000, 30000);
 adaptivePoll(loadFreezeStatus, 10000, 60000);
 adaptivePoll(loadOverview, 15000, 60000);
+adaptivePoll(loadTradingCalendar, 30000, 120000);
 updateSessionRail();
 setInterval(updateSessionRail, 1000);
 loadBacktestHistory();  // 回测历史面板首屏即加载 (与用户是否切 tab 无关)

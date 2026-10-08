@@ -125,10 +125,25 @@
   .freeze-rail[data-state="missing"] .freeze-rail__dot,.freeze-rail[data-state="invalid"] .freeze-rail__dot,.freeze-rail[data-state="tampered"] .freeze-rail__dot,.freeze-rail[data-state="unavailable"] .freeze-rail__dot{background:hsl(var(--danger-hsl));box-shadow:0 0 0 3px hsl(var(--danger-hsl)/.12),0 0 12px hsl(var(--danger-hsl)/.42)}
   .freeze-rail[data-state="missing"] .freeze-rail__status,.freeze-rail[data-state="invalid"] .freeze-rail__status,.freeze-rail[data-state="tampered"] .freeze-rail__status,.freeze-rail[data-state="unavailable"] .freeze-rail__status{color:hsl(var(--danger-hsl))}
   .freeze-rail[data-state="ready"] .freeze-rail__marker{color:hsl(var(--freeze-cool))}
-  @media(max-width:1080px){.freeze-rail{min-width:270px}.topbar{gap:10px}.topbar h1 .sub{display:none}}
-  @media(max-width:760px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:10px 16px}.topbar .brand{flex:1 1 auto}.freeze-rail{order:3;flex:1 1 100%;min-width:0}.topbar .badges{margin-left:auto}.wrap{padding:18px 16px 44px}}
+  @media(max-width:1080px){.freeze-rail{min-width:270px}.calendar-rail{min-width:200px}.topbar{gap:10px}.topbar h1 .sub{display:none}}
+  @media(max-width:760px){.topbar{align-items:flex-start;flex-wrap:wrap;padding:10px 16px}.topbar .brand{flex:1 1 auto}.freeze-rail,.calendar-rail{order:3;flex:1 1 100%;min-width:0}.topbar .badges{margin-left:auto}.wrap{padding:18px 16px 44px}}
   @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
   .topbar .badges{display:flex; gap:6px; flex-wrap:wrap}
+  .calendar-rail{
+    min-width:230px; display:grid; grid-template-columns:auto auto 1fr;
+    align-items:center; gap:7px; padding:7px 10px;
+    border:1px solid hsl(var(--border)); border-radius:9px;
+    background:hsl(var(--surface)/.72); color:hsl(var(--fg-secondary));
+    font:10px/1.1 'JetBrains Mono','Consolas',monospace;
+  }
+  .calendar-rail__label{color:hsl(var(--fg-muted));letter-spacing:.12em;font:600 9px/1 var(--sans)}
+  .calendar-rail strong{color:hsl(var(--fg-primary));font:700 11px/1 var(--sans)}
+  .calendar-rail span:last-child{grid-column:2 / -1;color:hsl(var(--fg-muted));white-space:nowrap}
+  .calendar-rail[data-state="authoritative"] strong{color:hsl(var(--freeze-cool))}
+  .calendar-rail[data-state="degraded"]{border-color:hsl(var(--warn)/.48)}
+  .calendar-rail[data-state="degraded"] strong{color:hsl(var(--warn))}
+  .calendar-rail[data-state="unknown"]{border-color:hsl(var(--danger)/.42)}
+  .calendar-rail[data-state="unknown"] strong{color:hsl(var(--danger))}
   .badge{
     display:inline-flex; align-items:center; gap:5px;
     background: hsl(var(--elevated));

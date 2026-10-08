@@ -20,7 +20,7 @@ import subprocess
 import argparse
 import logging
 import posixpath
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -34,6 +34,7 @@ DAILY_DIR = os.path.join(DATA_DIR, "daily")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 sys.path.insert(0, _BASE)
 from config import INIT_CAPITAL, DUCKDB_PATH
+from trading_calendar import calendar_provenance, is_trading_day
 
 _LOG = logging.getLogger("dashboard")
 
@@ -291,6 +292,79 @@ def read_live_payload():
     if not isinstance(payload.get("daily_series"), list):
         payload["daily_series"] = read_daily_series()
     return payload
+
+
+def _calendar_day_payload(day: date, strength: str) -> dict:
+    """Return one calendar row without turning a weak calendar into a fact."""
+    if strength not in {"official", "data_derived"}:
+        return {
+            "date": day.isoformat(),
+            "is_trading_day": None,
+            "session": "unknown",
+        }
+    trading = bool(is_trading_day(day))
+    return {
+        "date": day.isoformat(),
+        "is_trading_day": trading,
+        "session": "trading_day" if trading else "non_trading_day",
+    }
+
+
+def _calendar_neighbor(day: date, step: int) -> str | None:
+    """Find the nearest open day using the already-loaded calendar contract."""
+    for offset in range(1, 367):
+        candidate = day + timedelta(days=step * offset)
+        if is_trading_day(candidate):
+            return candidate.isoformat()
+    return None
+
+
+def read_trading_calendar(as_of: date | None = None, window: int = 5) -> dict:
+    """Expose a read-only trading-calendar view for the dashboard.
+
+    The calendar module has an explicit provenance strength.  When only the
+    weekday fallback is available, the UI must show ``unknown`` rather than
+    presenting a guessed open/closed decision to an operator.
+    """
+    day = as_of or datetime.now(_SHANGHAI).date()
+    try:
+        day = day.date() if isinstance(day, datetime) else day
+        if not isinstance(day, date):
+            raise TypeError("as_of must be a date")
+        window = max(0, min(int(window), 14))
+    except Exception as exc:
+        return {"ok": False, "error": f"invalid calendar request: {exc}"}
+
+    provenance = calendar_provenance()
+    strength = str(provenance.get("strength") or "weekday_only")
+    status = {"official": "authoritative", "data_derived": "degraded"}.get(
+        strength, "unknown"
+    )
+    rows = [
+        _calendar_day_payload(day + timedelta(days=offset), strength)
+        for offset in range(-window, window + 1)
+    ]
+    today_row = _calendar_day_payload(day, strength)
+    previous = _calendar_neighbor(day, -1) if status != "unknown" else None
+    following = _calendar_neighbor(day, 1) if status != "unknown" else None
+    return {
+        "ok": True,
+        "schema_version": 1,
+        "as_of": day.isoformat(),
+        "status": status,
+        "today": today_row,
+        "previous_trading_day": previous,
+        "next_trading_day": following,
+        "days": rows,
+        "provenance": {
+            "source": provenance.get("source"),
+            "strength": strength,
+            "updated": provenance.get("updated"),
+            "n": provenance.get("n", 0),
+            "future_days": provenance.get("future_days", 0),
+            "fallback_ok": bool(provenance.get("fallback_ok", False)),
+        },
+    }
 
 
 def source_etag(path: str) -> str | None:
@@ -3512,6 +3586,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(lv, etag=source_etag(source_path))
         if path == "/api/signal-freeze":
             return self._json(read_signal_freeze_status())
+        if path == "/api/trading-calendar":
+            return self._json(read_trading_calendar())
         if path == "/api/history":
             return self._json(read_history())
         if path == "/api/backtest":

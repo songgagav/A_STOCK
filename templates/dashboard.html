@@ -64,6 +64,12 @@
         <span class="session-rail__tick" data-session="afternoon">13:00</span>
         <span class="session-rail__tick" data-session="close">15:00</span>
       </div>
+      <div class="calendar-rail" id="calendarRail" data-state="unknown" aria-live="polite">
+        <span class="calendar-rail__label">CALENDAR</span>
+        <strong id="calendarStatus">读取中…</strong>
+        <span id="calendarDate">—</span>
+        <span id="calendarNext">下个交易日 —</span>
+      </div>
       <div class="freeze-track" id="freezeTrack" aria-label="冻结审计轨道">
         <div class="freeze-track__cell"><span>SNAPSHOT</span><strong id="freezeTrackStatus">—</strong><small id="freezeTrackAt">—</small></div>
         <div class="freeze-track__cell"><span>FROZEN</span><strong id="freezeTrackFrozen">09:25</strong><small>daily</small></div>
