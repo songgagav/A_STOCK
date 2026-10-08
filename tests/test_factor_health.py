@@ -118,7 +118,11 @@ class TestSelectorHealthOverride(unittest.TestCase):
                 "unstable": ["vol"], "drift_detail": {},
             }
             fl._health_logged.clear()
-            W = fl.selector_weights()
+            # 隔离健康契约本身，不让仓库运行时的动态 weights.json 改变
+            # 这个测试对静态 fallback 的预期。
+            from unittest.mock import patch
+            with patch("weight_optimizer.load_weights", return_value={}):
+                W = fl.selector_weights()
             self.assertEqual(W.get("vol"), 0.0)
             self.assertEqual(W.get("mom_rev"), 0.0)  # 静态默认 mom_rev=0
         finally:
