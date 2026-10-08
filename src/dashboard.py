@@ -571,6 +571,7 @@ def read_degradation():
     """
     out = {
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "unknown",
         "index": None,
         "spc": [],
         "alerts": [],
@@ -580,6 +581,14 @@ def read_degradation():
     try:
         from degradation import run_full_check
         check = run_full_check(days=10)
+        if check.get("status") != "ok":
+            # ArcticDB 是兼容层而非主行情源；缺历史后端时必须明确不可用，
+            # 不能把 None/空列表渲染成“没有退化”。
+            out["status"] = check.get("status", "unavailable")
+            out["backend"] = check.get("backend", "arcticdb")
+            out["error"] = check.get("reason") or check.get("error", "退化历史不可用")
+            return out
+        out["status"] = "ok"
         out["index"] = check.get("degradation_index") or {}
         # SPC 简化: 用 perf_history 跑默认 SPC
         try:

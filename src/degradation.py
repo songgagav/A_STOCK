@@ -354,11 +354,58 @@ def generate_incremental_samples(perf: pd.DataFrame,
 # =============================================================================
 # CLI
 # =============================================================================
+def _is_missing_arcticdb(exc: ModuleNotFoundError) -> bool:
+    """只识别 ArcticDB 缺失；其它模块缺失仍应继续暴露。"""
+    return exc.name == "arcticdb" or "No module named 'arcticdb'" in str(exc)
+
+
+def _arcticdb_unavailable(exc: BaseException) -> dict:
+    """返回可审计的不可用结果，避免缺历史后端被读成空健康分。"""
+    reason = f"ArcticDB 不可用: {type(exc).__name__}: {exc}"
+    _LOG.warning(reason)
+    return {
+        "ok": False,
+        "status": "unavailable",
+        "backend": "arcticdb",
+        "reason": reason,
+        "degradation_index": None,
+        "incremental_samples": [],
+    }
+
+
+def degradation_step_result(result: dict) -> dict:
+    """把退化检查结果转换为日终回执，保留不可用状态而不伪报成功。"""
+    status = result.get("status", "unavailable")
+    samples_n = len(result.get("incremental_samples") or [])
+    if status != "ok":
+        return {
+            "ok": False,
+            "status": status,
+            "backend": result.get("backend", "arcticdb"),
+            "reason": result.get("reason") or result.get("error", "退化历史不可用"),
+            "samples_n": samples_n,
+        }
+    index = result.get("degradation_index") or {}
+    return {
+        "ok": True,
+        "status": "ok",
+        "overall_score": index.get("overall_score"),
+        "worst_level": index.get("worst_level"),
+        "components": index.get("components", []),
+        "samples_n": samples_n,
+    }
+
+
 def run_full_check(days: int = 30) -> dict:
-    """一次性运行: 加载 ArcticDB 数据 + 计算退化指数 + SPC + 增量样本."""
-    perf = _load_perf_series(days=days + 30)
-    trades = _load_trades(days=days)
-    reward_df = _load_reward_curve(days=days)
+    """加载历史并计算退化指数；缺 ArcticDB 时显式返回 ``unavailable``。"""
+    try:
+        perf = _load_perf_series(days=days + 30)
+        trades = _load_trades(days=days)
+        reward_df = _load_reward_curve(days=days)
+    except ModuleNotFoundError as exc:
+        if _is_missing_arcticdb(exc):
+            return _arcticdb_unavailable(exc)
+        raise
 
     index = compute_strategy_degradation_index(perf, trades, reward_df)
     samples = generate_incremental_samples(perf, trades, days=days)
@@ -396,6 +443,8 @@ def run_full_check(days: int = 30) -> dict:
         _LOG.warning(f"退化指数落盘失败: {e}")
 
     return {
+        "ok": True,
+        "status": "ok",
         "degradation_index": index,
         "incremental_samples": samples,
     }

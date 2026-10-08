@@ -1333,16 +1333,9 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
 
             # 5.7) 策略退化检测: 退化指数 + 增量样本 (供 6.5 增量学习复用)
             try:
-                from degradation import run_full_check
+                from degradation import degradation_step_result, run_full_check
                 deg = run_full_check(days=30)
-                di = deg.get("degradation_index", {}) or {}
-                report["steps"]["degradation"] = {
-                    "ok": True,
-                    "overall_score": di.get("overall_score"),
-                    "worst_level": di.get("worst_level"),
-                    "components": di.get("components", []),
-                    "samples_n": len(deg.get("incremental_samples", [])),
-                }
+                report["steps"]["degradation"] = degradation_step_result(deg)
             except Exception as e:
                 report["steps"]["degradation"] = {"ok": False, "error": str(e)[:200]}
 

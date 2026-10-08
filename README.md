@@ -50,7 +50,8 @@ A 股规则纸面撮合
 源码采用扁平 `src/` 布局，逻辑上分为以下层次：
 
 ```text
-数据层       db.py / h5i_bar_store.py / arctic_store.py
+数据层       db.py / h5i_bar_store.py
+兼容层       arctic_store.py（ArcticDB 可选兼容层，非主数据源）
 因子层       factor_fusion.py / factor_library.py / factor_mine/
 决策层       selector.py / drl_train.py / target_weighting.py
 风控层       factor_gate.py / risk_first.py / risk_factor_optimizer.py
@@ -86,7 +87,7 @@ A_stock_rotation/
 ├── src/                              # 核心源代码（当前为扁平模块布局）
 │   ├── db.py                          # 统一数据访问入口
 │   ├── h5i_bar_store.py               # h5i 行情/财务/估值查询
-│   ├── arctic_store.py                # ArcticDB 读写与审计存储
+│   ├── arctic_store.py                # ArcticDB 可选兼容层（历史审计/退化数据）
 │   ├── build_factor_views.py          # 因子宽表与视图构建
 │   ├── free_stockdb_sync.py           # 本地行情镜像同步
 │   │
@@ -203,7 +204,7 @@ Copy-Item .env.example .env
 | 变量 | 说明 |
 | --- | --- |
 | `STOCKDB_ROOT` | 本地行情镜像或 free-stockdb 根目录 |
-| `ARCTIC_URI` | ArcticDB 地址；未配置时使用可用的本地后端 |
+| `ARCTIC_URI` | 遗留 ArcticDB 兼容层地址；主数据链路不依赖，未迁移的历史退化分析才可能使用 |
 | `PYBAO_DIR` | 可选的本地行情 SDK 路径 |
 | `TRAE_PYTHON` | 守护任务调用的外部 Python 解释器 |
 | `OPENAI_BASE_URL` | 可选的 LLM 服务地址 |
@@ -211,6 +212,10 @@ Copy-Item .env.example .env
 | `OPENAI_MODEL` | LLM 模型名 |
 | `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关，默认开启 |
 | `OVERFIT_RESULTS_FILE` | 覆盖过拟合检测使用的结果文件 |
+
+> **ArcticDB 兼容层说明**：ArcticDB 不是当前主行情/财务/估值链路的必需依赖，主链路使用 h5i。
+> `src/arctic_store.py` 暂时保留，用于尚未迁移的历史绩效、奖励曲线、成交记录和因子 IC。
+> 未安装 ArcticDB 时，退化分析会明确返回 `unavailable`，不能把该状态解释为“策略健康”。
 
 不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
 
@@ -423,6 +428,7 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/cleanup/fml-role.md`](docs/cleanup/fml-role.md)：`ml_fusion_bridge` 角色和退役条件；
 - [`docs/cleanup/service-lifecycle.md`](docs/cleanup/service-lifecycle.md)：服务入口、Celery 和进程探测边界；
 - [`docs/cleanup/env-blockers.md`](docs/cleanup/env-blockers.md)：安全扫描、覆盖率和依赖分析工具缺失时的替代证据；
+- [`docs/evolution/remaining-work.md`](docs/evolution/remaining-work.md)：ArcticDB 兼容层、数据源路由、Phase E 和其他剩余任务总清单；
 - [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建与回滚 Runbook；
 - [`docs/patch-retirement-watch.md`](docs/patch-retirement-watch.md)：估值补丁退役观察期与当前状态；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；

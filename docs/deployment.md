@@ -42,6 +42,21 @@ python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i
 powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 ```
 
+### 3.2 09:25 信号冻结 Shadow 运行
+
+信号冻结的操作边界和观察记录见 [`docs/evolution/signal-freeze-runbook.md`](evolution/signal-freeze-runbook.md)。默认模式是 `shadow`：引擎可以生成并验证 09:25 快照，但不会因为观察功能改变现有消费路径。
+
+交易日运行前必须确认：
+
+1. `read_mode_control('.')` 返回 `mode=shadow`；
+2. `TRADE_BROKER` 为 `paper` 或未设置（默认 `paper`）；
+3. `data/trade_calendar.json` 存在且覆盖当前日期；
+4. `daemon.py` 已启动并能在 09:25 运行引擎。
+
+09:25 后只接受已验证的 `signal_snapshot_<YYYYMMDD>.json` 作为冻结证据。快照不存在、格式无效或哈希不匹配时，自动链路只估值、不调仓；不得人工补写快照来“恢复”当日自动调仓。午间重选写入迟到归档，必须经完整候选池/权重人工审核后，才可作为次日可选输入。
+
+非交易日不生成观察日。2026-10-03 至 2026-10-07 的 Phase E 计数保持不变，下一交易日按本地日历检查。
+
 估值补丁退役的历史设计和当前公开仓库状态见 `docs/patch-retirement-watch.md`；在对应哨兵代码
 恢复并通过验收前，不得把“每日自动观察”当成已启用能力。
 

@@ -27,6 +27,27 @@
 4. **DRL** `drl_train.py`:CVaR-PPO 在 FactorValueEnv 上生成 signal/trend/govern/liquidity/vol/mom_rev 六维权重;signal 权重硬边界 `[0.10, 0.39]`,约束后其余权重重新归一化。
 5. **评估闭环** `overfitting_test.py`(7 维度)→ 输出 JSON/HTML;`backtest_with_gate.py` 用同一 `factor_gate` 逻辑做无前视连续重放,验证门控对回撤的收窄(当前基线→门控最大回撤 8.23%→7.69%)。
 
+### 2.1 09:25 决策冻结链
+
+交易日盘中链路在 09:25 增加一个明确的决策边界：
+
+```text
+[09:25 前候选/数据刷新]
+            │ 仅准备、监控，不写权威目标
+            ▼
+[realtime_engine 09:25 原子写入 signal_snapshot]
+            │ schema + input_hash + snapshot_hash 校验
+            ├─ ready    → PaperBook shadow 观察；未来 enforce 只读此快照
+            ├─ missing  → 只估值、不自动调仓、告警
+            ├─ invalid  → 只估值、不自动调仓、告警
+            └─ tampered → 拒绝虚拟盘交易、最高优先级告警
+            │
+            ▼
+[09:25 后] 快照是当日唯一目标来源；午间重选只进 late_signals 归档
+```
+
+默认模式为 `shadow`，不改变既有消费路径；观察记录见 [`signal-freeze-runbook.md`](evolution/signal-freeze-runbook.md)。任何 `enforce` 切换仍只允许作用于 PaperBook 虚拟盘，并需单独的人工作证据。
+
 ## 源码布局与演进(2026-09-07 已完成 src/ 迁移)
 
 - 全部 Python 源码已迁移至 `src/`(单层平铺,扁平 import 不变;`factor_mine/` 位于 `src/factor_mine/`)。
