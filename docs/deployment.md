@@ -23,14 +23,16 @@ python -m pytest tests/ -q        # 自检
 
 | 变量 | 说明 |
 |---|---|
-| `STOCKDB_ROOT` | 本地行情镜像根(parquet 分片/单文件全量) |
+| `STOCKDB_ROOT` | StockDB/free-stockdb 部署数据根(parquet 分片、`data`/`mydb`、`stockdb.conf`) |
+| `STOCKDB_PYBAO_DIR` | 可选的明确 SDK 覆盖路径；默认使用项目内 `vendor/stockdb/pybao` |
+| `STOCKDB_ENGINE` | StockDB 本地端点，默认 `127.0.0.1:7899` |
 | `ARCTIC_URI` | ArcticDB LMDB,如 `lmdb://<path>/arcticdb` |
-| `PYBAO_DIR` | 本地行情引擎 SDK(可选) |
+| `PYBAO_DIR` | 旧版外部 SDK 路径，仅作项目 bundle 缺失时的兼容回退 |
 | `TRAE_PYTHON` | 守护进程使用的外部 Python(含依赖) |
 | `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关(默认 `1`;`0` 关闭) |
 | `OVERFIT_RESULTS_FILE` | 过拟合检测窗口样本源(可选覆盖) |
 
-> Windows 持久化示例:`setx STOCKDB_ROOT "E:\data\stockdb"`。**修改环境变量后需新开终端再启动守护**,否则新进程读不到。
+> Windows 持久化示例:`setx STOCKDB_ROOT "E:\data\stockdb"`。**修改环境变量后需新开终端再启动守护**,否则新进程读不到。StockDB 的 SDK 和服务程序默认取项目内 `vendor/stockdb`，但数据工作目录仍必须是 `STOCKDB_ROOT`；不要把行情数据库目录复制进仓库。
 
 ## 3. 运行模式
 

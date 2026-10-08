@@ -1,0 +1,2 @@
+vendor/stockdb/bin/stockdb.exe binary
+vendor/stockdb/pybao/*.pyd binary
