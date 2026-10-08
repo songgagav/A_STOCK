@@ -75,9 +75,13 @@ Batch 5/6 不得修改 `signal_snapshot.py`、冻结消费逻辑、PaperBook wat
 ### D1. 2026-10-09 运行准备
 
 - `E:\A_stockDB\数据更新.exe` 已将行情端点追平至 `20261008`；h5i 已显式追加 5,517 行，freshness 为 `lag_trading_days=0`。
-- `.venv310` 盘前前置检查通过；守护进程已运行并等待今日 08:30 启动虚拟盘引擎，`TRADE_BROKER=paper`。
+- 项目已固化 StockDB Python 接口与服务二进制的可复核副本：SDK 从 `vendor/stockdb/pybao` 优先加载，私有数据目录仍留在外部 `E:\A_stockDB`；当前注册的 `AStockStockdb` 仍指向外部路径，但其二进制 SHA-256 与项目副本一致，切换注册路径需管理员服务变更。
+- `.venv310` 盘前前置检查通过；`AStockDaemon` / `AStockStockdb` 均为 `Running/Automatic`，守护进程已运行并等待今日 08:30 启动虚拟盘引擎，`TRADE_BROKER=paper`。
+- 守护子进程解释器已固定为显式 `TRAE_PYTHON` → 项目 `.venv310` → 当前解释器的确定性顺序；当前驻留代码哈希与磁盘一致，避免服务包装器把 h5i/torch 子任务落到系统 Python。
 - 09:25 快照的无时区时钟缺陷已修复并有回归测试；当前只能称为“开盘准备就绪”，必须等今日 08:30/09:25 新鲜产物验证后再计入 Phase E。
 - 2026-10-08 的 live_state 曾记录 `snapshot_write_failed:ValueError`、`spot empty` 和空仓；这些历史事实保留为 blocked/warn 证据，不补写为成功。
+
+本次 01:58 Asia/Shanghai 预开盘复核结果：`premarket OK=14 WARN=4 FAIL=0`，StockDB 探针 `engine_day=20261008`、`expected_day=20261008`、`lag_trading_days=0`，`http://127.0.0.1:8000/api/health` 返回 HTTP 200。该结果只证明开盘前就绪，不替代 08:30 引擎启动、09:25 快照和 09:30 盘中会话的同日证据。
 
 观察日必须同时满足：交易日、数据新鲜、daemon 健康、快照 `ready`、当天记录已落盘。LLM 点评不可用不应被伪装成可用，但按当前决定不阻塞冻结观察。
 

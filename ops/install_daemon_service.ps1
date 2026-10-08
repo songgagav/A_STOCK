@@ -180,7 +180,10 @@ $pairs = @(
   @('DisplayName', $DisplayName),
   @('Description', 'A股轮动量化守护: 盘前健康检查/盘中引擎/收盘选股; 由 NSSM 托管'),
   @('Start', 'SERVICE_AUTO_START'),
-  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1'),
+  # Explicitly pass the dependency-complete interpreter to daemon children.
+  # daemon.py also has a project-local fallback, but the service contract
+  # should remain observable in NSSM rather than relying on wrapper behavior.
+  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", "TRAE_PYTHON=$py", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1'),
   @('AppStdout', (Join-Path $LogDir 'daemon_service.out.log')),
   @('AppStderr', (Join-Path $LogDir 'daemon_service.err.log')),
   @('AppRotateFiles', '1'),

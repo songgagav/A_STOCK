@@ -60,6 +60,27 @@ positions and no trades today). Effective `DRL_PLAN_MODE` and
 This is an observation result only. No plan, PaperBook, pointer, selector, or
 broker artifact was written.
 
+## 2026-10-09 pre-open recheck
+
+The earlier blocked opening report remains an immutable historical observation
+of the `2026-10-08` artifacts. A separate read-only pre-open recheck at
+01:58 Asia/Shanghai verified the current runtime without writing a plan,
+position, order, fill, selector, PaperBook, or broker artifact:
+
+- `premarket_healthcheck.py`: `OK=14 WARN=4 FAIL=0`;
+- StockDB endpoint: `127.0.0.1:7899`, `engine_day=20261008`,
+  `expected_day=20261008`, `lag_trading_days=0`;
+- `AStockDaemon` and `AStockStockdb`: `Running/Automatic`;
+- Dashboard `/api/health`: HTTP 200;
+- `TRADE_BROKER=paper`, with `DRL_PLAN_MODE` and `FUSION_WEIGHT_MODE`
+  retaining their default `shadow` behavior.
+
+This is pre-open readiness only. The 08:30 engine start, 09:25 snapshot,
+and 09:30 session remain unobserved until their scheduled same-day artifacts
+exist. The four WARNs remain typed observations (orderbook representation,
+IC-curve freshness, decision-component availability, and the prior position
+gap); they are not converted into a fabricated all-clear.
+
 ## Remaining evidence limitation
 
 The historical `2026-09-24` replay produced a cash-inclusive target-weight
