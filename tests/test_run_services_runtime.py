@@ -47,3 +47,47 @@ def test_run_services_falls_back_to_current_python_when_preferred_missing(tmp_pa
     )
 
     assert selected == current
+
+
+def test_run_services_rejects_reused_pid_owned_by_unrelated_process(monkeypatch):
+    import sys
+    import types
+    import run_services as rs
+
+    class _Process:
+        def __init__(self):
+            self.info = {
+                "name": "nvcontainer.exe",
+                "cmdline": [r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe"],
+            }
+
+        def cmdline(self):
+            return self.info["cmdline"]
+
+    fake_psutil = types.SimpleNamespace(Process=lambda pid: _Process())
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(rs, "_proc_alive", lambda pid: True)
+
+    assert not rs._service_pid_alive(10684, "src/dashboard.py")
+
+
+def test_run_services_accepts_pid_running_expected_dashboard_script(monkeypatch):
+    import os
+    import sys
+    import types
+    import run_services as rs
+
+    class _Process:
+        def cmdline(self):
+            return [
+                r"D:\Python\python.exe",
+                os.path.join(rs._BASE, "src", "dashboard.py"),
+                "--port",
+                "8000",
+            ]
+
+    fake_psutil = types.SimpleNamespace(Process=lambda pid: _Process())
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(rs, "_proc_alive", lambda pid: True)
+
+    assert rs._service_pid_alive(12345, "src/dashboard.py")
