@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+import zipfile
 
 import numpy as np
 import pytest
@@ -191,8 +192,8 @@ class TestDataSourceFailureIsNotSilent:
         os.makedirs(vdir, exist_ok=True)
         with open(os.path.join(vdir, drl_degrade.LIVE_MARKER_NAME), "w", encoding="utf-8") as f:
             f.write("{}")
-        with open(os.path.join(vdir, "model.zip"), "wb") as f:
-            f.write(b"PK\x03\x04x")
+        with zipfile.ZipFile(os.path.join(vdir, "model.zip"), "w") as f:
+            f.writestr("data", "{}")
         import json
         with open(os.path.join(vdir, "train_meta.json"), "w", encoding="utf-8") as f:
             json.dump({"ok": True, "final_weights": {k: 1 / 6 for k in T.SCORE_FACTORS}}, f)

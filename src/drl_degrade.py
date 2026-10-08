@@ -56,6 +56,7 @@ import datetime as dt
 import json
 import os
 import sys
+import zipfile
 
 import config
 from dataguard import warn_once
@@ -124,6 +125,26 @@ def is_live_version(day: str) -> bool:
     return os.path.isfile(os.path.join(_drl_root(), d, _live_marker_name()))
 
 
+def model_archive_usable(day: str) -> bool:
+    """Check that the explicit model archive is a readable zip file.
+
+    This is a lightweight file-integrity gate.  Full Stable-Baselines/Torch
+    deserialization remains an explicit offline validation step and is not
+    imported into the degradation hot path.
+    """
+    d = str(day or "").replace("-", "")
+    if not (d.isdigit() and len(d) == 8):
+        return False
+    path = os.path.join(_drl_root(), d, "model.zip")
+    if not os.path.isfile(path) or not zipfile.is_zipfile(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
 def version_usable(day: str, require_live: bool = True) -> bool:
     """结构性"可用"判据（**非**真正的反序列化加载，见模块 docstring）。
 
@@ -136,7 +157,7 @@ def version_usable(day: str, require_live: bool = True) -> bool:
     if require_live and not is_live_version(d):
         return False
     vdir = os.path.join(_drl_root(), d)
-    if not os.path.isfile(os.path.join(vdir, "model.zip")):
+    if not model_archive_usable(d):
         return False
     fp = os.path.join(vdir, "train_meta.json")
     if not os.path.isfile(fp):
@@ -507,7 +528,7 @@ __all__ = ["LEVEL_OK", "LEVEL_RETAIN", "LEVEL_FALLBACK", "LEVEL_HALT",
            "LEVEL_NAME", "LEVEL_SEVERITY", "EVENT_LEDGER_NAME",
            "LIVE_MARKER_NAME", "FALLBACK_LOOKBACK_DAYS", "REQUIRED_RUNTIME",
            "event_ledger_path", "validation_ledger_path", "pointer_path",
-           "is_live_version", "version_usable", "version_weights",
+           "is_live_version", "model_archive_usable", "version_usable", "version_weights",
            "scan_versions", "latest_valid",
            "load_pointer", "save_pointer", "record_event", "record_validation",
            "resolve", "probe_runtime", "force_halt", "current_level",

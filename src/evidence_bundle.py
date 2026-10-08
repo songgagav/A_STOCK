@@ -127,13 +127,16 @@ class EvidenceBundleRequest:
         if not str(self.experiment_identity.get("experiment_hash") or ""):
             raise ValueError("experiment_identity.experiment_hash is required")
         expected_state = {
-            "RANK_BY_FUSION": "0",
-            "alpha_evidence_status": "not_promotable",
-            "drl_plan_mode_contract": "not_implemented",
+            "RANK_BY_FUSION": {"0"},
+            "alpha_evidence_status": {"not_promotable"},
+            # ``not_implemented`` is retained for historical Phase A
+            # fixtures; current Phase B evidence should use the explicit
+            # implemented-default-shadow value.
+            "drl_plan_mode_contract": {"not_implemented", "implemented_default_shadow"},
         }
-        for key, expected in expected_state.items():
-            if str(self.production_state.get(key)) != expected:
-                raise ValueError(f"production_state.{key} must be explicitly recorded as {expected!r}")
+        for key, allowed in expected_state.items():
+            if str(self.production_state.get(key)) not in allowed:
+                raise ValueError(f"production_state.{key} must be explicitly recorded as one of {sorted(allowed)!r}")
         try:
             equity = float(self.reference_equity)
         except (TypeError, ValueError) as exc:

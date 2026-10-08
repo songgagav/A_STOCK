@@ -4926,7 +4926,7 @@ function renderDrl(d){
       <div><div class="muted">Timesteps</div><b>${m.total_timesteps || '—'}</b></div>
       <div><div class="muted">Mean Reward</div><b class="${(m.mean_reward||0)>=0?'up':'down'}">${fmt(m.mean_reward, 4)}</b></div>
       <div><div class="muted">Obs Dim</div><b>${(m.llm_brief && m.llm_brief.obs_dim) || '—'}</b></div>
-      <div><div class="muted">vnpy Reward</div><b class="${(m.vnpy_reward||0)>=0?'up':'down'}">${fmt(m.vnpy_reward, 4)}</b></div>
+      <div><div class="muted">Execution diagnostic</div><b class="${(m.execution_diagnostic||0)>=0?'up':'down'}">${fmt(m.execution_diagnostic, 4)}</b></div>
     </div>
     <div style="font-size:12px;color:hsl(var(--fg-secondary))">
       Top-3 因子权重: ${topFactors.map(([k, v]) => `${k} ${(v*100).toFixed(1)}%`).join(' · ')}

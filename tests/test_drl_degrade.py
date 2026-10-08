@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import zipfile
 
 import pytest
 
@@ -57,8 +58,8 @@ def _mk_version(root, day, *, live=True, model=True, weights="default",
         with open(os.path.join(d, D.LIVE_MARKER_NAME), "w", encoding="utf-8") as f:
             f.write("{}")
     if model:
-        with open(os.path.join(d, "model.zip"), "wb") as f:
-            f.write(b"PK\x03\x04dummy")
+        with zipfile.ZipFile(os.path.join(d, "model.zip"), "w") as f:
+            f.writestr("data", "{}")
     for s in (subdirs or []):
         os.makedirs(os.path.join(d, s), exist_ok=True)
     if meta_raw is not None:
@@ -118,6 +119,13 @@ class TestStructuralUsability:
 
     def test_missing_model_zip_not_usable(self, tmp_path):
         _mk_version(tmp_path, "20260905", model=False)
+        assert D.version_usable("20260905") is False
+
+    def test_corrupt_model_archive_not_usable(self, tmp_path):
+        version_dir = _mk_version(tmp_path, "20260905")
+        with open(os.path.join(version_dir, "model.zip"), "wb") as handle:
+            handle.write(b"not-a-zip")
+        assert D.model_archive_usable("20260905") is False
         assert D.version_usable("20260905") is False
 
     def test_meta_not_ok_not_usable(self, tmp_path):
