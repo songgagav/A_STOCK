@@ -32,12 +32,34 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 os.chdir(_BASE)
 
-PY = sys.executable
-# 强制使用 TRAE 自带的 Python (含 duckdb / polars / vnpy / sb3 等),
-# 避免 PATH 中其它 Python (如系统 Python 3.14) 找不到依赖.
-_TRAE_PY = os.environ.get("TRAE_PYTHON", "")  # 可选: 指定含依赖的外部 Python 解释器
-if os.path.exists(_TRAE_PY):
-    PY = _TRAE_PY
+def _resolve_runtime_python(base=None, current_python=None, environ=None):
+    """Select the interpreter for daemon-owned child processes.
+
+    Windows service/venv wrappers can report the base interpreter as
+    ``sys.executable`` even when the service was launched through the project
+    venv.  Child processes must therefore use an explicit runtime contract:
+    ``TRAE_PYTHON`` first, the project's dependency-complete ``.venv310``
+    second, and only then the interpreter running this daemon.
+    """
+    root = base or _BASE
+    current = current_python or sys.executable
+    env = os.environ if environ is None else environ
+
+    override = str(env.get("TRAE_PYTHON", "") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    preferred = os.path.join(root, ".venv310", "Scripts", "python.exe")
+    if os.path.isfile(preferred):
+        return preferred
+
+    return current
+
+
+# Child jobs (engine, dashboard, health check, run_daily) must not silently
+# fall back to a system Python that lacks h5i_db/torch.  Keep this choice in
+# one place so service and manual launches have identical semantics.
+PY = _resolve_runtime_python()
 
 # 静默 akshare 内部的 tqdm 进度条 ("Please wait for a moment: 50% | ...")
 # 同时让 duckdb 走子进程模式 (Windows 下更稳定)
