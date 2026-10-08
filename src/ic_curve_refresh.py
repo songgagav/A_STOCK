@@ -140,7 +140,7 @@ def refresh(factor_names=None, full: bool = False, window_days: int = WINDOW_DAY
     latest = _latest_settled_day()
     for wkey in names:
         factor = ALPHA_FACTORS.get(wkey, wkey)   # 直接传文件因子名也可
-            entry = {"factor": factor}
+        entry = {"factor": factor}
         try:
             if full:
                 start = "2013-01-01"
