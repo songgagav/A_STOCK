@@ -1329,11 +1329,11 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         _log("NeSy-TA tuning 不可用, 回退 stance 固定模式: " + str(e))
 
     vnpy_stats = _load_vnpy_signal(day_dir) if use_vnpy_reward else {}
-    vnpy_reward = _vnpy_reward(vnpy_stats)
+    execution_diagnostic = _vnpy_reward(vnpy_stats)
     # 改造②: 绩效归因报告写回奖励. 报告为前一交易日版本 (run_daily 顺序所致),
-    # 语义 = "历史归因校准当日奖励". 缺失时 attr_reward=0.0 中性.
+    # 语义 = "历史归因诊断指标". 缺失时 attribution_diagnostic=0.0 中性.
     perf_report = _load_perf_report()
-    attr_reward = _attribution_reward(perf_report)
+    attribution_diagnostic = _attribution_reward(perf_report)
     # 增量学习闭环: 读取 data/reward_config.json 调整奖励权重 (vnpy/ic/attr 三权).
     # 默认 0.6 (基础), P0 退化时由 incremental_learn 自动提到 0.8+ 强调真实信号.
     reward_weights = {"vnpy_weight": 0.6, "ic_weight": 0.4, "attr_weight": 0.15}
@@ -1463,8 +1463,13 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                 "max_ddpercent": vnpy_stats.get("stats", {}).get("max_ddpercent"),
                 "trades": vnpy_stats.get("stats", {}).get("total_trade_count"),
             } if vnpy_stats else None,
-            "vnpy_reward": vnpy_reward,
-            "attr_reward": attr_reward,
+            "diagnostic_metrics": {
+                "execution_sortino_proxy": execution_diagnostic,
+                "attribution_sortino": attribution_diagnostic,
+                "note": "These are diagnostic/reporting metrics. They affect PPO gradients only when explicitly supplied as aligned reward_components.",
+            },
+            "execution_diagnostic": execution_diagnostic,
+            "attribution_diagnostic": attribution_diagnostic,
             "perf_report": {
                 "ok": bool(perf_report.get("ok")),
                 "day": perf_report.get("period", {}).get("end") if isinstance(perf_report.get("period"), dict) else None,
@@ -1479,12 +1484,11 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
                 "note": "market_regime: 0=震荡, 1=上涨趋势, 2=下跌趋势; "
                         "volatility_quantile: 0~1; trend_strength: 0~1",
             },
-            # Sortino 奖励指标 (2026-09-06 升级: 替代原 Sharpe 奖励)
-            "sortino_reward": {
-                "vnpy_sortino_approx": vnpy_reward,
-                "attr_sortino": attr_reward,
-                "note": "vnpy_reward 为 Sortino 近似 (利用 max_dd 代理下行风险), "
-                        "attr_reward 为真实 Sortino + 波动率自适应 + CVaR (利用日收益率序列)",
+            # Sortino 诊断指标 (不是隐式梯度输入)
+            "sortino_diagnostics": {
+                "execution_sortino_proxy": execution_diagnostic,
+                "attribution_sortino": attribution_diagnostic,
+                "note": "execution_sortino_proxy 使用 max_dd 代理下行风险；attribution_sortino 使用日收益率序列。两者只有在显式对齐后才进入 PPO 梯度。",
             },
             # CVaR-PPO 参数 (2026-09-06 升级: 尾部风险嵌入优化目标)
             "cvar_ppo": {
@@ -1513,12 +1517,12 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(8, 3))
             ax.plot(rewards, color="#1f77b4", label="PPO step reward (IC×vol_scaling)")
-            if vnpy_reward:
-                ax.axhline(vnpy_reward, color="r", linestyle="--",
-                           label=f"vnpy Sortino≈ ({vnpy_reward:+.3f})")
-            if attr_reward:
-                ax.axhline(attr_reward, color="g", linestyle=":",
-                           label=f"attr Sortino+CVaR ({attr_reward:+.3f})")
+            if execution_diagnostic:
+                ax.axhline(execution_diagnostic, color="r", linestyle="--",
+                           label=f"execution diagnostic≈ ({execution_diagnostic:+.3f})")
+            if attribution_diagnostic:
+                ax.axhline(attribution_diagnostic, color="g", linestyle=":",
+                           label=f"attribution diagnostic ({attribution_diagnostic:+.3f})")
             ax.set_title(f"PPO Reward Curve day={day}")
             ax.set_xlabel("step")
             ax.set_ylabel("reward")
@@ -1660,7 +1664,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
         _log(f"DRL 训练完成: timesteps={total_timesteps}, mean_reward={meta['mean_reward']:.4f}, "
-             f"vnpy_reward={vnpy_reward:+.4f}")
+             f"execution_diagnostic={execution_diagnostic:+.4f}")
         hb.stop(phase="done", ok=True)
         return meta
     except Exception as e:
