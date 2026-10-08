@@ -169,7 +169,8 @@ A_stock_rotation/
 ## 环境要求
 
 - Windows/Linux 均可用于轻量研究和测试。
-- 推荐 Python 3.14 虚拟环境用于核心回归、DRL 和纯 Python 工具。
+- 推荐 `.venv310` 作为完整运行时：`h5i_db`、PyTorch、Stable-Baselines3 和 vn.py 在同一解释器内。
+- `.venv314` 保留做纯 Python 研究和兼容性回归；它不作为 h5i/vn.py 完整运行时。
 - 部分本地 `h5i_db` 数据库组件使用 CPython 3.10 原生扩展；运行依赖该组件的数据脚本时，必须使用与 `_native.pyd` 匹配的 Python 3.10 环境。
 - 数据库、行情镜像、API token 和运行产物不随仓库提供。
 
@@ -248,28 +249,28 @@ CI 分为两部分：
 
 ```powershell
 # 刷新 IC 与门控缓存
-.venv314\Scripts\python.exe src/refresh_gate_ic.py
+.venv310\Scripts\python.exe src/refresh_gate_ic.py
 
 # 日频主流程
-.venv314\Scripts\python.exe src/run_daily.py
+.venv310\Scripts\python.exe src/run_daily.py
 
 # 连续交易日 PaperBook 回放
-.venv314\Scripts\python.exe src/backtest_engine.py --days 10
+.venv310\Scripts\python.exe src/backtest_engine.py --days 10
 
 # 指定起始日期回放
-.venv314\Scripts\python.exe src/backtest_engine.py --start 2026-06-01
+.venv310\Scripts\python.exe src/backtest_engine.py --start 2026-06-01
 
 # 门控历史重放
-.venv314\Scripts\python.exe src/backtest_with_gate.py
+.venv310\Scripts\python.exe src/backtest_with_gate.py
 
 # 非重叠样本外重跑
-.venv314\Scripts\python.exe scripts/nonoverlap_rerun.py
+.venv310\Scripts\python.exe scripts/nonoverlap_rerun.py
 
 # 过拟合/稳健性检测
-.venv314\Scripts\python.exe src/overfitting_test.py --html
+.venv310\Scripts\python.exe src/overfitting_test.py --html
 
 # 数据完整性巡检
-.venv314\Scripts\python.exe scripts/check_data_completeness.py
+.venv310\Scripts\python.exe scripts/check_data_completeness.py
 ```
 
 ### 盘中模拟与看板
@@ -291,20 +292,22 @@ CI 分为两部分：
 .venv310\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
-> ⚠️ **解释器要求（2026-09-19 修正）**：`.venv314`（Python 3.14）**没有 `h5i_db`**
-> （实测 `importlib.util.find_spec("h5i_db") is None`）。DuckDB 退役后 h5i 是**主数据源**，
-> 用 `.venv314` 启动看板会失去主源数据。请改用持有 `h5i_db` 的解释器，例如：
+> ⚠️ **解释器要求（2026-10-06 更新）**：`.venv314`（Python 3.14）**没有 `h5i_db` 或 `vnpy`**。
+> DuckDB 退役后 h5i 是**主数据源**，盘中/看板/回测必须使用已验收完整依赖的 `.venv310`：
 >
 > ```powershell
 > $env:BAR_STORE = 'h5i'
-> & "<持有 h5i_db 的解释器>\python.exe" src\dashboard.py --port 8000
+> & ".venv310\Scripts\python.exe" src\dashboard.py --port 8000
 > ```
 >
-> 验证方式：`& <解释器> -c "import h5i_db; print('ok')"`，以及看板
+> 验证方式：`& .venv310\Scripts\python.exe -c "import h5i_db, vnpy; print('ok')"`，以及看板
 > `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
 
-### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db 与 torch）
+### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db、torch 与 vn.py）
 
+> **2026-10-06 更新**：`.venv310` 是唯一 canonical runtime，当前已安装并验收 `vnpy==4.4.0`。
+> `.venv314` 继续用于纯 Python 研究和兼容性测试；不要通过 `PYTHONPATH` 混用两个环境的 site-packages。
+>
 > **2026-09-20 新增（解决 `P0-DRLDEP`）**。此前项目面临一个**无法回避的两难**：
 >
 > | 解释器 | h5i_db | torch | 后果 |
@@ -319,7 +322,7 @@ CI 分为两部分：
 >
 > ```powershell
 > # 一条命令完成：校验 SHA256 + Authenticode 签名 → 静默安装 3.10.11 →
-> # 建 .venv310 → 装 h5i-db / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
+> # 建 .venv310 → 装 h5i-db / vnpy / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
 > pwsh -File scripts/setup_py310_drl_venv.ps1
 > ```
 >
@@ -332,12 +335,12 @@ CI 分为两部分：
 > ```
 >
 > **实测收益（可复核）**：
-> - `drl_degrade.probe_runtime()` → `ok=True`（四项全 True），DRL 训练与 `target_plan` 生成恢复；
+> - `drl_degrade.probe_runtime()` → `ok=True`（核心依赖全 True），DRL 训练与 `target_plan` 生成恢复；
 > - 全量测试 **682 passed / 1 skipped**（`.venv314` 下为 **664 / 19**）—— 多出的 18 个正是
 >   原先因 `h5i-db 不可用` 而被跳过的 `tests/test_integration_f68.py` 用例，现在真的跑起来了；
 > - `scripts/preflight_drl_h5i_realrun.py` 从 `[BLOCKED]` 变为 **21/21 PASS**。
 >
-> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`（已在 PyPI 上）。
+> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`；vn.py 固定为 `4.4.0`。
 
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
@@ -414,6 +417,7 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
 - [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
 - [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/evolution/alpha-shadow-design.md`](docs/evolution/alpha-shadow-design.md)：Alpha shadow arm、实验哈希和运行时边界；
 - [`docs/hist-window-protocol.md`](docs/hist-window-protocol.md)：**历史窗口扩展与"环境外"窗口处理协议**
   （判据标定 / 必报项 / 技术前置检查；扩展历史窗口前必读）；
 - [`docs/preflight-verification.md`](docs/preflight-verification.md)：**上线前复验报告**

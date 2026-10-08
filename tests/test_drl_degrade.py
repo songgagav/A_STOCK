@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import zipfile
 
 import pytest
 
@@ -57,8 +58,8 @@ def _mk_version(root, day, *, live=True, model=True, weights="default",
         with open(os.path.join(d, D.LIVE_MARKER_NAME), "w", encoding="utf-8") as f:
             f.write("{}")
     if model:
-        with open(os.path.join(d, "model.zip"), "wb") as f:
-            f.write(b"PK\x03\x04dummy")
+        with zipfile.ZipFile(os.path.join(d, "model.zip"), "w") as f:
+            f.writestr("data", "{}")
     for s in (subdirs or []):
         os.makedirs(os.path.join(d, s), exist_ok=True)
     if meta_raw is not None:
@@ -118,6 +119,13 @@ class TestStructuralUsability:
 
     def test_missing_model_zip_not_usable(self, tmp_path):
         _mk_version(tmp_path, "20260905", model=False)
+        assert D.version_usable("20260905") is False
+
+    def test_corrupt_model_archive_not_usable(self, tmp_path):
+        version_dir = _mk_version(tmp_path, "20260905")
+        with open(os.path.join(version_dir, "model.zip"), "wb") as handle:
+            handle.write(b"not-a-zip")
+        assert D.model_archive_usable("20260905") is False
         assert D.version_usable("20260905") is False
 
     def test_meta_not_ok_not_usable(self, tmp_path):
@@ -521,14 +529,14 @@ class TestNoSilentFailurePathsInTrain:
         # 1 处定义 + 4 处调用。第 4 条是 2026-09-22 新增的 **DRL-1 学习前检查未通过**
         # (drl_precheck: 最小样本量 + 净值连续性) —— 它同样携带 degrade 走同一条链,
         # 故本不变量(『每条失败路径都走降级链, 不留静默路径』)的本意未被破坏。
-        assert src.count("_degrade_on_failure(") == 5, \
-            "1 处定义 + 4 处调用（数据源不可用 / 数据不足 / 学习前检查未通过(DRL-1) / 外层 except）"
+        assert src.count("_degrade_on_failure(") == 6, \
+            "1 处定义 + 5 处调用（含严格 OOS 切分失败）"
 
     def test_every_failure_return_carries_degrade(self):
         src = self._src()
-        assert src.count('"degrade": _degrade_on_failure') == 3   # 数据源 + 数据不足 + 学习前检查
+        assert src.count('"degrade": _degrade_on_failure') == 4   # 含严格 OOS 切分失败
         assert src.count('"degrade": _dec}') == 1                 # 外层 except
-        assert src.count('"degrade": ') == 4
+        assert src.count('"degrade": ') == 5
 
     def test_data_source_path_goes_through_chain(self):
         """`_load_factor_state` 抛异常也必须走降级链（原先在外层 try 之外 -> 逃出函数）。"""
@@ -552,6 +560,13 @@ class TestNoSilentFailurePathsInTrain:
         src = self._src()
         assert src.index("_dec = drl_degrade.resolve(") < src.index(
             "plan = _build_target_plan(")
+
+    def test_incumbent_is_captured_before_pointer_advances(self):
+        src = self._src()
+        capture = src.index("Capture the incumbent before resolve()")
+        resolve = src.index("_dec = drl_degrade.resolve(")
+        assert capture < resolve
+        assert "_incumbent_weights" in src[resolve:]
 
     def test_halt_skips_plan_construction(self):
         src = self._src()

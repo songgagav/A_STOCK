@@ -13,7 +13,8 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from factor_dynamic_weights import (
-    DYNAMIC_FACTORS, apply_dynamic_weights, load_dynamic_weights,
+    DYNAMIC_FACTORS, apply_dynamic_weights, compute_factor_day_metrics,
+    load_dynamic_weights,
 )
 
 
@@ -62,6 +63,25 @@ class TestApplyDynamicWeights(unittest.TestCase):
     def test_load_dynamic_weights_nonexistent(self):
         result = load_dynamic_weights("99999999")
         self.assertIsNone(result)
+
+
+class TestFactorDayMetrics(unittest.TestCase):
+    def test_metrics_are_cross_sectional_not_mean_scores(self):
+        scores = {
+            "f": {"a": 1.0, "b": 2.0, "c": 3.0, "d": 4.0, "e": 5.0},
+        }
+        labels = {"a": -0.05, "b": -0.02, "c": 0.0, "d": 0.03, "e": 0.06}
+        out = compute_factor_day_metrics(scores, labels, min_samples=5, quantile=0.2)
+        self.assertAlmostEqual(out["f"]["rank_ic"], 1.0)
+        self.assertAlmostEqual(out["f"]["long_short_return"], 0.11)
+        self.assertEqual(out["f"]["n_labeled"], 5)
+
+    def test_unmatured_labels_are_not_zero_filled(self):
+        scores = {"f": {"a": 1.0, "b": 2.0, "c": 3.0}}
+        labels = {"a": 0.1, "b": float("nan"), "c": float("nan")}
+        out = compute_factor_day_metrics(scores, labels, min_samples=3)
+        self.assertTrue(np.isnan(out["f"]["rank_ic"]))
+        self.assertTrue(np.isnan(out["f"]["long_short_return"]))
 
 
 if __name__ == "__main__":

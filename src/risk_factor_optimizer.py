@@ -147,6 +147,7 @@ class RiskFactorAugmentedEnv(FactorValueEnv):
         factor_names: list[str] | None = None,
         risk_factor_window: int = 20,
         cvar_alpha: float = 0.05,
+        episode_end: int | None = None,
     ):
         super().__init__(
             factor_history, future_returns, returns,
@@ -154,6 +155,7 @@ class RiskFactorAugmentedEnv(FactorValueEnv):
             regime_features=regime_features,
             risk_first_layer=risk_first_layer,
             factor_names=factor_names,
+            episode_end=episode_end,
         )
         self._rf_extractor = RiskFactorExtractor(
             returns, window=risk_factor_window, cvar_alpha=cvar_alpha)
@@ -280,6 +282,7 @@ def make_risk_factor_env(
     factor_names: list[str] | None = None,
     risk_factor_window: int = 20,
     cvar_alpha: float = 0.05,
+    episode_end: int | None = None,
 ) -> RiskFactorAugmentedEnv:
     """构造带风险因子观测的 FactorValueEnv 子类."""
     return RiskFactorAugmentedEnv(
@@ -290,4 +293,5 @@ def make_risk_factor_env(
         factor_names=factor_names,
         risk_factor_window=risk_factor_window,
         cvar_alpha=cvar_alpha,
+        episode_end=episode_end,
     )
