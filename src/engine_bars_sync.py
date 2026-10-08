@@ -47,6 +47,8 @@ import datetime as dt
 import os
 import sys
 
+import stockdb_runtime
+
 _APP = os.path.dirname(os.path.abspath(__file__))
 if _APP not in sys.path:
     sys.path.insert(0, _APP)
@@ -100,7 +102,10 @@ def _lake_root() -> str:
     return root
 
 
-PYBAO_DIR = os.environ.get("PYBAO_DIR", "").strip() or os.path.join(_lake_root(), "pybao")
+PYBAO_DIR = str(stockdb_runtime.resolve_pybao_dir(
+    repo_root=os.path.dirname(_APP),
+    external_root=_lake_root(),
+))
 ENGINE_ENDPOINT = os.environ.get("STOCKDB_ENGINE", "127.0.0.1:7899")
 
 
@@ -110,15 +115,15 @@ def _log(msg: str) -> None:
 
 
 def load_rd():
-    """把 pybao 加入 sys.path 并返回厂商 SDK 的 rd 句柄。失败一律抛 EngineUnavailable。"""
-    if PYBAO_DIR not in sys.path:
-        sys.path.insert(0, PYBAO_DIR)
+    """通过项目内 StockDB 边界加载 rd；失败一律抛 EngineUnavailable。"""
     try:
-        from stock_sdk import rd  # noqa: F401
+        return stockdb_runtime.load_rd(
+            pybao_dir=PYBAO_DIR,
+            repo_root=os.path.dirname(_APP),
+        )
     except Exception as e:  # noqa: BLE001
         raise EngineUnavailable(
             f"厂商 SDK 不可用: {type(e).__name__}: {e} (PYBAO_DIR={PYBAO_DIR})") from e
-    return rd
 
 
 # 健康探针/交易日历用的参考股票: 均为长期活跃的大盘股, 取并集可规避单只停牌缺口。

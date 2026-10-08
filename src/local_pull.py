@@ -41,6 +41,8 @@ from typing import Iterable, Optional
 import duckdb
 import pandas as pd
 
+import stockdb_runtime
+
 _LOG = logging.getLogger("local_pull")
 
 
@@ -67,7 +69,10 @@ FREE_STOCKDB_DIR = _lake_root()
 KLINE_PARTS_DIR = os.path.join(FREE_STOCKDB_DIR, "kline_parts")
 KLINE_FULL_PARQUET = os.path.join(FREE_STOCKDB_DIR, "kline_daily_full.parquet")
 # free-stockdb 引擎 SDK 目录
-PYBAO_DIR = os.environ.get("PYBAO_DIR", "") or os.path.join(_lake_root(), "pybao")
+PYBAO_DIR = str(stockdb_runtime.resolve_pybao_dir(
+    repo_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    external_root=_lake_root(),
+))
 
 # parquet -> daily_bars 列映射
 _COL_MAP = {
@@ -482,11 +487,12 @@ def pull_from_full_parquet(waterline_mode: str = "duckdb", con=None) -> dict:
 # ====================================================================
 
 def _load_sdk():
-    """把 free-stockdb 的 pybao 目录加入 sys.path 并导入 rd。"""
-    if str(PYBAO_DIR) not in sys.path:
-        sys.path.insert(0, str(PYBAO_DIR))
-    from stock_sdk import rd, bk, zb  # noqa: F401
-    return rd, bk, zb
+    """通过项目内 StockDB 边界加载 rd/bk/zb。"""
+    sdk = stockdb_runtime.load_sdk(
+        pybao_dir=PYBAO_DIR,
+        repo_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    return sdk.rd, sdk.bk, sdk.zb
 
 
 def pull_engine_valuation(max_symbols: int | None = None) -> dict:
