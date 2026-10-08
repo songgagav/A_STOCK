@@ -131,6 +131,7 @@ imports.txt
 config_usage.txt
 bandit.json
 .stockdb-bandit.json
+.daemon-bandit.json
 pytest_verbose.txt
 skip_report.txt
 _gap.txt

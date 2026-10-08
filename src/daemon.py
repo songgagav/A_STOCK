@@ -68,6 +68,7 @@ os.environ.setdefault("AKSHARE_TQDM", "0")
 
 LOG_DIR = os.path.join(_BASE, "logs")
 DAEMON_PID = os.path.join(LOG_DIR, "daemon.pid")
+DAEMON_LOCK = os.path.join(LOG_DIR, "daemon.lock")
 DAEMON_LOG = os.path.join(LOG_DIR, "daemon.log")
 TAIL_LOG = os.path.join(LOG_DIR, "daemon_tail.log")
 ENGINE_LOG = os.path.join(LOG_DIR, "live_engine.log")
@@ -76,6 +77,39 @@ ENGINE_PIDFILE = os.path.join(LOG_DIR, "engine.pid")
 DASH_PIDFILE = os.path.join(LOG_DIR, "dashboard.pid")
 DASH_PORT = 8000
 STOP_FILE = os.path.join(LOG_DIR, "daemon.stop")
+
+
+def _acquire_daemon_lock(path, pid=None):
+    """Acquire an OS-level non-blocking lock for the daemon instance.
+
+    The PID file is an observability artifact, not a mutual-exclusion
+    primitive.  A manual launch and the NSSM service can otherwise both pass
+    a stale-PID check and write the same health/target artifacts.  Keep the
+    lock handle open for the lifetime of the process; closing it releases the
+    lock on both Windows and POSIX.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(pid if pid is not None else os.getpid()).encode("ascii"))
+        handle.flush()
+        return handle
+    except (OSError, IOError):
+        handle.close()
+        return None
 
 # 交易日关键节点
 MARKET_OPEN = dtime(8, 30)      # 盘前健康检查 + 启动盘中引擎
@@ -924,6 +958,10 @@ if __name__ == "__main__":
     if args.status:
         _status()
         sys.exit(0)
+    _daemon_lock = _acquire_daemon_lock(DAEMON_LOCK)
+    if _daemon_lock is None:
+        print("守护进程已有实例运行, 拒绝启动", file=sys.stderr)
+        sys.exit(17)
     # 守护重启时恢复上次持久化的运行状态(daemon_state.json), 否则内存 _state 从默认值
     # (None) 起步, 会把"今天已完成"的收盘选股/非交易日维护/健康检查误判为未做而整条重跑
     # 一次(数据拉取+模型训练可长达几十分钟). 只读恢复, 不做覆盖合并上的数据清洗.
@@ -942,3 +980,4 @@ if __name__ == "__main__":
             os.remove(DAEMON_PID)
         except Exception:
             pass
+        _daemon_lock.close()

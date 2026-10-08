@@ -78,6 +78,7 @@ Batch 5/6 不得修改 `signal_snapshot.py`、冻结消费逻辑、PaperBook wat
 - 项目已固化 StockDB Python 接口与服务二进制的可复核副本：SDK 从 `vendor/stockdb/pybao` 优先加载，私有数据目录仍留在外部 `E:\A_stockDB`；当前注册的 `AStockStockdb` 仍指向外部路径，但其二进制 SHA-256 与项目副本一致，切换注册路径需管理员服务变更。
 - `.venv310` 盘前前置检查通过；`AStockDaemon` / `AStockStockdb` 均为 `Running/Automatic`，守护进程已运行并等待今日 08:30 启动虚拟盘引擎，`TRADE_BROKER=paper`。
 - 守护子进程解释器已固定为显式 `TRAE_PYTHON` → 项目 `.venv310` → 当前解释器的确定性顺序；当前驻留代码哈希与磁盘一致，避免服务包装器把 h5i/torch 子任务落到系统 Python。
+- 守护入口已增加 `logs/daemon.lock` 进程级单实例锁；现场验证第二次启动立即以退出码 17 拒绝，避免服务实例与手工实例同时写健康/交易运行态。
 - 09:25 快照的无时区时钟缺陷已修复并有回归测试；当前只能称为“开盘准备就绪”，必须等今日 08:30/09:25 新鲜产物验证后再计入 Phase E。
 - 2026-10-08 的 live_state 曾记录 `snapshot_write_failed:ValueError`、`spot empty` 和空仓；这些历史事实保留为 blocked/warn 证据，不补写为成功。
 

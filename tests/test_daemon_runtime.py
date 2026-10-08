@@ -47,3 +47,19 @@ def test_daemon_falls_back_to_current_python_when_project_runtime_missing(tmp_pa
     )
 
     assert selected == current
+
+
+def test_daemon_lock_rejects_a_second_instance_until_first_releases(tmp_path):
+    from src.daemon import _acquire_daemon_lock
+
+    path = tmp_path / "daemon.lock"
+    first = _acquire_daemon_lock(str(path), pid=111)
+    assert first is not None
+    try:
+        assert _acquire_daemon_lock(str(path), pid=222) is None
+    finally:
+        first.close()
+
+    third = _acquire_daemon_lock(str(path), pid=333)
+    assert third is not None
+    third.close()
