@@ -18,7 +18,7 @@ finalized dataset is never overwritten; a changed input produces a different
 dataset identity.
 
 The explicit historical run for `2026-09-22` through `2026-09-24` finalized
-dataset `079e13f9de90851bbed77206a4ce18771f28813193509bd2fe63bbe8e01c45e5`
+dataset `1459dfbfe6c31288c3552c8ed41b5e84b8697d946074aff540c354e4de8b42a3`
 under `data/evidence_phase_c/oos/`. It contains three available daily rows and
 records the current Phase B state as `DRL_PLAN_MODE=shadow`,
 `FUSION_WEIGHT_MODE=shadow`, `RANK_BY_FUSION=0`, and
