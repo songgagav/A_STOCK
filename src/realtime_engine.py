@@ -371,16 +371,11 @@ def _plan_to_targets(plan: dict, day: str, d: str):
         return None, None
     top_n = []
     for it in a_items:
-        top_n.append({
-            "canon": it["canon"],
-            "price": it.get("price"),
-            "score": it.get("drl_score", 0.0),
-            "target_weight": it.get("target_weight"),
-            "source": "drl_plan",
-            "change_pct": it.get("change_pct"),
-            "turnover": it.get("turnover"),
-            "source_signal": it.get("source_signal"),
-        })
+        row = dict(it)
+        row.setdefault("price", None)
+        row["score"] = it.get("drl_score", it.get("score", 0.0))
+        row["source"] = "drl_plan"
+        top_n.append(row)
     info = {
         "date": day,
         "source": "drl_plan",
@@ -396,6 +391,9 @@ def _plan_to_targets(plan: dict, day: str, d: str):
         # 选股/权重结果, 只是不再丢弃已有字段。
         "section_as_of": plan.get("section_as_of"),
         "data_lag_days": plan.get("data_lag_days"),
+        "promotion": plan.get("promotion"),
+        "drl_plan_mode": plan.get("drl_plan_mode"),
+        "provenance": plan.get("provenance"),
     }
     return top_n, info
 
@@ -541,11 +539,19 @@ def load_targets(day: str):
     # 先试"前一交易日目录"(新产物: 该目录里的 plan 显式声明 consume_day == 今天),
     # 再试"同日目录"(旧产物: 靠 generated_at 窗口间接判定)。两条都保留是为了
     # **兼容旧产物** —— 上线前写出的 plan 没有 consume_day 字段。
-    drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
-        d, day, prev_trade_day)
-    if top_n:
-        _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
-        return top_n, info, drl_prev_d
+    from strategy_contract import drl_plan_is_consumable, drl_plan_mode
+    _drl_mode = drl_plan_mode()
+    _drl_allowed = _drl_mode == "enforce"
+    if _drl_allowed:
+        drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
+            d, day, prev_trade_day)
+        # A plan is only consumable when it carries an explicit promotion
+        # approval.  The loader returns the raw plan metadata through info.
+        if top_n and drl_plan_is_consumable(info or {}):
+            _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
+            return top_n, info, drl_prev_d
+    else:
+        log(f"DRL plan mode={_drl_mode}: production target consumption blocked")
 
     # 2) 当日 selection.json
     sel_path = os.path.join(DAILY_DIR, d, "selection.json")
@@ -570,10 +576,11 @@ def load_targets(day: str):
     # [2026-09-28] 改调 `_cross_day_drl_fallback` —— 原先此处是**内联的同一段扫描**,
     # 而第 1 档现在也要扫 DRL 目录(条件不同: 要求显式 consume_day)。两处内联的
     # 近重复代码极易各自漂移(一处改了另一处忘), 故提取为单一定义。
-    cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
-    if top_n:
-        _trace_targets(day, cand, "drl_cross_day", len(top_n))
-        return top_n, info, cand
+    if _drl_allowed:
+        cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
+        if top_n and drl_plan_is_consumable(info or {}):
+            _trace_targets(day, cand, "drl_cross_day", len(top_n))
+            return top_n, info, cand
 
     # 4) 跨日回退 - selection: 最近的 selection.json
     sel = None

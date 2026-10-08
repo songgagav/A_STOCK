@@ -1,0 +1,198 @@
+# Alpha Shadow 对照设计
+
+## 目标
+
+在不改变生产排序、权重、09:25 快照、PaperBook 或交易通道的前提下，回答一个
+明确问题：正向的四因子融合信号是在因子层有效，还是在 selector 混合、排序和
+Top-N 过程中被稀释或反转。
+
+本阶段只做诊断，不做 promotion。生产默认仍为 `RANK_BY_FUSION=0`，总报告继续
+使用 `not_promotable` 作为当前结论。
+
+## 共同输入原则
+
+每个交易日的所有 arm 必须共享：
+
+- 同一份 PIT 截面；
+- 同一股票池过滤结果；
+- 同一 forward-return 观察窗口；
+- 同一缺失值和 fallback 处理结果。
+
+唯一允许变化的是排序变量。输入行通过纯数据结构传入
+`src/alpha_shadow.py`，不从生产 selector 读取全局环境变量，也不在 shadow 中
+打开生产开关。
+
+## 诊断 arm
+
+| arm | 排序字段 | 用途 |
+|---|---|---|
+| `control_prod` | `score` | 当前生产排序基线 |
+| `legacy_signal` | `signal` | 重现旧 selector 信号证据 |
+| `fusion_A` | `fusion_A` | 生产方向四因子融合 |
+| `selector_score` | `selector_score` | 观察最终 selector 分数 |
+| `fusion_rank_on` | `fusion_rank_on` | 观察开启融合排名后的变化 |
+
+输入行必须显式提供 `symbol` 和 `scores`。缺字段、非数值或非有限值直接报错，
+不静默删除股票。
+
+如果要计算前向指标，行中再提供：
+
+```json
+{
+  "symbol": "600001.SH",
+  "scores": {"score": 0.9, "signal": 0.2, "fusion_A": 0.7},
+  "forward_returns": {"1": 0.01, "5": 0.03}
+}
+```
+
+`forward_returns` 的值是小数收益率；缺失或非有限值会被明确记为
+`null`，不会补零。上一期持仓通过独立的 `previous_symbols` 参数传入，避免
+从 PaperBook 或生产状态文件读取。
+
+如果需要超额收益，输入必须显式提供基准：
+
+```json
+{
+  "benchmark": {
+    "name": "equal_weight_xsec_available",
+    "returns": {"1": 0.01, "5": 0.03},
+    "n": {"1": 1200, "5": 1195}
+  }
+}
+```
+
+缺少基准时超额收益保持 `null`，不把“没有基准”伪装成零超额。
+
+## 实验身份与缓存
+
+`build_experiment_manifest()` 记录：
+
+- 代码 SHA；
+- 各输入产物 SHA-256；
+- 排序无关的股票池哈希；
+- factor/direction/weight 版本；
+- selector 变体；
+- 环境标志；
+- arm 列表和 `experiment_config_hash`。
+
+manifest 的整体哈希决定缓存目录：
+
+```text
+data/shadow_alpha/<experiment_hash>/manifest.json
+```
+
+manifest 通过同目录临时文件加 `os.replace` 原子落盘。原始行情和研究产物仍留在
+本地数据目录，不进入 Git。
+
+## 离线 runner 输入与运行
+
+`scripts/research/alpha_shadow_compare.py` 只接受调用方已经准备好的规范化 PIT
+JSON，不负责取数。最小结构如下：
+
+```json
+{
+  "schema_version": 1,
+  "trade_day": "2026-09-01",
+  "rows": [{"symbol": "600001.SH", "scores": {}, "forward_returns": {"1": 0.01}}],
+  "previous_symbols": ["600002.SH"],
+  "input_hashes": {"pit": "...", "forward": "..."}
+}
+```
+
+示例：
+
+```powershell
+.venv310\Scripts\python.exe scripts\research\alpha_shadow_compare.py `
+  --input data\research\shadow_input_20260901.json `
+  --cache-root data\shadow_alpha `
+  --code-sha <已审计代码提交> `
+  --factor-version factor-v1 `
+  --direction-version direction-a `
+  --weight-version weights-v1 `
+  --selector-variant production-default `
+  --env-flag RANK_BY_FUSION=0
+```
+
+runner 的输出只写入 `data/shadow_alpha/<experiment_hash>/`。它不会自动将结果写入
+`selection.json`、`target_plan.json`、PaperBook 或任何交易输入；真实 PIT 适配器需在
+独立批次中生成上述输入，并提供其来源哈希。
+
+### 真实 PIT 批量适配器
+
+`scripts/research/alpha_shadow_batch.py` 负责把已有的 `xsec`、`fusion_x` parquet
+和 h5i 日线只读合成为规范化输入，再调用同一个离线 runner。它要求显式提供：
+
+```powershell
+.venv310\Scripts\python.exe scripts\research\alpha_shadow_batch.py `
+  --xsec-dir data\pit\xsec `
+  --fusion-dir data\pit\fusion_x `
+  --bar-db data\h5i\market.db `
+  --factor-config data\fusion_decompose.json `
+  --input-root data\shadow_alpha_inputs `
+  --cache-root data\shadow_alpha `
+  --report data\shadow_alpha_report.json `
+  --code-sha <审计提交> `
+  --factor-version <版本> `
+  --direction-version <版本> `
+  --weight-version <版本>
+  --cost-bps 9.6
+```
+
+适配器只读取 h5i，不修改生产数据；`fusion_x` 覆盖不足时写入 `coverage` 和排除
+清单。真实运行记录见 [`alpha-shadow-run-2026-10-06.md`](alpha-shadow-run-2026-10-06.md)。
+
+## 输出指标
+
+`evaluate_shadow_arms()` 当前输出每个 arm 的完整排名、Top-N 标的，并相对
+`control_prod` 计算：
+
+- 共同标的数；
+- Top-N Jaccard；
+- 全排名 Spearman 相关。
+- 每个 horizon 的 Top-N 平均前向收益；
+- 每个 horizon 的全样本 RankIC；
+- 显式基准下的每个 horizon 超额收益；
+- 指定成本假设下的成本敏感性收益；
+- 全截面 Q1–Q5 前向收益、Q5-Q1 spread 和逐日单调通过率；
+- forward 观测覆盖率、PIT 排除率和明确的 fallback 计数；
+- 相对上一期显式持仓的替换率 `turnover = 1 - overlap / max(|target|, |previous|)`。
+
+没有上一期持仓时，`turnover` 为 `null`；没有足够的前向收益时，平均收益和
+RankIC、超额收益和成本敏感性收益为 `null`。这些是不可计算，不是零表现。
+
+`--cost-bps` 只用于研究敏感性：
+
+```text
+cost_adjusted_forward_return_mean
+  = gross_forward_return_mean - turnover_proxy * cost_bps / 10000
+```
+
+它不是成交回放，也不替代 PaperBook 的逐笔费用计算；报告必须同时记录成本假设和
+换手代理的来源。批量适配器使用 `equal_weight_xsec_available` 作为“当日有观测股票的
+等权截面”诊断基准，并按 horizon 记录有效样本数。
+
+Q1–Q5 的定义是全截面按当前 arm 分数排序后，Q1 为最低分组、Q5 为最高分组；分组
+只使用该 horizon 已成熟且有 forward return 的股票。分组不足五组时，未观测组保持
+`null`。`is_non_decreasing` 是单个决策日的严格审计结果，多日报告中的
+`monotonic_rate` 是通过日数比例，不是把多日均值排序后得出的结论。
+
+后续仍需追加 RankIC（1/5/10/20/60/120d）、Q1-Q5 单调性、真实持仓换手、缺失率、
+fallback 次数和 universe size。没有这些共同输入和
+完整指标前，不得把 shadow 结果称为策略提升。
+
+## 环境边界
+
+- `.venv310`：canonical runtime，已验收 `h5i_db`、`torch`、`stable_baselines3`
+  和 `vnpy==4.4.0`；用于数据与执行 shadow。
+- `.venv314`：纯 Python 研究/兼容性回归；缺 `h5i_db` 和 `vnpy` 时必须显式记录，
+  不使用 `PYTHONPATH` 混用 site-packages。
+- `2026-09-04` 的 120d 窗口在 2026-10-06 尚未成熟，报告标记
+  `pending_maturity`，不计入失败，也不补造结果。
+
+## 明确不做
+
+- 不打开 `RANK_BY_FUSION`；
+- 不修改生产权重；
+- 不写 PaperBook 或真实 broker；
+- 不用 vn.py 缺失时的自研 fallback 冒充 vn.py 结果；
+- 不把 shadow 结果自动写回生产决策文件。

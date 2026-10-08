@@ -13,6 +13,7 @@ from config import DATA_DIR, DAILY_DIR, MAX_STOCKS, PAPER, STATE_FILE
 from db import StockDB
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
+from strategy_contract import drl_plan_mode
 
 
 class _IngestSkipped(Exception):
@@ -1149,10 +1150,27 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # （环境已损坏, 用陈旧模型下单的风险高于停一天）。
         _drl_probe = None
         _drl_forced = None
+        _drl_mode = drl_plan_mode()
+        report["steps"]["drl_plan_mode"] = {
+            "mode": _drl_mode,
+            "shadow_non_consumable": _drl_mode == "shadow",
+            "production_gate": "strategy_contract",
+        }
+        if _drl_mode == "off":
+            report["steps"]["drl_train"] = {
+                "ok": True,
+                "skipped": "drl_plan_mode_off",
+                "mode": _drl_mode,
+            }
         try:
             import drl_degrade
-            _drl_probe = drl_degrade.probe_runtime()
+            if _drl_mode == "off":
+                _drl_probe = {"ok": False, "skipped": "mode_off"}
+            else:
+                _drl_probe = drl_degrade.probe_runtime()
             if not _drl_probe.get("ok"):
+                if _drl_mode == "off":
+                    raise _IngestSkipped("DRL_PLAN_MODE=off")
                 _why = (f"DRL 运行环境不可用: 缺 {'/'.join(_drl_probe['missing'])} "
                         f"(python={_drl_probe['python']}); "
                         f"决策 D: 显式置 L3 且不回退旧模型")
@@ -1162,20 +1180,23 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                     "error": _why, "degrade": _drl_forced, "probe": _drl_probe,
                 }
                 print(f"[run_daily] DRL L3（显式暂停）: {_why}")
+        except _IngestSkipped:
+            pass
         except Exception as e:
             report["steps"]["drl_probe"] = {"ok": False, "error": str(e)[:200]}
 
         if _drl_forced is None:
-            try:
-                from drl_train import run_drl_train
-                from config import CVAR_PPO as _CVAR_CFG
-                report["steps"]["drl_train"] = run_drl_train(
-                    day, total_timesteps=800,
-                    cvar_alpha=_CVAR_CFG["cvar_alpha"],
-                    cvar_coef=_CVAR_CFG["cvar_coef"],
-                )
-            except Exception as e:
-                report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
+            if _drl_mode != "off":
+                try:
+                    from drl_train import run_drl_train
+                    from config import CVAR_PPO as _CVAR_CFG
+                    report["steps"]["drl_train"] = run_drl_train(
+                        day, total_timesteps=800,
+                        cvar_alpha=_CVAR_CFG["cvar_alpha"],
+                        cvar_coef=_CVAR_CFG["cvar_coef"],
+                    )
+                except Exception as e:
+                    report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
 
         # ===== DRL 降级状态进每日复盘（可见性: 用户要求"每日复盘告警可见"）=====
         # 无论走哪条路径都写: 复盘要能一眼看到 DRL 当前级别与最近一次降级事件。

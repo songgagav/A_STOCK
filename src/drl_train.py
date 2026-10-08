@@ -558,9 +558,16 @@ def _load_factor_state(day: dt.date, lookback_days: int = 60):
 
 def _load_base_weights() -> np.ndarray:
     try:
-        with open(os.path.join(DATA_DIR, "weights.json"), encoding="utf-8") as f:
-            w = json.load(f)
-        return np.array([w.get(k, 1 / 6) for k in SCORE_FACTORS], dtype=np.float64)
+        # Use the same nested payload/validation path as selector_weights;
+        # the old implementation looked for factor names at JSON top level
+        # and therefore silently returned six equal weights.
+        from weight_optimizer import load_weights
+        w = load_weights()
+        values = np.array([float(w.get(k, 0.0)) for k in SCORE_FACTORS],
+                          dtype=np.float64)
+        if not np.all(np.isfinite(values)) or np.any(values < 0) or values.sum() <= 0:
+            raise ValueError("invalid base weights")
+        return values / values.sum()
     except Exception:
         return np.ones(6, dtype=np.float64) / 6
 
@@ -1854,6 +1861,8 @@ def _build_target_plan(day: str, day_dir: str,
     dict: {"ok": bool, "path": str, "top_n": int, "universe_size": int,
            "method": str, "error": str|None}
     """
+    from strategy_contract import drl_plan_mode
+
     out_dir = os.path.join(DATA_DIR, "drl", day_dir)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "target_plan.json")
@@ -1965,6 +1974,8 @@ def _build_target_plan(day: str, day_dir: str,
     payload = {
         "day": day,
         "consume_day": _consume,
+        "drl_plan_mode": drl_plan_mode(),
+        "promotion": {"approved": False, "reason": "promotion gate required"},
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "method": res["method"],
         "weights_used": norm_w,
