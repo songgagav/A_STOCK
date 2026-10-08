@@ -105,6 +105,13 @@ def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path):
     assert persisted["snapshot"]["weights"] == {"600000.SH": 1.0}
 
 
+def test_run_tick_localizes_naive_clock_before_freeze(engine):
+    """生产默认时钟无时区时，09:25 快照仍必须能生成。"""
+    engine.run_tick(now=datetime(2026, 10, 3, 9, 25, 0))
+
+    assert engine.snapshot_status == "ready"
+
+
 def test_before_cutoff_keeps_live_resolution_for_preparation(engine):
     """09:25 前只允许准备候选，不得写出权威冻结结论。"""
     targets, _sel, _source_day, meta = engine._freeze_or_load_targets(_AT_0924)

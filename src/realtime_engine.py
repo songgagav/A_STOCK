@@ -82,6 +82,14 @@ def log(msg: str):
     print(line, flush=True)
 
 
+def _localize_runtime_time(value: datetime | None) -> datetime:
+    """把引擎时钟统一为带 Asia/Shanghai 时区的时间。"""
+    now = datetime.now(SHANGHAI) if value is None else value
+    if now.tzinfo is None or now.utcoffset() is None:
+        return now.replace(tzinfo=SHANGHAI)
+    return now.astimezone(SHANGHAI)
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -757,6 +765,7 @@ class RealtimeEngine:
 
     def _freeze_or_load_targets(self, now: datetime) -> tuple[list[dict], dict, str, dict]:
         """冻结窗口写一次，窗口后只读已验证快照，绝不自动实时回退。"""
+        now = _localize_runtime_time(now)
         day = self.pb.trade_date.replace("-", "")
         pending = {
             "snapshot_status": "pending",
@@ -884,7 +893,7 @@ class RealtimeEngine:
     # ---------- 一次 tick ----------
     def run_tick(self, now: datetime | None = None):
         self.tick += 1
-        now = now or datetime.now()
+        now = _localize_runtime_time(now)
         # [2026-09-22 修] Dead-Man's Switch: tick 落在**主循环的每一轮**, 而不是调仓那一刻。
         #
         # 原先这一 beat 在 `_rebalance_if_due()` 里、且位于"调仓间隔已到"之后 ——
