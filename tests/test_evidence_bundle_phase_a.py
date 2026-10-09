@@ -92,7 +92,7 @@ def _fill(*, side="buy", fill_price=10.01, stamp_tax=0.0, embedded=True):
     }
 
 
-def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None):
+def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None, production_state=None):
     raw = tmp_path / "input"
     raw.mkdir(exist_ok=True)
     artifacts = {
@@ -131,8 +131,11 @@ def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None):
         snapshot=snapshot,
         artifacts=artifacts,
         experiment_identity={"experiment_hash": "experiment-sha-1", "name": "fixture"},
-        production_state={
+        production_state=production_state or {
             "RANK_BY_FUSION": "0",
+            "DRL_PLAN_MODE": "shadow",
+            "FUSION_WEIGHT_MODE": "shadow",
+            "TRADE_BROKER": "paper",
             "alpha_evidence_status": "not_promotable",
             "drl_plan_mode_contract": "not_implemented",
         },
@@ -155,6 +158,8 @@ def test_bundle_is_deterministic_and_contains_raw_and_derived_evidence(tmp_path)
     assert first.manifest["bundle_id"] == first.bundle_id
     assert first.manifest["evidence_status"] == "available"
     assert first.manifest["snapshot_hash"] == request.snapshot.expected_sha256
+    assert first.manifest["observation_epoch"]["epoch_id"] == first.manifest["bundle_identity"]["observation_epoch"]["epoch_id"]
+    assert first.manifest["observation_epoch"]["identity"]["code_sha"] == request.code_sha
     assert first.manifest["production_state"]["RANK_BY_FUSION"] == "0"
     assert first.manifest["production_state"]["alpha_evidence_status"] == "not_promotable"
     assert first.manifest["production_state"]["drl_plan_mode_contract"] == "not_implemented"
@@ -163,6 +168,15 @@ def test_bundle_is_deterministic_and_contains_raw_and_derived_evidence(tmp_path)
     assert (first.path / "derived" / "turnover.json").is_file()
     assert (first.path / "derived" / "cost_records.jsonl").is_file()
     assert verify_bundle(first.path)["bundle_id"] == first.bundle_id
+
+
+def test_bundle_requires_explicit_shadow_runtime_state(tmp_path):
+    with pytest.raises(ValueError, match="DRL_PLAN_MODE"):
+        _request(tmp_path, production_state={
+            "RANK_BY_FUSION": "0",
+            "alpha_evidence_status": "not_promotable",
+            "drl_plan_mode_contract": "not_implemented",
+        })
 
 
 def test_manifest_constituent_tamper_is_detected_and_finalized_bundle_is_not_overwritten(tmp_path):

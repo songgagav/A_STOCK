@@ -92,6 +92,9 @@ def _bundle(tmp_path: Path, trade_day: str) -> Path:
             experiment_identity={"experiment_hash": "experiment-sha-1"},
             production_state={
                 "RANK_BY_FUSION": "0",
+                "DRL_PLAN_MODE": "shadow",
+                "FUSION_WEIGHT_MODE": "shadow",
+                "TRADE_BROKER": "paper",
                 "alpha_evidence_status": "not_promotable",
                 "drl_plan_mode_contract": "not_implemented",
             },
@@ -103,7 +106,12 @@ def _bundle(tmp_path: Path, trade_day: str) -> Path:
     return result.path
 
 
-def _request(tmp_path: Path, days: tuple[OOSDayInput, ...], trade_days: tuple[str, ...] | None = None):
+def _request(
+    tmp_path: Path,
+    days: tuple[OOSDayInput, ...],
+    trade_days: tuple[str, ...] | None = None,
+    production_state=None,
+):
     return OOSDatasetRequest(
         output_root=tmp_path / "oos",
         run_id="oos-run-1",
@@ -113,8 +121,11 @@ def _request(tmp_path: Path, days: tuple[OOSDayInput, ...], trade_days: tuple[st
         config_identity={"config_sha": "config-sha-1"},
         experiment_identity={"experiment_hash": "experiment-sha-1"},
         calendar_identity={"calendar_sha": "calendar-sha-1", "trade_days_are_explicit": True},
-        production_state={
+        production_state=production_state or {
             "RANK_BY_FUSION": "0",
+            "DRL_PLAN_MODE": "shadow",
+            "FUSION_WEIGHT_MODE": "shadow",
+            "TRADE_BROKER": "paper",
             "alpha_evidence_status": "not_promotable",
             "drl_plan_mode_contract": "not_implemented",
         },
@@ -146,10 +157,31 @@ def test_same_explicit_days_are_deterministic_and_include_provenance(tmp_path):
     assert first.path == second.path
     assert first.manifest["trade_days"] == ["2026-10-07", "2026-10-08"]
     assert first.manifest["daily_available"] == 2
+    assert first.manifest["observation_epoch"]["epoch_id"] == first.manifest["dataset_identity"]["observation_epoch"]["epoch_id"]
+    assert first.manifest["observation_epoch"]["identity"]["code_sha"] == "code-sha-1"
+    bundle_manifest = json.loads((first_bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert first.manifest["observation_epoch"] == bundle_manifest["observation_epoch"]
     assert first.manifest["constituent_artifact_hashes"]
     assert (first.path / "raw" / "day_index.jsonl").is_file()
     assert (first.path / "derived" / "daily_metrics.jsonl").is_file()
     assert verify_oos_dataset(first.path)["dataset_id"] == first.dataset_id
+
+
+def test_oos_requires_explicit_shadow_runtime_state(tmp_path):
+    day = OOSDayInput(
+        trade_day="2026-10-07",
+        bundle_path=None,
+        expected_manifest_sha256=None,
+        bundle_id=None,
+        status="pending_maturity",
+        reason="fixture",
+    )
+    with pytest.raises(ValueError, match="DRL_PLAN_MODE"):
+        _request(tmp_path, (day,), production_state={
+            "RANK_BY_FUSION": "0",
+            "alpha_evidence_status": "not_promotable",
+            "drl_plan_mode_contract": "not_implemented",
+        })
 
 
 def test_missing_day_is_preserved_and_not_converted_to_zero(tmp_path):

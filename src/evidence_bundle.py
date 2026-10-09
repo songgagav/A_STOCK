@@ -21,6 +21,11 @@ from typing import Any
 
 from evidence_cost import replay_costs
 from evidence_turnover import compute_turnover
+from observation_epoch import (
+    build_observation_epoch,
+    validate_shadow_production_state,
+    verify_observation_epoch,
+)
 
 
 SCHEMA_VERSION = 1
@@ -126,17 +131,7 @@ class EvidenceBundleRequest:
             raise ValueError("config_identity.config_sha is required")
         if not str(self.experiment_identity.get("experiment_hash") or ""):
             raise ValueError("experiment_identity.experiment_hash is required")
-        expected_state = {
-            "RANK_BY_FUSION": {"0"},
-            "alpha_evidence_status": {"not_promotable"},
-            # ``not_implemented`` is retained for historical Phase A
-            # fixtures; current Phase B evidence should use the explicit
-            # implemented-default-shadow value.
-            "drl_plan_mode_contract": {"not_implemented", "implemented_default_shadow"},
-        }
-        for key, allowed in expected_state.items():
-            if str(self.production_state.get(key)) not in allowed:
-                raise ValueError(f"production_state.{key} must be explicitly recorded as one of {sorted(allowed)!r}")
+        validate_shadow_production_state(self.production_state)
         try:
             equity = float(self.reference_equity)
         except (TypeError, ValueError) as exc:
@@ -259,6 +254,12 @@ def _manifest_without_hash(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_identity(request: EvidenceBundleRequest, source_hashes: dict[str, str]) -> dict[str, Any]:
+    observation_epoch = build_observation_epoch(
+        code_sha=request.code_sha,
+        data_identity=request.data_identity,
+        config_identity=request.config_identity,
+        experiment_identity=request.experiment_identity,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "trade_day": request.trade_day,
@@ -276,6 +277,7 @@ def _build_identity(request: EvidenceBundleRequest, source_hashes: dict[str, str
         "reference_timestamp": request.reference_timestamp,
         "cost_evidence_level": request.cost_evidence_level,
         "observation_statuses": request.observation_statuses,
+        "observation_epoch": observation_epoch,
     }
 
 
@@ -388,6 +390,7 @@ def build_bundle(request: EvidenceBundleRequest) -> BundleResult:
             "snapshot_path": raw_metadata["snapshot"]["source_path"],
             "experiment_hash": request.experiment_identity["experiment_hash"],
             "experiment_identity": request.experiment_identity,
+            "observation_epoch": identity["observation_epoch"],
             "builder_version": request.builder_version,
             "evidence_status": evidence_status,
             "blocked_reasons": blocked_reasons,
@@ -452,6 +455,11 @@ def verify_bundle(bundle_path: Path | str) -> dict[str, Any]:
     identity = manifest.get("bundle_identity")
     if not isinstance(identity, dict) or _digest(identity) != manifest.get("bundle_id"):
         raise BundleBuildError("tampered", ["bundle_identity_mismatch"])
+    if "observation_epoch" in manifest:
+        try:
+            verify_observation_epoch(manifest["observation_epoch"])
+        except ValueError as exc:
+            raise BundleBuildError("tampered", ["observation_epoch_mismatch"]) from exc
     for relative, expected in (manifest.get("constituent_artifact_hashes") or {}).items():
         file_path = path / relative
         if not file_path.is_file():
