@@ -42,6 +42,25 @@ def test_run_services_honors_valid_trae_python_override(tmp_path):
     assert os.path.normcase(selected) == os.path.normcase(str(override))
 
 
+def test_run_services_honors_explicit_project_314_runtime_over_preferred_310(tmp_path):
+    from src.run_services import _resolve_runtime_python
+
+    preferred = tmp_path / ".venv310" / "Scripts" / "python.exe"
+    preferred.parent.mkdir(parents=True)
+    preferred.write_text("", encoding="utf-8")
+    current = tmp_path / ".venv314" / "Scripts" / "python.exe"
+    current.parent.mkdir(parents=True)
+    current.write_text("", encoding="utf-8")
+
+    selected = _resolve_runtime_python(
+        base=str(tmp_path),
+        current_python=str(current),
+        environ={},
+    )
+
+    assert os.path.normcase(selected) == os.path.normcase(str(current))
+
+
 def test_run_services_falls_back_to_current_python_when_preferred_missing(tmp_path):
     from src.run_services import _resolve_runtime_python
 
@@ -84,6 +103,55 @@ def test_run_services_accepts_pid_running_expected_dashboard_script(monkeypatch)
     monkeypatch.setattr(rs, "_proc_alive", lambda pid: True)
 
     assert rs._service_pid_alive(12345, "src/dashboard.py")
+
+
+def test_run_services_marks_pid_identity_unknown_without_psutil(monkeypatch):
+    import src.run_services as rs
+
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(rs, "_proc_alive", lambda pid: True)
+
+    assert rs._service_pid_state(12345, "src/dashboard.py") == "unknown"
+
+
+def test_run_services_stop_does_not_kill_unverified_pid(monkeypatch, tmp_path):
+    import src.run_services as rs
+
+    pid_file = tmp_path / "dashboard.pid"
+    pid_file.write_text("12345", encoding="utf-8")
+    monkeypatch.setattr(rs, "DASH_PID", str(pid_file))
+    monkeypatch.setattr(rs, "ENGINE_PID", str(tmp_path / "missing-engine.pid"))
+    monkeypatch.setattr(rs, "_service_pid_state", lambda pid, script: "unknown")
+    killed = []
+    monkeypatch.setattr(rs.subprocess, "run", lambda *args, **kwargs: killed.append(args))
+
+    rs.stop()
+
+    assert killed == []
+
+
+def test_run_services_start_uses_src_script_paths(monkeypatch, tmp_path):
+    import src.run_services as rs
+
+    spawned = []
+    monkeypatch.setattr(rs, "PID_DIR", str(tmp_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "trading_calendar",
+        types.SimpleNamespace(is_trading_day=lambda day: True),
+    )
+    monkeypatch.setattr(
+        rs,
+        "_spawn",
+        lambda name, script, args, pid_file, stdout_log: spawned.append((name, script)),
+    )
+
+    rs.start()
+
+    assert [script for _, script in spawned] == [
+        "src/realtime_engine.py",
+        "src/dashboard.py",
+    ]
 
 
 def test_run_services_spawns_with_resolved_runtime_python(monkeypatch, tmp_path):

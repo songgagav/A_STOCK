@@ -49,6 +49,14 @@ def _resolve_runtime_python(base=None, current_python=None, environ=None):
     if override and os.path.isfile(override):
         return override
 
+    current_abs = os.path.normcase(os.path.abspath(current))
+    project_runtimes = {
+        os.path.normcase(os.path.abspath(os.path.join(root, ".venv310", "Scripts", "python.exe"))),
+        os.path.normcase(os.path.abspath(os.path.join(root, ".venv314", "Scripts", "python.exe"))),
+    }
+    if current_abs in project_runtimes and os.path.isfile(current):
+        return current
+
     preferred = os.path.join(root, ".venv310", "Scripts", "python.exe")
     if os.path.isfile(preferred):
         return preferred
