@@ -164,22 +164,6 @@ def test_snapshot_rejects_nonpositive_or_nonunit_weights():
         ], "selection", "20261006", [], at, _ROOT)
 
 
-def test_drl_base_weights_use_nested_payload(monkeypatch, tmp_path):
-    import drl_train
-    import weight_optimizer as wo
-
-    payload = {"weights": {
-        "signal": 2.0, "trend": 1.0, "govern": 1.0,
-        "liquidity": 1.0, "vol": 1.0, "mom_rev": 1.0,
-    }}
-    path = tmp_path / "weights.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(wo, "WEIGHTS_FILE", str(path))
-    values = drl_train._load_base_weights()
-    assert values.tolist() == pytest.approx([2 / 7, 1 / 7, 1 / 7,
-                                              1 / 7, 1 / 7, 1 / 7])
-
-
 def test_realtime_shadow_skips_drl_and_uses_non_drl_selection(tmp_path, monkeypatch):
     import realtime_engine as realtime
 

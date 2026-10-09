@@ -17,6 +17,7 @@ EXPECTED_DRL_TESTS = {
     "tests/test_drl_target_plan_h5i.py",
     "tests/test_drl_true_factor_state.py",
     "tests/test_drl_v2_contract.py",
+    "tests/test_drl_weights_contract.py",
     "tests/test_execution_decomposition.py",
     "tests/test_factor_dynamic_weights.py",
     "tests/test_factor_value_env.py",
@@ -54,3 +55,12 @@ def test_collection_filter_is_symmetric_for_core_and_drl():
     assert not should_ignore(drl_test, "drl", REPO)
     assert not should_ignore(core_test, "core", REPO)
     assert should_ignore(core_test, "drl", REPO)
+
+
+def test_drl_weight_contract_is_excluded_from_core_collection():
+    from ci_test_partition import should_ignore
+
+    drl_test = REPO / "tests" / "test_drl_weights_contract.py"
+
+    assert should_ignore(drl_test, "core", REPO)
+    assert not should_ignore(drl_test, "drl", REPO)

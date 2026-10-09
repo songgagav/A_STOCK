@@ -122,7 +122,7 @@ def _spawn(name, script, args, pid_file, stdout_log):
     out = open(stdout_log, "a", encoding="utf-8")
     p = subprocess.Popen([PY, os.path.join(_BASE, script)] + args,
                          cwd=_BASE, stdout=out, stderr=out,
-                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     _write_pid(pid_file, p.pid)
     time.sleep(2)
     log(f"{name} 已启动 pid={p.pid} -> {stdout_log}")

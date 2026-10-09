@@ -175,3 +175,26 @@ def test_run_services_spawns_with_resolved_runtime_python(monkeypatch, tmp_path)
     rs._spawn("dashboard", "src/dashboard.py", ["--port", "8000"], str(tmp_path / "pid"), str(log_path))
 
     assert calls[0][0][0] == r"C:\project\.venv310\Scripts\python.exe"
+
+
+def test_run_services_uses_portable_creation_flags(monkeypatch, tmp_path):
+    import src.run_services as rs
+
+    calls = []
+
+    class _Popen:
+        pid = 123
+
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.delattr(rs.subprocess, "CREATE_NEW_PROCESS_GROUP", raising=False)
+    monkeypatch.setattr(rs, "_service_pid_state", lambda pid, script: "stopped")
+    monkeypatch.setattr(rs, "_write_pid", lambda path, pid: None)
+    monkeypatch.setattr(rs.subprocess, "Popen", _Popen)
+    monkeypatch.setattr(rs.time, "sleep", lambda seconds: None)
+
+    log_path = tmp_path / "service.log"
+    rs._spawn("dashboard", "src/dashboard.py", ["--port", "8000"], str(tmp_path / "pid"), str(log_path))
+
+    assert calls[0][1]["creationflags"] == 0
