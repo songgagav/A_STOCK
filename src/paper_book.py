@@ -734,6 +734,12 @@ def _limit_prices(canon: str, last_close: float) -> tuple:
     return limit_up, limit_down
 
 
+def _open_reference_db():
+    """Open the project's canonical read-only bar store (StockDB/h5i)."""
+    from db import StockDB
+    return StockDB()
+
+
 class PriceFeed:
     """盘中实时价: AKShare 全A实时快照(带缓存与降级).
     交易时段拉实时spot; 缓存30s; 失败时保留上一次快照, 跳过价格返回.
@@ -748,6 +754,8 @@ class PriceFeed:
         self._ts = 0.0
         self._last_error = None
         self._total_fetch = 0
+        self._last_source = "none"
+        self._fallback_codes: set[str] = set()
         self.positions = {}  # 由外部 set_positions 注入, 用于构建 watchlist
         self._snapshot_targets: set[str] = set()
         self._snapshot_enforced = False
@@ -779,19 +787,48 @@ class PriceFeed:
             pass
         try:
             if os.path.isdir(DAILY_DIR):
-                days = sorted(os.listdir(DAILY_DIR), reverse=True)
-                for d in days[:2]:
+                days = sorted(
+                    (
+                        d for d in os.listdir(DAILY_DIR)
+                        if len(d) == 8 and d.isdigit()
+                        and os.path.isdir(os.path.join(DAILY_DIR, d))
+                    ),
+                    reverse=True,
+                )
+                for d in days:
                     sp = os.path.join(DAILY_DIR, d, "selection.json")
-                    if os.path.exists(sp):
+                    if not os.path.isfile(sp):
+                        continue
+                    try:
                         with open(sp, encoding="utf-8") as f:
                             selection = json.load(f)
-                        for target in (selection.get("top_n") or selection.get("targets") or []):
-                            if "canon" in target:
-                                watch.add(target["canon"])
-                        break
+                    except Exception:
+                        continue
+                    for target in (selection.get("top_n") or selection.get("targets") or []):
+                        if isinstance(target, dict) and target.get("canon"):
+                            watch.add(target["canon"])
+                    break
         except Exception:
             pass
         return watch
+
+    def _record_snapshot_source(self, snap: dict, primary_source: str | None = None):
+        """Record whether a snapshot is live, mixed, or h5i reference data."""
+        self._fallback_codes = {
+            canon for canon, quote in (snap or {}).items()
+            if isinstance(quote, dict) and quote.get("fallback_source") == "h5i_reference"
+        }
+        if self._fallback_codes:
+            has_live = any(canon not in self._fallback_codes for canon in (snap or {}))
+            self._last_source = "mixed" if has_live else "h5i_reference"
+        else:
+            self._last_source = primary_source or "none"
+
+    def mark_reference_fallback(self, codes):
+        """Mark caller-supplied h5i reference quotes for provenance reporting."""
+        self._fallback_codes.update(str(code) for code in (codes or []))
+        if self._fallback_codes:
+            self._last_source = "h5i_reference"
 
     def _suspended_set(self) -> set:
         """交易所停牌名单(当日), 返回 canon 集合。**取不到返回空集合**。
@@ -818,15 +855,17 @@ class PriceFeed:
           引擎只关心 watchlist (持仓+候选), 没必要全 A 抓 6000 只.
           1) 新浪单点接口 hq.sinajs.cn (毫秒级, 按 watchlist 直接拿)
           2) akshare stock_zh_a_spot_em 全 A (备选, 仅在新浪失败时)
-          3) DuckDB 最近收盘价兜底
+          3) StockDB/h5i 最近收盘价兜底
 
         fetch_all=True (午间重选/外部 API):
           1) 新浪全 A 接口 (180 只/批, 较快)
           2) akshare stock_zh_a_spot_em 全 A (备选)
-          3) DuckDB 全 A 最近收盘价兜底
+          3) StockDB/h5i 全 A 最近收盘价兜底
         """
         import akshare as ak
         out: dict = {}
+        primary_source = None
+        self._fallback_codes = set()
 
         # 静默 akshare 内部的 tqdm 进度条
         try:
@@ -844,8 +883,9 @@ class PriceFeed:
                     codes_sina = [self._canon_to_sina(c) for c in watch if c]
                     out.update(self._fetch_sina_spot(codes_sina))
                     if out:
+                        primary_source = "sina_spot"
                         self._last_error = None
-                        fallback_close = self._fetch_from_duckdb()
+                        fallback_close = self._fetch_from_duckdb(symbols=list(out))
                         for canon in list(out.keys()):
                             if canon in fallback_close:
                                 last = fallback_close[canon]["price"]
@@ -864,8 +904,10 @@ class PriceFeed:
                     df = None
                 if df is not None and not getattr(df, "empty", True):
                     out = self._ak_to_dict(df)
+                    if out:
+                        primary_source = "akshare_spot"
 
-            # 3) DuckDB 兜底
+            # 3) 本地参考价兜底
             if watch:
                 missing = [c for c in watch if c not in out]
                 if missing:
@@ -873,6 +915,7 @@ class PriceFeed:
                     for c, q in fb.items():
                         if c not in out:
                             out[c] = q
+            self._record_snapshot_source(out, primary_source)
             return out
 
         # ---- fetch_all=True ----
@@ -898,6 +941,7 @@ class PriceFeed:
                 sym6_to_canon[prefix + s6] = s6
             sina_out = self._fetch_sina_spot(sina_codes)
             if sina_out:
+                self._record_snapshot_source(sina_out, "sina_spot")
                 self._last_error = None
                 return sina_out
         except Exception:
@@ -914,9 +958,11 @@ class PriceFeed:
                 df = None
         if df is not None and not getattr(df, "empty", True):
             out = self._ak_to_dict(df)
+            self._record_snapshot_source(out, "akshare_spot")
             self._last_error = None
         else:
             out = self._fetch_from_duckdb()
+            self._record_snapshot_source(out, "h5i_reference")
         return out
 
     def _ak_to_dict(self, df) -> dict:
@@ -1014,29 +1060,27 @@ class PriceFeed:
         return out
 
     def _fetch_from_duckdb(self, symbols: list | None = None) -> dict:
-        """从 DuckDB daily_bars 取最近一日的 close 作为兜底价."""
-        import duckdb
-        try:
-            con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        except Exception:
-            return {}
+        """从项目 StockDB/h5i 取最近一日 close 作为参考价.
+
+        方法名保留以兼容旧的私有调用点；实际不再打开已退役的 DuckDB。
+        每条返回都带 ``fallback_source``，防止上层把静态参考价称为实时价。
+        """
         out = {}
-        try:
-            if symbols:
-                canon_list = symbols
-                codes = [c.split(".")[0] for c in canon_list]
-                placeholders = ",".join(["?"] * len(codes))
-                df = con.execute(
-                    f"SELECT symbol, close FROM daily_bars t1 "
-                    f"WHERE symbol IN ({placeholders}) AND close > 0 "
-                    f"AND date = (SELECT MAX(date) FROM daily_bars t2 "
-                    f"             WHERE t2.symbol = t1.symbol)",
-                    codes,
-                ).fetchdf()
-                sym_map = dict(zip(df["symbol"], df["close"]))
-                for canon, code in zip(canon_list, codes):
-                    if code in sym_map:
-                        last = float(sym_map[code] or 0)
+        if symbols is not None:
+            canon_list = [c for c in symbols if isinstance(c, str) and c]
+            if not canon_list:
+                return out
+            try:
+                db = _open_reference_db()
+            except Exception:
+                return out
+            try:
+                for canon in canon_list:
+                    try:
+                        df = db.get_bars(canon, 1)
+                        if df is None or df.empty:
+                            continue
+                        last = float(df.iloc[-1]["close"] or 0)
                         if last <= 0:
                             continue
                         lu, ld = _limit_prices(canon, last)
@@ -1046,30 +1090,34 @@ class PriceFeed:
                             "limit_up": lu,
                             "limit_down": ld,
                             "volume": 0,
-                            "suspended": False,
+                            "suspended": None,
                             "fallback": True,
+                            "fallback_source": "h5i_reference",
                         }
-            else:
-                # 全 A 最近收盘价: 取最新 date 所有 close
-                row = con.execute(
-                    "SELECT MAX(date) FROM daily_bars WHERE close > 0"
-                ).fetchone()
-                if not row or not row[0]:
-                    return out
-                latest = row[0]
-                df = con.execute(
-                    "SELECT symbol, close FROM daily_bars WHERE date=? AND close>0",
-                    [latest],
-                ).fetchdf()
-                for _, r in df.iterrows():
-                    code = str(r["symbol"])
-                    last = float(r["close"]) if r["close"] else 0
-                    if last <= 0 or len(code) != 6:
+                    except Exception:
                         continue
-                    market = "sh" if code[:2] in ("60", "68", "90") else \
-                             "bj" if code[:2] in ("92", "43", "8") else "sz"
-                    ex_suffix = "BSE" if market == "bj" else market.upper()
-                    canon = f"{code}.{ex_suffix}"
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            return out
+
+        # 全 A 参考快照仅供 fetch_all=True 的降级路径使用。
+        try:
+            from h5i_bar_store import H5iBarStore
+            store = H5iBarStore()
+            try:
+                days = store.trading_days()
+                if not days:
+                    return out
+                df = store.bars_on_day(days[-1])
+                for _, row in df.iterrows():
+                    code = str(row.get("symbol", "")).zfill(6)
+                    last = float(row.get("close") or 0)
+                    if len(code) != 6 or last <= 0:
+                        continue
+                    canon = _canon_of(code)
                     lu, ld = _limit_prices(canon, last)
                     out[canon] = {
                         "price": last,
@@ -1077,11 +1125,14 @@ class PriceFeed:
                         "limit_up": lu,
                         "limit_down": ld,
                         "volume": 0,
-                        "suspended": False,
+                        "suspended": None,
                         "fallback": True,
+                        "fallback_source": "h5i_reference",
                     }
-        finally:
-            con.close()
+            finally:
+                store.close()
+        except Exception:
+            return {}
         return out
 
     def get_latest(self, symbols: list) -> dict:
@@ -1095,6 +1146,8 @@ class PriceFeed:
         if now - self._ts > self.ttl:
             snap = self._fetch_spot_with_timeout()
             if snap:
+                previous_source = self._last_source if self._last_source != "none" else None
+                self._record_snapshot_source(snap, previous_source)
                 self._snap = {c: q["price"] for c, q in snap.items()}
                 # 停牌推断(三态, 2026-09-22 审计后改):
                 #   True  = 确认停牌(有成交量字段且 <=0)
@@ -1134,7 +1187,7 @@ class PriceFeed:
     def _fetch_spot_with_timeout(self, fetch_all: bool = False) -> dict:
         """带超时保护的快照拉取.
         fetch_all=False (默认, tick/报价用): 仅拉 watchlist (持仓+候选池), 毫秒级.
-        fetch_all=True  (午间重选用): 拉全 A (新浪分批 + DuckDB 兜底).
+        fetch_all=True  (午间重选用): 拉全 A (新浪分批 + h5i 兜底).
 
         东财接口无内置超时, 极端情况下会无限阻塞 -> 用线程 + 超时兜底.
         """
@@ -1151,15 +1204,25 @@ class PriceFeed:
             self._last_error = f"spot fetch timeout>{SPOT_TIMEOUT}s"
         except Exception as e:
             self._last_error = str(e)
-        # 实时源超时/失败/为空 -> DuckDB 兜底
-        fallback = self._fetch_from_duckdb()
+        # 实时源超时/失败/为空 -> 项目 h5i 参考价兜底
+        fallback_symbols = None if fetch_all else sorted(self.watchlist_codes())
+        fallback = self._fetch_from_duckdb(symbols=fallback_symbols)
         if fallback:
-            self._last_error = (self._last_error or "") + " (db fallback)"
+            self._record_snapshot_source(fallback, "h5i_reference")
+            self._last_error = (self._last_error or "") + " (h5i_reference fallback)"
         return fallback
 
     @property
     def last_error(self) -> str:
         return self._last_error or ""
+
+    @property
+    def last_source(self) -> str:
+        return self._last_source
+
+    @property
+    def fallback_codes(self) -> set[str]:
+        return set(self._fallback_codes)
 
     @property
     def total_fetch(self) -> int:
@@ -1171,7 +1234,7 @@ class PriceFeed:
         带超时保护(SPOT_TIMEOUT), 防止网络卡死阻塞调用方线程.
         失败返回空 dict(调用方自行处理降级).
 
-        实现: 优先用新浪全 A 接口 (180 只/批), 再 DuckDB 兜底.
+        实现: 优先用新浪全 A 接口, 再 h5i 参考价兜底.
         """
         snap = self._fetch_spot_with_timeout(fetch_all=True)
         if not snap:

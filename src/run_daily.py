@@ -202,24 +202,47 @@ def portfolio_construction() -> dict:
             lv = json.load(f)
         pos = lv.get("positions") or []
         held = {str(p.get("canon")) for p in pos if isinstance(p, dict) and p.get("canon")}
-        # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据);
-        # live_state 里有 targets 快照。若没有, 再退回当天 target_plan.json。
+        # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据)。
+        # 当前 live_state 按快照契约只保存 snapshot_ref/hash, 不再复制 targets;
+        # 因此必须先读取权威 signal snapshot, 不能把 shadow 模式下缺失的当日
+        # target_plan 当成失败依据。
         tgt_list = lv.get("targets") or []
         if tgt_list:
             want = [str(t.get("canon")) for t in tgt_list
                     if isinstance(t, dict) and t.get("canon")]
             src = "live_state.targets"
         else:
-            plan_fp = os.path.join(root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
-                                   "target_plan.json")
-            if not os.path.isfile(plan_fp):
-                out["error"] = "live_state 无 targets 且找不到当日 target_plan.json"
-                return out
-            with open(plan_fp, encoding="utf-8-sig") as f:
-                plan = json.load(f)
-            want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
-                    if isinstance(t, dict) and t.get("canon")]
-            src = "target_plan.top_n"
+            snapshot_ref = str(lv.get("snapshot_ref") or "").strip()
+            if snapshot_ref:
+                snapshot_fp = os.path.abspath(snapshot_ref)
+                if not os.path.isfile(snapshot_fp):
+                    out["error"] = f"snapshot_ref 不存在: {snapshot_ref}"
+                    return out
+                with open(snapshot_fp, encoding="utf-8-sig") as f:
+                    snapshot = json.load(f)
+                expected_hash = str(lv.get("snapshot_hash") or "").strip()
+                actual_hash = str(snapshot.get("snapshot_hash") or "").strip()
+                if expected_hash and expected_hash != actual_hash:
+                    out["error"] = "live_state snapshot_hash 与 snapshot_ref 不一致"
+                    return out
+                want = [str(t.get("canon")) for t in (snapshot.get("targets") or [])
+                        if isinstance(t, dict) and t.get("canon")]
+                if not want:
+                    out["error"] = "snapshot_ref 中没有有效 targets"
+                    return out
+                src = "signal_snapshot"
+            else:
+                plan_fp = os.path.join(
+                    root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
+                    "target_plan.json")
+                if not os.path.isfile(plan_fp):
+                    out["error"] = "live_state 无 targets/snapshot_ref 且找不到当日 target_plan.json"
+                    return out
+                with open(plan_fp, encoding="utf-8-sig") as f:
+                    plan = json.load(f)
+                want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
+                        if isinstance(t, dict) and t.get("canon")]
+                src = "target_plan.top_n"
 
         cap = lv.get("capital") or {}
         equity = float(cap.get("equity") or 0) or 1.0

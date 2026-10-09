@@ -86,6 +86,11 @@ class TestDegradedReasons:
         assert r["state"] == "DEGRADED"
         assert any("静态" in x for x in r["reasons"])
 
+    def test_h5i_held_static_price_flagged(self):
+        r = assemble(_snap(live_source="h5i_reference_held"))
+        assert r["state"] == "DEGRADED"
+        assert any("静态" in x for x in r["reasons"])
+
     def test_pool_missing_is_not_flagged(self):
         """**P2-LIVESRC 语义**: 仅候选池缺价不影响账户估值, 不得判为降级。"""
         assert assemble(_snap(live_source="duckdb_reference_pool"))["state"] == "NORMAL"

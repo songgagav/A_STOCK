@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -38,6 +39,7 @@ if _SRC not in sys.path:
 
 import realtime_engine as RE          # noqa: E402
 import run_daily as RD                # noqa: E402
+from signal_snapshot import build_snapshot, write_snapshot  # noqa: E402
 
 
 class _EngineStub:
@@ -188,6 +190,41 @@ class TestStallGuard:
 
 class TestPortfolioConstructionReceipt:
     """`run_daily.portfolio_construction()` 必须把建仓进度**如实**写进回执。"""
+
+    def test_uses_authoritative_snapshot_when_live_state_omits_targets(
+            self, tmp_path, monkeypatch):
+        """live_state 只保存 snapshot_ref 时，回执必须读取权威快照。"""
+        repo = tmp_path
+        (repo / "src").mkdir()
+        (repo / "data").mkdir()
+        snapshot_payload = build_snapshot(
+            "20261009",
+            [{"canon": "600000.SH", "target_weight": 0.5},
+             {"canon": "000001.SZ", "target_weight": 0.5}],
+            "selection", "20261008", [], datetime.now(timezone.utc), str(repo),
+        )
+        snapshot_ref = write_snapshot(str(repo / "data"), snapshot_payload)
+        (repo / "data" / "live_state.json").write_text(json.dumps({
+            "day": "2026-10-09",
+            "snapshot_ref": snapshot_ref,
+            "snapshot_hash": snapshot_payload["snapshot_hash"],
+            "positions": [{"canon": "600000.SH"}],
+            "capital": {
+                "equity": 100000.0,
+                "cash": 50000.0,
+                "market_value": 50000.0,
+                "cash_ratio": 0.5,
+            },
+        }), encoding="utf-8")
+        monkeypatch.setattr(RD, "__file__", str(repo / "src" / "run_daily.py"))
+
+        result = RD.portfolio_construction()
+
+        assert result["ok"] is True, result
+        assert result["source"] == "signal_snapshot"
+        assert result["target_count"] == 2
+        assert result["current_count"] == 1
+        assert result["pending_buys"] == 1
 
     def test_reads_real_live_state_and_reports_progress(self):
         """对**真实** live_state.json 跑一次, 断言字段齐全且互相自洽。

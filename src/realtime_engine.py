@@ -627,7 +627,7 @@ def load_targets(day: str):
     return sel.get("top_n", []), sel, d
 
 
-def _live_src_label(held_missing, pool_missing) -> str:
+def _live_src_label(held_missing, pool_missing, reference_source=None) -> str:
     """按**持仓**缺价判定实时来源标记 —— 使该字段能直接回答"我在实时撮合吗".
 
     [2026-09-21 修] 原逻辑是"池里**任一只**缺价 ⇒ 整批标 `duckdb_reference`",
@@ -639,13 +639,18 @@ def _live_src_label(held_missing, pool_missing) -> str:
 
     新语义:
       `akshare_spot`            持仓与候选池**全部**取到实时价
-      `duckdb_reference_pool`   仅**候选池**有缺价 —— 账户仍是实时估值, 影响的是**下次调仓**
-      `duckdb_reference_held`   持仓有缺价 —— 账面已用最近收盘价兜底, **不能**当实时看
+      `duckdb_reference_pool`   仅**候选池**有缺价 —— 兼容旧状态值
+      `duckdb_reference_held`   持仓有缺价 —— 兼容旧状态值
+      `h5i_reference_pool`      候选池使用 h5i 参考价
+      `h5i_reference_held`      持仓使用 h5i 参考价
     """
+    prefix = "h5i_reference" if reference_source == "h5i_reference" else "duckdb_reference"
     if held_missing:
-        return "duckdb_reference_held"
+        return f"{prefix}_held"
     if pool_missing:
-        return "duckdb_reference_pool"
+        return f"{prefix}_pool"
+    if reference_source == "h5i_reference":
+        return "h5i_reference"
     return "akshare_spot"
 
 
@@ -959,6 +964,8 @@ class RealtimeEngine:
         #   再算就永远判不出"谁是被静态价兜底的"。实测 2026-09-21 就是因为
         #   原实现只看"池里任一只缺价"就把整批标成 duckdb_reference, 使该字段
         #   **无法区分"账户按实时价估值"与"账户被静态价兜底"**。
+        reference_codes = set(getattr(self.feed, "fallback_codes", set()))
+        reference_codes.intersection_update(all_codes)
         missing = [c for c in all_codes if c not in latest or not latest.get(c)]
         held = list(self.pb.positions.keys())
         held_missing = [c for c in held if c in missing]
@@ -973,12 +980,32 @@ class RealtimeEngine:
                         if c not in self.feed.quotes:
                             self.feed.quotes[c] = {"price": p, "last_close": p,
                                                    "limit_up": None, "limit_down": None,
-                                                   "volume": 0, "suspended": False}
+                                                   "volume": 0, "suspended": None,
+                                                   "fallback": True,
+                                                   "fallback_source": "h5i_reference"}
+                        reference_codes.add(c)
+            mark_reference_fallback = getattr(self.feed, "mark_reference_fallback", None)
+            if callable(mark_reference_fallback):
+                mark_reference_fallback(reference_codes)
+        reference_held = [c for c in held if c in reference_codes]
+        reference_pool = [c for c in all_codes
+                          if c in reference_codes and c not in set(held)]
+        reference_source = "h5i_reference" if reference_codes else None
         # 来源标记**按持仓缺价**判定, 使该字段能直接回答"我在实时撮合吗":
         #   · held 有缺价  => 账户被静态价兜底, **不能**算实时(记账/风控都该打折看待)
         #   · 仅池内有缺价 => 账户仍是实时估值, 只是候选池不全(影响下次调仓, 不影响当前账面)
-        live_src = _live_src_label(held_missing, missing)
-        if held_missing:
+        live_src = _live_src_label(
+            reference_held or held_missing,
+            reference_pool or missing,
+            reference_source=reference_source,
+        )
+        if reference_held:
+            log(f"实时源告警: 持仓使用 h5i 参考价 {len(reference_held)}/{len(held)} 只 "
+                f"({','.join(reference_held[:5])})")
+        elif reference_pool:
+            log(f"实时源告警: 候选池使用 h5i 参考价 {len(reference_pool)}/{len(all_codes)} 只, "
+                f"持仓 {len(held)} 只未使用参考价")
+        elif held_missing:
             log(f"实时源告警: 持仓缺实时价 {len(held_missing)}/{len(held)} 只 "
                 f"({','.join(held_missing[:5])}) -> 账面已用最近收盘价兜底")
         elif missing:

@@ -120,6 +120,10 @@ class TestAttribution:
         r = evaluate(_s(updated=_ts(600), live_source="duckdb_reference_held"), now=NOW)
         assert r["cause"] == "feed_stale"
 
+    def test_h5i_reference_is_also_feed_stale(self):
+        r = evaluate(_s(updated=_ts(600), live_source="h5i_reference_held"), now=NOW)
+        assert r["cause"] == "feed_stale"
+
     def test_dead_process_is_its_own_cause(self):
         r = evaluate(_s(pid_alive=False, updated=_ts(600)), now=NOW)
         assert (r["level"], r["cause"]) == ("CRITICAL", "dead_process")

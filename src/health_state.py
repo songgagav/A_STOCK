@@ -14,7 +14,7 @@
   两峰相差三个数量级 ⇒ 阈值取 `p50 > 1s` 或 `p95 > 2s`（落在空旷地带，具体值不敏感）。
 · 数据滞后: 复用 `engine_bars_sync.freshness()` 的判据「引擎是否追平最后一个已收盘交易日」
   —— 该判据有自己的事故史（初版拿日历年尾当基准的范畴错误），不再另造。
-· 账户估值: 复用 `P2-LIVESRC` 的三态 —— `duckdb_reference_held` 即「持仓被静态价兜底」。
+· 账户估值: 复用 `P2-LIVESRC` 的三态 —— `*_reference_held` 即「持仓被静态价兜底」。
 · 策略: 当日 `drl_degrade_events.jsonl` 里出现 L3（决策 D 的门禁语义：不产出新信号）。
 
 状态语义
@@ -378,7 +378,7 @@ def assemble(snap: dict) -> dict:
     elif snap.get("freshness_ok") is False:
         reasons.append("引擎数据未追平最后一个已收盘交易日(厂商未发布当日数据)")
 
-    if snap.get("live_source") == "duckdb_reference_held":
+    if snap.get("live_source") in ("duckdb_reference_held", "h5i_reference_held"):
         reasons.append("持仓被静态参考价兜底(非实时估值, P2-LIVESRC)")
 
     l3 = int(snap.get("l3_today") or 0)
