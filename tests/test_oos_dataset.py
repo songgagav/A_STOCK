@@ -111,12 +111,13 @@ def _request(
     days: tuple[OOSDayInput, ...],
     trade_days: tuple[str, ...] | None = None,
     production_state=None,
+    code_sha="code-sha-1",
 ):
     return OOSDatasetRequest(
         output_root=tmp_path / "oos",
         run_id="oos-run-1",
         generated_at="2026-10-08T20:00:00+08:00",
-        code_sha="code-sha-1",
+        code_sha=code_sha,
         data_identity={"data_sha": "data-sha-1"},
         config_identity={"config_sha": "config-sha-1"},
         experiment_identity={"experiment_hash": "experiment-sha-1"},
@@ -182,6 +183,14 @@ def test_oos_requires_explicit_shadow_runtime_state(tmp_path):
             "alpha_evidence_status": "not_promotable",
             "drl_plan_mode_contract": "not_implemented",
         })
+
+
+def test_oos_rejects_bundle_from_a_different_observation_epoch(tmp_path):
+    bundle = _bundle(tmp_path, "2026-10-07")
+    day = _day(bundle, "2026-10-07")
+
+    with pytest.raises(OOSDatasetBuildError, match="observation_epoch_mismatch"):
+        build_oos_dataset(_request(tmp_path, (day,), code_sha="code-sha-2"))
 
 
 def test_missing_day_is_preserved_and_not_converted_to_zero(tmp_path):

@@ -9,11 +9,6 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-_REQUIRED_IDENTITIES = (
-    ("data_identity", "data_sha"),
-    ("config_identity", "config_sha"),
-    ("experiment_identity", "experiment_hash"),
-)
 _SHADOW_STATE = {
     "RANK_BY_FUSION": {"0"},
     "DRL_PLAN_MODE": {"shadow"},

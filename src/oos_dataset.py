@@ -217,7 +217,10 @@ def _read_json(path: Path, reason: str) -> dict[str, Any]:
     return value
 
 
-def _load_day(day: OOSDayInput) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_day(
+    day: OOSDayInput,
+    expected_observation_epoch: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if day.status != "available":
         row = {
             "trade_day": day.trade_day,
@@ -256,6 +259,8 @@ def _load_day(day: OOSDayInput) -> tuple[dict[str, Any], dict[str, Any]]:
         raise OOSDatasetBuildError("invalid", [f"bundle_trade_day_mismatch:{day.trade_day}"])
     if manifest.get("bundle_id") != day.bundle_id:
         raise OOSDatasetBuildError("tampered", [f"bundle_id_mismatch:{day.trade_day}"])
+    if expected_observation_epoch is not None and manifest.get("observation_epoch") != expected_observation_epoch:
+        raise OOSDatasetBuildError("blocked", [f"observation_epoch_mismatch:{day.trade_day}"])
     turnover = _read_json(day.bundle_path / "derived" / "turnover.json", f"turnover_unreadable:{day.trade_day}")
     cost_summary = _read_json(day.bundle_path / "derived" / "cost_summary.json", f"cost_summary_unreadable:{day.trade_day}")
     effective_status = str(manifest.get("evidence_status") or "invalid")
@@ -326,10 +331,16 @@ def build_oos_dataset(request: OOSDatasetRequest) -> OOSDatasetResult:
     """Build one immutable dataset from the caller's explicit day list."""
 
     day_by_date = {day.trade_day: day for day in request.days}
+    observation_epoch = build_observation_epoch(
+        code_sha=request.code_sha,
+        data_identity=request.data_identity,
+        config_identity=request.config_identity,
+        experiment_identity=request.experiment_identity,
+    )
     raw_rows: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
     for trade_day in request.trade_days:
-        raw_row, metric_row = _load_day(day_by_date[trade_day])
+        raw_row, metric_row = _load_day(day_by_date[trade_day], observation_epoch)
         raw_rows.append(raw_row)
         metric_rows.append(metric_row)
 
