@@ -24,7 +24,34 @@ os.chdir(_BASE)
 
 from proc_alive import alive as _process_alive  # noqa: E402
 
-PY = sys.executable
+def _resolve_runtime_python(base=None, current_python=None, environ=None):
+    """Choose the interpreter used for spawned services.
+
+    The dashboard and live engine need the production data runtime.  On this
+    host that is ``.venv310`` because it is the environment containing
+    ``h5i_db``.  Keep an explicit ``TRAE_PYTHON`` override for deployments
+    that pin another interpreter, then fall back to the interpreter running
+    this launcher when the preferred environment is unavailable.
+    """
+    root = base or _BASE
+    current = current_python or sys.executable
+    env = os.environ if environ is None else environ
+
+    override = str(env.get("TRAE_PYTHON", "") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    preferred = os.path.join(root, ".venv310", "Scripts", "python.exe")
+    if os.path.isfile(preferred):
+        return preferred
+
+    return current
+
+
+# Keep run_services.py aligned with ops/start_daemon.ps1: the production
+# runtime is the interpreter with h5i_db, not whichever Python started this
+# compatibility launcher.
+PY = _resolve_runtime_python()
 PID_DIR = os.path.join(_BASE, "logs")
 ENGINE_PID = os.path.join(PID_DIR, "engine.pid")
 DASH_PID = os.path.join(PID_DIR, "dashboard.pid")
@@ -47,6 +74,43 @@ def _proc_alive(pid):
     return _process_alive(pid, unknown_means_alive=True)
 
 
+def _norm_path(path):
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
+
+
+def _cmdline_has_script(cmdline, script):
+    """Require the service script to be an exact command-line argument."""
+    expected = _norm_path(os.path.join(_BASE, script))
+    return any(_norm_path(token) == expected for token in (cmdline or []))
+
+
+def _service_pid_alive(pid, script):
+    """Return whether pid is alive *and belongs to the requested service.
+
+    A PID file can outlive a process and later point at an unrelated process
+    after Windows reuses the PID.  PID liveness alone must therefore never
+    suppress service startup or authorize stopping the unrelated process.
+    """
+    if not _proc_alive(pid):
+        return False
+    try:
+        import psutil
+    except Exception:
+        # Preserve the existing conservative behavior if process identity
+        # cannot be inspected in a minimal runtime.
+        return True
+    try:
+        process = psutil.Process(int(pid))
+        return _cmdline_has_script(process.cmdline(), script)
+    except Exception as exc:
+        # AccessDenied proves the PID exists but prevents identity inspection;
+        # do not start a duplicate service in that case.  A missing/zombie
+        # process is safe to classify as stopped.
+        if exc.__class__.__name__ in {"AccessDenied", "PermissionError"}:
+            return True
+        return False
+
+
 def _write_pid(path, pid):
     os.makedirs(PID_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -54,7 +118,7 @@ def _write_pid(path, pid):
 
 
 def _spawn(name, script, args, pid_file, stdout_log):
-    alive = _proc_alive(_read_pid(pid_file))
+    alive = _service_pid_alive(_read_pid(pid_file), script)
     if alive:
         log(f"{name} 已在运行 (pid={_read_pid(pid_file)})")
         return
@@ -85,9 +149,12 @@ def start():
 
 
 def stop():
-    for name, pid_file in (("Web可视化", DASH_PID), ("盘中引擎", ENGINE_PID)):
+    for name, script, pid_file in (
+        ("Web可视化", "src/dashboard.py", DASH_PID),
+        ("盘中引擎", "src/realtime_engine.py", ENGINE_PID),
+    ):
         pid = _read_pid(pid_file)
-        if _proc_alive(pid):
+        if _service_pid_alive(pid, script):
             try:
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                capture_output=True)
@@ -106,7 +173,7 @@ def status():
         ("Web可视化", DASH_PID, "dashboard.py"),
     ):
         pid = _read_pid(pid_file)
-        alive = _proc_alive(pid)
+        alive = _service_pid_alive(pid, os.path.join("src", exe))
         log(f"{name}: pid={pid} {'运行中' if alive else '未运行'}")
 
 

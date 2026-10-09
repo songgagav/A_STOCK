@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(_REPO, "src"))
 
 from premarket_healthcheck import (  # noqa: E402
     _arcticdb_retired, _freshness_verdict, _norm_day, _retired_record,
-    check_arcticdb, check_arcticdb_rw, check_strategy_diagnostics,
+    check_arcticdb, check_arcticdb_rw, check_ic_curve, check_ic_history,
+    check_strategy_diagnostics,
 )
 
 EXPECTED = date(2026, 9, 21)     # 最后一个已收盘交易日(日历口径)
@@ -102,3 +103,70 @@ class TestNormDay:
     def test_mixed_types_do_not_raise(self):
         """这条直接锁住那个 TypeError 回归。"""
         assert _freshness_verdict("2026-09-18", EXPECTED, "20260918")[0] == "OK"
+
+
+class TestIcHistoryEmptySelection:
+    """空选股池没有可计算的 IC，不应被健康检查误报为缺失结算。"""
+
+    def test_empty_selection_day_is_not_missing_ic(self, tmp_path, monkeypatch):
+        import ic_track as icm
+        import premarket_healthcheck as health
+
+        daily = tmp_path / "daily"
+        day_dir = daily / "20260831"
+        day_dir.mkdir(parents=True)
+        (day_dir / "selection.json").write_text(
+            '{"date":"2026-08-31","top_n":[]}', encoding="utf-8"
+        )
+        history = daily / "ic_history.csv"
+        history.write_text("day,ic_h1,ic_h3,ic_h5,ic_h10\n", encoding="utf-8")
+
+        monkeypatch.setattr(icm, "DAILY_DIR", str(daily))
+        monkeypatch.setattr(icm, "IC_HISTORY", str(history))
+        monkeypatch.setattr(icm, "available_days", lambda: ["20260831"])
+        monkeypatch.setattr(
+            health, "_latest_bar_day", lambda: ("20260930", "h5i")
+        )
+        monkeypatch.setattr(
+            health,
+            "_distinct_trade_days",
+            lambda _n: ["20260831", "20260929", "20260930"],
+        )
+
+        result = check_ic_history()
+
+        assert result["status"] == "OK"
+        assert result["detail"]["empty_selection_days"] == ["20260831"]
+        assert result["detail"]["missing"] == []
+
+
+class TestIcCurveRefreshCoverage:
+    """只把实际纳入刷新链路的 IC 曲线作为新鲜度硬门禁。"""
+
+    def test_unmanaged_factors_are_warned_not_reported_as_stale_failure(
+        self, tmp_path, monkeypatch
+    ):
+        import weight_optimizer as wo
+        import premarket_healthcheck as health
+
+        (tmp_path / "ic_curve_vol_k20.csv").write_text(
+            "day,ic_h20\n20260901,0.1\n", encoding="utf-8"
+        )
+        (tmp_path / "ic_curve_mom_20_k20.csv").write_text(
+            "day,ic_h20\n20260901,0.1\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(wo, "IC_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            health, "_bar_store_latest", lambda: ("h5i", "20260930", 0, "")
+        )
+        monkeypatch.setattr(
+            health,
+            "_distinct_trade_days",
+            lambda _n: ["20260811"] * 20 + ["20260901"],
+        )
+
+        result = check_ic_curve()
+
+        assert result["status"] == "WARN"
+        assert result["detail"]["very_stale_files"] == []
+        assert result["detail"]["unmanaged_factors"] == ["pb_rev", "roe", "mf_net"]

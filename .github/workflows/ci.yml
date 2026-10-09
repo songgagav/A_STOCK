@@ -112,11 +112,20 @@ jobs:
           # h5i_db 的原生扩展不在 Python 3.14 核心环境中；该 job
           # 专门验证 h5i 临时库写入与等价性路径，避免 CI 只验证 skip 分支。
           pip install "h5i-db>=0.1.6"
+          # 与 canonical Python 3.10 runtime 保持执行依赖可探测。
+          pip install "vnpy==4.4.0"
       - name: Verify h5i_db is available
         run: python -c "import h5i_db; print(h5i_db.__file__)"
+      - name: Verify h5i execution runtime
+        run: python -c "import h5i_db, vnpy; print('h5i-runtime=ok')"
       - name: Run h5i integration regression
         run: |
           python -m pytest \
             tests/test_baostock_backfill.py \
             tests/test_h5i_accel_equivalence.py \
             -q -rs
+      - name: Run signal freeze regression with h5i enabled
+        run: |
+          # Core job 会在无 h5i 的环境中运行这些测试；这里补一轮 h5i-enabled
+          # 运行，避免 factor_fusion/target_weighting 的真实分支被环境性假绿掩盖。
+          python -m pytest tests/test_signal_*.py -q -rs

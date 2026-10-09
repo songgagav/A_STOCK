@@ -16,13 +16,20 @@ import pytest
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from health_state import assemble  # noqa: E402
+from health_state import _live_state_is_current, assemble  # noqa: E402
 
 
 def _snap(**kw):
     s = {"tick_ms": None, "freshness_ok": None, "live_source": None, "l3_today": 0}
     s.update(kw)
     return s
+
+
+def test_live_state_currentness_rejects_previous_day_metrics():
+    """上一交易日的 tick 统计不能继续作为今天的健康指标。"""
+    assert _live_state_is_current({"day": "2026-10-05"}, today="2026-10-05") is True
+    assert _live_state_is_current({"day": "2026-10-02"}, today="2026-10-05") is False
+    assert _live_state_is_current({}, today="2026-10-05") is True
 
 
 class TestNormal:
@@ -76,6 +83,11 @@ class TestDegradedReasons:
 
     def test_held_static_price_flagged(self):
         r = assemble(_snap(live_source="duckdb_reference_held"))
+        assert r["state"] == "DEGRADED"
+        assert any("静态" in x for x in r["reasons"])
+
+    def test_h5i_held_static_price_flagged(self):
+        r = assemble(_snap(live_source="h5i_reference_held"))
         assert r["state"] == "DEGRADED"
         assert any("静态" in x for x in r["reasons"])
 

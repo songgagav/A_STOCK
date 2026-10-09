@@ -336,6 +336,8 @@ class TestLoadTargetsLadderWiring(unittest.TestCase):
         (root / "drl").mkdir(parents=True, exist_ok=True)
         (root / "daily").mkdir(parents=True, exist_ok=True)
         self._orig = (re.DATA_DIR, re.DAILY_DIR)
+        self._orig_drl_mode = os.environ.get("DRL_PLAN_MODE")
+        os.environ["DRL_PLAN_MODE"] = "enforce"
         re.DATA_DIR = str(root)
         re.DAILY_DIR = str(root / "daily")
         # 第 2 档屏蔽器: 让 `daily/<当日>/selection.json` 看起来不存在
@@ -346,6 +348,10 @@ class TestLoadTargetsLadderWiring(unittest.TestCase):
     def tearDown(self):
         self._mask.stop()
         re.DATA_DIR, re.DAILY_DIR = self._orig
+        if self._orig_drl_mode is None:
+            os.environ.pop("DRL_PLAN_MODE", None)
+        else:
+            os.environ["DRL_PLAN_MODE"] = self._orig_drl_mode
         self._tmp.cleanup()
 
     def _fake_exists(self, p):
@@ -357,6 +363,8 @@ class TestLoadTargetsLadderWiring(unittest.TestCase):
     def _write(self, day8, plan):
         d = Path(re.DATA_DIR) / "drl" / day8
         d.mkdir(parents=True, exist_ok=True)
+        plan = dict(plan)
+        plan.setdefault("promotion", {"approved": True})
         (d / "target_plan.json").write_text(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8")
 

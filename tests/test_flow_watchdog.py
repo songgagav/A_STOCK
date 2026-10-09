@@ -120,6 +120,10 @@ class TestAttribution:
         r = evaluate(_s(updated=_ts(600), live_source="duckdb_reference_held"), now=NOW)
         assert r["cause"] == "feed_stale"
 
+    def test_h5i_reference_is_also_feed_stale(self):
+        r = evaluate(_s(updated=_ts(600), live_source="h5i_reference_held"), now=NOW)
+        assert r["cause"] == "feed_stale"
+
     def test_dead_process_is_its_own_cause(self):
         r = evaluate(_s(pid_alive=False, updated=_ts(600)), now=NOW)
         assert (r["level"], r["cause"]) == ("CRITICAL", "dead_process")
@@ -165,6 +169,28 @@ class TestGather:
         gather(live_state=lv, pidfile=str(pf), state=str(tmp_path / "wd.json"),
                pid_alive_fn=lambda pid: seen.append(pid) or True, now=NOW)
         assert seen == [4242]
+
+    def test_stale_previous_session_is_idle_on_non_trading_day(self, tmp_path):
+        """非交易日不得把上一交易日的 in_session=true 误报成引擎死亡。"""
+        lv = self._write(
+            tmp_path,
+            in_session=True,
+            updated="2026-10-02 15:00:49",
+            tick=5,
+            live_source="akshare_spot",
+            feed_error="spot empty",
+        )
+        r = gather(
+            live_state=lv,
+            pidfile=str(tmp_path / "engine.pid"),
+            state=str(tmp_path / "wd.json"),
+            pid_alive_fn=lambda _pid: False,
+            now=datetime(2026, 10, 5, 10, 30, 0),
+            is_trading_day_fn=lambda _day: False,
+        )
+        assert r["observed"]["calendar_is_trading_day"] is False
+        assert (r["level"], r["cause"]) == ("OK", "idle")
+        assert "非交易日" in r["reason"]
 
     def test_missing_live_state_is_not_a_crash(self, tmp_path):
         r = gather(live_state=str(tmp_path / "nope.json"), pidfile=str(tmp_path / "nope.pid"),

@@ -50,7 +50,8 @@ A 股规则纸面撮合
 源码采用扁平 `src/` 布局，逻辑上分为以下层次：
 
 ```text
-数据层       db.py / h5i_bar_store.py / arctic_store.py
+数据层       db.py / h5i_bar_store.py
+兼容层       arctic_store.py（ArcticDB 可选兼容层，非主数据源）
 因子层       factor_fusion.py / factor_library.py / factor_mine/
 决策层       selector.py / drl_train.py / target_weighting.py
 风控层       factor_gate.py / risk_first.py / risk_factor_optimizer.py
@@ -86,7 +87,7 @@ A_stock_rotation/
 ├── src/                              # 核心源代码（当前为扁平模块布局）
 │   ├── db.py                          # 统一数据访问入口
 │   ├── h5i_bar_store.py               # h5i 行情/财务/估值查询
-│   ├── arctic_store.py                # ArcticDB 读写与审计存储
+│   ├── arctic_store.py                # ArcticDB 可选兼容层（历史审计/退化数据）
 │   ├── build_factor_views.py          # 因子宽表与视图构建
 │   ├── free_stockdb_sync.py           # 本地行情镜像同步
 │   │
@@ -168,7 +169,8 @@ A_stock_rotation/
 ## 环境要求
 
 - Windows/Linux 均可用于轻量研究和测试。
-- 推荐 Python 3.14 虚拟环境用于核心回归、DRL 和纯 Python 工具。
+- 推荐 `.venv310` 作为完整运行时：`h5i_db`、PyTorch、Stable-Baselines3 和 vn.py 在同一解释器内。
+- `.venv314` 保留做纯 Python 研究和兼容性回归；它不作为 h5i/vn.py 完整运行时。
 - 部分本地 `h5i_db` 数据库组件使用 CPython 3.10 原生扩展；运行依赖该组件的数据脚本时，必须使用与 `_native.pyd` 匹配的 Python 3.10 环境。
 - 数据库、行情镜像、API token 和运行产物不随仓库提供。
 
@@ -202,9 +204,11 @@ Copy-Item .env.example .env
 
 | 变量 | 说明 |
 | --- | --- |
-| `STOCKDB_ROOT` | 本地行情镜像或 free-stockdb 根目录 |
-| `ARCTIC_URI` | ArcticDB 地址；未配置时使用可用的本地后端 |
-| `PYBAO_DIR` | 可选的本地行情 SDK 路径 |
+| `STOCKDB_ROOT` | StockDB/free-stockdb 部署数据根目录；不提交到 Git |
+| `STOCKDB_PYBAO_DIR` | 可选的明确 SDK 覆盖路径；默认优先使用项目内 `vendor/stockdb/pybao` |
+| `STOCKDB_ENGINE` | StockDB 本地端点，默认 `127.0.0.1:7899` |
+| `ARCTIC_URI` | 遗留 ArcticDB 兼容层地址；主数据链路不依赖，未迁移的历史退化分析才可能使用 |
+| `PYBAO_DIR` | 旧版外部 SDK 路径，仅作项目 bundle 缺失时的兼容回退 |
 | `TRAE_PYTHON` | 守护任务调用的外部 Python 解释器 |
 | `OPENAI_BASE_URL` | 可选的 LLM 服务地址 |
 | `OPENAI_API_KEY` | LLM API 密钥，只通过环境变量提供 |
@@ -212,7 +216,13 @@ Copy-Item .env.example .env
 | `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关，默认开启 |
 | `OVERFIT_RESULTS_FILE` | 覆盖过拟合检测使用的结果文件 |
 
+> **ArcticDB 兼容层说明**：ArcticDB 不是当前主行情/财务/估值链路的必需依赖，主链路使用 h5i。
+> `src/arctic_store.py` 暂时保留，用于尚未迁移的历史绩效、奖励曲线、成交记录和因子 IC。
+> 未安装 ArcticDB 时，退化分析会明确返回 `unavailable`，不能把该状态解释为“策略健康”。
+
 不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
+
+StockDB 的 Python 接口已固定在 [`vendor/stockdb`](vendor/stockdb/README.md)。项目只提交可运行的接口文件和服务程序，不提交其 `data`、`data1`、`mydb`、行情镜像或日志；服务注册时工作目录仍必须指向部署数据根目录。所有 `rd` 加载经过 `src/stockdb_runtime.py`，以避免不同终端的 `PYBAO_DIR` 静默改变数据源。
 
 本项目当前以环境变量作为运行时配置接口，`.env.example` 是公开配置模板；没有运行时
 `config.toml` 解析器，因此不提供一个会误导使用者的 `config.example.toml`。
@@ -243,63 +253,65 @@ CI 分为两部分：
 
 ```powershell
 # 刷新 IC 与门控缓存
-.venv314\Scripts\python.exe src/refresh_gate_ic.py
+.venv310\Scripts\python.exe src/refresh_gate_ic.py
 
 # 日频主流程
-.venv314\Scripts\python.exe src/run_daily.py
+.venv310\Scripts\python.exe src/run_daily.py
 
 # 连续交易日 PaperBook 回放
-.venv314\Scripts\python.exe src/backtest_engine.py --days 10
+.venv310\Scripts\python.exe src/backtest_engine.py --days 10
 
 # 指定起始日期回放
-.venv314\Scripts\python.exe src/backtest_engine.py --start 2026-06-01
+.venv310\Scripts\python.exe src/backtest_engine.py --start 2026-06-01
 
 # 门控历史重放
-.venv314\Scripts\python.exe src/backtest_with_gate.py
+.venv310\Scripts\python.exe src/backtest_with_gate.py
 
 # 非重叠样本外重跑
-.venv314\Scripts\python.exe scripts/nonoverlap_rerun.py
+.venv310\Scripts\python.exe scripts/nonoverlap_rerun.py
 
 # 过拟合/稳健性检测
-.venv314\Scripts\python.exe src/overfitting_test.py --html
+.venv310\Scripts\python.exe src/overfitting_test.py --html
 
 # 数据完整性巡检
-.venv314\Scripts\python.exe scripts/check_data_completeness.py
+.venv310\Scripts\python.exe scripts/check_data_completeness.py
 ```
 
 ### 盘中模拟与看板
 
 ```powershell
 # 单次模拟 tick，不启动常驻循环
-.venv314\Scripts\python.exe src/realtime_engine.py --once
+.venv310\Scripts\python.exe src/realtime_engine.py --once
 
 # 启动盘中 PaperBook 引擎和 Web 看板
-.venv314\Scripts\python.exe src/run_services.py start
+.venv310\Scripts\python.exe src/run_services.py start
 
 # 查看服务状态
-.venv314\Scripts\python.exe src/run_services.py status
+.venv310\Scripts\python.exe src/run_services.py status
 
 # 停止服务
-.venv314\Scripts\python.exe src/run_services.py stop
+.venv310\Scripts\python.exe src/run_services.py stop
 
 # 直接启动看板
-.venv314\Scripts\python.exe src/dashboard.py --port 8000
+.venv310\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
-> ⚠️ **解释器要求（2026-09-19 修正）**：`.venv314`（Python 3.14）**没有 `h5i_db`**
-> （实测 `importlib.util.find_spec("h5i_db") is None`）。DuckDB 退役后 h5i 是**主数据源**，
-> 用 `.venv314` 启动看板会失去主源数据。请改用持有 `h5i_db` 的解释器，例如：
+> ⚠️ **解释器要求（2026-10-06 更新）**：`.venv314`（Python 3.14）**没有 `h5i_db` 或 `vnpy`**。
+> DuckDB 退役后 h5i 是**主数据源**，盘中/看板/回测必须使用已验收完整依赖的 `.venv310`：
 >
 > ```powershell
 > $env:BAR_STORE = 'h5i'
-> & "<持有 h5i_db 的解释器>\python.exe" src\dashboard.py --port 8000
+> & ".venv310\Scripts\python.exe" src\dashboard.py --port 8000
 > ```
 >
-> 验证方式：`& <解释器> -c "import h5i_db; print('ok')"`，以及看板
+> 验证方式：`& .venv310\Scripts\python.exe -c "import h5i_db, vnpy; print('ok')"`，以及看板
 > `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
 
-### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db 与 torch）
+### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db、torch 与 vn.py）
 
+> **2026-10-06 更新**：`.venv310` 是唯一 canonical runtime，当前已安装并验收 `vnpy==4.4.0`。
+> `.venv314` 继续用于纯 Python 研究和兼容性测试；不要通过 `PYTHONPATH` 混用两个环境的 site-packages。
+>
 > **2026-09-20 新增（解决 `P0-DRLDEP`）**。此前项目面临一个**无法回避的两难**：
 >
 > | 解释器 | h5i_db | torch | 后果 |
@@ -314,7 +326,7 @@ CI 分为两部分：
 >
 > ```powershell
 > # 一条命令完成：校验 SHA256 + Authenticode 签名 → 静默安装 3.10.11 →
-> # 建 .venv310 → 装 h5i-db / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
+> # 建 .venv310 → 装 h5i-db / vnpy / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
 > pwsh -File scripts/setup_py310_drl_venv.ps1
 > ```
 >
@@ -327,12 +339,12 @@ CI 分为两部分：
 > ```
 >
 > **实测收益（可复核）**：
-> - `drl_degrade.probe_runtime()` → `ok=True`（四项全 True），DRL 训练与 `target_plan` 生成恢复；
+> - `drl_degrade.probe_runtime()` → `ok=True`（核心依赖全 True），DRL 训练与 `target_plan` 生成恢复；
 > - 全量测试 **682 passed / 1 skipped**（`.venv314` 下为 **664 / 19**）—— 多出的 18 个正是
 >   原先因 `h5i-db 不可用` 而被跳过的 `tests/test_integration_f68.py` 用例，现在真的跑起来了；
 > - `scripts/preflight_drl_h5i_realrun.py` 从 `[BLOCKED]` 变为 **21/21 PASS**。
 >
-> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`（已在 PyPI 上）。
+> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`；vn.py 固定为 `4.4.0`。
 
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
@@ -409,6 +421,7 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
 - [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
 - [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/evolution/alpha-shadow-design.md`](docs/evolution/alpha-shadow-design.md)：Alpha shadow arm、实验哈希和运行时边界；
 - [`docs/hist-window-protocol.md`](docs/hist-window-protocol.md)：**历史窗口扩展与"环境外"窗口处理协议**
   （判据标定 / 必报项 / 技术前置检查；扩展历史窗口前必读）；
 - [`docs/preflight-verification.md`](docs/preflight-verification.md)：**上线前复验报告**
@@ -423,6 +436,7 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/cleanup/fml-role.md`](docs/cleanup/fml-role.md)：`ml_fusion_bridge` 角色和退役条件；
 - [`docs/cleanup/service-lifecycle.md`](docs/cleanup/service-lifecycle.md)：服务入口、Celery 和进程探测边界；
 - [`docs/cleanup/env-blockers.md`](docs/cleanup/env-blockers.md)：安全扫描、覆盖率和依赖分析工具缺失时的替代证据；
+- [`docs/evolution/remaining-work.md`](docs/evolution/remaining-work.md)：ArcticDB 兼容层、数据源路由、Phase E 和其他剩余任务总清单；
 - [`docs/valuation-rebuild-runbook.md`](docs/valuation-rebuild-runbook.md)：估值主表重建与回滚 Runbook；
 - [`docs/patch-retirement-watch.md`](docs/patch-retirement-watch.md)：估值补丁退役观察期与当前状态；
 - [`docs/perf-plan.md`](docs/perf-plan.md)：回测性能改进计划；

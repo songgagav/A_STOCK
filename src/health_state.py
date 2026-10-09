@@ -14,7 +14,7 @@
   两峰相差三个数量级 ⇒ 阈值取 `p50 > 1s` 或 `p95 > 2s`（落在空旷地带，具体值不敏感）。
 · 数据滞后: 复用 `engine_bars_sync.freshness()` 的判据「引擎是否追平最后一个已收盘交易日」
   —— 该判据有自己的事故史（初版拿日历年尾当基准的范畴错误），不再另造。
-· 账户估值: 复用 `P2-LIVESRC` 的三态 —— `duckdb_reference_held` 即「持仓被静态价兜底」。
+· 账户估值: 复用 `P2-LIVESRC` 的三态 —— `*_reference_held` 即「持仓被静态价兜底」。
 · 策略: 当日 `drl_degrade_events.jsonl` 里出现 L3（决策 D 的门禁语义：不产出新信号）。
 
 状态语义
@@ -308,6 +308,21 @@ def _classify_probe_error(err: str) -> str:
     return "unknown"
 
 
+def _live_state_is_current(live_state: dict, today=None) -> bool:
+    """判断 live_state 是否属于当前自然日。
+
+    引擎在周末/节假日不会刷新 ``live_state.json``；缺少 ``day`` 的旧格式
+    仍按兼容策略视为可用，但显式的历史日期不能继续驱动今日健康状态。
+    """
+    day = str((live_state or {}).get("day") or "").strip()
+    if not day:
+        return True
+    current = today or datetime.now()
+    if hasattr(current, "strftime"):
+        current = current.strftime("%Y-%m-%d")
+    return day == str(current)
+
+
 def assemble(snap: dict) -> dict:
     """把观测快照装配成单一健康状态（**纯函数**，CI 可测）。
 
@@ -363,7 +378,7 @@ def assemble(snap: dict) -> dict:
     elif snap.get("freshness_ok") is False:
         reasons.append("引擎数据未追平最后一个已收盘交易日(厂商未发布当日数据)")
 
-    if snap.get("live_source") == "duckdb_reference_held":
+    if snap.get("live_source") in ("duckdb_reference_held", "h5i_reference_held"):
         reasons.append("持仓被静态参考价兜底(非实时估值, P2-LIVESRC)")
 
     l3 = int(snap.get("l3_today") or 0)
@@ -617,8 +632,14 @@ def gather() -> dict:
         try:
             with open(lv_fp, encoding="utf-8-sig") as f:
                 lv = json.load(f)
-            snap["tick_ms"] = (lv.get("ops") or {}).get("tick_ms")
-            snap["live_source"] = lv.get("live_source")
+            snap["live_state_day"] = lv.get("day")
+            snap["live_state_current"] = _live_state_is_current(lv)
+            if snap["live_state_current"]:
+                snap["tick_ms"] = (lv.get("ops") or {}).get("tick_ms")
+                snap["live_source"] = lv.get("live_source")
+            else:
+                # 跨日旧状态只保留审计信息，不让旧延迟/估值来源污染今天的状态。
+                snap["live_state_stale"] = True
             snap["live_data_ts"] = lv.get("data_ts")
         except Exception:  # noqa: BLE001
             pass

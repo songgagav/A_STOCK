@@ -359,8 +359,8 @@ class TestFactorWeightEnvRegime(unittest.TestCase):
             if done:
                 break
             actual_t = env.t
-            # _state() 在 step() 自增 t 后调用, 索引为 env.t
-            expected_regime = self.regime_features[actual_t]
+            # _state() 在 step() 自增 t 后调用, 只暴露 reward 时点之前的状态
+            expected_regime = self.regime_features[actual_t - 1]
             for dim in range(3):
                 self.assertAlmostEqual(
                     obs[-3 + dim], expected_regime[dim], places=5,

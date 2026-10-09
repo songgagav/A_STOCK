@@ -40,26 +40,26 @@ def spearman_ic(series_x: pd.Series, series_y: pd.Series) -> float:
 
 
 def build_factor(pct: pd.DataFrame, k: int, factor: str):
-    """pct: index=date, columns=symbol, 值为日涨跌幅(小数)。
-    返回宽表: index=date, columns=symbol, 值为因子信号。
+    """从已规范为小数的宽表计算 IC 曲线因子。
 
-    委托 factor_library(统一因子事实源): mom_<k> / vol / reversal 均为
-    factor_library 注册的 wide 构建, 保证"回测口径 = 打分口径"。
+    与现行 ``build_factor_views`` 的日频视图保持同口径：``mom_20`` 是
+    涨跌幅滚动均值，``reversal`` 为其相反数，``vol`` 是滚动总体标准差。
+    这里直接对宽表计算，避免依赖已移除的旧 ``factor_library.FACTORS``
+    wide 注册表。
     """
-    import factor_library as fl
-
-    # mom_<k> -> mom 因子 + k 参数
     if factor.startswith("mom_"):
-        kk = int(factor.split("_")[1])
-        return fl.FACTORS["mom"]["wide"](pct, kk)
+        try:
+            kk = int(factor.split("_", 1)[1])
+        except (IndexError, ValueError):
+            raise ValueError("无效动量因子: {}".format(factor)) from None
+        if kk <= 0:
+            raise ValueError("动量窗口必须为正数: {}".format(kk))
+        return pct.rolling(kk, min_periods=kk).mean()
     if factor == "reversal":
-        return fl.FACTORS["reversal"]["wide"](pct, k)
+        return -pct.rolling(k, min_periods=k).mean()
     if factor == "vol":
-        return fl.FACTORS["vol"]["wide"](pct, 20)
-    if factor in fl.FACTORS:
-        return fl.FACTORS[factor]["wide"](pct, k)
-    raise ValueError("未知因子: {} (可用: mom_<k>|vol|reversal|{})".format(
-        factor, "|".join(fl.FACTOR_NAMES)))
+        return pct.rolling(20, min_periods=20).std(ddof=0)
+    raise ValueError("未知因子: {} (可用: mom_<k>|vol|reversal)".format(factor))
 
 
 def fwd_return(pct: pd.DataFrame, h: int) -> pd.DataFrame:
@@ -69,6 +69,79 @@ def fwd_return(pct: pd.DataFrame, h: int) -> pd.DataFrame:
     ret = (1.0 + pct).rolling(h).apply(np.prod, raw=True) - 1.0
     # ret[t] 是 t-h+1..t 的累计; 我们需要 t+1..t+H -> 用 shift(-h)
     return ret.shift(-h)
+
+
+def _pivot_change_pct(df: pd.DataFrame) -> pd.DataFrame | None:
+    """把日线长表的百分比点涨跌幅规范成 IC 所需的小数宽表."""
+    if df is None or df.empty:
+        return None
+    date_col = "d" if "d" in df.columns else "date"
+    required = {date_col, "symbol", "change_pct"}
+    if not required.issubset(df.columns):
+        raise ValueError("daily_bars 缺少 IC 所需列: {}".format(
+            sorted(required - set(df.columns))))
+    work = df[[date_col, "symbol", "change_pct"]].copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work["change_pct"] = pd.to_numeric(work["change_pct"], errors="coerce") / 100.0
+    work = work.dropna(subset=[date_col, "symbol", "change_pct"])
+    if work.empty:
+        return None
+    return work.pivot_table(index=date_col, columns="symbol", values="change_pct")
+
+
+def _load_pct_h5i(start: str, end: str) -> pd.DataFrame | None:
+    """从 h5i 读取未复权日线; h5i 的 change_pct 单位是百分比点."""
+    from h5i_bar_store import H5iBarStore
+
+    store = H5iBarStore()
+    try:
+        rows = store.closes_window(start, end, positive_close_only=True)
+    finally:
+        store.close()
+    return _pivot_change_pct(rows)
+
+
+def load_pct(start: str, end: str, use_adj: bool = False) -> pd.DataFrame | None:
+    """加载 IC 回算收益，优先使用 h5i，legacy DuckDB 仅作兼容回退.
+
+    ``use_adj=True`` 仍沿用已有 DuckDB ASOF 复权路径；默认未复权路径使用
+    h5i 的标准日线接口，避免在 DuckDB 已退役后刷新器直接失败。
+    """
+    if use_adj:
+        return load_adj_pct(start, end)
+
+    h5i_error = None
+    if os.environ.get("BAR_STORE", "h5i").strip().lower() != "duck":
+        try:
+            pct = _load_pct_h5i(start, end)
+            if pct is not None and not pct.empty:
+                return pct
+            h5i_error = "h5i 区间无有效 change_pct"
+        except Exception as exc:  # noqa: BLE001
+            h5i_error = f"{type(exc).__name__}: {exc}"
+
+    if not os.path.exists(DUCKDB_PATH):
+        raise RuntimeError(
+            "h5i 未返回有效 IC 数据 ({})，legacy DuckDB 已退役且不存在: {}".format(
+                h5i_error or "BAR_STORE=duck", DUCKDB_PATH
+            )
+        )
+
+    import duckdb
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    try:
+        df = con.execute(
+            """
+            SELECT date, symbol, change_pct
+            FROM daily_bars
+            WHERE date >= ? AND date <= ?
+                  AND change_pct IS NOT NULL
+            """,
+            [start, end],
+        ).fetchdf()
+    finally:
+        con.close()
+    return _pivot_change_pct(df)
 
 
 def load_adj_pct(start, end):
@@ -123,25 +196,10 @@ def run(start: str, end: str, k: int, holds, factor: str, use_adj: bool,
             return None, None
         print("(adj) 前复权收益 pivot 形状: {} 天 x {} 只".format(pct.shape[0], pct.shape[1]))
     else:
-        con = duckdb.connect(DUCKDB_PATH, read_only=True)
-        try:
-            q = """
-            SELECT date, symbol, change_pct
-            FROM daily_bars
-            WHERE date >= ? AND date <= ?
-                  AND change_pct IS NOT NULL
-            """
-            df = con.execute(q, [start, end]).fetchdf()
-        finally:
-            con.close()
-
-        if df.empty:
+        pct = load_pct(start, end, use_adj=False)
+        if pct is None or pct.empty:
             print("区间内无 daily_bars 数据")
             return None, None
-
-        df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce") / 100.0
-        # pivot: index=date, columns=symbol, values=change_pct
-        pct = df.pivot_table(index="date", columns="symbol", values="change_pct")
         print("pivot 形状: {} 天 x {} 只".format(pct.shape[0], pct.shape[1]))
 
     sig = build_factor(pct, k, factor)

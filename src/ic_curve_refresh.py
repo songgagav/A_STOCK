@@ -43,8 +43,31 @@ WINDOW_DAYS = 75                    # 增量时重算的交易日天数
 ALPHA_FACTORS = {"vol": "vol", "mom_rev": "mom_20"}
 
 
+def _h5i_trade_days():
+    """读取 h5i 交易日，失败时返回 None 交给 legacy 回退处理."""
+    if os.environ.get("BAR_STORE", "h5i").strip().lower() == "duck":
+        return None
+    try:
+        from h5i_bar_store import H5iBarStore
+        store = H5iBarStore()
+        try:
+            days = store.trading_days()
+        finally:
+            store.close()
+        return sorted(str(day)[:10] for day in days if day)
+    except Exception:
+        return None
+
+
 def _latest_settled_day():
     """daily_bars 最新交易日(用于 ic_h20 需要未来20日的收益, 实际可用样本会更早)。"""
+    h5i_days = _h5i_trade_days()
+    if h5i_days:
+        return h5i_days[-1]
+    if not os.path.exists(DUCKDB_PATH):
+        raise RuntimeError(
+            "h5i 交易日不可读，legacy DuckDB 已退役且不存在: {}".format(DUCKDB_PATH)
+        )
     import duckdb
     con = duckdb.connect(DUCKDB_PATH, read_only=True)
     try:
@@ -57,6 +80,15 @@ def _latest_settled_day():
 def _window_start(latest, days=WINDOW_DAYS):
     """增量区间的起始日: 往前数 days 个(去重)交易日。缺 GROUP BY 时直接 MIN 会被
     同一日期的高频行淹没, 故子查询先 GROUP BY 成"每交易日一行"再取倒数第 days 个。"""
+    h5i_days = _h5i_trade_days()
+    if h5i_days:
+        latest_s = latest.isoformat() if hasattr(latest, "isoformat") else str(latest)[:10]
+        eligible = [day for day in h5i_days if day <= latest_s]
+        return eligible[-min(days, len(eligible))] if eligible else None
+    if not os.path.exists(DUCKDB_PATH):
+        raise RuntimeError(
+            "h5i 交易日不可读，legacy DuckDB 已退役且不存在: {}".format(DUCKDB_PATH)
+        )
     import duckdb
     con = duckdb.connect(DUCKDB_PATH, read_only=True)
     try:
@@ -112,8 +144,10 @@ def refresh(factor_names=None, full: bool = False, window_days: int = WINDOW_DAY
         try:
             if full:
                 start = "2013-01-01"
-                end = (latest.isoformat() if latest else
-                       datetime.date.today().isoformat())
+                if latest:
+                    end = latest.isoformat() if hasattr(latest, "isoformat") else str(latest)
+                else:
+                    end = datetime.date.today().isoformat()
                 ic_series, curve_file = ic_backtest.run(
                     start, end, K, HOLDS, factor, use_adj=False)
                 entry["mode"] = "full"

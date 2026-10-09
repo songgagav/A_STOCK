@@ -31,6 +31,10 @@ from config import (
 from db import StockDB, _canon_to_db
 from paper_book import PaperBook, _limit_prices
 from selector import RotationSelector
+from strategy_contract import (
+    TargetContractError, drl_plan_is_consumable, drl_plan_mode,
+    normalize_target_contract,
+)
 import duckdb
 import pandas as pd
 
@@ -236,12 +240,21 @@ class BacktestRunner:
     _CANON_A = staticmethod(lambda c: _is_a_share_code(str(c or "")))
 
     def _norm_targets(self, top_n: list) -> list:
-        """统一成 {canon,name,score} 列表."""
-        return [
-            {"canon": t["canon"], "name": t.get("name", t["canon"]),
-             "score": t.get("score", 0.0)}
-            for t in top_n if t.get("canon")
-        ]
+        """Normalize the shared TargetContract without dropping provenance."""
+        rows = []
+        for item in top_n:
+            if not isinstance(item, dict) or not item.get("canon"):
+                continue
+            row = dict(item)
+            row.setdefault("name", row["canon"])
+            row.setdefault("score", 0.0)
+            rows.append(row)
+        try:
+            return normalize_target_contract(rows)
+        except TargetContractError:
+            # Historical rows may omit optional metadata, but malformed rows
+            # must not be converted into an apparently valid target silently.
+            return []
 
     def _select_targets_hist(self, hist_day: str) -> list:
         """在历史执行日 hist_day 取"虚拟盘当日同款目标池"(消除与虚拟盘的池子分叉).
@@ -271,21 +284,23 @@ class BacktestRunner:
         except Exception:
             prev = None
 
-        # 1) 跨日回退 DRL: 候选目录严格 C < D (盘前视角防前视)
-        try:
-            cands = [x for x in os.listdir(os.path.join(DATA_DIR, "drl"))
-                     if x.isdigit() and len(x) == 8 and x < d]
-            cands.sort(reverse=True)
-            for cand in cands:
-                try:
-                    top_n, _info = _try_load_daily_plan(cand, hist_day,
-                                                        prev_trade_day=prev)
-                    if top_n:
-                        return self._norm_targets(top_n)
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        # 1) 跨日回退 DRL: only an explicitly promoted enforce-mode plan may
+        # enter replay.  Shadow/off remain observable but non-authoritative.
+        if drl_plan_mode() == "enforce":
+            try:
+                cands = [x for x in os.listdir(os.path.join(DATA_DIR, "drl"))
+                         if x.isdigit() and len(x) == 8 and x < d]
+                cands.sort(reverse=True)
+                for cand in cands:
+                    try:
+                        top_n, _info = _try_load_daily_plan(cand, hist_day,
+                                                            prev_trade_day=prev)
+                        if top_n and drl_plan_is_consumable(_info or {}):
+                            return self._norm_targets(top_n)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
         # 2) 跨日回退 selection: 候选目录严格 C < D (盘前视角防前视)
         try:

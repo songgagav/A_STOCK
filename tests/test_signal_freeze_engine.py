@@ -94,11 +94,22 @@ def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path):
     """09:25 仅此一次重新解析、加权、原子写入并复读校验。"""
     targets, _sel, _source_day, meta = engine._freeze_or_load_targets(_AT_0925)
 
-    assert targets == _TARGETS
+    # 冻结契约只约束标的与目标权重；ensure_target_weights 可能附带
+    # fml/fml_source 等融合诊断字段，不应让本测试耦合到融合实现。
+    assert len(targets) == 1
+    assert targets[0]["canon"] == "600000.SH"
+    assert targets[0]["target_weight"] == 1.0
     assert meta["snapshot_status"] == "ready"
     persisted = read_snapshot(str(tmp_path), "20261003")
     assert persisted["status"] == "ready"
     assert persisted["snapshot"]["weights"] == {"600000.SH": 1.0}
+
+
+def test_run_tick_localizes_naive_clock_before_freeze(engine):
+    """生产默认时钟无时区时，09:25 快照仍必须能生成。"""
+    engine.run_tick(now=datetime(2026, 10, 3, 9, 25, 0))
+
+    assert engine.snapshot_status == "ready"
 
 
 def test_before_cutoff_keeps_live_resolution_for_preparation(engine):

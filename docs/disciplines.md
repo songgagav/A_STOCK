@@ -43,18 +43,18 @@ hindsight_ingest_document(...)  ->  401 {"detail":"Authentication ..."}
 |---|---|---|
 | `.venv314`(跑测试) | 无 `h5i_db` / `baostock` / PyYAML | 相关用例**带原因 skip**; PyYAML 那几条**可用生产解释器的 site-packages 桥接**跑, 见下 |
 | 生产 VM 工具解释器 | 无 `torch` / `baostock` / pytest | **不是**生产守护用的那个, 别拿它当基线(见下) |
-| `.venv310` | 无 `vnpy` | **生产守护 + 取数 + DRL 训练**的真跑环境; 四项齐备 |
+| `.venv310` | 已具备 `h5i_db` / `torch` / `vnpy` | **生产守护 + 取数 + DRL 训练 + 执行 shadow** 的 canonical runtime |
 | `DrlEnvMissing` 告警 | —— | **不是误报**！曾于 09-25 被错标, 09-26 已更正 —— 见下 |
 
 #### 生产守护用的是 `.venv310`, 不是那个"生产 VM 工具解释器"
 
 **这是 2026-09-26 实测更正的一个高代价误解**(直接导致我把一条真告警标成了误报):
 
-| 解释器 | `h5i_db` | `torch` | 用途 |
+| 解释器 | `h5i_db` | `torch` | `vnpy` | 用途 |
 |---|---|---|---|
 | `%APPDATA%\TRAE SOLO CN\...\vm\tools\python\python.exe` (CPython 3.10.11) | ✅ | ❌ | **只**用来跑一次性诊断/校 YAML; **不是**守护 |
-| `.venv310` (CPython 3.10.11) | ✅ 0.1.6 | ✅ 2.14.0+cpu | **生产守护** (`scripts/start_daemon.ps1` 默认)、取数、DRL 训练 |
-| `.venv314` | ❌ | ✅ | 跑 pytest |
+| `.venv310` (CPython 3.10.11) | ✅ 0.1.6 | ✅ 2.14.0+cpu | ✅ 4.4.0 | **生产守护** (`scripts/start_daemon.ps1` 默认)、取数、DRL 训练、执行 shadow |
+| `.venv314` | ❌ | ✅ | ❌ | 纯 Python 研究与兼容性回归；不能作为 h5i/vn.py 完整运行时 |
 
 **机制**: `src/daemon.py:35-40` 是 `PY = sys.executable`, 若 `TRAE_PYTHON` 存在则覆盖;
 而 metrics_server 与 run_daily **都由这个同一个 `PY` 启动** ⇒ **所有子进程天然同源**。

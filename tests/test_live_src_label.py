@@ -61,3 +61,8 @@ class TestLiveSrcLabel:
     def test_all_three_labels_are_distinct(self):
         labels = {_f([], []), _f([], ["X"]), _f(["X"], [])}
         assert len(labels) == 3, f"三种状态必须可区分, 实得 {labels}"
+
+    def test_h5i_reference_never_claims_realtime_source(self):
+        assert _f([], [], reference_source="h5i_reference") == "h5i_reference"
+        assert _f([], ["X"], reference_source="h5i_reference") == "h5i_reference_pool"
+        assert _f(["X"], [], reference_source="h5i_reference") == "h5i_reference_held"

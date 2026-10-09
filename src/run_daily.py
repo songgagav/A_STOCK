@@ -13,6 +13,7 @@ from config import DATA_DIR, DAILY_DIR, MAX_STOCKS, PAPER, STATE_FILE
 from db import StockDB
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
+from strategy_contract import drl_plan_mode
 
 
 class _IngestSkipped(Exception):
@@ -25,6 +26,11 @@ class _IngestSkipped(Exception):
     归因错误) —— 故每个摄入步骤都先 `except _IngestSkipped: pass`。
     """
     pass
+
+
+def format_console_json(payload) -> str:
+    """将日报安全地输出到 Windows 控制台代码页。"""
+    return json.dumps(payload, ensure_ascii=True, indent=2, default=str)
 
 
 def self_closed_loop(day: str, day_dir: str, db) -> dict:
@@ -196,24 +202,47 @@ def portfolio_construction() -> dict:
             lv = json.load(f)
         pos = lv.get("positions") or []
         held = {str(p.get("canon")) for p in pos if isinstance(p, dict) and p.get("canon")}
-        # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据);
-        # live_state 里有 targets 快照。若没有, 再退回当天 target_plan.json。
+        # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据)。
+        # 当前 live_state 按快照契约只保存 snapshot_ref/hash, 不再复制 targets;
+        # 因此必须先读取权威 signal snapshot, 不能把 shadow 模式下缺失的当日
+        # target_plan 当成失败依据。
         tgt_list = lv.get("targets") or []
         if tgt_list:
             want = [str(t.get("canon")) for t in tgt_list
                     if isinstance(t, dict) and t.get("canon")]
             src = "live_state.targets"
         else:
-            plan_fp = os.path.join(root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
-                                   "target_plan.json")
-            if not os.path.isfile(plan_fp):
-                out["error"] = "live_state 无 targets 且找不到当日 target_plan.json"
-                return out
-            with open(plan_fp, encoding="utf-8-sig") as f:
-                plan = json.load(f)
-            want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
-                    if isinstance(t, dict) and t.get("canon")]
-            src = "target_plan.top_n"
+            snapshot_ref = str(lv.get("snapshot_ref") or "").strip()
+            if snapshot_ref:
+                snapshot_fp = os.path.abspath(snapshot_ref)
+                if not os.path.isfile(snapshot_fp):
+                    out["error"] = f"snapshot_ref 不存在: {snapshot_ref}"
+                    return out
+                with open(snapshot_fp, encoding="utf-8-sig") as f:
+                    snapshot = json.load(f)
+                expected_hash = str(lv.get("snapshot_hash") or "").strip()
+                actual_hash = str(snapshot.get("snapshot_hash") or "").strip()
+                if expected_hash and expected_hash != actual_hash:
+                    out["error"] = "live_state snapshot_hash 与 snapshot_ref 不一致"
+                    return out
+                want = [str(t.get("canon")) for t in (snapshot.get("targets") or [])
+                        if isinstance(t, dict) and t.get("canon")]
+                if not want:
+                    out["error"] = "snapshot_ref 中没有有效 targets"
+                    return out
+                src = "signal_snapshot"
+            else:
+                plan_fp = os.path.join(
+                    root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
+                    "target_plan.json")
+                if not os.path.isfile(plan_fp):
+                    out["error"] = "live_state 无 targets/snapshot_ref 且找不到当日 target_plan.json"
+                    return out
+                with open(plan_fp, encoding="utf-8-sig") as f:
+                    plan = json.load(f)
+                want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
+                        if isinstance(t, dict) and t.get("canon")]
+                src = "target_plan.top_n"
 
         cap = lv.get("capital") or {}
         equity = float(cap.get("equity") or 0) or 1.0
@@ -1144,10 +1173,27 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # （环境已损坏, 用陈旧模型下单的风险高于停一天）。
         _drl_probe = None
         _drl_forced = None
+        _drl_mode = drl_plan_mode()
+        report["steps"]["drl_plan_mode"] = {
+            "mode": _drl_mode,
+            "shadow_non_consumable": _drl_mode == "shadow",
+            "production_gate": "strategy_contract",
+        }
+        if _drl_mode == "off":
+            report["steps"]["drl_train"] = {
+                "ok": True,
+                "skipped": "drl_plan_mode_off",
+                "mode": _drl_mode,
+            }
         try:
             import drl_degrade
-            _drl_probe = drl_degrade.probe_runtime()
+            if _drl_mode == "off":
+                _drl_probe = {"ok": False, "skipped": "mode_off"}
+            else:
+                _drl_probe = drl_degrade.probe_runtime()
             if not _drl_probe.get("ok"):
+                if _drl_mode == "off":
+                    raise _IngestSkipped("DRL_PLAN_MODE=off")
                 _why = (f"DRL 运行环境不可用: 缺 {'/'.join(_drl_probe['missing'])} "
                         f"(python={_drl_probe['python']}); "
                         f"决策 D: 显式置 L3 且不回退旧模型")
@@ -1157,20 +1203,23 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                     "error": _why, "degrade": _drl_forced, "probe": _drl_probe,
                 }
                 print(f"[run_daily] DRL L3（显式暂停）: {_why}")
+        except _IngestSkipped:
+            pass
         except Exception as e:
             report["steps"]["drl_probe"] = {"ok": False, "error": str(e)[:200]}
 
         if _drl_forced is None:
-            try:
-                from drl_train import run_drl_train
-                from config import CVAR_PPO as _CVAR_CFG
-                report["steps"]["drl_train"] = run_drl_train(
-                    day, total_timesteps=800,
-                    cvar_alpha=_CVAR_CFG["cvar_alpha"],
-                    cvar_coef=_CVAR_CFG["cvar_coef"],
-                )
-            except Exception as e:
-                report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
+            if _drl_mode != "off":
+                try:
+                    from drl_train import run_drl_train
+                    from config import CVAR_PPO as _CVAR_CFG
+                    report["steps"]["drl_train"] = run_drl_train(
+                        day, total_timesteps=800,
+                        cvar_alpha=_CVAR_CFG["cvar_alpha"],
+                        cvar_coef=_CVAR_CFG["cvar_coef"],
+                    )
+                except Exception as e:
+                    report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
 
         # ===== DRL 降级状态进每日复盘（可见性: 用户要求"每日复盘告警可见"）=====
         # 无论走哪条路径都写: 复盘要能一眼看到 DRL 当前级别与最近一次降级事件。
@@ -1328,16 +1377,9 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
 
             # 5.7) 策略退化检测: 退化指数 + 增量样本 (供 6.5 增量学习复用)
             try:
-                from degradation import run_full_check
+                from degradation import degradation_step_result, run_full_check
                 deg = run_full_check(days=30)
-                di = deg.get("degradation_index", {}) or {}
-                report["steps"]["degradation"] = {
-                    "ok": True,
-                    "overall_score": di.get("overall_score"),
-                    "worst_level": di.get("worst_level"),
-                    "components": di.get("components", []),
-                    "samples_n": len(deg.get("incremental_samples", [])),
-                }
+                report["steps"]["degradation"] = degradation_step_result(deg)
             except Exception as e:
                 report["steps"]["degradation"] = {"ok": False, "error": str(e)[:200]}
 
@@ -1547,4 +1589,4 @@ if __name__ == "__main__":
     a = ap.parse_args()
     day = a.date or a.day
     r = run_daily(day, mode="maint" if a.maint else "full")
-    print(json.dumps(r, ensure_ascii=False, indent=2, default=str))
+    print(format_console_json(r))

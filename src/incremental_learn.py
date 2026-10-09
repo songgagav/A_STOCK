@@ -233,6 +233,15 @@ def run_incremental_learn(day: str, days: int = 10,
         hb.stop(phase="degradation_check_failed", ok=False, error=out["error"])
         return out
 
+    if check.get("status") != "ok":
+        out["status"] = check.get("status", "unavailable")
+        out["backend"] = check.get("backend", "arcticdb")
+        out["error"] = check.get("reason") or check.get(
+            "error", "退化历史不可用，未执行增量学习"
+        )
+        hb.stop(phase="degradation_check_unavailable", ok=False, error=out["error"])
+        return out
+
     samples = check.get("incremental_samples", [])
     index = check.get("degradation_index", {})
     out["samples_n"] = len(samples)

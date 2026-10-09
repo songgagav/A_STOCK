@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from config import DATA_DIR, SCORE_WEIGHTS
+from strategy_contract import WeightContractError, normalize_weight_map
 
 IC_DIR = os.path.join(DATA_DIR, "ic")          # factor_library 之外统一读这里
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
@@ -46,6 +47,17 @@ ALPHA_FACTORS = {
     "pb_rev": "pb_rev",
     "roe": "roe",
     "mf_net": "mf_net",
+}
+
+# IC files contain the source-factor direction.  The selector's ``mom_rev``
+# score is the reverse of the raw ``mom_20`` series, so its expected source IC
+# sign is negative.  Never infer this by taking abs(ICIR).
+FACTOR_EXPECTED_DIRECTIONS = {
+    "vol": 1,
+    "mom_rev": -1,
+    "pb_rev": 1,
+    "roe": 1,
+    "mf_net": 1,
 }
 
 # selector 全部权重键(必须等于 SCORE_WEIGHTS 的并集)
@@ -86,10 +98,23 @@ def _icir(ic: pd.Series) -> float:
 
 # ---------------- 自适应权重 ----------------
 # 可靠性门槛与集中度防护常量
-MIN_ICIR = 0.3                   # |ICIR|<MIN_ICIR 视为统计上不可靠 -> 压到地板
+MIN_ICIR = 0.3                   # 方向调整后 ICIR<MIN_ICIR 视为不可靠 -> 压到地板
 FLOOR_W = 0.02                   # 不可靠因子的地板权重(占整体)
 MAX_ALPHA_SINGLE_SHARE = 0.55    # 单个 alpha 因子在 alpha_share 内占比上限(防一家独大)
 BROKEN_IC_MEAN = -0.15           # 短窗 IC 均值低于此阈值 -> 因子方向性失效, 强制抑制
+
+
+def signed_icir_strength(icir: float, expected_direction: int) -> float:
+    """Return usable ICIR strength after applying an explicit direction."""
+    try:
+        value = float(icir)
+        direction = int(expected_direction)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(value) or direction not in (-1, 1):
+        return 0.0
+    signed = value * direction
+    return float(signed) if signed > 0 else 0.0
 
 
 def optimize_weights(window: int = 40, alpha_share: float = 0.28,
@@ -130,8 +155,8 @@ def optimize_weights(window: int = 40, alpha_share: float = 0.28,
         else:
             stability[wkey] = False
 
-    # 2) 计算每个 alpha 因子"初始强度" = |ICIR| (反转义因子负IC为有效, 取绝对值)
-    #    不可靠判据: 数据缺失 / |ICIR|<MIN_ICIR(统计不显著) / 短长窗符号背离(漂移翻转)
+    # 2) 计算每个 alpha 因子"初始强度" = 经过显式方向调整后的正向 ICIR.
+    #    不可靠判据: 数据缺失 / 方向调整后 ICIR<MIN_ICIR / 短长窗符号背离.
     alphas = {k: icir[k]["icir"] for k in ALPHA_FACTORS}
     default_share = {
         "vol": base.get("vol", 0.10),
@@ -144,25 +169,33 @@ def optimize_weights(window: int = 40, alpha_share: float = 0.28,
     reliable = {}
     for k in ALPHA_FACTORS:
         a = alphas[k]
+        expected_direction = FACTOR_EXPECTED_DIRECTIONS[k]
+        icir[k]["expected_direction"] = expected_direction
+        icir[k]["signed_icir"] = (
+            round(float(a * expected_direction), 3)
+            if a is not None and a == a else None
+        )
         if a is None or a != a:            # 无 IC 数据
             raw[k] = 0.0; reliable[k] = False
             continue
-        mag = abs(a)
-        ok = (mag >= MIN_ICIR) and not stability.get(k, False)
-        # 方向性失效检查: 短窗 IC 均值深负 -> 因子方向已反, 强制抑制
+        signed = a * expected_direction
+        mag = max(0.0, signed)
+        ok = (signed >= MIN_ICIR) and not stability.get(k, False)
+        # 方向性失效检查: 经过因子方向调整后的短窗 IC 均值深负.
         if ok and icir[k].get("ic_short") is not None:
-            if icir[k]["ic_short"] < BROKEN_IC_MEAN:
+            signed_short = icir[k]["ic_short"] * expected_direction
+            if signed_short < BROKEN_IC_MEAN:
                 ok = False
                 icir[k]["suppressed_to_floor"] = True
                 icir[k]["suppress_reason"] = (
-                    f"短窗IC均值 {icir[k]['ic_short']:.3f} < {BROKEN_IC_MEAN}, 方向性失效")
+                    f"方向调整后短窗IC均值 {signed_short:.3f} < {BROKEN_IC_MEAN}, 方向性失效")
         raw[k] = mag if ok else 0.0
         reliable[k] = ok
         if not ok:
             icir[k]["suppressed_to_floor"] = True
             icir[k]["suppress_reason"] = icir[k].get("suppress_reason") or (
                 "short/long ICIR 异号(风格漂移)" if stability.get(k)
-                else (f"|ICIR| {mag:.2f} < {MIN_ICIR}" if mag < MIN_ICIR
+                else (f"方向调整后ICIR {signed:.2f} < {MIN_ICIR}" if signed < MIN_ICIR
                       else "ICIR 缺失"))
         else:
             icir[k]["suppressed_to_floor"] = False
@@ -230,15 +263,36 @@ def optimize_weights(window: int = 40, alpha_share: float = 0.28,
     return {"weights": weights, "meta": meta}
 
 
-def load_weights():
-    """selector 用: 返回当前生效权重 dict。若无 weights.json 则返回 config.SCORE_WEIGHTS。"""
-    if os.path.exists(WEIGHTS_FILE):
-        try:
-            with open(WEIGHTS_FILE, encoding="utf-8") as f:
-                return json.load(f).get("weights", dict(SCORE_WEIGHTS))
-        except Exception:
-            pass
-    return dict(SCORE_WEIGHTS)
+def load_authoritative_weights() -> dict[str, float]:
+    """Load and validate the nested ``weights.json["weights"]`` payload."""
+    if not os.path.exists(WEIGHTS_FILE):
+        raise FileNotFoundError(WEIGHTS_FILE)
+    try:
+        with open(WEIGHTS_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, TypeError) as exc:
+        raise WeightContractError(f"invalid weights payload: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("weights"), dict):
+        raise WeightContractError("weights.json must contain object field 'weights'")
+    # Factor weights may intentionally be zero (for a disabled factor), but
+    # can never be negative, non-finite, or structurally malformed.
+    return normalize_weight_map(payload["weights"], allow_zero=True)
+
+
+def load_weights() -> dict[str, float]:
+    """Return the single effective selector-weight source.
+
+    Missing or invalid dynamic files fall back to the static, validated
+    configuration.  Invalid dynamic data is never returned as authoritative.
+    """
+    try:
+        return load_authoritative_weights()
+    except FileNotFoundError:
+        return normalize_weight_map(dict(SCORE_WEIGHTS), allow_zero=True)
+    except WeightContractError as exc:
+        print(f"[weights] dynamic payload rejected: {exc}; using static config",
+              flush=True)
+        return normalize_weight_map(dict(SCORE_WEIGHTS), allow_zero=True)
 
 
 def _print_report(opt: dict):

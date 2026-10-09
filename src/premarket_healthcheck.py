@@ -668,6 +668,31 @@ def _norm_date(v):
     return s[:8] if len(s) >= 8 and s[:4].isdigit() else s
 
 
+def _partition_ic_selection_days(days, daily_dir):
+    """把到期 selection 日拆为可计算日与空池日.
+
+    ``ic_track.compute_day_ic`` 对 ``top_n=[]`` 的 selection 按契约返回空 IC,
+    因此这类日期不应被盘前检查误报为“缺失 IC 行”。读取失败或结构异常则
+    保守地保留在可计算集合中，让缺失结算继续暴露，而不是把异常降级成空池。
+    """
+    evaluable = []
+    empty = []
+    for day in days:
+        path = os.path.join(daily_dir, day, "selection.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                selection = json.load(f)
+            pool = selection.get("top_n", [])
+            if not pool:
+                empty.append(day)
+                continue
+        except Exception:
+            # 保守处理：文件损坏/结构异常不能伪装成“无样本”。
+            pass
+        evaluable.append(day)
+    return evaluable, empty
+
+
 def check_ic_history() -> dict:
     """断言① ic_history 行数与新鲜度: 检出 ic_history 从未被管道生成的静默断层.
 
@@ -714,22 +739,27 @@ def check_ic_history() -> dict:
                             "latest_bar": latest_bar, "prev_trade_day": prev_trade_day},
                            t0)
 
+        # 空选股池按 ic_track 契约不会产生 IC; 记录但不纳入缺失覆盖判定。
+        evaluable_due_days, empty_selection_days = _partition_ic_selection_days(
+            due_days, icm.DAILY_DIR
+        )
+
         # 统计 ic_history 覆盖
         rows = icm._read_history_rows()
         hist_rows = rows[1] if rows[0] is not None else []
         hist_days = {r.split(",")[0] for r in hist_rows if r.strip()}
-        missing = [d for d in due_days if d not in hist_days]
+        missing = [d for d in evaluable_due_days if d not in hist_days]
         # 新鲜度: ic_history 应有最近一个"可结算天"的记录
         latest_hist_day = max(hist_days) if hist_days else None
         hold_cols = [int(c.split("ic_h", 1)[1]) for c in rows[0].split(",")[1:]] if rows[0] else []
         # 完整性: 对已完整到期(h = MAX_HOLD 收益已发生)的天, 是否都有其 IC 深度的列
-        complete_due = [d for d in due_days
+        complete_due = [d for d in evaluable_due_days
                         if len(trade_days) >= MAX_HOLD + 1
                         and d <= trade_days[-1 - MAX_HOLD]]
         full_depth = all(h in hold_cols for h in [1, 3, 5, 10])
 
         problems = []
-        if latest_hist_day is None:
+        if latest_hist_day is None and evaluable_due_days:
             problems.append("ic_history 无任何数据行")
         if missing:
             problems.append(f"以下已可结算天无 IC 行: {missing}")
@@ -742,7 +772,10 @@ def check_ic_history() -> dict:
         return _record(name, status,
                        {"source": bar_src,
                         "latest_bar": latest_bar,
-                        "due_days": len(due_days), "hist_rows": len(hist_rows),
+                        "due_days": len(due_days),
+                        "evaluable_due_days": len(evaluable_due_days),
+                        "empty_selection_days": empty_selection_days,
+                        "hist_rows": len(hist_rows),
                         "latest_hist_day": latest_hist_day,
                         "prev_trade_day": prev_trade_day,
                         "complete_due": len(complete_due),
@@ -831,8 +864,13 @@ def check_ic_curve() -> dict:
         latest_bar = bar_latest
 
         import weight_optimizer as wo
+        import ic_curve_refresh as icr
+        managed_factors = set(icr.ALPHA_FACTORS)
         factors = {}
+        unmanaged_factors = []
         for wkey, fname in wo.ALPHA_FACTORS.items():
+            if wkey not in managed_factors:
+                unmanaged_factors.append(wkey)
             p = os.path.join(wo.IC_DIR, "ic_curve_{}_k20.csv".format(fname))
             if not os.path.isfile(p):
                 factors[wkey] = {"file": p, "status": "MISSING"}
@@ -871,7 +909,7 @@ def check_ic_curve() -> dict:
         very_stale_files = []
         if due is not None:
             for wkey, info in factors.items():
-                if wkey.startswith("_"):
+                if wkey.startswith("_") or wkey not in managed_factors:
                     continue
                 last_day = info.get("last_day")
                 if info.get("status") in ("MISSING", "EMPTY", "ERROR"):
@@ -898,6 +936,11 @@ def check_ic_curve() -> dict:
         elif stale_files:
             status = "WARN"
             note = "ic_curve 未追平到最近可结算日, 建议增量刷新(ic_curve_refresh)"
+        elif unmanaged_factors:
+            status = "WARN"
+            note = ("部分因子尚未纳入 ic_curve_refresh: {}；"
+                    "当前不将其缺失误报为刷新链路故障").format(
+                        ", ".join(unmanaged_factors))
         else:
             status = "OK"
             note = "ic_curve 的有效 ic_h20 覆盖到最近可结算日"
@@ -906,6 +949,8 @@ def check_ic_curve() -> dict:
                         "latest_bar": latest_bar, "due_settled_day": due,
                         "factors": {k: v for k, v in factors.items()
                                     if not k.startswith("_")},
+                        "managed_factors": sorted(managed_factors),
+                        "unmanaged_factors": unmanaged_factors,
                         "stale_files": stale_files,
                         "very_stale_files": very_stale_files,
                         "action": note},

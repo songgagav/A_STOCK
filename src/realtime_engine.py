@@ -82,6 +82,14 @@ def log(msg: str):
     print(line, flush=True)
 
 
+def _localize_runtime_time(value: datetime | None) -> datetime:
+    """把引擎时钟统一为带 Asia/Shanghai 时区的时间。"""
+    now = datetime.now(SHANGHAI) if value is None else value
+    if now.tzinfo is None or now.utcoffset() is None:
+        return now.replace(tzinfo=SHANGHAI)
+    return now.astimezone(SHANGHAI)
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -363,16 +371,11 @@ def _plan_to_targets(plan: dict, day: str, d: str):
         return None, None
     top_n = []
     for it in a_items:
-        top_n.append({
-            "canon": it["canon"],
-            "price": it.get("price"),
-            "score": it.get("drl_score", 0.0),
-            "target_weight": it.get("target_weight"),
-            "source": "drl_plan",
-            "change_pct": it.get("change_pct"),
-            "turnover": it.get("turnover"),
-            "source_signal": it.get("source_signal"),
-        })
+        row = dict(it)
+        row.setdefault("price", None)
+        row["score"] = it.get("drl_score", it.get("score", 0.0))
+        row["source"] = "drl_plan"
+        top_n.append(row)
     info = {
         "date": day,
         "source": "drl_plan",
@@ -388,6 +391,9 @@ def _plan_to_targets(plan: dict, day: str, d: str):
         # 选股/权重结果, 只是不再丢弃已有字段。
         "section_as_of": plan.get("section_as_of"),
         "data_lag_days": plan.get("data_lag_days"),
+        "promotion": plan.get("promotion"),
+        "drl_plan_mode": plan.get("drl_plan_mode"),
+        "provenance": plan.get("provenance"),
     }
     return top_n, info
 
@@ -533,11 +539,19 @@ def load_targets(day: str):
     # 先试"前一交易日目录"(新产物: 该目录里的 plan 显式声明 consume_day == 今天),
     # 再试"同日目录"(旧产物: 靠 generated_at 窗口间接判定)。两条都保留是为了
     # **兼容旧产物** —— 上线前写出的 plan 没有 consume_day 字段。
-    drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
-        d, day, prev_trade_day)
-    if top_n:
-        _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
-        return top_n, info, drl_prev_d
+    from strategy_contract import drl_plan_is_consumable, drl_plan_mode
+    _drl_mode = drl_plan_mode()
+    _drl_allowed = _drl_mode == "enforce"
+    if _drl_allowed:
+        drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
+            d, day, prev_trade_day)
+        # A plan is only consumable when it carries an explicit promotion
+        # approval.  The loader returns the raw plan metadata through info.
+        if top_n and drl_plan_is_consumable(info or {}):
+            _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
+            return top_n, info, drl_prev_d
+    else:
+        log(f"DRL plan mode={_drl_mode}: production target consumption blocked")
 
     # 2) 当日 selection.json
     sel_path = os.path.join(DAILY_DIR, d, "selection.json")
@@ -562,10 +576,11 @@ def load_targets(day: str):
     # [2026-09-28] 改调 `_cross_day_drl_fallback` —— 原先此处是**内联的同一段扫描**,
     # 而第 1 档现在也要扫 DRL 目录(条件不同: 要求显式 consume_day)。两处内联的
     # 近重复代码极易各自漂移(一处改了另一处忘), 故提取为单一定义。
-    cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
-    if top_n:
-        _trace_targets(day, cand, "drl_cross_day", len(top_n))
-        return top_n, info, cand
+    if _drl_allowed:
+        cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
+        if top_n and drl_plan_is_consumable(info or {}):
+            _trace_targets(day, cand, "drl_cross_day", len(top_n))
+            return top_n, info, cand
 
     # 4) 跨日回退 - selection: 最近的 selection.json
     sel = None
@@ -612,7 +627,7 @@ def load_targets(day: str):
     return sel.get("top_n", []), sel, d
 
 
-def _live_src_label(held_missing, pool_missing) -> str:
+def _live_src_label(held_missing, pool_missing, reference_source=None) -> str:
     """按**持仓**缺价判定实时来源标记 —— 使该字段能直接回答"我在实时撮合吗".
 
     [2026-09-21 修] 原逻辑是"池里**任一只**缺价 ⇒ 整批标 `duckdb_reference`",
@@ -624,13 +639,18 @@ def _live_src_label(held_missing, pool_missing) -> str:
 
     新语义:
       `akshare_spot`            持仓与候选池**全部**取到实时价
-      `duckdb_reference_pool`   仅**候选池**有缺价 —— 账户仍是实时估值, 影响的是**下次调仓**
-      `duckdb_reference_held`   持仓有缺价 —— 账面已用最近收盘价兜底, **不能**当实时看
+      `duckdb_reference_pool`   仅**候选池**有缺价 —— 兼容旧状态值
+      `duckdb_reference_held`   持仓有缺价 —— 兼容旧状态值
+      `h5i_reference_pool`      候选池使用 h5i 参考价
+      `h5i_reference_held`      持仓使用 h5i 参考价
     """
+    prefix = "h5i_reference" if reference_source == "h5i_reference" else "duckdb_reference"
     if held_missing:
-        return "duckdb_reference_held"
+        return f"{prefix}_held"
     if pool_missing:
-        return "duckdb_reference_pool"
+        return f"{prefix}_pool"
+    if reference_source == "h5i_reference":
+        return "h5i_reference"
     return "akshare_spot"
 
 
@@ -757,6 +777,7 @@ class RealtimeEngine:
 
     def _freeze_or_load_targets(self, now: datetime) -> tuple[list[dict], dict, str, dict]:
         """冻结窗口写一次，窗口后只读已验证快照，绝不自动实时回退。"""
+        now = _localize_runtime_time(now)
         day = self.pb.trade_date.replace("-", "")
         pending = {
             "snapshot_status": "pending",
@@ -884,7 +905,7 @@ class RealtimeEngine:
     # ---------- 一次 tick ----------
     def run_tick(self, now: datetime | None = None):
         self.tick += 1
-        now = now or datetime.now()
+        now = _localize_runtime_time(now)
         # [2026-09-22 修] Dead-Man's Switch: tick 落在**主循环的每一轮**, 而不是调仓那一刻。
         #
         # 原先这一 beat 在 `_rebalance_if_due()` 里、且位于"调仓间隔已到"之后 ——
@@ -943,6 +964,8 @@ class RealtimeEngine:
         #   再算就永远判不出"谁是被静态价兜底的"。实测 2026-09-21 就是因为
         #   原实现只看"池里任一只缺价"就把整批标成 duckdb_reference, 使该字段
         #   **无法区分"账户按实时价估值"与"账户被静态价兜底"**。
+        reference_codes = set(getattr(self.feed, "fallback_codes", set()))
+        reference_codes.intersection_update(all_codes)
         missing = [c for c in all_codes if c not in latest or not latest.get(c)]
         held = list(self.pb.positions.keys())
         held_missing = [c for c in held if c in missing]
@@ -957,12 +980,32 @@ class RealtimeEngine:
                         if c not in self.feed.quotes:
                             self.feed.quotes[c] = {"price": p, "last_close": p,
                                                    "limit_up": None, "limit_down": None,
-                                                   "volume": 0, "suspended": False}
+                                                   "volume": 0, "suspended": None,
+                                                   "fallback": True,
+                                                   "fallback_source": "h5i_reference"}
+                        reference_codes.add(c)
+            mark_reference_fallback = getattr(self.feed, "mark_reference_fallback", None)
+            if callable(mark_reference_fallback):
+                mark_reference_fallback(reference_codes)
+        reference_held = [c for c in held if c in reference_codes]
+        reference_pool = [c for c in all_codes
+                          if c in reference_codes and c not in set(held)]
+        reference_source = "h5i_reference" if reference_codes else None
         # 来源标记**按持仓缺价**判定, 使该字段能直接回答"我在实时撮合吗":
         #   · held 有缺价  => 账户被静态价兜底, **不能**算实时(记账/风控都该打折看待)
         #   · 仅池内有缺价 => 账户仍是实时估值, 只是候选池不全(影响下次调仓, 不影响当前账面)
-        live_src = _live_src_label(held_missing, missing)
-        if held_missing:
+        live_src = _live_src_label(
+            reference_held or held_missing,
+            reference_pool or missing,
+            reference_source=reference_source,
+        )
+        if reference_held:
+            log(f"实时源告警: 持仓使用 h5i 参考价 {len(reference_held)}/{len(held)} 只 "
+                f"({','.join(reference_held[:5])})")
+        elif reference_pool:
+            log(f"实时源告警: 候选池使用 h5i 参考价 {len(reference_pool)}/{len(all_codes)} 只, "
+                f"持仓 {len(held)} 只未使用参考价")
+        elif held_missing:
             log(f"实时源告警: 持仓缺实时价 {len(held_missing)}/{len(held)} 只 "
                 f"({','.join(held_missing[:5])}) -> 账面已用最近收盘价兜底")
         elif missing:

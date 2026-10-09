@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "vendor": "StockDB",
+  "source_observed_at": "2026-10-09",
+  "source_root": "E:\\A_stockDB",
+  "python_runtime": "3.10",
+  "endpoint": "127.0.0.1:7899",
+  "artifacts": {
+    "bin/stockdb.exe": "beb7759f47ba63319836f112b65a4060183ba1917ca7b66852f7b2c9e84b2778",
+    "pybao/stock_sdk.py": "389962576f9fd29530bbd143b379c22a613af50aea9f608d84671497df10c047",
+    "pybao/stockdb.pyd": "76e63a098220f8f0d9920f83175f750d889c16df0de94b04972b9d5ed619dfc3",
+    "pybao/zb_core.pyd": "0cfdb20bf45cb4069737abde3160c2cee7ce37a2ce579165863e2e88e5365384",
+    "pybao/zhibiao.py": "c7a08ffbad25e13a4d7217cc00a462fcd2618377e04b17975ee8fb5c041dfc47"
+  },
+  "data_policy": "deployment data directories remain outside Git"
+}

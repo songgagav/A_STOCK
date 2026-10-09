@@ -28,6 +28,7 @@ import math
 import os
 
 import config
+from drl_v2_contract import build_temporal_split
 
 LEDGER_NAME = "drl_post_metrics.jsonl"
 #: 滚动窗口默认天数（设计里写的是"近 20 日"）
@@ -189,14 +190,16 @@ VAL_DAYS_DEFAULT = 5
 SPLIT_SPEC = {
     "method": "temporal_holdout_tail",
     "desc": ("把评分区间 [lookback, n-1] **按时间顺序**切成两段: 末尾 val_days 天为验证集, "
-             "其余为训练段。**不做 shuffle** —— IC 序列是时间序列, 打乱会引入未来信息泄漏。"),
+             "验证集前 purge_days 天明确丢弃, 其余为训练段。**不做 shuffle** —— IC 序列是时间序列, "
+             "打乱会引入未来信息泄漏。"),
     "limitation": ("IC 序列通常只有 40–60 天, 验证集仅 5 天 ⇒ 验证分数**噪声很大**; "
                    "故本模块只记录数值, 不据它判定'新模型是否该部署'(METHOD-1)。"),
 }
 
 
 def split_validation(n: int, lookback: int = 10,
-                     val_days: int = VAL_DAYS_DEFAULT) -> dict:
+                     val_days: int = VAL_DAYS_DEFAULT,
+                     purge_days: int = 0) -> dict:
     """按时间顺序切出训练段/验证段的下标。
 
     评分区间与 `FactorWeightEnv` 的可评步一致: `t ∈ [lookback, n-1]`
@@ -207,13 +210,14 @@ def split_validation(n: int, lookback: int = 10,
     """
     scored = list(range(max(0, int(lookback)), max(0, int(n))))
     k = max(0, int(val_days))
+    split = build_temporal_split(
+        int(n), lookback=int(lookback), val_days=k, purge_days=int(purge_days))
     out = {"n": int(n), "lookback": int(lookback), "val_days": k,
-           "scored": scored, "train": scored, "val": [], "notes": []}
-    if k == 0 or len(scored) <= k:
+           "purge_days": int(purge_days), "scored": scored,
+           "train": list(split.train), "purge": list(split.purge),
+           "val": list(split.validation), "notes": []}
+    if k and not split.validation:
         out["notes"].append(f"可评步数 {len(scored)} 不足以留出 {k} 天验证集, 验证段为空")
-        return out
-    out["val"] = scored[-k:]
-    out["train"] = scored[:-k]
     return out
 
 
@@ -252,7 +256,8 @@ def score_weights(ic, base_weights, weights, idx) -> dict:
 
 
 def validation_compare(ic, base_weights, new_weights, old_weights=None,
-                       lookback: int = 10, val_days: int = VAL_DAYS_DEFAULT) -> dict:
+                       lookback: int = 10, val_days: int = VAL_DAYS_DEFAULT,
+                       purge_days: int = 0) -> dict:
     """新旧模型在同一**留出验证段**上的对比 —— **只记录数值, 不判定**。
 
     `old_weights` 为 None 时（例如没有上一版模型）只记录 new/base, 并给出 note。
@@ -260,14 +265,17 @@ def validation_compare(ic, base_weights, new_weights, old_weights=None,
     按 METHOD-1 本批次**不做**, 故输出里没有 passed/ok 之类字段。
     """
     import numpy as np
-    sp = split_validation(len(ic), lookback=lookback, val_days=val_days)
+    sp = split_validation(
+        len(ic), lookback=lookback, val_days=val_days, purge_days=purge_days)
     res = {
         "schema": 1,
         "threshold_applied": False,
         "note": "只记录数值, 不判定'新模型是否该部署'(METHOD-1: 阈值须基于下游表现)",
         "split": dict(SPLIT_SPEC),
         "lookback": int(lookback), "val_days": int(sp["val_days"]),
+        "purge_days": int(sp["purge_days"]),
         "n_scored": len(sp["scored"]), "n_train": len(sp["train"]),
+        "n_purge": len(sp["purge"]),
         "val_index": (sp["val"][0], sp["val"][-1]) if sp["val"] else None,
         "new": score_weights(ic, base_weights, new_weights, sp["val"]),
         "base": score_weights(ic, base_weights, base_weights, sp["val"]),

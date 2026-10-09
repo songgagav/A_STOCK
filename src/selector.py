@@ -18,6 +18,9 @@ from p08_signal import (
 )
 from factor_library import selector_weights, score_factor, _pb_rev_score, _roe_score, _mf_net_score
 from ml_fusion_bridge import FML_WEIGHT  # 兼容旧 import; f_ml 计算统一走 factor_fusion.fusion_or_fml
+from strategy_contract import (
+    FusionContractError, average_rank, fusion_missing_policy, fusion_weight_mode,
+)
 
 
 # ---- 横截面 rank percentile 归一化 ----
@@ -78,8 +81,7 @@ def _rank_normalize(scored: list, W: dict) -> None:
         valid = np.isfinite(vals)
         ranks = np.full(n, 0.5)
         if np.sum(valid) > 1:
-            order = np.argsort(np.argsort(vals[valid]))
-            ranks[valid] = order / (np.sum(valid) - 1.0)
+            ranks[valid] = np.asarray(average_rank(vals[valid]), dtype=float)
         for i, s in enumerate(scored):
             s[field] = round(float(ranks[i]), 4)
 
@@ -145,7 +147,12 @@ class RotationSelector:
             if not zmap:
                 return
             zs = np.array([zmap.get(s, np.nan) for s in syms], dtype=float)
-            if int(np.isfinite(zs).sum()) < 30:
+            n_finite = int(np.isfinite(zs).sum())
+            if fusion_missing_policy() == "blocked" and n_finite < len(zs):
+                raise FusionContractError("Fusion rank missing scores in enforce mode")
+            if n_finite < 30:
+                if fusion_missing_policy() == "blocked":
+                    raise FusionContractError("Fusion rank coverage below minimum")
                 return
             med = float(np.nanmedian(zs))
             zs = np.where(np.isfinite(zs), zs, med)
@@ -157,13 +164,16 @@ class RotationSelector:
             old = np.array([float(x.get("score") or 0.0) for x in scored], dtype=float)
 
             def _pct_rank(a: np.ndarray) -> np.ndarray:
-                o = np.argsort(np.argsort(a))
-                return o / max(len(a) - 1, 1)
+                return np.asarray(average_rank(a), dtype=float)
 
             blended = (1.0 - alpha) * _pct_rank(old) + alpha * _pct_rank(zs_t)
             for x, b, z in zip(scored, blended, zs):
                 x["fusion_rank_key"] = float(b)
                 x["fusion_z"] = float(z)
+        except FusionContractError:
+            if fusion_weight_mode() == "enforce":
+                raise
+            return
         except Exception:
             return
 
@@ -176,6 +186,12 @@ class RotationSelector:
         try:
             from factor_fusion import fusion_or_fml
             fml, _used = fusion_or_fml(scored, as_of)
+        except FusionContractError:
+            # Enforce mode must fail closed.  A legacy/equal fallback here
+            # would make the production target silently diverge from policy.
+            if fusion_weight_mode() == "enforce":
+                raise
+            return
         except Exception:  # noqa: BLE001
             return
         if not fml:
@@ -189,8 +205,7 @@ class RotationSelector:
         good = ~np.isnan(vals_t)
         ranks = np.full(len(scored), np.nan)
         if int(good.sum()) > 1:
-            order = np.argsort(np.argsort(vals_t[good]))
-            ranks[good] = order / (good.sum() - 1.0)
+            ranks[good] = np.asarray(average_rank(vals_t[good]), dtype=float)
         if trimmed.any():
             ranks[trimmed] = 0.0
         w = min(max(float(FML_WEIGHT), 0.0), 0.5)
@@ -410,6 +425,8 @@ class RotationSelector:
         if top_n:
             from target_weighting import allocate_target_weights
             allocate_target_weights(top_n)
+            from strategy_contract import normalize_target_contract
+            top_n = normalize_target_contract(top_n, require_weights=True)
 
         basket_signal = float(np.mean([t["signal"] for t in top_n])) if top_n else 0.0
 

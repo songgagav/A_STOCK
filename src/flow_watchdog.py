@@ -69,6 +69,7 @@ def evaluate(sample: dict, now=None) -> dict:
       engine_pid  引擎 pid，仅用于措辞
       feed_error  引擎自报的行情源错误
       live_source 估值来源标签
+      calendar_is_trading_day 交易日历判定；明确为 False 时不判定盘中停流
 
     返回 {level, cause, reason, age_s, tick, tick_stuck}；level ∈ OK|WARN|CRITICAL。
     """
@@ -78,6 +79,13 @@ def evaluate(sample: dict, now=None) -> dict:
     tick, prev = st.get("tick"), st.get("prev_tick")
     tick_stuck = (isinstance(tick, int) and isinstance(prev, int) and tick == prev)
     base = {"age_s": age, "tick": tick, "tick_stuck": tick_stuck}
+
+    # live_state.json 在非交易日不会被引擎刷新。若沿用上一交易日的
+    # ``in_session=true``，就会把旧 PID/旧时间戳误报成 dead_process。
+    # 交易日历是更高优先级的事实：明确知道今天休市时，不判定盘中数据流。
+    if st.get("calendar_is_trading_day") is False:
+        return {**base, "level": "OK", "cause": "idle",
+                "reason": "非交易日, 不判定数据停流(上一交易日 live_state 不参与当前巡检)"}
 
     # 1) 非盘中不判定 —— 收盘后引擎本就不再写状态，此时 age 无限增大是**正常**的。
     #    (夜间误报是"狼来了"的典型来源; 2026-09-21 夜就踩过一次同类的 tick 窗口冻结。)
@@ -99,7 +107,7 @@ def evaluate(sample: dict, now=None) -> dict:
     if age > STALL_AFTER_S:
         err = str(st.get("feed_error") or "").strip()
         src = st.get("live_source")
-        if err or src in ("price_hold", "duckdb_reference_held"):
+        if err or src in ("price_hold", "duckdb_reference_held", "h5i_reference_held"):
             why = (f"行情源错误: {err[:110]}" if err
                    else f"估值退化为静态价(live_source={src})")
             return {**base, "level": "CRITICAL", "cause": "feed_stale",
@@ -169,12 +177,27 @@ def _write_json_atomic(fp: str, payload: dict) -> None:
 
 
 def gather(live_state: str | None = None, pidfile: str | None = None,
-           state: str | None = None, pid_alive_fn=None, now=None) -> dict:
+           state: str | None = None, pid_alive_fn=None, now=None,
+           is_trading_day_fn=None) -> dict:
     """采集真实可观测量 -> 判定，并把本次 tick 采样存下（供下次判定"是否推进"）。
 
     路径/存活探测均可注入，便于测试（本函数触碰文件系统，不在 CI 里直接跑）。
     """
     root = _repo_root()
+    # 生产调用不传 ``now``，此时用权威交易日历；测试传入固定 now 时，
+    # 只有显式注入 is_trading_day_fn 才启用该额外事实，避免测试依赖当前日历。
+    calendar_is_trading_day = None
+    if now is None or is_trading_day_fn is not None:
+        try:
+            check_now = now or datetime.now()
+            if is_trading_day_fn is None:
+                import sys
+                sys.path.insert(0, os.path.join(root, "src"))
+                from trading_calendar import is_trading_day as is_trading_day_fn
+            calendar_is_trading_day = bool(is_trading_day_fn(check_now.date()))
+        except Exception:  # noqa: BLE001
+            # 日历不可用时保留原有 in_session 判据，但不伪造交易日结论。
+            calendar_is_trading_day = None
     lv_fp = live_state or os.path.join(root, "data", "live_state.json")
     pf = pidfile or os.path.join(root, "logs", "engine.pid")
     sp = state_path(state)
@@ -198,6 +221,8 @@ def gather(live_state: str | None = None, pidfile: str | None = None,
         "engine_pid": pid,
         "pid_alive": (pid_alive_fn or _default_proc_alive)(pid),
     }
+    if calendar_is_trading_day is not None:
+        sample["calendar_is_trading_day"] = calendar_is_trading_day
     verdict = evaluate(sample, now=now)
 
     try:

@@ -1,8 +1,13 @@
 # 部署指南
 
+完整生产运行时统一使用仓库根目录的 `.venv310`。它必须同时能够导入
+`h5i_db`、`torch`、`stable_baselines3` 和 `vnpy`；`.venv314` 仅用于纯 Python
+研究和兼容性回归，不通过 `PYTHONPATH` 混用两个环境的 site-packages。
+
 ## 1. 环境准备
 
-- Python 3.14(核心依赖见 `requirements_314.txt`)
+- Python 3.10.11（完整运行时由 `scripts/setup_py310_drl_venv.ps1` 创建）
+- Python 3.14 可作为纯 Python 研究/兼容性回归环境
 - 轻量运行(选股/门控/回测/检测):numpy, pandas, scipy, scikit-learn, h5py, pyarrow
 - DRL 链路(可选):torch, stable-baselines3, gymnasium
 - 数据:需自行准备本地行情/财务/估值数据(推荐 free-stockdb / CNEquity 镜像)
@@ -18,29 +23,46 @@ python -m pytest tests/ -q        # 自检
 
 | 变量 | 说明 |
 |---|---|
-| `STOCKDB_ROOT` | 本地行情镜像根(parquet 分片/单文件全量) |
+| `STOCKDB_ROOT` | StockDB/free-stockdb 部署数据根(parquet 分片、`data`/`mydb`、`stockdb.conf`) |
+| `STOCKDB_PYBAO_DIR` | 可选的明确 SDK 覆盖路径；默认使用项目内 `vendor/stockdb/pybao` |
+| `STOCKDB_ENGINE` | StockDB 本地端点，默认 `127.0.0.1:7899` |
 | `ARCTIC_URI` | ArcticDB LMDB,如 `lmdb://<path>/arcticdb` |
-| `PYBAO_DIR` | 本地行情引擎 SDK(可选) |
+| `PYBAO_DIR` | 旧版外部 SDK 路径，仅作项目 bundle 缺失时的兼容回退 |
 | `TRAE_PYTHON` | 守护进程使用的外部 Python(含依赖) |
 | `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关(默认 `1`;`0` 关闭) |
 | `OVERFIT_RESULTS_FILE` | 过拟合检测窗口样本源(可选覆盖) |
 
-> Windows 持久化示例:`setx STOCKDB_ROOT "E:\data\stockdb"`。**修改环境变量后需新开终端再启动守护**,否则新进程读不到。
+> Windows 持久化示例:`setx STOCKDB_ROOT "E:\data\stockdb"`。**修改环境变量后需新开终端再启动守护**,否则新进程读不到。StockDB 的 SDK 和服务程序默认取项目内 `vendor/stockdb`，但数据工作目录仍必须是 `STOCKDB_ROOT`；不要把行情数据库目录复制进仓库。
 
 ## 3. 运行模式
 
 ```bash
-# 一次性/日频
-python src/run_daily.py                    # 收盘选股主流程
-python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
+# 一次性/日频（使用 .venv310）
+.venv310\Scripts\python.exe src/run_daily.py # 收盘选股主流程
+.venv310\Scripts\python.exe src/gate_refresh_daemon.py # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
 # 估值补丁观察：当前公开 checkout 未包含 sentinel_daemon.py，按 docs/patch-retirement-watch.md 人工验收
-python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘选股 **19:10** / 崩溃自动拉起
-python src/realtime_engine.py --once       # 盘中撮合单次
-python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i_db, 见 README)
+.venv310\Scripts\python.exe src/daemon.py                 # 交易日守护
+.venv310\Scripts\python.exe src/realtime_engine.py --once # 盘中撮合单次
+.venv310\Scripts\python.exe src/dashboard.py --port 8000  # Web 面板
 
 # 后台常驻(观测栈 + 上述守护) 一键拉起, 幂等, 重复执行不会起第二个
 powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 ```
+
+### 3.2 09:25 信号冻结 Shadow 运行
+
+信号冻结的操作边界和观察记录见 [`docs/evolution/signal-freeze-runbook.md`](evolution/signal-freeze-runbook.md)。默认模式是 `shadow`：引擎可以生成并验证 09:25 快照，但不会因为观察功能改变现有消费路径。
+
+交易日运行前必须确认：
+
+1. `read_mode_control('.')` 返回 `mode=shadow`；
+2. `TRADE_BROKER` 为 `paper` 或未设置（默认 `paper`）；
+3. `data/trade_calendar.json` 存在且覆盖当前日期；
+4. `daemon.py` 已启动并能在 09:25 运行引擎。
+
+09:25 后只接受已验证的 `signal_snapshot_<YYYYMMDD>.json` 作为冻结证据。快照不存在、格式无效或哈希不匹配时，自动链路只估值、不调仓；不得人工补写快照来“恢复”当日自动调仓。午间重选写入迟到归档，必须经完整候选池/权重人工审核后，才可作为次日可选输入。
+
+非交易日不生成观察日。2026-10-03 至 2026-10-07 的 Phase E 计数保持不变，下一交易日按本地日历检查。
 
 估值补丁退役的历史设计和当前公开仓库状态见 `docs/patch-retirement-watch.md`；在对应哨兵代码
 恢复并通过验收前，不得把“每日自动观察”当成已启用能力。
