@@ -190,7 +190,26 @@ def test_corrupt_previous_config_degradation_remains_active_provenance(reward_pa
     assert json.loads(reward_path.read_text(encoding="utf-8"))["previous_provenance"] == state["active_provenance"]
 
 
+def test_resolved_calendar_identity_must_match_current_authoritative_cache(reward_path):
+    _calendar()
+    assert inc.set_reward_weights(0.5, 0.25, 0.25, generated_on="2026-10-09")
+    with open(calendar.CAL_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"days": ["20261009", "20261012", "20261014"],
+                   "source": "akshare_tool_trade_date_hist_sina",
+                   "updated": "2026-10-09 20:00:00"}, handle)
+    state = inc.get_reward_weight_state(as_of="2026-10-12")
+    assert state["status"] == "degraded_default"
+    assert "authoritative calendar evidence" in state["reason"]
+
+
 def test_parser_rejects_boolean_reward_weight():
     with pytest.raises(RuntimeError, match="invalid reward"):
         inc._parse_response({"content": [{"text": json.dumps({"reward_rebalance": {
             "vnpy_weight": True, "ic_weight": 0.25, "attr_weight": 0.25}})}]})
+
+
+def test_parser_normalizes_explicit_three_weight_recommendation():
+    parsed = inc._parse_response({"content": [{"text": json.dumps({"reward_rebalance": {
+        "vnpy_weight": 4, "ic_weight": 2, "attr_weight": 2}})}]})["reward_rebalance"]
+    assert [parsed[key] for key in ("vnpy_weight", "ic_weight", "attr_weight")] == pytest.approx(
+        [0.5, 0.25, 0.25])

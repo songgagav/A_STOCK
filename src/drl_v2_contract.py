@@ -99,6 +99,8 @@ def combine_reward_components(
     if length < 0:
         raise ValueError("expected_length must be non-negative")
     if not components:
+        if weights:
+            raise ValueError("reward weights supplied without components")
         return np.zeros(length, dtype=np.float32)
     if set(weights) - set(components):
         raise ValueError("reward weights reference missing components")

@@ -164,8 +164,8 @@ def _parse_response(body: dict) -> dict:
                   "ic_weight": rr.get("ic_weight", 0.5)}
         if rr.get("attr_weight") is not None:
             reward["attr_weight"] = rr["attr_weight"]
-        normalize_reward_weights({**reward, "attr_weight": reward.get("attr_weight", 0.15)})
-        reward = {key: float(value) for key, value in reward.items()}
+        normalized = normalize_reward_weights({**reward, "attr_weight": reward.get("attr_weight", 0.15)})
+        reward = {key: normalized[key] for key in reward}
         reward["rationale"] = str(rr.get("rationale") or "").strip()
     except (TypeError, ValueError, AttributeError) as exc:
         raise RuntimeError(f"invalid reward_rebalance: {exc}") from exc
@@ -411,8 +411,11 @@ def get_reward_weight_state(*, as_of: str | None = None) -> dict:
         effective = dt.date.fromisoformat(effective_raw)
         if effective <= generated:
             raise ValueError("effective_from must follow generated_on")
-        expected, _identity = _next_reward_session(generated)
-        if not calendar_identity.get("source") or not calendar_identity.get("version") or expected != effective_raw:
+        expected, current_identity = _next_reward_session(generated)
+        if (not calendar_identity.get("source") or not calendar_identity.get("version")
+                or expected != effective_raw
+                or any(calendar_identity.get(key) != current_identity.get(key)
+                       for key in ("source", "version"))):
             raise ValueError("effective_from is not supported by authoritative calendar evidence")
         if day < effective:
             return {**state, "weights": previous, "status": "pending_effective",

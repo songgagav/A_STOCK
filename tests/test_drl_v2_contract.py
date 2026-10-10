@@ -67,6 +67,11 @@ def test_finite_large_reward_weights_are_normalized_before_multiplication():
     assert np.isfinite(reward)
 
 
+def test_reward_weights_without_aligned_components_are_rejected():
+    with pytest.raises(ValueError, match="without components"):
+        combine_reward_components({}, {"ic": 1.0}, expected_length=1)
+
+
 def test_rank_ic_uses_average_ties_and_drops_nonfinite_pairs():
     scores = np.array([1.0, 1.0, 2.0, np.nan, 4.0])
     future = np.array([0.1, 0.2, 0.3, 0.4, np.inf])
