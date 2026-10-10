@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from evidence_bundle import ArtifactInput, EvidenceBundleRequest, build_bundle
+from evidence_bundle import ArtifactInput, EvidenceBundleRequest, build_bundle, verify_bundle
 from oos_dataset import (
     OOSDatasetRequest,
     OOSDayInput,
@@ -66,6 +66,14 @@ def _fill() -> dict:
     }
 
 
+def _lineage():
+    return {
+        "source": "h5i", "schema": "v1", "routing": "h5i-primary",
+        "universe": "a-share-v1", "calendar_source": "official-fixture",
+        "calendar_version": "2026-v1", "lineage_sha": "lineage-sha-1",
+    }
+
+
 def _bundle(tmp_path: Path, trade_day: str) -> Path:
     raw = tmp_path / f"raw-{trade_day}"
     raw.mkdir()
@@ -85,7 +93,8 @@ def _bundle(tmp_path: Path, trade_day: str) -> Path:
             generated_at=f"{trade_day}T16:00:00+08:00",
             run_id=f"run-{trade_day}",
             code_sha="code-sha-1",
-            data_identity={"data_sha": "data-sha-1"},
+            data_identity={"data_sha": "daily-data-" + trade_day},
+            data_lineage_identity=_lineage(),
             config_identity={"config_sha": "config-sha-1"},
             snapshot=snapshot,
             artifacts=artifacts,
@@ -96,7 +105,7 @@ def _bundle(tmp_path: Path, trade_day: str) -> Path:
                 "FUSION_WEIGHT_MODE": "shadow",
                 "TRADE_BROKER": "paper",
                 "alpha_evidence_status": "not_promotable",
-                "drl_plan_mode_contract": "not_implemented",
+                "drl_plan_mode_contract": "implemented_default_shadow",
             },
             reference_equity=100_000.0,
             reference_timestamp=f"{trade_day}T09:25:00+08:00",
@@ -119,6 +128,7 @@ def _request(
         generated_at="2026-10-08T20:00:00+08:00",
         code_sha=code_sha,
         data_identity={"data_sha": "data-sha-1"},
+        data_lineage_identity=_lineage(),
         config_identity={"config_sha": "config-sha-1"},
         experiment_identity={"experiment_hash": "experiment-sha-1"},
         calendar_identity={"calendar_sha": "calendar-sha-1", "trade_days_are_explicit": True},
@@ -128,7 +138,7 @@ def _request(
             "FUSION_WEIGHT_MODE": "shadow",
             "TRADE_BROKER": "paper",
             "alpha_evidence_status": "not_promotable",
-            "drl_plan_mode_contract": "not_implemented",
+            "drl_plan_mode_contract": "implemented_default_shadow",
         },
         trade_days=trade_days if trade_days is not None else tuple(day.trade_day for day in days),
         days=days,
@@ -149,6 +159,12 @@ def _day(path: Path, trade_day: str) -> OOSDayInput:
 def test_same_explicit_days_are_deterministic_and_include_provenance(tmp_path):
     first_bundle = _bundle(tmp_path, "2026-10-07")
     second_bundle = _bundle(tmp_path, "2026-10-08")
+    first_daily_manifest = verify_bundle(first_bundle)
+    second_daily_manifest = verify_bundle(second_bundle)
+    assert first_daily_manifest["data_sha"] != second_daily_manifest["data_sha"]
+    assert first_daily_manifest["snapshot_hash"] != second_daily_manifest["snapshot_hash"]
+    assert first_daily_manifest["bundle_identity"]["source_artifact_hashes"]["market_data"] != second_daily_manifest["bundle_identity"]["source_artifact_hashes"]["market_data"]
+    assert first_daily_manifest["observation_epoch"] == second_daily_manifest["observation_epoch"]
     days = (_day(first_bundle, "2026-10-07"), _day(second_bundle, "2026-10-08"))
 
     first = build_oos_dataset(_request(tmp_path, days))

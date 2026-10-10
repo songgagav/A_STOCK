@@ -28,15 +28,27 @@ records the current Phase B state as `DRL_PLAN_MODE=shadow`,
 
 Every newly built Evidence Bundle and OOS dataset carries the same
 `observation_epoch` object. Its `epoch_id` is a deterministic SHA-256 of the
-canonical `code_sha`, `data_identity`, `config_identity`, and
-`experiment_identity` objects. This prevents a five-day observation window
-from silently mixing code, data, configuration, or experiment revisions.
+canonical `code_sha`, `data_lineage_identity`, `config_identity`,
+`experiment_identity`, and `production_state` objects (epoch schema v2).
+Stable lineage explicitly records `source`, `schema`, `routing`, `universe`,
+`calendar_source`, `calendar_version`, and `lineage_sha`. These fields describe
+the frozen data contract; daily artifact hashes cannot be added to this object.
+Daily `data_identity.data_sha` and source/snapshot/positions/orders/fills hashes
+remain in each bundle, so changing market artifacts does not restart the window.
+Changing code, configuration, experiment, stable lineage, or production state
+does change the epoch.
 
 The evidence builders also require the non-promoted runtime state to be
 explicitly recorded: `RANK_BY_FUSION=0`, `DRL_PLAN_MODE=shadow`,
 `FUSION_WEIGHT_MODE=shadow`, `TRADE_BROKER=paper`, and
 `alpha_evidence_status=not_promotable`. Missing or non-shadow values block
 evidence construction rather than producing a misleading qualified day.
+New epochs and producers require
+`drl_plan_mode_contract=implemented_default_shadow`. Historical v1 epochs and
+pre-epoch Phase A bundles remain verifiable, including their original
+`not_implemented` contract; verification never rewrites them. A v2 manifest must
+also agree with the epoch embedded in its artifact identity. OOS composition
+continues to reject mixed epochs.
 
 ## Daily holdings and cost evidence
 

@@ -127,6 +127,11 @@ def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None, produ
         run_id=run_id,
         code_sha="code-sha-1",
         data_identity={"data_sha": "data-sha-1", "source": "fixture"},
+        data_lineage_identity={
+            "source": "fixture", "schema": "v1", "routing": "h5i-primary",
+            "universe": "a-share-v1", "calendar_source": "official-fixture",
+            "calendar_version": "2026-v1", "lineage_sha": "lineage-sha-1",
+        },
         config_identity={"config_sha": "config-sha-1", "version": "paper-v1"},
         snapshot=snapshot,
         artifacts=artifacts,
@@ -137,7 +142,7 @@ def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None, produ
             "FUSION_WEIGHT_MODE": "shadow",
             "TRADE_BROKER": "paper",
             "alpha_evidence_status": "not_promotable",
-            "drl_plan_mode_contract": "not_implemented",
+            "drl_plan_mode_contract": "implemented_default_shadow",
         },
         reference_equity=100_000.0,
         reference_timestamp="2026-10-08T09:25:00+08:00",
@@ -162,12 +167,66 @@ def test_bundle_is_deterministic_and_contains_raw_and_derived_evidence(tmp_path)
     assert first.manifest["observation_epoch"]["identity"]["code_sha"] == request.code_sha
     assert first.manifest["production_state"]["RANK_BY_FUSION"] == "0"
     assert first.manifest["production_state"]["alpha_evidence_status"] == "not_promotable"
-    assert first.manifest["production_state"]["drl_plan_mode_contract"] == "not_implemented"
+    assert first.manifest["production_state"]["drl_plan_mode_contract"] == "implemented_default_shadow"
     assert (first.path / "manifest.json").is_file()
     assert (first.path / "raw" / "snapshot.json").is_file()
     assert (first.path / "derived" / "turnover.json").is_file()
     assert (first.path / "derived" / "cost_records.jsonl").is_file()
     assert verify_bundle(first.path)["bundle_id"] == first.bundle_id
+
+
+def _canonical_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def test_new_bundle_rejects_unimplemented_drl_contract(tmp_path):
+    state = dict(_request(tmp_path).production_state)
+    state["drl_plan_mode_contract"] = "not_implemented"
+    with pytest.raises(ValueError, match="implemented_default_shadow"):
+        _request(tmp_path, run_id="new-contract", production_state=state)
+
+
+@pytest.mark.parametrize("with_epoch", [False, True])
+def test_legacy_phase_a_bundle_verifies_with_unimplemented_contract(tmp_path, with_epoch):
+    # Recreate the historical manifest contract independently in temporary output.
+    result = build_bundle(_request(tmp_path))
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    identity = manifest["bundle_identity"]
+    identity.pop("data_lineage_identity")
+    manifest.pop("data_lineage_identity")
+    state = {**manifest["production_state"], "drl_plan_mode_contract": "not_implemented"}
+    identity["production_state"] = manifest["production_state"] = state
+    if with_epoch:
+        epoch_identity = {"schema_version": 1, **{key: identity[key] for key in (
+            "code_sha", "data_identity", "config_identity", "experiment_identity",
+        )}}
+        epoch = {"schema_version": 1, "epoch_id": _canonical_digest(epoch_identity),
+                 "identity": epoch_identity}
+        identity["observation_epoch"] = manifest["observation_epoch"] = epoch
+    else:
+        identity.pop("observation_epoch")
+        manifest.pop("observation_epoch")
+    manifest["bundle_id"] = _canonical_digest(identity)
+    manifest["manifest_hash"] = _canonical_digest({k: v for k, v in manifest.items() if k != "manifest_hash"})
+    legacy_path = result.path.with_name(manifest["bundle_id"])
+    result.path.rename(legacy_path)
+    (legacy_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert verify_bundle(legacy_path)["production_state"]["drl_plan_mode_contract"] == "not_implemented"
+
+
+@pytest.mark.parametrize("mutation", ["state", "missing_epoch"])
+def test_v2_manifest_cannot_disagree_with_bound_epoch(tmp_path, mutation):
+    result = build_bundle(_request(tmp_path))
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    if mutation == "state":
+        manifest["production_state"]["DRL_PLAN_MODE"] = "enforce"
+    else:
+        manifest.pop("observation_epoch")
+    manifest["manifest_hash"] = _canonical_digest({k: v for k, v in manifest.items() if k != "manifest_hash"})
+    (result.path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(BundleBuildError, match="observation_epoch"):
+        verify_bundle(result.path)
 
 
 def test_bundle_requires_explicit_shadow_runtime_state(tmp_path):
