@@ -1,8 +1,13 @@
 # 部署指南
 
+完整生产运行时统一使用仓库根目录的 `.venv310`。它必须同时能够导入
+`h5i_db`、`torch`、`stable_baselines3` 和 `vnpy`；`.venv314` 仅用于纯 Python
+研究和兼容性回归，不通过 `PYTHONPATH` 混用两个环境的 site-packages。
+
 ## 1. 环境准备
 
-- Python 3.14(核心依赖见 `requirements_314.txt`)
+- Python 3.10.11（完整运行时由 `scripts/setup_py310_drl_venv.ps1` 创建）
+- Python 3.14 可作为纯 Python 研究/兼容性回归环境
 - 轻量运行(选股/门控/回测/检测):numpy, pandas, scipy, scikit-learn, h5py, pyarrow
 - DRL 链路(可选):torch, stable-baselines3, gymnasium
 - 数据:需自行准备本地行情/财务/估值数据(推荐 free-stockdb / CNEquity 镜像)
@@ -30,13 +35,13 @@ python -m pytest tests/ -q        # 自检
 ## 3. 运行模式
 
 ```bash
-# 一次性/日频
-python src/run_daily.py                    # 收盘选股主流程
-python src/gate_refresh_daemon.py          # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
+# 一次性/日频（使用 .venv310）
+.venv310\Scripts\python.exe src/run_daily.py # 收盘选股主流程
+.venv310\Scripts\python.exe src/gate_refresh_daemon.py # IC 缓存刷新守护 (交易日 16:05-16:50 窗口)
 # 估值补丁观察：当前公开 checkout 未包含 sentinel_daemon.py，按 docs/patch-retirement-watch.md 人工验收
-python src/daemon.py                       # 交易日守护: 引擎 08:30 / 收盘选股 **19:10** / 崩溃自动拉起
-python src/realtime_engine.py --once       # 盘中撮合单次
-python src/dashboard.py --port 8000        # Web 面板 (⚠ 解释器须有 h5i_db, 见 README)
+.venv310\Scripts\python.exe src/daemon.py                 # 交易日守护
+.venv310\Scripts\python.exe src/realtime_engine.py --once # 盘中撮合单次
+.venv310\Scripts\python.exe src/dashboard.py --port 8000  # Web 面板
 
 # 后台常驻(观测栈 + 上述守护) 一键拉起, 幂等, 重复执行不会起第二个
 powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1

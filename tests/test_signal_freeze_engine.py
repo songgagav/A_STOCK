@@ -2,9 +2,12 @@
 """09:25 冻结在引擎侧的 fail-closed 契约。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
@@ -25,6 +28,19 @@ _AT_0924 = datetime(2026, 10, 3, 9, 24, 59, tzinfo=_SH)
 _AT_0925 = datetime(2026, 10, 3, 9, 25, 0, tzinfo=_SH)
 _AFTER_0925 = datetime(2026, 10, 3, 9, 26, 0, tzinfo=_SH)
 _TARGETS = [{"canon": "600000.SH", "target_weight": 1.0}]
+
+
+@pytest.fixture(params=["naive", "utc", "shanghai"])
+def runtime_clock(request):
+    """同一上海时刻的无时区、UTC 和上海输入。"""
+    def represent(local_at):
+        if request.param == "naive":
+            return local_at.replace(tzinfo=None)
+        if request.param == "utc":
+            return local_at.astimezone(timezone.utc)
+        return local_at
+
+    return represent
 
 
 @pytest.fixture
@@ -61,12 +77,32 @@ def engine(monkeypatch, tmp_path):
     instance._rebalance = Mock()
     instance.in_session = Mock(return_value=True)
     monkeypatch.setattr(RE, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(RE, "DAILY_DIR", str(tmp_path / "daily"))
+    monkeypatch.setattr("deadman_switch.beat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         RE,
         "load_targets",
         lambda _day: ([dict(item) for item in _TARGETS], {"top_n": _TARGETS}, "20261002"),
     )
     return instance
+
+
+@pytest.fixture
+def runtime_engine(engine, monkeypatch, tmp_path):
+    """保留真实时段判断、账本、状态写入和快照读写，只隔离外部依赖。"""
+    engine.pb = PaperBook()
+    engine.pb.trade_date = engine.cur_day
+    engine.pb.day = engine.cur_day
+    engine.in_session = RE.RealtimeEngine.in_session
+    engine._write_state = RE.RealtimeEngine._write_state.__get__(engine)
+    engine._tick_ms = deque()
+    engine.midday_targets = None
+    engine.midday_result = None
+    engine.degraded = None
+    monkeypatch.setattr("trading_calendar.is_trading_day", lambda _now: True)
+    monkeypatch.setattr(RE, "LIVE_STATE", str(tmp_path / "live_state.json"))
+    monkeypatch.setattr(RE, "STATE_FILE", str(tmp_path / "state.json"))
+    return engine
 
 
 def test_missing_or_invalid_mode_control_defaults_to_shadow(tmp_path):
@@ -90,27 +126,54 @@ def test_paper_book_rejects_nonpaper_broker_at_order_entry(monkeypatch):
         book.buy("600000.SH", 100, 10.0)
 
 
-def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path):
+def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path, runtime_clock):
     """09:25 仅此一次重新解析、加权、原子写入并复读校验。"""
-    targets, _sel, _source_day, meta = engine._freeze_or_load_targets(_AT_0925)
+    targets, _sel, _source_day, meta = engine._freeze_or_load_targets(runtime_clock(_AT_0925))
 
     assert targets == _TARGETS
     assert meta["snapshot_status"] == "ready"
     persisted = read_snapshot(str(tmp_path), "20261003")
     assert persisted["status"] == "ready"
     assert persisted["snapshot"]["weights"] == {"600000.SH": 1.0}
+    assert persisted["snapshot"]["generated_at"] == "2026-10-03T09:25:00+08:00"
+    assert persisted["snapshot"]["generated_at_utc"] == "2026-10-03T01:25:00Z"
+    assert meta["snapshot_hash"] == persisted["snapshot"]["snapshot_hash"]
 
 
-def test_before_cutoff_keeps_live_resolution_for_preparation(engine):
+def test_drl_selection_receipt_points_to_consumed_target_plan(engine, monkeypatch, tmp_path):
+    """DRL receipts hash the plan file, not a same-day selection decoy."""
+    root = tmp_path / "repo"
+    data = root / "data"
+    plan = data / "drl" / "20261002" / "target_plan.json"
+    selection_file = data / "daily" / "20261002" / "selection.json"
+    plan.parent.mkdir(parents=True)
+    selection_file.parent.mkdir(parents=True)
+    plan.write_text("{}", encoding="utf-8")
+    selection_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(RE, "_BASE", str(root))
+    monkeypatch.setattr(RE, "DATA_DIR", str(data))
+    selection = {"source": "drl_plan", "top_n": _TARGETS}
+
+    artifacts = engine._snapshot_artifacts("20261002", selection)
+
+    assert engine._snapshot_source_tier(selection) == "drl_plan"
+    assert len(artifacts) == 1
+    assert (root / artifacts[0]["path"]).resolve() == plan.resolve()
+
+
+def test_before_cutoff_keeps_live_resolution_for_preparation(engine, tmp_path, runtime_clock):
     """09:25 前只允许准备候选，不得写出权威冻结结论。"""
-    targets, _sel, _source_day, meta = engine._freeze_or_load_targets(_AT_0924)
+    targets, _sel, _source_day, meta = engine._freeze_or_load_targets(runtime_clock(_AT_0924))
 
     assert targets == _TARGETS
     assert meta["snapshot_status"] == "pending"
     assert engine._freeze_attempted is False
+    assert read_snapshot(str(tmp_path), "20261003")["status"] == "missing"
 
 
-def test_after_cutoff_reads_verified_snapshot_without_live_resolve(engine, monkeypatch, tmp_path):
+def test_after_cutoff_reads_verified_snapshot_without_live_resolve(
+    engine, monkeypatch, tmp_path, runtime_clock,
+):
     """冻结窗口结束后唯一权威来源是已落盘快照，而非实时五级解析器。"""
     snapshot = build_snapshot(
         "20261003", _TARGETS, "selection_same_day", "20261002", [], _AT_0925, _REPO,
@@ -119,11 +182,68 @@ def test_after_cutoff_reads_verified_snapshot_without_live_resolve(engine, monke
     engine._freeze_attempted = True
     monkeypatch.setattr(RE, "load_targets", Mock(side_effect=AssertionError("不得实时重算")))
 
-    targets, _sel, source_day, meta = engine._freeze_or_load_targets(_AFTER_0925)
+    targets, _sel, source_day, meta = engine._freeze_or_load_targets(runtime_clock(_AFTER_0925))
 
     assert targets == _TARGETS
     assert source_day == "20261002"
     assert meta["snapshot_status"] == "ready"
+
+
+def test_run_tick_runtime_clock_persists_and_reads_ready_snapshot(
+    runtime_engine, runtime_clock, monkeypatch, tmp_path,
+):
+    """真实 tick 跨越冻结边界，且 UTC 09:30 等价时刻进入交易时段。"""
+    runtime_engine.run_tick(now=runtime_clock(_AT_0924))
+    assert runtime_engine.snapshot_status == "pending"
+    assert read_snapshot(str(tmp_path), "20261003")["status"] == "missing"
+
+    runtime_engine.run_tick(now=runtime_clock(_AT_0925))
+    persisted = read_snapshot(str(tmp_path), "20261003")
+    assert runtime_engine.snapshot_status == "ready"
+    assert persisted["status"] == "ready"
+    snapshot = persisted["snapshot"]
+    assert snapshot["targets"] == _TARGETS
+    assert snapshot["generated_at"] == "2026-10-03T09:25:00+08:00"
+    assert snapshot["generated_at_utc"] == "2026-10-03T01:25:00Z"
+    live = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert live["snapshot_status"] == "ready"
+    assert live["snapshot_hash"] == snapshot["snapshot_hash"]
+    persisted_path = Path(RE.snapshot_path(str(tmp_path), "20261003"))
+    assert live["snapshot_ref"] == str(persisted_path)
+    assert live["in_session"] is False
+
+    monkeypatch.setattr(RE, "load_targets", Mock(side_effect=AssertionError("不得实时重算")))
+    frozen_bytes = persisted_path.read_bytes()
+    for local_at, in_session in [
+        (_AFTER_0925, False),
+        (datetime(2026, 10, 3, 9, 30, tzinfo=_SH), True),
+    ]:
+        runtime_engine.run_tick(now=runtime_clock(local_at))
+        live = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+        assert live["snapshot_status"] == "ready"
+        assert live["snapshot_hash"] == snapshot["snapshot_hash"]
+        assert live["in_session"] is in_session
+        assert read_snapshot(str(tmp_path), "20261003")["status"] == "ready"
+        assert persisted_path.read_bytes() == frozen_bytes
+
+
+def test_run_tick_default_clock_persists_ready_snapshot(runtime_engine, monkeypatch, tmp_path):
+    """未显式传入 now 的真实运行路径也能在 09:25 落盘并复读。"""
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _AT_0925.replace(tzinfo=None) if tz is None else _AT_0925.astimezone(tz)
+
+    monkeypatch.setattr(RE, "datetime", FrozenDatetime)
+    runtime_engine.run_tick()
+
+    persisted = read_snapshot(str(tmp_path), "20261003")
+    assert runtime_engine.snapshot_status == "ready"
+    assert persisted["status"] == "ready"
+    assert persisted["snapshot"]["generated_at"] == "2026-10-03T09:25:00+08:00"
+    live = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert live["snapshot_status"] == "ready"
+    assert live["snapshot_hash"] == persisted["snapshot"]["snapshot_hash"]
 
 
 def test_nonready_snapshot_is_latched_for_the_rest_of_the_day(engine, tmp_path):

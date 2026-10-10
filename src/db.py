@@ -720,6 +720,7 @@ class StockDB:
 
         as_of: P4 支持 no-lookahead 回测——限定只取 date <= as_of 的K线，
                避免用 day 之后未来K线计算当日因子/信号造成前视偏差。
+        attrs["backend_source"] 记录实际返回数据的后端，而非配置期望值。
         """
         if _h5i_enabled():
             try:
@@ -743,14 +744,18 @@ class StockDB:
                             keep = [c for c in ("date", "open", "high", "low", "close",
                                                 "volume", "amount", "change_pct")
                                     if c in df.columns]
-                            return df[keep].sort_values("date").reset_index(drop=True)
+                            df = df[keep].sort_values("date").reset_index(drop=True)
+                            df.attrs["backend_source"] = "h5i"
+                            return df
                 s = _h5i_store()
                 df = s.bars(_canon_to_db(canon), end=as_of)
                 if df is not None and not df.empty:
                     df = df.tail(n).rename(columns={"d": "date"})
                     keep = [c for c in ("date", "open", "high", "low", "close",
                                         "volume", "amount", "change_pct") if c in df.columns]
-                    return df[keep].sort_values("date").reset_index(drop=True)
+                    df = df[keep].sort_values("date").reset_index(drop=True)
+                    df.attrs["backend_source"] = "h5i"
+                    return df
             except Exception:
                 pass
             # h5i 模式兜底: DuckDB 已退役时不再回退 duck 源 (降级为空)
@@ -803,8 +808,10 @@ class StockDB:
                 except Exception:
                     pass
         if df.empty:
+            df.attrs["backend_source"] = "duckdb"
             return df
         df = df.sort_values("date").reset_index(drop=True)
+        df.attrs["backend_source"] = "duckdb"
         return df
 
     def _get_bars_fallback(self, canon: str, n: int, as_of=None) -> pd.DataFrame:

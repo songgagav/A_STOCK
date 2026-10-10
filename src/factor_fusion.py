@@ -46,6 +46,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from strategy_contract import FusionContractError, fusion_missing_policy, fusion_weight_mode
+
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 H5I_DB_PATH = os.path.join(_BASE, "data", "h5i", "market.db")
@@ -763,13 +765,14 @@ def gp4_watch_scores(df: pd.DataFrame) -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------
 # fusion_or_fml 统一入口 (替换点共用)
 # ---------------------------------------------------------------------------
-def fusion_or_fml(items: list[dict], as_of: str):
+def fusion_or_fml(items: list[dict], as_of: str, mode: str | None = None):
     """集中打分入口: 先 fusion, 失败/低覆盖回退旧 f_ml, 再空则 equal.
 
     Returns (scores_dict: {canon: float}, used: 'fusion'|'fml_fallback'|'equal')
     canon 为 items 中的原始 canon (600519.SH 等). 绝不抛异常.
     """
     from datetime import date as _date
+    effective_mode = mode or fusion_weight_mode()
     raw_asof = str(as_of or "").strip()
     as_of = raw_asof[:10] if raw_asof else _date.today().strftime("%Y-%m-%d")
     canons = [str(t.get("canon") or "").strip() for t in items]
@@ -797,7 +800,7 @@ def fusion_or_fml(items: list[dict], as_of: str):
     if req_n == 0:
         return _finish("equal", {})
 
-    if _is_on():
+    if effective_mode != "off" and _is_on():
         try:
             r = cross_section_scores(as_of, symbols=canons)
             sc_all = r.get("scores") or {}
@@ -805,7 +808,10 @@ def fusion_or_fml(items: list[dict], as_of: str):
             sc = {c: sc_all[code] for c, code in zip(canons, codes)
                   if code in sc_all}
             cov = len(sc) / req_n if req_n else 0.0
-            if (r.get("n_scored") or 0) >= MIN_POOL_N and cov >= MIN_COVERAGE:
+            coverage_ok = cov >= MIN_COVERAGE
+            if fusion_missing_policy() == "blocked":
+                coverage_ok = coverage_ok and cov >= 1.0
+            if (r.get("n_scored") or 0) >= MIN_POOL_N and coverage_ok:
                 _LOG.info("[fusion_or_fml] fusion OK as_of=%s pool=%d scored=%d cov=%.2f",
                           r.get("as_of"), r.get("n_pool", 0), len(sc_all), cov)
                 return _finish("fusion", sc)
@@ -819,10 +825,23 @@ def fusion_or_fml(items: list[dict], as_of: str):
             _LOG.warning("[fusion_or_fml] fusion 异常回退 f_ml: %s: %s",
                          type(e).__name__, e)
     else:
-        st["degrade_reason"] = "融合被禁用(FORCE_FML/FUSION_SCORE)"
+        st["degrade_reason"] = ("融合被禁用(FUSION_WEIGHT_MODE=off/FORCE_FML/FUSION_SCORE)"
+                                 if effective_mode == "off"
+                                 else "融合被禁用(FORCE_FML/FUSION_SCORE)")
         _LOG.info("[fusion_or_fml] 融合被禁用(FORCE_FML/FUSION_SCORE) -> f_ml 路径")
 
-    # 旧路径回退
+    if effective_mode == "enforce":
+        st["used"] = "blocked"
+        st["n"] = 0
+        st["coverage"] = 0.0
+        st["degraded"] = True
+        st["checked_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        _record_fusion_state("blocked", st)
+        raise FusionContractError(st.get("degrade_reason") or "Fusion enforce blocked")
+
+    # 旧路径回退 is permitted only outside enforce mode.  In shadow it is
+    # evidence/degradation output and must not be used as an authoritative
+    # target-weight result by target_weighting.
     try:
         from ml_fusion_bridge import compute_fml
         res = compute_fml(canons, as_of)

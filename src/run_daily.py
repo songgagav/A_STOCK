@@ -13,6 +13,8 @@ from config import DATA_DIR, DAILY_DIR, MAX_STOCKS, PAPER, STATE_FILE
 from db import StockDB
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
+from strategy_contract import drl_plan_mode
+from signal_snapshot import read_snapshot, snapshot_path
 
 
 class _IngestSkipped(Exception):
@@ -25,6 +27,34 @@ class _IngestSkipped(Exception):
     归因错误) —— 故每个摄入步骤都先 `except _IngestSkipped: pass`。
     """
     pass
+
+
+def apply_incremental_reward_update(inc: dict, day: str) -> dict:
+    """Persist an optional recommendation and report the actual write outcome."""
+    from incremental_learn import get_reward_weight_state, set_reward_weights
+    receipt = {
+        "triggered": inc.get("triggered"), "samples_n": inc.get("samples_n"),
+        "worst_level": inc.get("degradation_worst_level"),
+        "overall_score": inc.get("degradation_overall_score"),
+        "reason": inc.get("reason"), "error": inc.get("error"),
+        "reward_config_written": False,
+    }
+    if not inc.get("triggered") or not inc.get("optimization"):
+        return receipt
+    rr = inc["optimization"].get("reward_rebalance") or {}
+    if rr.get("vnpy_weight") is None or rr.get("ic_weight") is None:
+        return receipt
+    written = set_reward_weights(
+        rr["vnpy_weight"], rr["ic_weight"], attr_weight=rr.get("attr_weight"),
+        source="incremental_learn", rationale=rr.get("rationale") or "incremental_learn triggered",
+        processing_day=day,
+    )
+    receipt["reward_config_written"] = written
+    if written:
+        receipt["reward_config_state"] = get_reward_weight_state()
+    else:
+        receipt["error"] = "reward_config validation or atomic write failed"
+    return receipt
 
 
 def self_closed_loop(day: str, day_dir: str, db) -> dict:
@@ -180,15 +210,15 @@ def portfolio_construction() -> dict:
     ## 为什么由回执侧算, 而不是让引擎写
 
     引擎(`realtime_engine`)是**盘中进程**, 它在 15:03 就退出了; 而回执在 19:10 生成。
-    故这里读引擎留下的 `data/live_state.json`(它含 `positions` 与 `targets` 快照)
-    与当天的 `target_plan.json` —— 两边都是**已落盘的事实**, 不新增进程间耦合。
+    故这里读引擎留下的 `live_state.json` 与其引用的权威冻结快照。
+    缺少内嵌目标时，只有 schema/内容哈希、日期及回执哈希均通过才报告建仓进度。
 
-    返回 `{}` 表示取不到数据(不臆造数字); 调用方据此记 `error`, 而不是记 0。
+    返回 `ok=False` 表示取不到有效证据(不臆造数字); 调用方据此记 `error`。
     """
     out: dict = {"ok": False}
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        lv_fp = os.path.join(root, "data", "live_state.json")
+        lv_fp = os.path.join(DATA_DIR, "live_state.json")
         if not os.path.isfile(lv_fp):
             out["error"] = f"缺少 {lv_fp}"
             return out
@@ -197,23 +227,38 @@ def portfolio_construction() -> dict:
         pos = lv.get("positions") or []
         held = {str(p.get("canon")) for p in pos if isinstance(p, dict) and p.get("canon")}
         # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据);
-        # live_state 里有 targets 快照。若没有, 再退回当天 target_plan.json。
+        # 缺内嵌目标时必须验证冻结回执，shadow DRL plan 不能替代执行证据。
         tgt_list = lv.get("targets") or []
         if tgt_list:
             want = [str(t.get("canon")) for t in tgt_list
                     if isinstance(t, dict) and t.get("canon")]
             src = "live_state.targets"
         else:
-            plan_fp = os.path.join(root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
-                                   "target_plan.json")
-            if not os.path.isfile(plan_fp):
-                out["error"] = "live_state 无 targets 且找不到当日 target_plan.json"
+            day = str(lv.get("day") or "").replace("-", "")
+            ref = str(lv.get("snapshot_ref") or "").strip()
+            expected_hash = str(lv.get("snapshot_hash") or "").strip()
+            if lv.get("snapshot_status") != "ready" or not ref or not expected_hash:
+                out["error"] = "缺少 ready snapshot_ref/snapshot_hash 回执"
                 return out
-            with open(plan_fp, encoding="utf-8-sig") as f:
-                plan = json.load(f)
-            want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
-                    if isinstance(t, dict) and t.get("canon")]
-            src = "target_plan.top_n"
+            ref_path = ref if os.path.isabs(ref) else os.path.join(root, ref)
+            authoritative = snapshot_path(DATA_DIR, day)
+            if (os.path.normcase(os.path.realpath(ref_path))
+                    != os.path.normcase(os.path.realpath(authoritative))):
+                out["error"] = "snapshot_ref 不是当日权威 signal snapshot"
+                return out
+            receipt = read_snapshot(DATA_DIR, day)
+            if receipt["status"] != "ready":
+                out["error"] = f"signal_snapshot {receipt['status']}: {receipt['reason']}"
+                return out
+            snapshot = receipt["snapshot"]
+            if expected_hash != snapshot["snapshot_hash"]:
+                out["error"] = "live_state snapshot_hash 与已校验快照不一致"
+                return out
+            want = [t["canon"] for t in snapshot["targets"]]
+            if not want:
+                out["error"] = "signal_snapshot 中没有有效 targets"
+                return out
+            src = "signal_snapshot"
 
         cap = lv.get("capital") or {}
         equity = float(cap.get("equity") or 0) or 1.0
@@ -1144,10 +1189,27 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # （环境已损坏, 用陈旧模型下单的风险高于停一天）。
         _drl_probe = None
         _drl_forced = None
+        _drl_mode = drl_plan_mode()
+        report["steps"]["drl_plan_mode"] = {
+            "mode": _drl_mode,
+            "shadow_non_consumable": _drl_mode == "shadow",
+            "production_gate": "strategy_contract",
+        }
+        if _drl_mode == "off":
+            report["steps"]["drl_train"] = {
+                "ok": True,
+                "skipped": "drl_plan_mode_off",
+                "mode": _drl_mode,
+            }
         try:
             import drl_degrade
-            _drl_probe = drl_degrade.probe_runtime()
+            if _drl_mode == "off":
+                _drl_probe = {"ok": False, "skipped": "mode_off"}
+            else:
+                _drl_probe = drl_degrade.probe_runtime()
             if not _drl_probe.get("ok"):
+                if _drl_mode == "off":
+                    raise _IngestSkipped("DRL_PLAN_MODE=off")
                 _why = (f"DRL 运行环境不可用: 缺 {'/'.join(_drl_probe['missing'])} "
                         f"(python={_drl_probe['python']}); "
                         f"决策 D: 显式置 L3 且不回退旧模型")
@@ -1157,20 +1219,23 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
                     "error": _why, "degrade": _drl_forced, "probe": _drl_probe,
                 }
                 print(f"[run_daily] DRL L3（显式暂停）: {_why}")
+        except _IngestSkipped:
+            pass
         except Exception as e:
             report["steps"]["drl_probe"] = {"ok": False, "error": str(e)[:200]}
 
         if _drl_forced is None:
-            try:
-                from drl_train import run_drl_train
-                from config import CVAR_PPO as _CVAR_CFG
-                report["steps"]["drl_train"] = run_drl_train(
-                    day, total_timesteps=800,
-                    cvar_alpha=_CVAR_CFG["cvar_alpha"],
-                    cvar_coef=_CVAR_CFG["cvar_coef"],
-                )
-            except Exception as e:
-                report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
+            if _drl_mode != "off":
+                try:
+                    from drl_train import run_drl_train
+                    from config import CVAR_PPO as _CVAR_CFG
+                    report["steps"]["drl_train"] = run_drl_train(
+                        day, total_timesteps=800,
+                        cvar_alpha=_CVAR_CFG["cvar_alpha"],
+                        cvar_coef=_CVAR_CFG["cvar_coef"],
+                    )
+                except Exception as e:
+                    report["steps"]["drl_train"] = {"ok": False, "error": str(e)[:200]}
 
         # ===== DRL 降级状态进每日复盘（可见性: 用户要求"每日复盘告警可见"）=====
         # 无论走哪条路径都写: 复盘要能一眼看到 DRL 当前级别与最近一次降级事件。
@@ -1415,27 +1480,9 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # 6.5) 增量学习闭环: 退化检测 + (P0/P1 触发) LLM 调参 + 写 reward_config.
         #     异常一律容错, 不阻断主流程.
         try:
-            from incremental_learn import run_incremental_learn, set_reward_weights
+            from incremental_learn import run_incremental_learn
             inc = run_incremental_learn(day, days=10, trigger_threshold="P1")
-            report["steps"]["incremental_learn"] = {
-                "triggered": inc.get("triggered"),
-                "samples_n": inc.get("samples_n"),
-                "worst_level": inc.get("degradation_worst_level"),
-                "overall_score": inc.get("degradation_overall_score"),
-                "reason": inc.get("reason"),
-                "error": inc.get("error"),
-            }
-            # 若 LLM 触发并给出 reward_rebalance, 写入 reward_config
-            if inc.get("triggered") and inc.get("optimization"):
-                rr = inc["optimization"].get("reward_rebalance") or {}
-                vw = rr.get("vnpy_weight")
-                iw = rr.get("ic_weight")
-                if vw is not None and iw is not None:
-                    rationale = rr.get("rationale") or "incremental_learn triggered"
-                    set_reward_weights(float(vw), float(iw),
-                                       source="incremental_learn",
-                                       rationale=rationale)
-                    report["steps"]["incremental_learn"]["reward_config_written"] = True
+            report["steps"]["incremental_learn"] = apply_incremental_reward_update(inc, day)
         except Exception as e:
             report["steps"]["incremental_learn"] = {"error": str(e)[:200]}
 

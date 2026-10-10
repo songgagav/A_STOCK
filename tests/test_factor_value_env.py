@@ -69,7 +69,7 @@ def test_factor_value_env_no_regime():
 
 
 def test_factor_value_env_with_brief():
-    """传入 brief 情绪因子后观测向量对应位置正确."""
+    """当日 brief 不得广播到历史训练观测; 保留原观测维度."""
     T = 60
     n_factors = 4
     fv = np.random.randn(T, n_factors).astype(np.float32) * 0.5
@@ -88,11 +88,10 @@ def test_factor_value_env_with_brief():
     sent_start = 5 * 4  # 20
     sent_end = sent_start + 4  # 24
     np.testing.assert_array_almost_equal(
-        obs[sent_start:sent_end], [0.8, -0.3, 0.1, 0.5], decimal=5
+        obs[sent_start:sent_end], [0.0, 0.0, 0.0, 0.0], decimal=5
     )
-    # stance = 1.4 (加仓)
-    assert abs(obs[24] - 1.4) < 1e-5, f"stance 应为 1.4, 实际 {obs[24]}"
-    print("4. 情绪因子 + stance 映射正确: OK")
+    assert obs[24] == 1.0
+    print("4. 历史情绪与 stance 保持中性: OK")
 
 
 if __name__ == "__main__":
@@ -115,11 +114,8 @@ if __name__ == "__main__":
     obs, _ = env.reset()
     sent_start = 5 * 4
     sent_end = sent_start + 4
-    assert abs(obs[sent_start] - 0.8) < 1e-5
-    assert abs(obs[sent_start + 1] - (-0.3)) < 1e-5
-    assert abs(obs[sent_start + 2] - 0.1) < 1e-5
-    assert abs(obs[sent_start + 3] - 0.5) < 1e-5
-    assert abs(obs[24] - 1.4) < 1e-5
-    print("4. 情绪因子 + stance 映射正确: OK")
+    np.testing.assert_array_equal(obs[sent_start:sent_end], np.zeros(4))
+    assert obs[24] == 1.0
+    print("4. 历史情绪与 stance 保持中性: OK")
 
     print("\n所有 FactorValueEnv 测试通过!")

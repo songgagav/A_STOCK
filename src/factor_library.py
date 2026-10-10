@@ -82,18 +82,28 @@ def build_adj_close(df: pd.DataFrame) -> pd.Series:
 #   _mf_net_score. 语义与旧版一致 (线性裁切映射到 0..1), 使 realtime_engine 可导入.
 # ---------------------------------------------------------------------------
 def selector_weights(as_of: str | None = None) -> dict:
-    """旧打分权重: 返回 config.SCORE_WEIGHTS 副本, 并经因子健康处置 (失效因子隔离).
+    """Return the single effective selector-weight payload.
 
     as_of (2026-09-13 新增): 历史日期 -> 用**该日及之前**的 IC 曲线判隔离, 消除
     "用今天的 IC 给历史定权重"的前视; None = 实盘(取曲线末尾)。
+
+    ``weight_optimizer.load_weights`` is the sole dynamic source.  The
+    configuration remains the explicit fallback when no valid dynamic file is
+    available; callers never read ``weights.json`` independently.
     """
     try:
         from config import SCORE_WEIGHTS
-        W = dict(SCORE_WEIGHTS)
+        from weight_optimizer import load_weights
+        static = dict(SCORE_WEIGHTS)
+        W = dict(static)
+        W.update(load_weights())
     except Exception:
         W = {"signal": 0.34, "trend": 0.14, "govern": 0.16, "liquidity": 0.08,
              "vol": 0.10, "mom_rev": 0.0, "pb_rev": 0.06, "roe": 0.06, "mf_net": 0.06}
     _apply_factor_health(W, as_of=as_of)
+    total = sum(float(v) for v in W.values() if np.isfinite(float(v)) and float(v) >= 0)
+    if total > 0:
+        W = {key: max(0.0, float(value)) / total for key, value in W.items()}
     return W
 
 

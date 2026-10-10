@@ -16,6 +16,9 @@ Promotion requires all of the following:
 - every difference has one of `expected_timing`, `data_refresh`,
   `source_disagreement`, or `unexplained`;
 - reviewer and evidence references are recorded for every day;
+- all five rows reference one unchanged `observation_epoch_id` binding the
+  code, stable data-lineage, configuration, experiment, and production-state
+  identities (Observation Epoch v2; daily artifact hashes are separate);
 - `TRADE_BROKER=paper` is confirmed;
 - no broker credential, order API, or real-account side effect is enabled;
 - a human approves the promotion and records the approval in
@@ -36,13 +39,13 @@ observation window; investigate and record the difference first.
 
 ## Daily evidence
 
-| Trading day | Snapshot status/hash | Late candidates | Differences | Classification(s) | Reviewer | Evidence path | Notes |
-|---|---|---:|---:|---|---|---|---|
-| YYYY-MM-DD |  |  |  |  |  |  |  |
-| YYYY-MM-DD |  |  |  |  |  |  |  |
-| YYYY-MM-DD |  |  |  |  |  |  |  |
-| YYYY-MM-DD |  |  |  |  |  |  |  |
-| YYYY-MM-DD |  |  |  |  |  |  |  |
+| Trading day | Observation epoch ID | Snapshot status/hash | Late candidates | Differences | Classification(s) | Reviewer | Evidence path | Notes |
+|---|---|---|---:|---:|---|---|---|---|
+| YYYY-MM-DD |  |  |  |  |  |  |  |  |
+| YYYY-MM-DD |  |  |  |  |  |  |  |  |
+| YYYY-MM-DD |  |  |  |  |  |  |  |  |
+| YYYY-MM-DD |  |  |  |  |  |  |  |  |
+| YYYY-MM-DD |  |  |  |  |  |  |  |  |
 
 ## Paper-only promotion approval
 

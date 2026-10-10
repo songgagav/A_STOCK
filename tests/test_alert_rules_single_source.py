@@ -37,6 +37,16 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: 仓库**外层**目录(obs-stack 与 A_stock_rotation 平级)
 _OUTER = os.path.dirname(_REPO)
 _PROM_YML = os.path.join(_OUTER, "obs-stack", "prometheus.yml")
+# linked worktree 的 sibling checkout 不属于 Prometheus 的搜索路径。
+# 普通 checkout 的 `.git` 是目录，保持原有的外层扫描范围不变；linked
+# worktree 的 `.git` 是文件，此时跳过整个共享 `.worktrees` 容器，避免把
+# 其它 checkout 的仓内 `ops/alert_rules.yml` 误报成仓外运行时副本。
+_WORKTREE_ROOT = (
+    os.path.dirname(_REPO)
+    if os.path.isfile(os.path.join(_REPO, ".git"))
+    and os.path.basename(os.path.dirname(_REPO)).lower() == ".worktrees"
+    else None
+)
 
 #: 用 `find_spec` 而不是 `import yaml`: 这样**不需要 yaml 的那条用例仍会真跑**。
 #: 模块级 `pytest.importorskip("yaml")` 会把整个文件跳掉(实测 .venv314 与 .venv310
@@ -327,6 +337,10 @@ class TestSingleSourceOfTruthForAlertRules:
             # 仓内那份是**唯一合法**的; 其它 git checkout 副本(_merge_workspace)不算陷阱,
             # 因为它们不在 Prometheus 的搜索路径上 —— 但 obs-stack 下必须是空的。
             if os.path.abspath(dp).lower().startswith(os.path.abspath(_REPO).lower()):
+                continue
+            if _WORKTREE_ROOT and os.path.abspath(dp).lower().startswith(
+                os.path.abspath(_WORKTREE_ROOT).lower() + os.sep
+            ):
                 continue
             for fn in fns:
                 if fn != "alert_rules.yml":

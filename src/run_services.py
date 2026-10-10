@@ -24,7 +24,34 @@ os.chdir(_BASE)
 
 from proc_alive import alive as _process_alive  # noqa: E402
 
-PY = sys.executable
+
+def _resolve_runtime_python(base=None, current_python=None, environ=None):
+    """Choose the interpreter used for spawned services."""
+
+    root = base or _BASE
+    current = current_python or sys.executable
+    env = os.environ if environ is None else environ
+
+    override = str(env.get("TRAE_PYTHON", "") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    current_abs = os.path.normcase(os.path.abspath(current))
+    project_runtimes = {
+        os.path.normcase(os.path.abspath(os.path.join(root, ".venv310", "Scripts", "python.exe"))),
+        os.path.normcase(os.path.abspath(os.path.join(root, ".venv314", "Scripts", "python.exe"))),
+    }
+    if current_abs in project_runtimes and os.path.isfile(current):
+        return current
+
+    preferred = os.path.join(root, ".venv310", "Scripts", "python.exe")
+    if os.path.isfile(preferred):
+        return preferred
+
+    return current
+
+
+PY = _resolve_runtime_python()
 PID_DIR = os.path.join(_BASE, "logs")
 ENGINE_PID = os.path.join(PID_DIR, "engine.pid")
 DASH_PID = os.path.join(PID_DIR, "dashboard.pid")
@@ -47,6 +74,37 @@ def _proc_alive(pid):
     return _process_alive(pid, unknown_means_alive=True)
 
 
+def _norm_path(path):
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
+
+
+def _cmdline_has_script(cmdline, script):
+    expected = _norm_path(os.path.join(_BASE, script))
+    return any(_norm_path(token) == expected for token in (cmdline or []))
+
+
+def _service_pid_state(pid, script):
+    """Classify a PID without treating unverifiable identity as a match."""
+
+    if not _proc_alive(pid):
+        return "stopped"
+    try:
+        import psutil
+    except Exception:
+        return "unknown"
+    try:
+        process = psutil.Process(int(pid))
+        return "matching" if _cmdline_has_script(process.cmdline(), script) else "mismatch"
+    except Exception:
+        return "unknown"
+
+
+def _service_pid_alive(pid, script):
+    """Preserve conservative startup/status semantics for unknown identity."""
+
+    return _service_pid_state(pid, script) in {"matching", "unknown"}
+
+
 def _write_pid(path, pid):
     os.makedirs(PID_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -54,14 +112,17 @@ def _write_pid(path, pid):
 
 
 def _spawn(name, script, args, pid_file, stdout_log):
-    alive = _proc_alive(_read_pid(pid_file))
-    if alive:
+    state = _service_pid_state(_read_pid(pid_file), script)
+    if state == "matching":
         log(f"{name} 已在运行 (pid={_read_pid(pid_file)})")
         return
+    if state == "unknown":
+        log(f"{name} PID 身份无法核验, 为避免重复启动暂不拉起")
+        return
     out = open(stdout_log, "a", encoding="utf-8")
-    p = subprocess.Popen([sys.executable, os.path.join(_BASE, script)] + args,
+    p = subprocess.Popen([PY, os.path.join(_BASE, script)] + args,
                          cwd=_BASE, stdout=out, stderr=out,
-                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     _write_pid(pid_file, p.pid)
     time.sleep(2)
     log(f"{name} 已启动 pid={p.pid} -> {stdout_log}")
@@ -76,24 +137,31 @@ def start():
     except Exception:
         tradable = date.today().weekday() < 5
     if tradable:
-        _spawn("盘中引擎", "realtime_engine.py", ["--interval", "15"], ENGINE_PID,
+        _spawn("盘中引擎", "src/realtime_engine.py", ["--interval", "15"], ENGINE_PID,
                os.path.join(PID_DIR, "live_engine.log"))
     else:
         log("非交易日(周末/节假日), 不启动盘中引擎 (可跑 run_daily.py --maint 做数据拉取+模型训练)")
-    _spawn("Web可视化", "dashboard.py", ["--port", "8000"], DASH_PID,
+    _spawn("Web可视化", "src/dashboard.py", ["--port", "8000"], DASH_PID,
            os.path.join(PID_DIR, "dashboard.log"))
 
 
 def stop():
-    for name, pid_file in (("Web可视化", DASH_PID), ("盘中引擎", ENGINE_PID)):
+    for name, script, pid_file in (
+        ("Web可视化", "src/dashboard.py", DASH_PID),
+        ("盘中引擎", "src/realtime_engine.py", ENGINE_PID),
+    ):
         pid = _read_pid(pid_file)
-        if _proc_alive(pid):
+        state = _service_pid_state(pid, script)
+        if state == "matching":
             try:
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                capture_output=True)
                 log(f"{name} 已停止 pid={pid}")
             except Exception as e:
                 log(f"{name} 停止失败: {e}")
+        elif state == "unknown":
+            log(f"{name} PID 身份无法核验, 为避免误杀暂不停止")
+            continue
         else:
             log(f"{name} 未在运行")
         if os.path.exists(pid_file):
@@ -106,8 +174,9 @@ def status():
         ("Web可视化", DASH_PID, "dashboard.py"),
     ):
         pid = _read_pid(pid_file)
-        alive = _proc_alive(pid)
-        log(f"{name}: pid={pid} {'运行中' if alive else '未运行'}")
+        state = _service_pid_state(pid, os.path.join("src", exe))
+        label = {"matching": "运行中", "unknown": "状态未知", "stopped": "未运行", "mismatch": "未运行"}[state]
+        log(f"{name}: pid={pid} {label}")
 
 
 if __name__ == "__main__":

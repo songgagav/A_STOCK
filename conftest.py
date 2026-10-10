@@ -3,6 +3,9 @@
 (config / factor_gate / ... 均位于 src/)."""
 import os
 import sys
+from pathlib import Path
+
+from ci_test_partition import should_ignore
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _SRC not in sys.path:
@@ -25,3 +28,13 @@ if _SRC not in sys.path:
 #   故它只是**第二层兜底**, 不替代 `testpaths`。
 # 只忽略 `data/` —— 不用宽泛的 `*_tmp*` 模式, 免得将来误伤合法用例名。
 collect_ignore_glob = ["data/*"]
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Partition core and DRL tests before pytest imports test modules."""
+
+    return should_ignore(
+        Path(collection_path),
+        os.environ.get("CI_TEST_PARTITION"),
+        Path(__file__).resolve().parent,
+    )

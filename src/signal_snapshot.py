@@ -10,10 +10,12 @@ import json
 import math
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from strategy_contract import TargetContractError, normalize_target_contract
 
 from utils import atomic_write_json
 
@@ -78,25 +80,12 @@ def _relative_artifacts(artifacts: list[dict[str, Any]], repo_root: str) -> list
 
 
 def _normalized_targets(targets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    if not isinstance(targets, list):
-        raise ValueError("targets 必须为列表")
-    normalized: list[dict[str, Any]] = []
-    weights: dict[str, float] = {}
-    for target in targets:
-        if not isinstance(target, dict):
-            raise ValueError("target 必须为对象")
-        canon = target.get("canon")
-        if not isinstance(canon, str) or not canon:
-            raise ValueError("target 缺少 canon")
-        if canon in weights:
-            raise ValueError(f"target 重复: {canon}")
-        weight = target.get("target_weight")
-        if not isinstance(weight, (int, float)) or isinstance(weight, bool) or not math.isfinite(weight):
-            raise ValueError(f"target_weight 非有限: {canon}")
-        copied = dict(target)
-        copied["target_weight"] = float(weight)
-        normalized.append(copied)
-        weights[canon] = float(weight)
+    try:
+        normalized = normalize_target_contract(targets, require_weights=True)
+    except TargetContractError as exc:
+        raise ValueError(str(exc)) from exc
+    weights = {str(target["canon"]): float(target["target_weight"])
+               for target in normalized}
     return normalized, weights
 
 
@@ -186,6 +175,29 @@ def _input_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _valid_generation_timestamp(snapshot: dict[str, Any], day: str) -> bool:
+    """Require matching Shanghai/UTC timestamps inside the 09:25 freeze minute."""
+    try:
+        generated_at = datetime.fromisoformat(snapshot["generated_at"])
+        utc_text = snapshot["generated_at_utc"]
+        if not isinstance(utc_text, str):
+            return False
+        generated_at_utc = datetime.fromisoformat(
+            utc_text[:-1] + "+00:00" if utc_text.endswith("Z") else utc_text
+        )
+        if generated_at.utcoffset() != timedelta(hours=8):
+            return False
+        if generated_at_utc.utcoffset() != timedelta(0):
+            return False
+        if generated_at.strftime("%Y%m%d") != day:
+            return False
+        if (generated_at.hour, generated_at.minute) != (9, 25):
+            return False
+        return generated_at.astimezone(timezone.utc) == generated_at_utc
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
     """验证已落盘快照；绝不以实时目标池替代失败的快照。"""
     if not isinstance(snapshot, dict) or not _required_snapshot_fields(snapshot):
@@ -200,12 +212,19 @@ def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
         return _invalid("invalid_snapshot_hash")
 
     try:
+        normalized_targets, normalized_weights = _normalized_targets(snapshot["targets"])
+        if normalized_targets != snapshot["targets"]:
+            return _invalid("non_canonical_targets")
         if sha256_json(_input_payload_from_snapshot(snapshot)) != snapshot["input_hash"]:
             return _tampered("input_hash_mismatch")
         hash_payload = dict(snapshot)
         hash_payload["snapshot_hash"] = None
         if sha256_json(hash_payload) != snapshot["snapshot_hash"]:
             return _tampered("snapshot_hash_mismatch")
+        if not _valid_generation_timestamp(snapshot, day):
+            return _invalid("invalid_generation_timestamp")
+        if normalized_weights != snapshot["weights"]:
+            return _invalid("target_weights_mismatch")
     except (TypeError, ValueError):
         return _invalid("non_canonical_snapshot")
     return {"status": "ready", "snapshot": snapshot, "reason": None}

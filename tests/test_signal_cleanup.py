@@ -26,6 +26,7 @@ from signal_snapshot import (  # noqa: E402
 SH = ZoneInfo("Asia/Shanghai")
 AT_1128 = datetime(2026, 10, 3, 11, 28, tzinfo=SH)
 AT_1500 = datetime(2026, 10, 3, 15, 0, tzinfo=SH)
+AT_0925 = datetime(2026, 12, 1, 9, 25, tzinfo=SH)
 TARGETS = [{"canon": "600000.SH", "target_weight": 1.0}]
 
 
@@ -92,7 +93,7 @@ def test_cleanup_does_not_delete_when_latest_snapshot_is_invalid(tmp_path):
 def test_cleanup_removes_t91_but_keeps_t90_after_valid_new_snapshot(tmp_path):
     days = [f"2026{month:02d}01" for month in range(1, 13)]
     latest = days[-1]
-    snapshot = build_snapshot(latest, TARGETS, "selection", latest, [], AT_1128, _REPO)
+    snapshot = build_snapshot(latest, TARGETS, "selection", latest, [], AT_0925, _REPO)
     write_snapshot(str(tmp_path), snapshot)
     old_day, boundary_day = days[0], days[1]
     for day in (old_day, boundary_day):
