@@ -6,8 +6,13 @@
 `17b7bf2a8ba7b5c687215abf40957c3c48a3f777`。PR #17、main、主工作树、历史
 Evidence 与运行数据均不修改；不合并、不关闭 PR、不 force-push。
 
-候选代码 SHA：`b030ef9fa4873dba81bd0d98cd5d81ee5e393103`。推送后仍须以 PR 同一 SHA
-的 GitHub checks 为准；本地 Python 3.10 结果不冒充远端 Python 3.11/3.12 结果。
+本地源代码修复提交：`b030ef9fa4873dba81bd0d98cd5d81ee5e393103`；本地代码/测试
+验证基线提交：`63a3439a0e41881682d36f697738d2e10a6caa7c`。本地到 GitHub 的 Git HTTPS
+连接不可达，因此通过 GitHub 对象接口发布快照提交 `5202ac1d463a08161beb3cc6f9469d967e5a990d`；
+其 tree `0d48e0bc0862e95c2c17f7263c01e20bafcbb1a9` 与该本地验证基线的完整 tree 完全一致。
+该发布提交的 GitHub Actions `ci-regression` #235（core 3.11/3.12、DRL、h5i）和
+`security-scans` #55 均已通过。之后仅对本报告作验收状态同步，源代码和测试文件未变。
+远端 Python 3.11/3.12 状态以对应 GitHub checks 为准。
 
 ## T01–T10 对照
 
@@ -46,9 +51,10 @@ Evidence 与运行数据均不修改；不合并、不关闭 PR、不 force-push
 7. reward 旧文件缺生效语义时降级到归一化默认，不猜日期。日历使用命名权威来源/现有 published-future-session 不变量，历史数据推导日期不当权威。未知日历保持 pending，需权威证据后重新生成；本轮不构建完整历史 reward config ledger。
 8. 当前 brief 只属于 inference；未知有效日期不填 requested day。生产 promotion gates 不变。没有发明 normal pipeline 的 PPO reward components，也未改网络/reward 算法。
 
-## 尚未完成的外部验收
+## 当前外部验收与剩余门禁
 
-- 将 `b030ef9fa4873dba81bd0d98cd5d81ee5e393103` 及本报告更新推送到 PR #18；同一最终 head 的 GitHub CI/security 检查待运行。
+- 已将 pre-observation hardening 上传到 PR #18（目标仍是 PR #17 的分支，不是 `main`）；发布提交 `5202ac1d463a08161beb3cc6f9469d967e5a990d` 的 tree 与本地代码/测试验证基线一致，远端 core 3.11/3.12、DRL、h5i 和 security-scans 全部通过。
+- PR #18 仍为 open/unmerged。本次通过 GitHub API 快进更新分支；本地原始提交历史保留，PR 远端提交 SHA 与本地提交 SHA 不同，但代码/测试树已逐对象核对一致。
 - PR 整合与实际部署 SHA 选择、解释器/PID 身份验证。
 - 在该部署身份下冻结 Observation Epoch v2、配置/lineage/production state。
 - 冻结后至少五个连续合格真实交易日的不可变 Evidence/OOS/持仓换手/逐笔成本与差异审查。当前新 epoch 的合格天数为 **0**；旧快照、测试、回放都不计入。
