@@ -517,10 +517,14 @@ def run_pre_drl_brief(day: str, day_dir: str) -> dict:
     # 把 effective_day 写到 meta 顶层, 便于审计 fallback 行为
     if result.get("ok"):
         meta = result.setdefault("meta", {})
+        market_available = bool(market and market.get("ok"))
+        vnpy_available = bool(vnpy and not vnpy.get("fallback"))
         meta["effective_day"] = {
             "requested": day,
-            "market": m_eff or day,
-            "vnpy": v_eff or day,
+            "market": m_eff if market_available else None,
+            "vnpy": v_eff if vnpy_available else None,
+            "market_available": market_available,
+            "vnpy_available": vnpy_available,
             "any_fallback": (m_eff != day) or (v_eff != day),
         }
 
@@ -537,6 +541,21 @@ def run_pre_drl_brief(day: str, day_dir: str) -> dict:
         _LOG.warning("写 pre_drl_brief.json 失败: %s", e)
         hb.stop(phase="write_failed", ok=False, error=f"{type(e).__name__}: {e}")
 
+    return result
+
+
+def normalize_brief_provenance(provenance: Any) -> dict:
+    """Known fields survive; missing fields stay explicit unknowns, not today."""
+    supplied = provenance if isinstance(provenance, dict) else {}
+    result = {"source": "unknown", "requested_day": None, "generated_at": None,
+              "effective_day": None, **supplied}
+    result["source"] = supplied.get("source") or "unknown"
+    if isinstance(result["effective_day"], dict):
+        result["effective_day"] = {
+            "requested": None, "market": None, "vnpy": None,
+            "market_available": None, "vnpy_available": None,
+            **result["effective_day"],
+        }
     return result
 
 
@@ -561,11 +580,11 @@ def load_pre_drl_brief(day_dir: str) -> dict | None:
     meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
     effective = meta.get("effective_day")
     effective = effective if isinstance(effective, dict) else {}
-    return {**brief, "provenance": {
+    return {**brief, "provenance": normalize_brief_provenance({
         "source": p, "requested_day": d.get("day") or effective.get("requested"),
         "generated_at": meta.get("generated_at"),
         "effective_day": meta.get("effective_day"),
-    }}
+    })}
 
 
 if __name__ == "__main__":

@@ -745,6 +745,11 @@ def _load_base_weights() -> np.ndarray:
         return np.ones(6, dtype=np.float64) / 6
 
 
+def _brief_provenance(brief: dict | None) -> dict:
+    from pre_drl_brief import normalize_brief_provenance
+    return normalize_brief_provenance(brief.get("provenance") if isinstance(brief, dict) else None)
+
+
 def _apply_brief_multiplier(base_weights: np.ndarray, brief: dict | None) -> tuple[np.ndarray, dict]:
     """把 LLM factor_recommendations (0~2 乘子) 应用到 base_weights, 再归一.
     返回 (调整后权重, 应用明细 {factor: 原 base / 乘子 / 调整后}).
@@ -1422,9 +1427,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             "inference_weights": None,
             "current_inference_brief": {
                 **brief_meta_for_log,
-                "provenance": (brief.get("provenance") if isinstance(brief, dict) else None)
-                              or {"requested_day": day, "generated_at": None,
-                                  "effective_day": None, "source": "unknown"},
+                "provenance": _brief_provenance(brief),
                 "applied": False,
             },
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
@@ -1897,9 +1900,7 @@ def run_factor_value_drl(
         "current_inference_brief": {
             "applied": False,
             "status": "no_overlay_for_factor_value",
-            "provenance": (brief.get("provenance") if isinstance(brief, dict) else None)
-                          or {"requested_day": day, "generated_at": None,
-                              "effective_day": None, "source": "unknown"},
+            "provenance": _brief_provenance(brief),
         },
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,

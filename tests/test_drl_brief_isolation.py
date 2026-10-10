@@ -36,6 +36,27 @@ def test_loaded_brief_retains_generation_and_effective_provenance(monkeypatch, t
     assert brief["provenance"]["effective_day"]["market"] == "2026-10-09"
 
 
+def test_brief_producer_keeps_missing_evidence_dates_unknown(monkeypatch, tmp_path):
+    import pre_drl_brief as loader
+    import graph_map, graphrag_bridge
+    monkeypatch.setattr(loader, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(loader, "_load_market", lambda day: (None, None))
+    monkeypatch.setattr(loader, "_load_vnpy_summary", lambda day: (None, None))
+    monkeypatch.setattr(loader, "_load_perf", lambda: None)
+    monkeypatch.setattr(loader, "_load_ic_trend", lambda *args: None)
+    monkeypatch.setattr(graph_map, "build_graph_evidence", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graphrag_bridge, "build_kb_evidence", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loader, "generate_pre_drl_brief", lambda *args, **kwargs: {
+        "ok": True, "brief": {"stance": "维持"}, "meta": {"generated_at": "2026-10-09 19:00:00"}})
+    result = loader.run_pre_drl_brief("2026-10-09", "20261009")
+    effective = result["meta"]["effective_day"]
+    assert effective["market"] is None
+    assert effective["vnpy"] is None
+    assert effective["market_available"] is False
+    assert effective["vnpy_available"] is False
+    assert loader.load_pre_drl_brief("20261009")["provenance"]["effective_day"] == effective
+
+
 @pytest.mark.parametrize("kind", ["weight", "value"])
 def test_historical_environments_ignore_todays_brief(kind):
     states, weights = [], []
@@ -114,6 +135,10 @@ def test_orchestration_keeps_historical_prior_and_records_separate_inference(mon
         assert sum(result["reward_weights"].values()) == pytest.approx(1.0)
         assert result["reward_config_state"]["status"]
         assert result["current_inference_brief"]["provenance"]["generated_on"] == "2026-10-09"
+        provenance = result["current_inference_brief"]["provenance"]
+        assert provenance["requested_day"] is None
+        assert provenance["generated_at"] is None
+        assert provenance["effective_day"] is None
     assert results[0]["inference_weights"] != results[1]["inference_weights"]
     saved = json.loads((tmp_path / "drl" / "20261009" / "train_meta.json").read_text(encoding="utf-8"))
     assert saved["training_brief_used"] is False
@@ -128,3 +153,4 @@ def test_orchestration_keeps_historical_prior_and_records_separate_inference(mon
     assert value_result["training_brief_used"] is False
     assert value_result["training_weights"] == value_result["final_weights"]
     assert value_result["current_inference_brief"]["applied"] is False
+    assert value_result["current_inference_brief"]["provenance"]["effective_day"] is None
