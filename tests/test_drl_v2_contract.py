@@ -56,6 +56,17 @@ def test_reward_components_are_explicitly_aligned_and_weighted():
     np.testing.assert_allclose(rewards, [0.05, 0.15, 0.25])
 
 
+def test_finite_large_reward_weights_are_normalized_before_multiplication():
+    components = {"ic": np.full(10, 0.1), "vnpy": np.full(10, 0.3), "attr": np.full(10, -0.1)}
+    weights = dict.fromkeys(components, 1e308)
+    np.testing.assert_allclose(combine_reward_components(components, weights, expected_length=10), 0.1)
+    env = FactorWeightEnv(np.full((10, 2), 0.1), np.array([0.5, 0.5]),
+                          lookback=3, reward_components=components, reward_weights=weights)
+    env.reset(seed=7)
+    _, reward, _, _, _ = env.step(np.zeros(2))
+    assert np.isfinite(reward)
+
+
 def test_rank_ic_uses_average_ties_and_drops_nonfinite_pairs():
     scores = np.array([1.0, 1.0, 2.0, np.nan, 4.0])
     future = np.array([0.1, 0.2, 0.3, 0.4, np.inf])

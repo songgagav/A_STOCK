@@ -103,21 +103,27 @@ def combine_reward_components(
     if set(weights) - set(components):
         raise ValueError("reward weights reference missing components")
     values: list[np.ndarray] = []
-    total = 0.0
+    raw_weights = []
     for name, raw in components.items():
         arr = np.asarray(raw, dtype=np.float64)
         if arr.ndim != 1 or len(arr) != length:
             raise ValueError(f"reward component {name!r} must have length {length}")
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"reward component {name!r} contains non-finite values")
-        weight = float(weights.get(name, 0.0))
+        raw_weight = weights.get(name, 0.0)
+        if isinstance(raw_weight, bool):
+            raise ValueError(f"reward weight {name!r} must be numeric, not boolean")
+        weight = float(raw_weight)
         if not np.isfinite(weight) or weight < 0:
             raise ValueError(f"reward weight {name!r} must be finite and non-negative")
-        total += weight
-        values.append(arr * weight)
-    if total <= 0:
+        raw_weights.append(weight)
+        values.append(arr)
+    scale = max(raw_weights)
+    if scale <= 0:
         raise ValueError("reward weights must contain a positive total")
-    return (np.sum(values, axis=0) / total).astype(np.float32)
+    scaled = np.asarray(raw_weights, dtype=np.float64) / scale
+    normalized = scaled / scaled.sum()
+    return np.sum([arr * weight for arr, weight in zip(values, normalized)], axis=0).astype(np.float32)
 
 
 def _average_rank(values: np.ndarray) -> np.ndarray:

@@ -47,11 +47,11 @@ def apply_incremental_reward_update(inc: dict, day: str) -> dict:
     written = set_reward_weights(
         rr["vnpy_weight"], rr["ic_weight"], attr_weight=rr.get("attr_weight"),
         source="incremental_learn", rationale=rr.get("rationale") or "incremental_learn triggered",
-        generated_on=day,
+        processing_day=day,
     )
     receipt["reward_config_written"] = written
     if written:
-        receipt["reward_config_state"] = get_reward_weight_state(as_of=day)
+        receipt["reward_config_state"] = get_reward_weight_state()
     else:
         receipt["error"] = "reward_config validation or atomic write failed"
     return receipt

@@ -15,6 +15,7 @@ def reward_path(monkeypatch, tmp_path):
     path = tmp_path / "reward_config.json"
     monkeypatch.setattr(inc, "REWARD_CONFIG_FILE", str(path))
     monkeypatch.setattr(calendar, "CAL_FILE", str(tmp_path / "calendar.json"))
+    monkeypatch.setattr(inc, "_generation_day", lambda: inc.dt.date(2026, 10, 9), raising=False)
     return path
 
 
@@ -145,3 +146,51 @@ def test_failed_atomic_write_preserves_config_and_daily_receipt_is_false(reward_
     assert result["reward_config_written"] is False
     assert result["error"]
     assert reward_path.read_bytes() == before
+
+
+def test_backfill_processing_day_does_not_backdate_generation(reward_path):
+    _calendar()
+    receipt = run_daily.apply_incremental_reward_update({"triggered": True, "optimization": {
+        "reward_rebalance": {"vnpy_weight": 0.5, "ic_weight": 0.25, "attr_weight": 0.25},
+    }}, "2026-09-01")
+    assert receipt["reward_config_written"] is True
+    saved = json.loads(reward_path.read_text(encoding="utf-8"))
+    assert saved["generated_on"] == "2026-10-09"
+    assert saved["processing_day"] == "2026-09-01"
+    assert inc.get_reward_weight_state(as_of="2026-09-02")["status"] == "degraded_default"
+
+
+@pytest.mark.parametrize("change", ["saturday", "missing_effective", "missing_calendar"])
+def test_invalid_schedule_claims_degrade(reward_path, change):
+    _calendar()
+    assert inc.set_reward_weights(0.5, 0.25, 0.25, generated_on="2026-10-09")
+    saved = json.loads(reward_path.read_text(encoding="utf-8"))
+    if change == "saturday":
+        saved["effective_from"] = "2026-10-10"
+    elif change == "missing_calendar":
+        saved.pop("calendar_identity")
+    else:
+        saved["calendar_status"] = "pending_calendar_resolution"
+        saved.pop("effective_from")
+    reward_path.write_text(json.dumps(saved), encoding="utf-8")
+    assert inc.get_reward_weight_state(as_of="2026-10-12")["status"] == "degraded_default"
+
+
+def test_corrupt_previous_config_degradation_remains_active_provenance(reward_path):
+    _calendar()
+    reward_path.write_text("{bad", encoding="utf-8")
+    receipt = run_daily.apply_incremental_reward_update({"triggered": True, "optimization": {
+        "reward_rebalance": {"vnpy_weight": 0.5, "ic_weight": 0.25, "attr_weight": 0.25},
+    }}, "2026-10-09")
+    assert receipt["reward_config_written"] is True
+    state = receipt["reward_config_state"]
+    assert state["status"] == "pending_effective"
+    assert state["active_provenance"]["status"] == "degraded_default"
+    assert "JSONDecodeError" in state["active_provenance"]["reason"]
+    assert json.loads(reward_path.read_text(encoding="utf-8"))["previous_provenance"] == state["active_provenance"]
+
+
+def test_parser_rejects_boolean_reward_weight():
+    with pytest.raises(RuntimeError, match="invalid reward"):
+        inc._parse_response({"content": [{"text": json.dumps({"reward_rebalance": {
+            "vnpy_weight": True, "ic_weight": 0.25, "attr_weight": 0.25}})}]})

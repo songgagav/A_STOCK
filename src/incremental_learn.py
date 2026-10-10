@@ -160,11 +160,12 @@ def _parse_response(body: dict) -> dict:
     rr = parsed.get("reward_rebalance") or {}
     ar = parsed.get("action_recommendation") or {}
     try:
-        reward = {"vnpy_weight": float(rr.get("vnpy_weight", 0.5)),
-                  "ic_weight": float(rr.get("ic_weight", 0.5))}
+        reward = {"vnpy_weight": rr.get("vnpy_weight", 0.5),
+                  "ic_weight": rr.get("ic_weight", 0.5)}
         if rr.get("attr_weight") is not None:
-            reward["attr_weight"] = float(rr["attr_weight"])
+            reward["attr_weight"] = rr["attr_weight"]
         normalize_reward_weights({**reward, "attr_weight": reward.get("attr_weight", 0.15)})
+        reward = {key: float(value) for key, value in reward.items()}
         reward["rationale"] = str(rr.get("rationale") or "").strip()
     except (TypeError, ValueError, AttributeError) as exc:
         raise RuntimeError(f"invalid reward_rebalance: {exc}") from exc
@@ -364,19 +365,37 @@ REWARD_CONFIG_FILE = os.path.join(DATA_DIR, "reward_config.json")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _generation_day() -> dt.date:
+    return dt.datetime.now(_SHANGHAI).date()
+
+
 def get_reward_weight_state(*, as_of: str | None = None) -> dict:
     """Read scheduled config, exposing every fallback as explicit evidence."""
     default = normalize_reward_weights(DEFAULT_REWARD_WEIGHTS)
     state = {"weights": default, "status": "default", "reason": "config_missing",
              "source": REWARD_CONFIG_FILE, "generated_on": None, "effective_from": None}
+    state["active_provenance"] = {key: state[key] for key in
+                                  ("status", "reason", "source", "generated_on", "effective_from")}
     try:
-        day = dt.date.fromisoformat(as_of) if as_of else dt.datetime.now(_SHANGHAI).date()
+        day = dt.date.fromisoformat(as_of) if as_of else _generation_day()
         with open(REWARD_CONFIG_FILE, encoding="utf-8") as f:
             d = json.load(f)
         if not isinstance(d, dict) or d.get("schema_version") != 2:
             raise ValueError("reward_config schema_version must be 2")
+        required = {"generated_on", "effective_from", "calendar_status", "calendar_identity",
+                    "previous_weights", "previous_provenance", "source", "updated_at"}
+        if required - d.keys():
+            raise ValueError(f"reward_config missing fields: {sorted(required - d.keys())}")
         weights = normalize_reward_weights(d)
         previous = normalize_reward_weights(d.get("previous_weights"))
+        previous_provenance = d["previous_provenance"]
+        if (not isinstance(previous_provenance, dict)
+                or previous_provenance.get("status") not in ("default", "degraded_default", "available")
+                or not previous_provenance.get("source") or "reason" not in previous_provenance):
+            raise ValueError("reward_config previous_provenance invalid")
+        calendar_identity = d["calendar_identity"]
+        if not isinstance(calendar_identity, dict) or not {"source", "version"} <= calendar_identity.keys():
+            raise ValueError("reward_config calendar_identity invalid")
         generated = dt.date.fromisoformat(d["generated_on"])
         if day < generated:
             raise ValueError("future-generated reward_config cannot supply historical weights")
@@ -385,21 +404,32 @@ def get_reward_weight_state(*, as_of: str | None = None) -> dict:
                       "calendar_identity": d.get("calendar_identity")})
         if d.get("calendar_status") == "pending_calendar_resolution" and effective_raw is None:
             return {**state, "weights": previous, "status": "pending_calendar_resolution",
+                    "active_provenance": previous_provenance,
                     "reason": "next_authoritative_session_unknown"}
         if d.get("calendar_status") != "resolved":
             raise ValueError("reward_config calendar_status invalid")
         effective = dt.date.fromisoformat(effective_raw)
         if effective <= generated:
             raise ValueError("effective_from must follow generated_on")
+        expected, _identity = _next_reward_session(generated)
+        if not calendar_identity.get("source") or not calendar_identity.get("version") or expected != effective_raw:
+            raise ValueError("effective_from is not supported by authoritative calendar evidence")
         if day < effective:
             return {**state, "weights": previous, "status": "pending_effective",
+                    "active_provenance": previous_provenance,
                     "reason": "effective_session_not_reached"}
-        return {**state, "weights": weights, "status": "available", "reason": None}
+        active = {"status": "available", "reason": None, "source": REWARD_CONFIG_FILE,
+                  "config_source": d["source"], "generated_on": generated.isoformat(),
+                  "effective_from": effective_raw}
+        return {**state, "weights": weights, "status": "available", "reason": None,
+                "active_provenance": active}
     except FileNotFoundError:
         return state
     except (OSError, ValueError, KeyError, TypeError) as exc:
+        reason = f"{type(exc).__name__}: {exc}"
         return {**state, "weights": default, "status": "degraded_default",
-                "reason": f"{type(exc).__name__}: {exc}"}
+                "reason": reason, "active_provenance": {
+                    "status": "degraded_default", "reason": reason, "source": REWARD_CONFIG_FILE}}
 
 
 def get_reward_weights(*, as_of: str | None = None) -> dict:
@@ -415,7 +445,7 @@ def _next_reward_session(generated: dt.date) -> tuple[str | None, dict]:
     cache = trading_calendar._load_cache()
     source = str(cache.get("source") or "")
     identity = {"source": source or None, "version": cache.get("updated")}
-    if not cache.get("ok"):
+    if not cache.get("ok") or not identity["version"]:
         return None, identity
     try:
         days = sorted(dt.datetime.strptime(str(day), "%Y%m%d").date() for day in cache["days"])
@@ -431,12 +461,16 @@ def _next_reward_session(generated: dt.date) -> tuple[str | None, dict]:
 def set_reward_weights(vnpy_weight: float, ic_weight: float,
                        attr_weight: float | None = None,
                        source: str = "incremental_learn",
-                       rationale: str = "", *, generated_on: str | None = None) -> bool:
+                       rationale: str = "", *, generated_on: str | None = None,
+                       processing_day: str | None = None) -> bool:
     """写 DRL reward 权重. attr_weight 可选: None 时保留配置中现有值 (默认 0.15).
     归一化保证三权和=1; 生效日未知时保留原有效配置, 不猜测工作日."""
     try:
-        generated = dt.date.fromisoformat(generated_on) if generated_on else dt.datetime.now(_SHANGHAI).date()
-        previous = get_reward_weight_state(as_of=generated.isoformat())["weights"]
+        generated = dt.date.fromisoformat(generated_on) if generated_on else _generation_day()
+        if processing_day is not None:
+            processing_day = dt.date.fromisoformat(processing_day).isoformat()
+        previous_state = get_reward_weight_state(as_of=generated.isoformat())
+        previous = previous_state["weights"]
         weights = normalize_reward_weights({
             "vnpy_weight": vnpy_weight, "ic_weight": ic_weight,
             "attr_weight": previous["attr_weight"] if attr_weight is None else attr_weight,
@@ -445,8 +479,10 @@ def set_reward_weights(vnpy_weight: float, ic_weight: float,
         payload = {**weights, "schema_version": 2, "source": source, "rationale": rationale,
                    "updated_at": dt.datetime.now(_SHANGHAI).isoformat(),
                    "generated_on": generated.isoformat(), "effective_from": effective,
+                   "processing_day": processing_day,
                    "calendar_status": "resolved" if effective else "pending_calendar_resolution",
-                   "calendar_identity": calendar_identity, "previous_weights": previous}
+                   "calendar_identity": calendar_identity, "previous_weights": previous,
+                   "previous_provenance": previous_state["active_provenance"]}
         atomic_write_json(REWARD_CONFIG_FILE, payload)
         return True
     except (OSError, ValueError, TypeError) as exc:
