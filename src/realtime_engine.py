@@ -1715,7 +1715,37 @@ class RealtimeEngine:
                 self.midday_done = True
 
     # ---------- 持久化 ----------
+    def _persisted_price_source(self, latest: dict, retained: bool = False) -> str:
+        """Classify the prices against post-trade holdings, retaining backend tags."""
+        previous = getattr(self, "price_sources", {})
+        sources = {}
+        codes = set(latest) | set(self.pb.positions)
+        for canon in codes:
+            if not latest.get(canon):
+                sources[canon] = "price_missing"
+            elif canon in previous:
+                sources[canon] = previous[canon]
+            else:
+                q = self.feed.quotes.get(canon) or {}
+                sources[canon] = q.get("fallback_source") or q.get("price_source") or "unknown_reference"
+        self.price_sources = sources
+        live_names = {"akshare_spot", "sina_spot"}
+        held = [c for c in self.pb.positions if sources[c] not in live_names]
+        pool = [c for c in codes if c not in self.pb.positions and sources[c] not in live_names]
+        affected = held or pool
+        if affected:
+            names = {sources[c] for c in affected}
+            source = next((s for s in ("price_missing", "unknown_reference", "h5i_reference", "duckdb_reference")
+                           if s in names), "unknown_reference")
+            return _live_src_label(held, pool, source)
+        if retained:
+            return "price_hold"
+        names = set(sources.values())
+        return next(iter(names)) if len(names) == 1 else "mixed_spot"
+
     def _write_state(self, latest: dict, session: bool, live_src: str):
+        retained = live_src == "price_hold"
+        live_src = self._persisted_price_source(latest, retained=retained)
         snap = self.pb.snapshot()
         # 盘中实时权益
         positions = []
@@ -1771,8 +1801,8 @@ class RealtimeEngine:
             "mode": "盘中实时撮合" if session else "待机/收盘(仅价格刷新)",
             "in_session": session,
             "live_source": live_src,
-            "price_sources": ({c: "price_hold" for c in latest} if live_src == "price_hold"
-                              else getattr(self, "price_sources", {})),
+            "price_sources": self.price_sources,
+            "price_update_mode": "retained" if retained else "fetched",
             "feed_error": self.feed.last_error or "",
             # updated 是状态写入时间；data_ts 只代表实际 spot 抓取时间。
             "data_ts": (

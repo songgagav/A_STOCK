@@ -139,6 +139,36 @@ def test_reference_only_without_holdings_is_not_called_spot(runtime, monkeypatch
     assert state.get("price_sources") == {POOL: "h5i_reference"}
 
 
+def test_reference_candidate_becomes_held_in_same_tick(runtime, monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: {
+        HELD: quote(10), POOL: quote(20, "h5i_reference")})
+    monkeypatch.setattr(runtime, "_disk_ref_prices", lambda _codes: {})
+    # Preserve the real book acquisition transition; replace only sizing policy.
+    runtime._rebalance = lambda prices: runtime.pb.buy(POOL, 100, prices[POOL])
+    runtime.run_tick(NOW)
+    state = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert POOL in runtime.pb.positions
+    assert state["live_source"] == "h5i_reference_held"
+    assert assemble({"live_source": state["live_source"]})["state"] == "DEGRADED"
+
+
+@pytest.mark.parametrize("hour,minute", [(12, 0), (15, 10)])
+def test_non_session_retains_reference_origin_and_degradation(runtime, monkeypatch, tmp_path, hour, minute):
+    monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: {
+        HELD: quote(10, "h5i_reference"), POOL: quote(20)})
+    monkeypatch.setattr(runtime, "_disk_ref_prices", lambda _codes: {})
+    runtime.run_tick(NOW)
+    before = dict(runtime.pb.d_price)
+    runtime.run_tick(NOW.replace(hour=hour, minute=minute))
+    state = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert state["in_session"] is False
+    assert state["price_sources"][HELD] == "h5i_reference"
+    assert state["live_source"] == "h5i_reference_held"
+    assert state["data_ts"] is None
+    assert assemble({"live_source": state["live_source"]})["state"] == "DEGRADED"
+    assert runtime.pb.d_price == before
+
+
 def test_cached_spot_keeps_fetch_time_and_cached_reference_keeps_source(runtime, monkeypatch, tmp_path):
     cached_at = datetime(2026, 10, 9, 10, 20)
     class FeedClock(datetime):
