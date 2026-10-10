@@ -106,6 +106,17 @@ class PaperBook:
         # 兼容旧字段
         self.trade_log.append(trade)
 
+    @staticmethod
+    def _position_acquisition_basis(position: dict) -> dict:
+        """只有新账本记录的取得依据可用；旧聚合仓位不能推断完整历史。"""
+        basis = position.get("acquisition_basis")
+        if isinstance(basis, dict) and basis.get("status") in ("single_date", "unknown"):
+            # restore 的旧 T+1 日期兜底不能补出精确的红利取得依据。
+            if basis["status"] == "single_date" and position.get("buy_date") is None:
+                return {"status": "unknown", "reason": "invalid_buy_date"}
+            return dict(basis)
+        return {"status": "unknown", "reason": "legacy_aggregate"}
+
     # ---------- 撮合 ----------
     def buy(self, canon: str, qty: int, price: float,
             avg_daily_volume: float | None = None,
@@ -156,6 +167,12 @@ class PaperBook:
         self.buy_fees += fee
         if canon in self.positions:
             p = self.positions[canon]
+            basis = self._position_acquisition_basis(p)
+            if basis["status"] == "single_date" and (
+                basis.get("date") != self.trade_date or basis.get("date") != p.get("buy_date")
+            ):
+                basis = {"status": "unknown", "reason": "multiple_acquisition_dates"}
+            p["acquisition_basis"] = basis
             tot_cost = p["avg_cost"] * p["qty"] + cost
             p["qty"] += qty
             p["avg_cost"] = tot_cost / p["qty"]
@@ -165,6 +182,7 @@ class PaperBook:
             self.positions[canon] = {
                 "qty": qty, "avg_cost": exec_price,
                 "buy_date": self.trade_date, "locked_qty": qty,
+                "acquisition_basis": {"status": "single_date", "date": self.trade_date},
             }
         _trade = {
             "type": "buy", "canon": canon, "qty": qty,
@@ -284,6 +302,7 @@ class PaperBook:
             p = self.positions[canon]
             qty = p["qty"]
             notes = []
+            dividend_evidence = {}
 
             # 1) 送转股/拆股 (bonus_ratio 每10股)
             bonus_r = float(ev.get("bonus_ratio") or 0)
@@ -302,38 +321,81 @@ class PaperBook:
             div10 = float(ev.get("dividend_cash") or 0)
             if div10 > 0 and qty > 0:
                 div_per = div10 / 10.0
-                holding_days = self._holding_days(canon, ev.get("ex_date"))
-                if holding_days >= 365:
+                dividend_evidence = self._dividend_holding_basis(canon, ev.get("ex_date"))
+                holding_days = dividend_evidence["holding_days"]
+                if holding_days is None:
+                    # 缺完整取得依据时按现有税率表最高档近似，绝不冒充逐批精算。
+                    tax = max(self._DIV_TAX_SHORT, self._DIV_TAX_MID, self._DIV_TAX_LONG)
+                elif holding_days >= 365:
                     tax = self._DIV_TAX_LONG
                 elif holding_days >= 30:
                     tax = self._DIV_TAX_MID
                 else:
                     tax = self._DIV_TAX_SHORT
-                after_tax = div_per * p["qty"] * (1 - tax)
+                gross = div_per * p["qty"]
+                after_tax = gross * (1 - tax)
                 self.cash += after_tax
-                notes.append(f"红利+{after_tax:.2f}(税后,{tax*100:.0f}%税)")
+                dividend_evidence.update({
+                    "tax_rate": tax,
+                    "tax_status": dividend_evidence["holding_status"],
+                    "tax_policy": ("conservative_max_rate" if holding_days is None
+                                   else "holding_period_schedule"),
+                    "dividend_gross": round(gross, 2),
+                    "dividend_net": round(after_tax, 2),
+                })
+                if holding_days is None:
+                    notes.append(f"红利+{after_tax:.2f}(近似税后,{tax*100:.0f}%保守税率,取得依据未知)")
+                else:
+                    notes.append(f"红利+{after_tax:.2f}(税后,{tax*100:.0f}%税)")
             applied.append({
                  "canon": canon, "symbol": sym,
                  "ex_date": str(ev.get("ex_date")),
                  "type": "/".join(n for n in notes if n) or "无记账",
+                 **dividend_evidence,
              })
             if ev.get("key"):
                 self.applied_corp.add(ev["key"])
         return applied
 
-    def _holding_days(self, canon: str, ex_date) -> float:
-        """以 ex_date 计当日持有天数 (无精确成本日时按当前 trade_date 近似)."""
+    def _dividend_holding_basis(self, canon: str, ex_date) -> dict:
+        """仅单日取得的完整仓位可精确计期；未知/坏日期不替换为今天。"""
+        position = self.positions.get(canon) or {}
+        basis = self._position_acquisition_basis(position)
+        evidence = {
+            "holding_days": None,
+            "holding_basis": "unknown",
+            "holding_status": "approximate",
+            "holding_reason": basis.get("reason") or "legacy_aggregate",
+        }
+        if basis["status"] != "single_date":
+            return evidence
         try:
-            d = date.fromisoformat(str(ex_date))
-        except Exception:
-            d = date.today()
-        ref = date.today()
-        if self.trade_date:
-            try:
-                ref = date.fromisoformat(self.trade_date)
-            except Exception:
-                ref = date.today()
-        return max((ref - d).days, 0)
+            buy_day = date.fromisoformat(str(position.get("buy_date")))
+        except (TypeError, ValueError):
+            evidence["holding_reason"] = "invalid_buy_date"
+            return evidence
+        try:
+            ex_day = date.fromisoformat(str(ex_date))
+        except (TypeError, ValueError):
+            evidence["holding_reason"] = "invalid_ex_date"
+            return evidence
+        if buy_day > ex_day:
+            evidence["holding_reason"] = "future_buy_date"
+            return evidence
+        if str(basis.get("date")) != buy_day.isoformat():
+            evidence["holding_reason"] = "inconsistent_acquisition_date"
+            return evidence
+        evidence.update({
+            "holding_days": (ex_day - buy_day).days,
+            "holding_basis": "single_date",
+            "holding_status": "exact",
+            "holding_reason": None,
+        })
+        return evidence
+
+    def _holding_days(self, canon: str, ex_date) -> int | None:
+        """返回有证据的 ex_date - buy_date；聚合/无效依据返回 None。"""
+        return self._dividend_holding_basis(canon, ex_date)["holding_days"]
 
     # ---------- 风控 (行为层拦截) ----------
     # 规则(见 config.PAPER):
@@ -595,6 +657,7 @@ class PaperBook:
                     "qty": int(p["qty"]),
                     "avg_cost": float(p["avg_cost"]),
                     "buy_date": p.get("buy_date", self.trade_date),
+                    "acquisition_basis": self._position_acquisition_basis(p),
                 }
                 for c, p in state["positions"].items()
             }
