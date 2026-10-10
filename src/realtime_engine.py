@@ -1719,7 +1719,7 @@ class RealtimeEngine:
         """Classify the prices against post-trade holdings, retaining backend tags."""
         previous = getattr(self, "price_sources", {})
         sources = {}
-        codes = set(latest) | set(self.pb.positions)
+        codes = set(latest) | set(self.pb.positions) | {t["canon"] for t in self.targets}
         for canon in codes:
             if not latest.get(canon):
                 sources[canon] = "price_missing"

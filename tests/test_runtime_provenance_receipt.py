@@ -152,6 +152,16 @@ def test_reference_candidate_becomes_held_in_same_tick(runtime, monkeypatch, tmp
     assert assemble({"live_source": state["live_source"]})["state"] == "DEGRADED"
 
 
+def test_missing_candidate_survives_post_trade_classification(runtime, monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: {HELD: quote(10)})
+    monkeypatch.setattr(runtime, "_disk_ref_prices", lambda _codes: {})
+    runtime.run_tick(NOW)
+    state = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert state["price_sources"][POOL] == "price_missing"
+    assert state["live_source"] == "price_missing_pool"
+    assert state["data_ts"] is None
+
+
 @pytest.mark.parametrize("hour,minute", [(12, 0), (15, 10)])
 def test_non_session_retains_reference_origin_and_degradation(runtime, monkeypatch, tmp_path, hour, minute):
     monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: {
