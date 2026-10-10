@@ -10,6 +10,14 @@
 
 ## Explicit input contract
 
+下列内容保留 Phase A 的历史设计背景。当前新建 bundle 还必须显式传入
+`data_lineage_identity`（source/schema/routing/universe/calendar_source/calendar_version/lineage_sha）
+与完整 shadow/paper production state，使用 Observation Epoch v2；每日
+`data_identity.data_sha` 与 artifact hash 保留在当天 bundle，不得进入稳定 lineage。
+新建要求 `drl_plan_mode_contract=implemented_default_shadow`；旧 `not_implemented`
+bundle 只走历史验证路径，不被覆盖或改写。详见
+[当前 epoch 契约](oos-and-execution-evidence-phase-c.md#observation-epoch-binding)。
+
 `EvidenceBundleRequest` 必须显式提供：
 
 - `trade_day`、`generated_at`、`run_id`、`code_sha`；

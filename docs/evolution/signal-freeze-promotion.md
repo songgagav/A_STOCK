@@ -17,7 +17,8 @@ Promotion requires all of the following:
   `source_disagreement`, or `unexplained`;
 - reviewer and evidence references are recorded for every day;
 - all five rows reference one unchanged `observation_epoch_id` binding the
-  code, data, configuration, and experiment identities;
+  code, stable data-lineage, configuration, experiment, and production-state
+  identities (Observation Epoch v2; daily artifact hashes are separate);
 - `TRADE_BROKER=paper` is confirmed;
 - no broker credential, order API, or real-account side effect is enabled;
 - a human approves the promotion and records the approval in
