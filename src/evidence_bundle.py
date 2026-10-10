@@ -24,7 +24,7 @@ from evidence_turnover import compute_turnover
 from observation_epoch import (
     build_observation_epoch,
     validate_shadow_production_state,
-    verify_observation_epoch,
+    verify_epoch_manifest_binding,
 )
 
 
@@ -98,6 +98,7 @@ class EvidenceBundleRequest:
     run_id: str
     code_sha: str
     data_identity: dict[str, Any]
+    data_lineage_identity: dict[str, Any]
     config_identity: dict[str, Any]
     snapshot: ArtifactInput
     artifacts: dict[str, ArtifactInput]
@@ -113,6 +114,7 @@ class EvidenceBundleRequest:
         object.__setattr__(self, "output_root", Path(self.output_root))
         object.__setattr__(self, "artifacts", dict(self.artifacts))
         object.__setattr__(self, "data_identity", dict(self.data_identity))
+        object.__setattr__(self, "data_lineage_identity", dict(self.data_lineage_identity))
         object.__setattr__(self, "config_identity", dict(self.config_identity))
         object.__setattr__(self, "experiment_identity", dict(self.experiment_identity))
         object.__setattr__(self, "production_state", dict(self.production_state))
@@ -132,6 +134,11 @@ class EvidenceBundleRequest:
         if not str(self.experiment_identity.get("experiment_hash") or ""):
             raise ValueError("experiment_identity.experiment_hash is required")
         validate_shadow_production_state(self.production_state)
+        build_observation_epoch(
+            code_sha=self.code_sha, data_lineage_identity=self.data_lineage_identity,
+            config_identity=self.config_identity, experiment_identity=self.experiment_identity,
+            production_state=self.production_state,
+        )
         try:
             equity = float(self.reference_equity)
         except (TypeError, ValueError) as exc:
@@ -256,9 +263,10 @@ def _manifest_without_hash(manifest: dict[str, Any]) -> dict[str, Any]:
 def _build_identity(request: EvidenceBundleRequest, source_hashes: dict[str, str]) -> dict[str, Any]:
     observation_epoch = build_observation_epoch(
         code_sha=request.code_sha,
-        data_identity=request.data_identity,
+        data_lineage_identity=request.data_lineage_identity,
         config_identity=request.config_identity,
         experiment_identity=request.experiment_identity,
+        production_state=request.production_state,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -267,6 +275,7 @@ def _build_identity(request: EvidenceBundleRequest, source_hashes: dict[str, str
         "run_id": request.run_id,
         "code_sha": request.code_sha,
         "data_identity": request.data_identity,
+        "data_lineage_identity": request.data_lineage_identity,
         "config_identity": request.config_identity,
         "snapshot_hash": source_hashes["snapshot"],
         "experiment_identity": request.experiment_identity,
@@ -384,6 +393,7 @@ def build_bundle(request: EvidenceBundleRequest) -> BundleResult:
             "code_sha": request.code_sha,
             "data_sha": request.data_identity["data_sha"],
             "data_identity": request.data_identity,
+            "data_lineage_identity": request.data_lineage_identity,
             "config_sha": request.config_identity["config_sha"],
             "config_identity": request.config_identity,
             "snapshot_hash": source_hashes["snapshot"],
@@ -455,11 +465,13 @@ def verify_bundle(bundle_path: Path | str) -> dict[str, Any]:
     identity = manifest.get("bundle_identity")
     if not isinstance(identity, dict) or _digest(identity) != manifest.get("bundle_id"):
         raise BundleBuildError("tampered", ["bundle_identity_mismatch"])
-    if "observation_epoch" in manifest:
-        try:
-            verify_observation_epoch(manifest["observation_epoch"])
-        except ValueError as exc:
-            raise BundleBuildError("tampered", ["observation_epoch_mismatch"]) from exc
+    try:
+        verify_epoch_manifest_binding(manifest, identity)
+    except ValueError as exc:
+        reason = ("manifest_identity_mismatch"
+                  if str(exc).startswith("manifest_identity_mismatch")
+                  else "observation_epoch_mismatch")
+        raise BundleBuildError("tampered", [reason]) from exc
     for relative, expected in (manifest.get("constituent_artifact_hashes") or {}).items():
         file_path = path / relative
         if not file_path.is_file():

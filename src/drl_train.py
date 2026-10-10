@@ -2,9 +2,8 @@
 # drl_train.py -- 基于 vnpy 主链路真实回测的因子权重微调 (sb3 PPO)
 #
 # State  : 过去 N 日全 A 6 类因子 (signal/trend/govern/liquidity/vol/mom_rev) 的近似 IC 序列
-#          + LLM pre_drl_brief 提供的 4 维情绪因子 (risk_on_off / rotation_intensity /
-#          liquidity_stress / policy_catalyst) + 1 维 stance 标量 (扰动幅度)
-# Action : 6 维权重增量, 经 tanh 后归一 (幅度受 stance 调节)
+#          + 4 维中性情绪预留槽位 + 1 维中性 stance (历史状态禁止广播当日 LLM)
+# Action : 6 维权重增量, 经 tanh 后归一; 当日 brief 仅用于训练后的推断 overlay
 # Reward : Sortino 比率 + 波动率自适应 + CVaR 惩罚 (2026-09-06 升级)
 #          vnpy 奖励: 用 max_dd 近似下行风险, 计算 Sortino ≈ + 波动率缩放 - CVaR
 #          归因奖励: 从 benchmark.daily 日收益率序列计算真实 Sortino + 波动率缩放 - CVaR
@@ -34,6 +33,7 @@ import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 tor
 import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
 import drl_metrics  # noqa: E402  (学习中断指标 DRL-2; 轻量模块, 不拖入 torch)
 from drl_v2_contract import combine_reward_components  # noqa: E402
+from reward_weights import DEFAULT_REWARD_WEIGHTS, normalize_reward_weights
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -267,21 +267,12 @@ class FactorWeightEnv(gymnasium.Env):
             # 无数据时默认中性值
             self.regime_features = np.full((len(ic_history), 3), 0.5, dtype=np.float32)
 
-        # LLM pre_drl_brief: 4 维情绪因子 + 1 维 stance 标量
-        brief = brief or {}
-        sf = brief.get("sentiment_factors") if isinstance(brief, dict) else None
-        stance = brief.get("stance") if isinstance(brief, dict) else None
-        self.sentiment_vec = np.array([
-            float((sf or {}).get("risk_on_off", 0.0)),
-            float((sf or {}).get("rotation_intensity", 0.0)),
-            float((sf or {}).get("liquidity_stress", 0.0)),
-            float((sf or {}).get("policy_catalyst", 0.0)),
-        ], dtype=np.float32)
-        self.stance_scalar = np.array([
-            float(STANCE_DELTA.get(stance, 1.0)),
-        ], dtype=np.float32)
+        # A current brief has no historical timestamp alignment. Keep the
+        # existing observation shape, but never broadcast today's LLM values.
+        self.sentiment_vec = np.zeros(4, dtype=np.float32)
+        self.stance_scalar = np.ones(1, dtype=np.float32)
 
-        # NeSy-TA 动态调优参数 (P2): 优先用 tuning, 否则用 LLM stance 固定映射
+        # NeSy-TA 显式 tuning 保留; 无 tuning 时历史扰动参数保持中性。
         tuning = tuning or {}
         if tuning and tuning.get("mode") != "fallback":
             self.delta_scale = float(tuning.get("delta_scale", _DEFAULT_TUNING["delta_scale"]))
@@ -289,10 +280,10 @@ class FactorWeightEnv(gymnasium.Env):
             self.weight_clip = float(tuning.get("weight_clip", _DEFAULT_TUNING["weight_clip"]))
             self.tuning_mode = tuning.get("mode", "unknown")
         else:
-            self.delta_scale = float(STANCE_DELTA.get(stance, 1.0))
+            self.delta_scale = 1.0
             self.temperature = 1.0
             self.weight_clip = 0.6
-            self.tuning_mode = "stance_fixed"
+            self.tuning_mode = "historical_neutral"
 
         # 观测: IC 历史(10×6=60) + 4 情绪 + 1 stance + 3 市场状态 = 68
         obs_dim = lookback * self.n_factors + 4 + 1 + 3
@@ -433,19 +424,9 @@ class FactorValueEnv(gymnasium.Env):
         else:
             self.regime_features = np.full((len(returns), 3), 0.5, dtype=np.float32)
 
-        # LLM 情绪因子
-        brief = brief or {}
-        sf = brief.get("sentiment_factors") if isinstance(brief, dict) else None
-        stance = brief.get("stance") if isinstance(brief, dict) else None
-        self.sentiment_vec = np.array([
-            float((sf or {}).get("risk_on_off", 0.0)),
-            float((sf or {}).get("rotation_intensity", 0.0)),
-            float((sf or {}).get("liquidity_stress", 0.0)),
-            float((sf or {}).get("policy_catalyst", 0.0)),
-        ], dtype=np.float32)
-        self.stance_scalar = np.array([
-            float(STANCE_DELTA.get(stance, 1.0)),
-        ], dtype=np.float32)
+        # Current LLM evidence is inference-only, never historical features.
+        self.sentiment_vec = np.zeros(4, dtype=np.float32)
+        self.stance_scalar = np.ones(1, dtype=np.float32)
 
         # 观测: 因子值(扁平 lookback × n_factors) + 情绪(4) + stance(1) + regime(3)
         feat_dim = lookback * self.n_factors + 4 + 1 + 3
@@ -762,6 +743,11 @@ def _load_base_weights() -> np.ndarray:
         return values / values.sum()
     except Exception:
         return np.ones(6, dtype=np.float64) / 6
+
+
+def _brief_provenance(brief: dict | None) -> dict:
+    from pre_drl_brief import normalize_brief_provenance
+    return normalize_brief_provenance(brief.get("provenance") if isinstance(brief, dict) else None)
 
 
 def _apply_brief_multiplier(base_weights: np.ndarray, brief: dict | None) -> tuple[np.ndarray, dict]:
@@ -1311,8 +1297,9 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     }
 
     base_w = _load_base_weights()
-    # 应用 LLM 推荐的先验乘子
-    prior_w, brief_detail = _apply_brief_multiplier(base_w, brief)
+    # The historical training prior is independent of today's brief.
+    prior_w = base_w.copy()
+    brief_detail = {}
     _log(f"LLM brief 已加载: stance={brief_meta_for_log['stance']} "
          f"regime={brief_meta_for_log['regime']} conf={brief_meta_for_log['confidence']}")
 
@@ -1335,13 +1322,15 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     perf_report = _load_perf_report()
     attribution_diagnostic = _attribution_reward(perf_report)
     # 增量学习闭环: 读取 data/reward_config.json 调整奖励权重 (vnpy/ic/attr 三权).
-    # 默认 0.6 (基础), P0 退化时由 incremental_learn 自动提到 0.8+ 强调真实信号.
-    reward_weights = {"vnpy_weight": 0.6, "ic_weight": 0.4, "attr_weight": 0.15}
+    # 配置按 next-session 生效; 默认与降级三权也必须归一化并保留来源.
+    reward_weights = normalize_reward_weights(DEFAULT_REWARD_WEIGHTS)
     try:
-        from incremental_learn import get_reward_weights
-        reward_weights = get_reward_weights()
-    except Exception:
-        pass
+        from incremental_learn import get_reward_weight_state
+        reward_config_state = get_reward_weight_state(as_of=day)
+        reward_weights = normalize_reward_weights(reward_config_state["weights"])
+    except Exception as exc:
+        reward_config_state = {"weights": reward_weights, "status": "degraded_default",
+                               "reason": f"{type(exc).__name__}: {exc}", "source": "unknown"}
     vnpy_w = reward_weights["vnpy_weight"]
     ic_w = reward_weights["ic_weight"]
     attr_w = reward_weights["attr_weight"]
@@ -1365,7 +1354,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
         ic,
         prior_w,
         day=day_dt,
-        brief=brief or {},
+        brief=None,
         tuning=nesy_tuning,
         regime_features=regime_features,
         reward_components=reward_components,
@@ -1433,6 +1422,14 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             "base_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, base_w)},
             "prior_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, prior_w)},
             "final_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)},
+            "training_weights": {k: float(v) for k, v in zip(SCORE_FACTORS, env.weights)},
+            "training_brief_used": False,
+            "inference_weights": None,
+            "current_inference_brief": {
+                **brief_meta_for_log,
+                "provenance": _brief_provenance(brief),
+                "applied": False,
+            },
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
             # LLM brief 元信息
@@ -1456,6 +1453,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             # 增量学习 reward 权重 (由 incremental_learn 动态调整)
             "reward_weights": {"vnpy_weight": vnpy_w, "ic_weight": ic_w,
                                "attr_weight": attr_w},
+            "reward_config_state": reward_config_state,
             "vnpy_stats": {
                 "engine": vnpy_stats.get("engine"),
                 "total_return": vnpy_stats.get("stats", {}).get("total_return"),
@@ -1593,13 +1591,22 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             _log("DRL 降级 L3: 无有效模型, **已阻断当日 target_plan 生成**, 需人工介入")
         else:
             _use_w = _dec.get("effective_weights") or _trained_weights
+            # Apply a current inference overlay only after historical training
+            # and degradation resolution. Learned/version weights stay pure PPO.
+            _inference_w, brief_detail = _apply_brief_multiplier(
+                np.array([_use_w[k] for k in SCORE_FACTORS], dtype=np.float64), brief)
+            meta["inference_weights"] = {k: float(v) for k, v in zip(SCORE_FACTORS, _inference_w)}
+            meta["current_inference_brief"].update({
+                "applied": bool(brief_detail), "applied_multiplier": brief_detail,
+                "weights_source_day": _dec.get("source_day"),
+            })
             if _dec.get("level", 0) > 0:
                 _log(f"DRL 降级 L{_dec.get('level')}: 使用 {_dec.get('source_day')} 的权重"
                      f"({_dec.get('action')})")
             try:
                 plan = _build_target_plan(
                     day=day, day_dir=day_dir,
-                    final_weights={k: float(v) for k, v in _use_w.items()},
+                    final_weights=meta["inference_weights"],
                     top_n=MAX_STOCKS,
                 )
                 meta["target_plan"] = {
@@ -1887,6 +1894,14 @@ def run_factor_value_drl(
         "factor_names": list(factor_names),
         "obs_steps": len(rewards),
         "final_weights": final_weights,
+        "training_weights": list(final_weights),
+        "training_brief_used": False,
+        "inference_weights": list(final_weights),
+        "current_inference_brief": {
+            "applied": False,
+            "status": "no_overlay_for_factor_value",
+            "provenance": _brief_provenance(brief),
+        },
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "sum_reward": float(np.sum(rewards)) if rewards else 0.0,
         "regime_aware": {

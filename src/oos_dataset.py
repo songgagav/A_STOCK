@@ -24,7 +24,7 @@ from evidence_bundle import BundleBuildError, verify_bundle
 from observation_epoch import (
     build_observation_epoch,
     validate_shadow_production_state,
-    verify_observation_epoch,
+    verify_epoch_manifest_binding,
 )
 
 
@@ -106,6 +106,7 @@ class OOSDatasetRequest:
     generated_at: str
     code_sha: str
     data_identity: dict[str, Any]
+    data_lineage_identity: dict[str, Any]
     config_identity: dict[str, Any]
     experiment_identity: dict[str, Any]
     calendar_identity: dict[str, Any]
@@ -117,6 +118,7 @@ class OOSDatasetRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "output_root", Path(self.output_root))
         object.__setattr__(self, "data_identity", dict(self.data_identity))
+        object.__setattr__(self, "data_lineage_identity", dict(self.data_lineage_identity))
         object.__setattr__(self, "config_identity", dict(self.config_identity))
         object.__setattr__(self, "experiment_identity", dict(self.experiment_identity))
         object.__setattr__(self, "calendar_identity", dict(self.calendar_identity))
@@ -160,6 +162,11 @@ class OOSDatasetRequest:
         if len(self.days) != len(self.trade_days) or {day.trade_day for day in self.days} != set(self.trade_days):
             raise ValueError("one day input per trade_day is required")
         validate_shadow_production_state(self.production_state)
+        build_observation_epoch(
+            code_sha=self.code_sha, data_lineage_identity=self.data_lineage_identity,
+            config_identity=self.config_identity, experiment_identity=self.experiment_identity,
+            production_state=self.production_state,
+        )
 
 
 @dataclass(frozen=True)
@@ -293,9 +300,10 @@ def _load_day(
 def _identity(request: OOSDatasetRequest, raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
     observation_epoch = build_observation_epoch(
         code_sha=request.code_sha,
-        data_identity=request.data_identity,
+        data_lineage_identity=request.data_lineage_identity,
         config_identity=request.config_identity,
         experiment_identity=request.experiment_identity,
+        production_state=request.production_state,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -303,6 +311,7 @@ def _identity(request: OOSDatasetRequest, raw_rows: list[dict[str, Any]]) -> dic
         "generated_at": request.generated_at,
         "code_sha": request.code_sha,
         "data_identity": request.data_identity,
+        "data_lineage_identity": request.data_lineage_identity,
         "config_identity": request.config_identity,
         "experiment_identity": request.experiment_identity,
         "calendar_identity": request.calendar_identity,
@@ -333,9 +342,10 @@ def build_oos_dataset(request: OOSDatasetRequest) -> OOSDatasetResult:
     day_by_date = {day.trade_day: day for day in request.days}
     observation_epoch = build_observation_epoch(
         code_sha=request.code_sha,
-        data_identity=request.data_identity,
+        data_lineage_identity=request.data_lineage_identity,
         config_identity=request.config_identity,
         experiment_identity=request.experiment_identity,
+        production_state=request.production_state,
     )
     raw_rows: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
@@ -392,6 +402,7 @@ def build_oos_dataset(request: OOSDatasetRequest) -> OOSDatasetResult:
             "code_sha": request.code_sha,
             "data_sha": request.data_identity.get("data_sha"),
             "data_identity": request.data_identity,
+            "data_lineage_identity": request.data_lineage_identity,
             "config_sha": request.config_identity.get("config_sha"),
             "config_identity": request.config_identity,
             "experiment_hash": request.experiment_identity.get("experiment_hash"),
@@ -452,11 +463,13 @@ def verify_oos_dataset(dataset_path: Path | str) -> dict[str, Any]:
     identity = manifest.get("dataset_identity")
     if not isinstance(identity, dict) or _digest(identity) != manifest.get("dataset_id"):
         raise OOSDatasetBuildError("tampered", ["dataset_identity_mismatch"])
-    if "observation_epoch" in manifest:
-        try:
-            verify_observation_epoch(manifest["observation_epoch"])
-        except ValueError as exc:
-            raise OOSDatasetBuildError("tampered", ["observation_epoch_mismatch"]) from exc
+    try:
+        verify_epoch_manifest_binding(manifest, identity)
+    except ValueError as exc:
+        reason = ("manifest_identity_mismatch"
+                  if str(exc).startswith("manifest_identity_mismatch")
+                  else "observation_epoch_mismatch")
+        raise OOSDatasetBuildError("tampered", [reason]) from exc
     for relative, expected in (manifest.get("constituent_artifact_hashes") or {}).items():
         file_path = path / relative
         if not file_path.is_file():

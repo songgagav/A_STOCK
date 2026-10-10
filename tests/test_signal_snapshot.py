@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(_REPO, "src"))
 from signal_snapshot import (  # noqa: E402
     build_snapshot,
     read_snapshot,
+    sha256_json,
     snapshot_path,
     write_snapshot,
 )
@@ -167,6 +168,35 @@ def test_read_changed_metadata_with_old_hash_returns_l3_tampered(tmp_path):
     assert result["status"] == "tampered"
     assert result["snapshot"] is None
     assert result["reason"] == "snapshot_hash_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("generated_at", "generated_at_utc"),
+    [
+        ("2026-10-03T09:24:59+08:00", "2026-10-03T01:24:59Z"),
+        ("2026-10-03T09:26:00+08:00", "2026-10-03T01:26:00Z"),
+        ("2026-10-03T09:25:00", "2026-10-03T01:25:00Z"),
+        ("2026-10-03T09:25:00+08:00", "2026-10-03T01:24:00Z"),
+        ("not-a-timestamp", "2026-10-03T01:25:00Z"),
+    ],
+)
+def test_read_rejects_snapshot_without_consistent_shanghai_freeze_time(
+    tmp_path, generated_at, generated_at_utc,
+):
+    """A recomputed content hash must not make an out-of-window receipt ready."""
+    snapshot = _snapshot([{"canon": "600000.SH", "target_weight": 1.0}])
+    snapshot["generated_at"] = generated_at
+    snapshot["generated_at_utc"] = generated_at_utc
+    snapshot["snapshot_hash"] = None
+    snapshot["snapshot_hash"] = sha256_json(snapshot)
+    path = Path(snapshot_path(str(tmp_path), "20261003"))
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = read_snapshot(str(tmp_path), "20261003")
+
+    assert result["status"] == "invalid"
+    assert result["reason"] == "invalid_generation_timestamp"
 
 
 def test_read_snapshot_with_wrong_embedded_day_is_l2_invalid(tmp_path):
