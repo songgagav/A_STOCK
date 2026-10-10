@@ -628,7 +628,7 @@ def load_targets(day: str):
     return sel.get("top_n", []), sel, d
 
 
-def _live_src_label(held_missing, pool_missing) -> str:
+def _live_src_label(held_missing, pool_missing, reference_source=None) -> str:
     """按**持仓**缺价判定实时来源标记 —— 使该字段能直接回答"我在实时撮合吗".
 
     [2026-09-21 修] 原逻辑是"池里**任一只**缺价 ⇒ 整批标 `duckdb_reference`",
@@ -642,12 +642,15 @@ def _live_src_label(held_missing, pool_missing) -> str:
       `akshare_spot`            持仓与候选池**全部**取到实时价
       `duckdb_reference_pool`   仅**候选池**有缺价 —— 账户仍是实时估值, 影响的是**下次调仓**
       `duckdb_reference_held`   持仓有缺价 —— 账面已用最近收盘价兜底, **不能**当实时看
+      `h5i_reference_pool/held` 按实际使用参考价的标的分组，兼容旧 DuckDB 标签
+      `price_missing_pool/held` 参考价也未补齐，不能声称来自某个参考源
     """
+    prefix = reference_source or "duckdb_reference"
     if held_missing:
-        return "duckdb_reference_held"
+        return f"{prefix}_held"
     if pool_missing:
-        return "duckdb_reference_pool"
-    return "akshare_spot"
+        return f"{prefix}_pool"
+    return reference_source or "akshare_spot"
 
 
 class RealtimeEngine:
@@ -955,18 +958,18 @@ class RealtimeEngine:
         errors = self.feed.last_error
         if errors:
             log(f"实时源告警: {errors[:120]}")
-        live_src = "akshare_spot"
         # ★ 判据必须在**用参考价补齐之前**算: 补齐之后 latest 人人有价,
         #   再算就永远判不出"谁是被静态价兜底的"。实测 2026-09-21 就是因为
         #   原实现只看"池里任一只缺价"就把整批标成 duckdb_reference, 使该字段
         #   **无法区分"账户按实时价估值"与"账户被静态价兜底"**。
         missing = [c for c in all_codes if c not in latest or not latest.get(c)]
         held = list(self.pb.positions.keys())
-        held_missing = [c for c in held if c in missing]
         # 兜底: 实时源断连/缺失价 -> 用最近收盘价补齐, 保证撮合恒有价
         if missing or not latest:
             ref = self._disk_ref_prices(missing)
             if ref:
+                from db import BAR_STORE
+                source = "h5i_reference" if BAR_STORE == "h5i" else "duckdb_reference"
                 for c, p in ref.items():
                     if p > 0 and not latest.get(c):
                         latest[c] = p
@@ -975,16 +978,40 @@ class RealtimeEngine:
                             self.feed.quotes[c] = {"price": p, "last_close": p,
                                                    "limit_up": None, "limit_down": None,
                                                    "volume": 0, "suspended": False}
+                        self.feed.quotes[c].update(
+                            price=p, fallback=True, fallback_source=source, price_source=source,
+                        )
         # 来源标记**按持仓缺价**判定, 使该字段能直接回答"我在实时撮合吗":
         #   · held 有缺价  => 账户被静态价兜底, **不能**算实时(记账/风控都该打折看待)
         #   · 仅池内有缺价 => 账户仍是实时估值, 只是候选池不全(影响下次调仓, 不影响当前账面)
-        live_src = _live_src_label(held_missing, missing)
-        if held_missing:
-            log(f"实时源告警: 持仓缺实时价 {len(held_missing)}/{len(held)} 只 "
-                f"({','.join(held_missing[:5])}) -> 账面已用最近收盘价兜底")
-        elif missing:
-            log(f"实时源告警: 仅候选池缺价 {len(missing)}/{len(all_codes)} 只, "
-                f"持仓 {len(held)} 只全部实时")
+        # PriceFeed 可能已在内部补齐参考价，不能仅检查 latest 的缺项。
+        price_sources = {}
+        for c in all_codes:
+            q = self.feed.quotes.get(c) or {}
+            if not latest.get(c):
+                price_sources[c] = "price_missing"
+            else:
+                price_sources[c] = q.get("fallback_source") or (
+                    "duckdb_reference" if q.get("fallback")
+                    else q.get("price_source", "akshare_spot")
+                )
+        self.price_sources = price_sources
+        held_set = set(held)
+        held_reference = [c for c in held if price_sources[c] not in ("akshare_spot", "sina_spot")]
+        pool_reference = [c for c in all_codes if c not in held_set
+                          and price_sources[c] not in ("akshare_spot", "sina_spot")]
+        affected = held_reference or pool_reference
+        if affected:
+            sources = {price_sources[c] for c in affected}
+            # 未补齐持仓优先，不能因候选用了 H5i 就把该持仓归因 H5i。
+            source = next(s for s in ("price_missing", "h5i_reference", "duckdb_reference")
+                          if s in sources)
+        else:
+            sources = set(price_sources.values())
+            source = next(iter(sources)) if len(sources) == 1 else "mixed_spot"
+        live_src = _live_src_label(held_reference, pool_reference, source)
+        if affected:
+            log(f"实时源告警: {live_src}, 涉及 {len(affected)} 只 ({','.join(affected[:5])})")
 
         # 用实时价更新账面撮合价
         self.pb.d_price = {c: latest[c] for c in latest if latest.get(c) and latest[c] > 0}
@@ -1010,9 +1037,9 @@ class RealtimeEngine:
 
         self._write_state(latest, session, live_src)
 
-    # ---------- 参考价兜底 (实时源断连时用 DuckDB 最近收盘价) ----------
+    # ---------- 参考价兜底 (实时源断连时用 StockDB/h5i 最近收盘价) ----------
     def _ref_db(self) -> StockDB:
-        """惰性创建并在引擎生命周期内复用 DuckDB 参考价连接, 避免每 tick 新建."""
+        """惰性创建并在引擎生命周期内复用 StockDB 参考价连接, 避免每 tick 新建."""
         if self._ref_db_inst is None:
             self._ref_db_inst = StockDB()
         return self._ref_db_inst
@@ -1027,7 +1054,7 @@ class RealtimeEngine:
             self._ref_db_inst = None
 
     def _disk_ref_prices(self, codes: list) -> dict:
-        """从 DuckDB 取最近一根日线收盘价作参考价. codes为缺价标的."""
+        """从 StockDB/h5i 取最近一根日线收盘价作参考价. codes为缺价标的."""
         if not codes:
             return {}
         out = {}
@@ -1741,8 +1768,15 @@ class RealtimeEngine:
             "mode": "盘中实时撮合" if session else "待机/收盘(仅价格刷新)",
             "in_session": session,
             "live_source": live_src,
+            "price_sources": ({c: "price_hold" for c in latest} if live_src == "price_hold"
+                              else getattr(self, "price_sources", {})),
             "feed_error": self.feed.last_error or "",
-            "data_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # updated 是状态写入时间；data_ts 只代表实际 spot 抓取时间。
+            "data_ts": (
+                datetime.fromtimestamp(self.feed._ts).strftime("%Y-%m-%d %H:%M:%S")
+                if live_src in ("akshare_spot", "sina_spot", "mixed_spot")
+                and getattr(self.feed, "_ts", 0) > 0 else None
+            ),
             "capital": {
                 "init_capital": INIT_CAPITAL,
                 "equity": snap["equity"],

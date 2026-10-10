@@ -14,6 +14,7 @@ from db import StockDB
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
 from strategy_contract import drl_plan_mode
+from signal_snapshot import read_snapshot, snapshot_path
 
 
 class _IngestSkipped(Exception):
@@ -181,15 +182,15 @@ def portfolio_construction() -> dict:
     ## 为什么由回执侧算, 而不是让引擎写
 
     引擎(`realtime_engine`)是**盘中进程**, 它在 15:03 就退出了; 而回执在 19:10 生成。
-    故这里读引擎留下的 `data/live_state.json`(它含 `positions` 与 `targets` 快照)
-    与当天的 `target_plan.json` —— 两边都是**已落盘的事实**, 不新增进程间耦合。
+    故这里读引擎留下的 `live_state.json` 与其引用的权威冻结快照。
+    缺少内嵌目标时，只有 schema/内容哈希、日期及回执哈希均通过才报告建仓进度。
 
-    返回 `{}` 表示取不到数据(不臆造数字); 调用方据此记 `error`, 而不是记 0。
+    返回 `ok=False` 表示取不到有效证据(不臆造数字); 调用方据此记 `error`。
     """
     out: dict = {"ok": False}
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        lv_fp = os.path.join(root, "data", "live_state.json")
+        lv_fp = os.path.join(DATA_DIR, "live_state.json")
         if not os.path.isfile(lv_fp):
             out["error"] = f"缺少 {lv_fp}"
             return out
@@ -198,23 +199,38 @@ def portfolio_construction() -> dict:
         pos = lv.get("positions") or []
         held = {str(p.get("canon")) for p in pos if isinstance(p, dict) and p.get("canon")}
         # 目标池以**引擎当时用的** self.targets 为准(它才是实际执行的依据);
-        # live_state 里有 targets 快照。若没有, 再退回当天 target_plan.json。
+        # 缺内嵌目标时必须验证冻结回执，shadow DRL plan 不能替代执行证据。
         tgt_list = lv.get("targets") or []
         if tgt_list:
             want = [str(t.get("canon")) for t in tgt_list
                     if isinstance(t, dict) and t.get("canon")]
             src = "live_state.targets"
         else:
-            plan_fp = os.path.join(root, "data", "drl", str(lv.get("day") or "").replace("-", ""),
-                                   "target_plan.json")
-            if not os.path.isfile(plan_fp):
-                out["error"] = "live_state 无 targets 且找不到当日 target_plan.json"
+            day = str(lv.get("day") or "").replace("-", "")
+            ref = str(lv.get("snapshot_ref") or "").strip()
+            expected_hash = str(lv.get("snapshot_hash") or "").strip()
+            if lv.get("snapshot_status") != "ready" or not ref or not expected_hash:
+                out["error"] = "缺少 ready snapshot_ref/snapshot_hash 回执"
                 return out
-            with open(plan_fp, encoding="utf-8-sig") as f:
-                plan = json.load(f)
-            want = [str(t.get("canon")) for t in (plan.get("top_n") or [])
-                    if isinstance(t, dict) and t.get("canon")]
-            src = "target_plan.top_n"
+            ref_path = ref if os.path.isabs(ref) else os.path.join(root, ref)
+            authoritative = snapshot_path(DATA_DIR, day)
+            if (os.path.normcase(os.path.realpath(ref_path))
+                    != os.path.normcase(os.path.realpath(authoritative))):
+                out["error"] = "snapshot_ref 不是当日权威 signal snapshot"
+                return out
+            receipt = read_snapshot(DATA_DIR, day)
+            if receipt["status"] != "ready":
+                out["error"] = f"signal_snapshot {receipt['status']}: {receipt['reason']}"
+                return out
+            snapshot = receipt["snapshot"]
+            if expected_hash != snapshot["snapshot_hash"]:
+                out["error"] = "live_state snapshot_hash 与已校验快照不一致"
+                return out
+            want = [t["canon"] for t in snapshot["targets"]]
+            if not want:
+                out["error"] = "signal_snapshot 中没有有效 targets"
+                return out
+            src = "signal_snapshot"
 
         cap = lv.get("capital") or {}
         equity = float(cap.get("equity") or 0) or 1.0

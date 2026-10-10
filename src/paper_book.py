@@ -818,7 +818,7 @@ class PriceFeed:
           引擎只关心 watchlist (持仓+候选), 没必要全 A 抓 6000 只.
           1) 新浪单点接口 hq.sinajs.cn (毫秒级, 按 watchlist 直接拿)
           2) akshare stock_zh_a_spot_em 全 A (备选, 仅在新浪失败时)
-          3) DuckDB 最近收盘价兜底
+          3) StockDB/h5i 按原 watchlist 取最近收盘参考价
 
         fetch_all=True (午间重选/外部 API):
           1) 新浪全 A 接口 (180 只/批, 较快)
@@ -845,7 +845,7 @@ class PriceFeed:
                     out.update(self._fetch_sina_spot(codes_sina))
                     if out:
                         self._last_error = None
-                        fallback_close = self._fetch_from_duckdb()
+                        fallback_close = self._fetch_from_duckdb(symbols=list(out))
                         for canon in list(out.keys()):
                             if canon in fallback_close:
                                 last = fallback_close[canon]["price"]
@@ -941,6 +941,7 @@ class PriceFeed:
                 "price": px, "last_close": last_close,
                 "limit_up": lu, "limit_down": ld,
                 "volume": volume, "suspended": False,
+                "price_source": "akshare_spot",
             }
         return out
 
@@ -1010,46 +1011,48 @@ class PriceFeed:
                     "limit_down": ld,
                     "volume": -1,
                     "suspended": False,
+                    "price_source": "sina_spot",
                 }
         return out
 
     def _fetch_from_duckdb(self, symbols: list | None = None) -> dict:
-        """从 DuckDB daily_bars 取最近一日的 close 作为兜底价."""
+        """有界标的经 StockDB 取参考价；保留旧全市场 DuckDB 路径。"""
+        out = {}
+        if symbols is not None:
+            if not symbols:
+                return out
+            from db import BAR_STORE, StockDB
+            source = "h5i_reference" if BAR_STORE == "h5i" else "duckdb_reference"
+            db = StockDB()
+            try:
+                for canon in symbols:
+                    try:
+                        df = db.get_bars(canon, 1)
+                        if df is None or df.empty:
+                            continue
+                        last = float(df.iloc[-1]["close"] or 0)
+                        if last <= 0:
+                            continue
+                        lu, ld = _limit_prices(canon, last)
+                        out[canon] = {
+                            "price": last, "last_close": last,
+                            "limit_up": lu, "limit_down": ld,
+                            "volume": 0, "suspended": False, "fallback": True,
+                            "fallback_source": source, "price_source": source,
+                        }
+                    except Exception:
+                        continue
+            finally:
+                db.close()
+            return out
+
         import duckdb
         try:
             con = duckdb.connect(DUCKDB_PATH, read_only=True)
         except Exception:
             return {}
-        out = {}
         try:
-            if symbols:
-                canon_list = symbols
-                codes = [c.split(".")[0] for c in canon_list]
-                placeholders = ",".join(["?"] * len(codes))
-                df = con.execute(
-                    f"SELECT symbol, close FROM daily_bars t1 "
-                    f"WHERE symbol IN ({placeholders}) AND close > 0 "
-                    f"AND date = (SELECT MAX(date) FROM daily_bars t2 "
-                    f"             WHERE t2.symbol = t1.symbol)",
-                    codes,
-                ).fetchdf()
-                sym_map = dict(zip(df["symbol"], df["close"]))
-                for canon, code in zip(canon_list, codes):
-                    if code in sym_map:
-                        last = float(sym_map[code] or 0)
-                        if last <= 0:
-                            continue
-                        lu, ld = _limit_prices(canon, last)
-                        out[canon] = {
-                            "price": last,
-                            "last_close": last,
-                            "limit_up": lu,
-                            "limit_down": ld,
-                            "volume": 0,
-                            "suspended": False,
-                            "fallback": True,
-                        }
-            else:
+            if symbols is None:
                 # 全 A 最近收盘价: 取最新 date 所有 close
                 row = con.execute(
                     "SELECT MAX(date) FROM daily_bars WHERE close > 0"
@@ -1079,6 +1082,8 @@ class PriceFeed:
                         "volume": 0,
                         "suspended": False,
                         "fallback": True,
+                        "fallback_source": "duckdb_reference",
+                        "price_source": "duckdb_reference",
                     }
         finally:
             con.close()
@@ -1151,8 +1156,10 @@ class PriceFeed:
             self._last_error = f"spot fetch timeout>{SPOT_TIMEOUT}s"
         except Exception as e:
             self._last_error = str(e)
-        # 实时源超时/失败/为空 -> DuckDB 兜底
-        fallback = self._fetch_from_duckdb()
+        # tick fallback 仅覆盖既有 watchlist；全市场路径保留原 DuckDB 输入。
+        fallback = self._fetch_from_duckdb(
+            symbols=None if fetch_all else sorted(self.watchlist_codes()),
+        )
         if fallback:
             self._last_error = (self._last_error or "") + " (db fallback)"
         return fallback
