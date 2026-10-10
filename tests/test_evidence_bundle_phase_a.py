@@ -187,8 +187,7 @@ def test_new_bundle_rejects_unimplemented_drl_contract(tmp_path):
         _request(tmp_path, run_id="new-contract", production_state=state)
 
 
-@pytest.mark.parametrize("with_epoch", [False, True])
-def test_legacy_phase_a_bundle_verifies_with_unimplemented_contract(tmp_path, with_epoch):
+def _legacy_bundle_fixture(tmp_path, with_epoch):
     # Recreate the historical manifest contract independently in temporary output.
     result = build_bundle(_request(tmp_path))
     manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
@@ -212,7 +211,27 @@ def test_legacy_phase_a_bundle_verifies_with_unimplemented_contract(tmp_path, wi
     legacy_path = result.path.with_name(manifest["bundle_id"])
     result.path.rename(legacy_path)
     (legacy_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return legacy_path
+
+
+@pytest.mark.parametrize("with_epoch", [False, True])
+def test_legacy_phase_a_bundle_verifies_with_unimplemented_contract(tmp_path, with_epoch):
+    legacy_path = _legacy_bundle_fixture(tmp_path, with_epoch)
     assert verify_bundle(legacy_path)["production_state"]["drl_plan_mode_contract"] == "not_implemented"
+
+
+@pytest.mark.parametrize("mutation", ["null", "missing"])
+def test_legacy_v1_manifest_cannot_drop_its_bound_epoch(tmp_path, mutation):
+    legacy_path = _legacy_bundle_fixture(tmp_path, True)
+    manifest = json.loads((legacy_path / "manifest.json").read_text(encoding="utf-8"))
+    if mutation == "null":
+        manifest["observation_epoch"] = None
+    else:
+        manifest.pop("observation_epoch")
+    manifest["manifest_hash"] = _canonical_digest({k: v for k, v in manifest.items() if k != "manifest_hash"})
+    (legacy_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(BundleBuildError, match="observation_epoch"):
+        verify_bundle(legacy_path)
 
 
 @pytest.mark.parametrize("mutation", ["state", "missing_epoch"])

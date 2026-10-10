@@ -150,14 +150,14 @@ def verify_epoch_manifest_binding(manifest: Mapping[str, Any], identity: Mapping
     """Verify new manifest metadata against its bound epoch, retaining legacy reads."""
     epoch = manifest.get("observation_epoch")
     has_lineage = "data_lineage_identity" in identity
-    if epoch is None and not has_lineage:
+    if "observation_epoch" not in manifest and "observation_epoch" not in identity and not has_lineage:
         return  # Pre-epoch Phase A artifact.
     verified = verify_observation_epoch(epoch)
+    if identity.get("observation_epoch") != verified:
+        raise ValueError("manifest observation_epoch differs from artifact identity")
     if has_lineage and verified["schema_version"] != SCHEMA_VERSION:
         raise ValueError("lineage-bearing manifests require a v2 observation_epoch")
     if verified["schema_version"] == SCHEMA_VERSION:
-        if identity.get("observation_epoch") != verified:
-            raise ValueError("manifest observation_epoch differs from artifact identity")
         for key in ("code_sha", "data_lineage_identity", "config_identity",
                     "experiment_identity", "production_state"):
             bound = verified["identity"][key]
