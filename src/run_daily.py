@@ -29,6 +29,34 @@ class _IngestSkipped(Exception):
     pass
 
 
+def apply_incremental_reward_update(inc: dict, day: str) -> dict:
+    """Persist an optional recommendation and report the actual write outcome."""
+    from incremental_learn import get_reward_weight_state, set_reward_weights
+    receipt = {
+        "triggered": inc.get("triggered"), "samples_n": inc.get("samples_n"),
+        "worst_level": inc.get("degradation_worst_level"),
+        "overall_score": inc.get("degradation_overall_score"),
+        "reason": inc.get("reason"), "error": inc.get("error"),
+        "reward_config_written": False,
+    }
+    if not inc.get("triggered") or not inc.get("optimization"):
+        return receipt
+    rr = inc["optimization"].get("reward_rebalance") or {}
+    if rr.get("vnpy_weight") is None or rr.get("ic_weight") is None:
+        return receipt
+    written = set_reward_weights(
+        rr["vnpy_weight"], rr["ic_weight"], attr_weight=rr.get("attr_weight"),
+        source="incremental_learn", rationale=rr.get("rationale") or "incremental_learn triggered",
+        generated_on=day,
+    )
+    receipt["reward_config_written"] = written
+    if written:
+        receipt["reward_config_state"] = get_reward_weight_state(as_of=day)
+    else:
+        receipt["error"] = "reward_config validation or atomic write failed"
+    return receipt
+
+
 def self_closed_loop(day: str, day_dir: str, db) -> dict:
     """D->B 反馈闭环: 当日信号 IC 回算(幂等写 ic_history.csv) + ICIR 驱动因子权重刷新.
 
@@ -1452,27 +1480,9 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         # 6.5) 增量学习闭环: 退化检测 + (P0/P1 触发) LLM 调参 + 写 reward_config.
         #     异常一律容错, 不阻断主流程.
         try:
-            from incremental_learn import run_incremental_learn, set_reward_weights
+            from incremental_learn import run_incremental_learn
             inc = run_incremental_learn(day, days=10, trigger_threshold="P1")
-            report["steps"]["incremental_learn"] = {
-                "triggered": inc.get("triggered"),
-                "samples_n": inc.get("samples_n"),
-                "worst_level": inc.get("degradation_worst_level"),
-                "overall_score": inc.get("degradation_overall_score"),
-                "reason": inc.get("reason"),
-                "error": inc.get("error"),
-            }
-            # 若 LLM 触发并给出 reward_rebalance, 写入 reward_config
-            if inc.get("triggered") and inc.get("optimization"):
-                rr = inc["optimization"].get("reward_rebalance") or {}
-                vw = rr.get("vnpy_weight")
-                iw = rr.get("ic_weight")
-                if vw is not None and iw is not None:
-                    rationale = rr.get("rationale") or "incremental_learn triggered"
-                    set_reward_weights(float(vw), float(iw),
-                                       source="incremental_learn",
-                                       rationale=rationale)
-                    report["steps"]["incremental_learn"]["reward_config_written"] = True
+            report["steps"]["incremental_learn"] = apply_incremental_reward_update(inc, day)
         except Exception as e:
             report["steps"]["incremental_learn"] = {"error": str(e)[:200]}
 

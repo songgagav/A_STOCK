@@ -33,6 +33,7 @@ import drl_drift  # noqa: E402  (权重漂移检查; 轻量模块, 不拖入 tor
 import drl_degrade  # noqa: E402  (降级链 DRL-4; 轻量模块, 不拖入 torch)
 import drl_metrics  # noqa: E402  (学习中断指标 DRL-2; 轻量模块, 不拖入 torch)
 from drl_v2_contract import combine_reward_components  # noqa: E402
+from reward_weights import DEFAULT_REWARD_WEIGHTS, normalize_reward_weights
 
 import gymnasium  # noqa: E402
 import gymnasium.spaces as spaces  # noqa: E402
@@ -1316,13 +1317,15 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
     perf_report = _load_perf_report()
     attribution_diagnostic = _attribution_reward(perf_report)
     # 增量学习闭环: 读取 data/reward_config.json 调整奖励权重 (vnpy/ic/attr 三权).
-    # 默认 0.6 (基础), P0 退化时由 incremental_learn 自动提到 0.8+ 强调真实信号.
-    reward_weights = {"vnpy_weight": 0.6, "ic_weight": 0.4, "attr_weight": 0.15}
+    # 配置按 next-session 生效; 默认与降级三权也必须归一化并保留来源.
+    reward_weights = normalize_reward_weights(DEFAULT_REWARD_WEIGHTS)
     try:
-        from incremental_learn import get_reward_weights
-        reward_weights = get_reward_weights()
-    except Exception:
-        pass
+        from incremental_learn import get_reward_weight_state
+        reward_config_state = get_reward_weight_state(as_of=day)
+        reward_weights = normalize_reward_weights(reward_config_state["weights"])
+    except Exception as exc:
+        reward_config_state = {"weights": reward_weights, "status": "degraded_default",
+                               "reason": f"{type(exc).__name__}: {exc}", "source": "unknown"}
     vnpy_w = reward_weights["vnpy_weight"]
     ic_w = reward_weights["ic_weight"]
     attr_w = reward_weights["attr_weight"]
@@ -1447,6 +1450,7 @@ def run_drl_train(day: str, total_timesteps: int = 800, n_epochs: int = 4,
             # 增量学习 reward 权重 (由 incremental_learn 动态调整)
             "reward_weights": {"vnpy_weight": vnpy_w, "ic_weight": ic_w,
                                "attr_weight": attr_w},
+            "reward_config_state": reward_config_state,
             "vnpy_stats": {
                 "engine": vnpy_stats.get("engine"),
                 "total_return": vnpy_stats.get("stats", {}).get("total_return"),

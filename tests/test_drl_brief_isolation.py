@@ -111,6 +111,8 @@ def test_orchestration_keeps_historical_prior_and_records_separate_inference(mon
     for result in results:
         assert result["training_brief_used"] is False
         assert result["final_weights"] == result["training_weights"]
+        assert sum(result["reward_weights"].values()) == pytest.approx(1.0)
+        assert result["reward_config_state"]["status"]
         assert result["current_inference_brief"]["provenance"]["generated_on"] == "2026-10-09"
     assert results[0]["inference_weights"] != results[1]["inference_weights"]
     saved = json.loads((tmp_path / "drl" / "20261009" / "train_meta.json").read_text(encoding="utf-8"))
