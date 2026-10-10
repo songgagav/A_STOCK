@@ -100,7 +100,7 @@ def evaluate(sample: dict, now=None) -> dict:
         err = str(st.get("feed_error") or "").strip()
         src = st.get("live_source")
         if err or src in ("price_hold", "duckdb_reference_held", "h5i_reference_held",
-                          "price_missing_held"):
+                          "unknown_reference_held", "price_missing_held"):
             why = (f"行情源错误: {err[:110]}" if err
                    else f"估值退化为静态价(live_source={src})")
             return {**base, "level": "CRITICAL", "cause": "feed_stale",

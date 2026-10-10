@@ -363,7 +363,8 @@ def assemble(snap: dict) -> dict:
     elif snap.get("freshness_ok") is False:
         reasons.append("引擎数据未追平最后一个已收盘交易日(厂商未发布当日数据)")
 
-    if snap.get("live_source") in ("duckdb_reference_held", "h5i_reference_held"):
+    if snap.get("live_source") in ("duckdb_reference_held", "h5i_reference_held",
+                                  "unknown_reference_held"):
         reasons.append("持仓被静态参考价兜底(非实时估值, P2-LIVESRC)")
     elif snap.get("live_source") == "price_missing_held":
         reasons.append("持仓缺价且参考价未补齐(估值不完整, P2-LIVESRC)")
