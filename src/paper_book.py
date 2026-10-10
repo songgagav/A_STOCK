@@ -734,6 +734,13 @@ def _limit_prices(canon: str, last_close: float) -> tuple:
     return limit_up, limit_down
 
 
+def reference_price_source(bars) -> str:
+    """仅实际 bar-result 标签可以证明参考价后端；缺标签保持未知。"""
+    return {"h5i": "h5i_reference", "duckdb": "duckdb_reference"}.get(
+        bars.attrs.get("backend_source"), "unknown_reference",
+    )
+
+
 class PriceFeed:
     """盘中实时价: AKShare 全A实时快照(带缓存与降级).
     交易时段拉实时spot; 缓存30s; 失败时保留上一次快照, 跳过价格返回.
@@ -1021,8 +1028,7 @@ class PriceFeed:
         if symbols is not None:
             if not symbols:
                 return out
-            from db import BAR_STORE, StockDB
-            source = "h5i_reference" if BAR_STORE == "h5i" else "duckdb_reference"
+            from db import StockDB
             db = StockDB()
             try:
                 for canon in symbols:
@@ -1034,6 +1040,7 @@ class PriceFeed:
                         if last <= 0:
                             continue
                         lu, ld = _limit_prices(canon, last)
+                        source = reference_price_source(df)
                         out[canon] = {
                             "price": last, "last_close": last,
                             "limit_up": lu, "limit_down": ld,

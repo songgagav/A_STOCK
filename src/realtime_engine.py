@@ -35,7 +35,7 @@ from config import (
 )
 from db import StockDB, is_a_share_symbol as _is_a_share_code
 from selector import RotationSelector, save_selection
-from paper_book import PaperBook, PriceFeed
+from paper_book import PaperBook, PriceFeed, reference_price_source
 from utils import atomic_write_json as _atomic_write_json
 from signal_snapshot import (
     SHANGHAI,
@@ -644,6 +644,7 @@ def _live_src_label(held_missing, pool_missing, reference_source=None) -> str:
       `duckdb_reference_held`   持仓有缺价 —— 账面已用最近收盘价兜底, **不能**当实时看
       `h5i_reference_pool/held` 按实际使用参考价的标的分组，兼容旧 DuckDB 标签
       `price_missing_pool/held` 参考价也未补齐，不能声称来自某个参考源
+      `unknown_reference_pool/held` 参考价有效但实际后端标签缺失
     """
     prefix = reference_source or "duckdb_reference"
     if held_missing:
@@ -966,12 +967,12 @@ class RealtimeEngine:
         held = list(self.pb.positions.keys())
         # 兜底: 实时源断连/缺失价 -> 用最近收盘价补齐, 保证撮合恒有价
         if missing or not latest:
+            self._disk_ref_price_sources = {}
             ref = self._disk_ref_prices(missing)
             if ref:
-                from db import BAR_STORE
-                source = "h5i_reference" if BAR_STORE == "h5i" else "duckdb_reference"
                 for c, p in ref.items():
                     if p > 0 and not latest.get(c):
+                        source = self._disk_ref_price_sources.get(c, "unknown_reference")
                         latest[c] = p
                         # 同步到 feed.quotes, 让 _tradable / 涨跌停判断有价可用
                         if c not in self.feed.quotes:
@@ -992,7 +993,7 @@ class RealtimeEngine:
                 price_sources[c] = "price_missing"
             else:
                 price_sources[c] = q.get("fallback_source") or (
-                    "duckdb_reference" if q.get("fallback")
+                    "unknown_reference" if q.get("fallback")
                     else q.get("price_source", "akshare_spot")
                 )
         self.price_sources = price_sources
@@ -1004,7 +1005,7 @@ class RealtimeEngine:
         if affected:
             sources = {price_sources[c] for c in affected}
             # 未补齐持仓优先，不能因候选用了 H5i 就把该持仓归因 H5i。
-            source = next(s for s in ("price_missing", "h5i_reference", "duckdb_reference")
+            source = next(s for s in ("price_missing", "unknown_reference", "h5i_reference", "duckdb_reference")
                           if s in sources)
         else:
             sources = set(price_sources.values())
@@ -1055,6 +1056,7 @@ class RealtimeEngine:
 
     def _disk_ref_prices(self, codes: list) -> dict:
         """从 StockDB/h5i 取最近一根日线收盘价作参考价. codes为缺价标的."""
+        self._disk_ref_price_sources = {}
         if not codes:
             return {}
         out = {}
@@ -1067,6 +1069,7 @@ class RealtimeEngine:
                         px = float(df.iloc[-1]["close"])
                         if px > 0:
                             out[c] = px
+                            self._disk_ref_price_sources[c] = reference_price_source(df)
                 except Exception:
                     continue
         except Exception:

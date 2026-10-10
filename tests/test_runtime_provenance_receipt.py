@@ -106,7 +106,13 @@ def runtime(monkeypatch, tmp_path):
 def test_tick_persists_per_code_sources(runtime, monkeypatch, tmp_path,
                                         live, reference, expected, sources, health):
     monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: live)
-    monkeypatch.setattr(runtime, "_disk_ref_prices", lambda _codes: reference)
+    class ReferenceDB:
+        def get_bars(self, canon, n):
+            frame = pd.DataFrame({"close": [reference[canon]]}) if canon in reference else pd.DataFrame()
+            frame.attrs["backend_source"] = "h5i"
+            return frame
+
+    monkeypatch.setattr(runtime, "_ref_db", ReferenceDB)
     runtime.run_tick(NOW)
     state = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
     assert state["live_source"] == expected
@@ -191,7 +197,9 @@ def test_bounded_reference_uses_stockdb_without_changing_quote_metadata(monkeypa
     class ReferenceDB:
         def get_bars(self, canon, n):
             calls.append((canon, n))
-            return pd.DataFrame({"close": [10.0]})
+            frame = pd.DataFrame({"close": [10.0]})
+            frame.attrs["backend_source"] = "h5i"
+            return frame
 
         def close(self):
             calls.append("closed")
