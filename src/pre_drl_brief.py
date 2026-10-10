@@ -13,8 +13,8 @@
 #   - confidence        0..1, evidence 不足时 <=0.3
 #
 # 落盘: data/drl/<YYYYMMDD>/pre_drl_brief.json
-# DRL 端读取此产物: sentiment_factors 拼入 obs,
-#                  factor_recommendations 调整先验权重, stance 调节探索幅度.
+# DRL 端读取此产物: 仅供当前推断 overlay 及审计,
+#                  不进入历史 PPO observation 或训练 prior.
 # ============================================================
 
 from __future__ import annotations
@@ -555,7 +555,17 @@ def load_pre_drl_brief(day_dir: str) -> dict | None:
         return None
     if not isinstance(d, dict) or not d.get("ok"):
         return None
-    return d.get("brief") or None
+    brief = d.get("brief")
+    if not isinstance(brief, dict) or not brief:
+        return None
+    meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+    effective = meta.get("effective_day")
+    effective = effective if isinstance(effective, dict) else {}
+    return {**brief, "provenance": {
+        "source": p, "requested_day": d.get("day") or effective.get("requested"),
+        "generated_at": meta.get("generated_at"),
+        "effective_day": meta.get("effective_day"),
+    }}
 
 
 if __name__ == "__main__":

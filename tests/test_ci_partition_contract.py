@@ -13,6 +13,7 @@ MANIFEST = REPO / "tests" / "ci_test_partitions.json"
 
 EXPECTED_DRL_TESTS = {
     "tests/test_cvar_config.py",
+    "tests/test_drl_brief_isolation.py",
     "tests/test_drl_factor_state_h5i.py",
     "tests/test_drl_target_plan_h5i.py",
     "tests/test_drl_true_factor_state.py",
@@ -64,3 +65,10 @@ def test_drl_weight_contract_is_excluded_from_core_collection():
 
     assert should_ignore(drl_test, "core", REPO)
     assert not should_ignore(drl_test, "drl", REPO)
+
+
+def test_historical_brief_regression_is_excluded_from_core_collection():
+    from ci_test_partition import should_ignore
+    test_path = REPO / "tests" / "test_drl_brief_isolation.py"
+    assert should_ignore(test_path, "core", REPO)
+    assert not should_ignore(test_path, "drl", REPO)
