@@ -69,6 +69,15 @@ def _today() -> date:
     return _DAY_OVERRIDE if _DAY_OVERRIDE is not None else date.today()
 
 
+def _runtime_now(now: datetime | None = None) -> datetime:
+    """运行时无时区时间视为上海时间；带时区的瞬间转换到上海。"""
+    if now is None:
+        return datetime.now(SHANGHAI)
+    if now.tzinfo is None or now.utcoffset() is None:
+        return now.replace(tzinfo=SHANGHAI)
+    return now.astimezone(SHANGHAI)
+
+
 def _keep_a_share(items: list) -> list:
     """按 A 股代码段过滤 top_n 列表(防御 selection/历史文件含可转债)."""
     if not items:
@@ -764,6 +773,7 @@ class RealtimeEngine:
 
     def _freeze_or_load_targets(self, now: datetime) -> tuple[list[dict], dict, str, dict]:
         """冻结窗口写一次，窗口后只读已验证快照，绝不自动实时回退。"""
+        now = _runtime_now(now)
         day = self.pb.trade_date.replace("-", "")
         pending = {
             "snapshot_status": "pending",
@@ -891,7 +901,7 @@ class RealtimeEngine:
     # ---------- 一次 tick ----------
     def run_tick(self, now: datetime | None = None):
         self.tick += 1
-        now = now or datetime.now()
+        now = _runtime_now(now)
         # [2026-09-22 修] Dead-Man's Switch: tick 落在**主循环的每一轮**, 而不是调仓那一刻。
         #
         # 原先这一 beat 在 `_rebalance_if_due()` 里、且位于"调仓间隔已到"之后 ——
