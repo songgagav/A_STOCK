@@ -742,7 +742,7 @@ class RealtimeEngine:
     def _snapshot_artifacts(self, source_day: str, selection: dict) -> list[dict]:
         """只枚举本轮实际读取的计划或选择产物，供构造器计算内容摘要。"""
         day = str(source_day).replace("-", "")
-        is_drl = isinstance(selection, dict) and "consume_day" in selection
+        is_drl = self._snapshot_source_tier(selection) == "drl_plan"
         candidate = (
             os.path.join(DATA_DIR, "drl", day, "target_plan.json")
             if is_drl else os.path.join(DAILY_DIR, day, "selection.json")
@@ -752,7 +752,9 @@ class RealtimeEngine:
         return [{"path": os.path.relpath(candidate, _BASE)}]
 
     def _snapshot_source_tier(self, selection: dict) -> str:
-        if isinstance(selection, dict) and "consume_day" in selection:
+        if isinstance(selection, dict) and (
+            selection.get("source") == "drl_plan" or "consume_day" in selection
+        ):
             return "drl_plan"
         return "selection"
 

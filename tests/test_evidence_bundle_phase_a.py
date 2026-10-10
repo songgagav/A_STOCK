@@ -248,6 +248,28 @@ def test_v2_manifest_cannot_disagree_with_bound_epoch(tmp_path, mutation):
         verify_bundle(result.path)
 
 
+@pytest.mark.parametrize("field", ["data_sha", "data_sha_missing", "data_identity", "snapshot_hash"])
+def test_bundle_manifest_provenance_copies_must_match_identity(tmp_path, field):
+    result = build_bundle(_request(tmp_path))
+    manifest_path = result.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if field == "data_sha":
+        manifest[field] = "f" * 64
+    elif field == "data_sha_missing":
+        manifest.pop("data_sha")
+    elif field == "data_identity":
+        manifest[field] = {**manifest[field], "data_sha": "f" * 64}
+    else:
+        manifest[field] = "f" * 64
+    manifest["manifest_hash"] = _canonical_digest(
+        {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BundleBuildError, match="manifest_identity_mismatch"):
+        verify_bundle(result.path)
+
+
 def test_bundle_requires_explicit_shadow_runtime_state(tmp_path):
     with pytest.raises(ValueError, match="DRL_PLAN_MODE"):
         _request(tmp_path, production_state={

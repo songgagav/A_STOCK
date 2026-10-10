@@ -19,6 +19,12 @@ from oos_dataset import (
 )
 
 
+def _canonical_digest(value) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _json_artifact(path: Path, name: str, value) -> ArtifactInput:
     path.write_text(
         json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
@@ -182,6 +188,27 @@ def test_same_explicit_days_are_deterministic_and_include_provenance(tmp_path):
     assert (first.path / "raw" / "day_index.jsonl").is_file()
     assert (first.path / "derived" / "daily_metrics.jsonl").is_file()
     assert verify_oos_dataset(first.path)["dataset_id"] == first.dataset_id
+
+
+@pytest.mark.parametrize("field", ["calendar_identity", "trade_days", "data_sha"])
+def test_oos_manifest_provenance_copies_must_match_identity(tmp_path, field):
+    bundle = _bundle(tmp_path, "2026-10-07")
+    dataset = build_oos_dataset(_request(tmp_path, (_day(bundle, "2026-10-07"),)))
+    manifest_path = dataset.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if field == "calendar_identity":
+        manifest[field] = {**manifest[field], "calendar_sha": "changed"}
+    elif field == "trade_days":
+        manifest[field] = ["2026-10-08"]
+    else:
+        manifest[field] = "f" * 64
+    manifest["manifest_hash"] = _canonical_digest(
+        {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(OOSDatasetBuildError, match="manifest_identity_mismatch"):
+        verify_oos_dataset(dataset.path)
 
 
 def test_oos_requires_explicit_shadow_runtime_state(tmp_path):

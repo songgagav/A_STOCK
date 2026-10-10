@@ -10,7 +10,7 @@ import json
 import math
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -175,6 +175,29 @@ def _input_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _valid_generation_timestamp(snapshot: dict[str, Any], day: str) -> bool:
+    """Require matching Shanghai/UTC timestamps inside the 09:25 freeze minute."""
+    try:
+        generated_at = datetime.fromisoformat(snapshot["generated_at"])
+        utc_text = snapshot["generated_at_utc"]
+        if not isinstance(utc_text, str):
+            return False
+        generated_at_utc = datetime.fromisoformat(
+            utc_text[:-1] + "+00:00" if utc_text.endswith("Z") else utc_text
+        )
+        if generated_at.utcoffset() != timedelta(hours=8):
+            return False
+        if generated_at_utc.utcoffset() != timedelta(0):
+            return False
+        if generated_at.strftime("%Y%m%d") != day:
+            return False
+        if (generated_at.hour, generated_at.minute) != (9, 25):
+            return False
+        return generated_at.astimezone(timezone.utc) == generated_at_utc
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
     """验证已落盘快照；绝不以实时目标池替代失败的快照。"""
     if not isinstance(snapshot, dict) or not _required_snapshot_fields(snapshot):
@@ -198,6 +221,8 @@ def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
         hash_payload["snapshot_hash"] = None
         if sha256_json(hash_payload) != snapshot["snapshot_hash"]:
             return _tampered("snapshot_hash_mismatch")
+        if not _valid_generation_timestamp(snapshot, day):
+            return _invalid("invalid_generation_timestamp")
         if normalized_weights != snapshot["weights"]:
             return _invalid("target_weights_mismatch")
     except (TypeError, ValueError):

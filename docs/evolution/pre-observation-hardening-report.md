@@ -6,16 +6,16 @@
 `17b7bf2a8ba7b5c687215abf40957c3c48a3f777`。PR #17、main、主工作树、历史
 Evidence 与运行数据均不修改；不合并、不关闭 PR、不 force-push。
 
-候选代码 SHA：`395d99980d32e48b7f5fbb1ff004f4775dcb9e1a`。推送后仍须以 PR 同一 SHA
+候选代码 SHA：`b030ef9fa4873dba81bd0d98cd5d81ee5e393103`。推送后仍须以 PR 同一 SHA
 的 GitHub checks 为准；本地 Python 3.10 结果不冒充远端 Python 3.11/3.12 结果。
 
 ## T01–T10 对照
 
 | 任务 | 实施内容 | 当前状态 |
 |---|---|---|
-| T01 | naive 按上海时间解释、aware 转换；09:25 实际持久化 ready snapshot | 实施及独立审查通过 |
-| T02 | 逐代码真实来源、参考价不冒充实时、持仓降级；canonical snapshot day/schema/hash 回执，禁止 DRL fallback | 实施完成；两轮转换修补自审及定向回归通过，最终独立复审代理触及用量上限；GitHub checks 待运行 |
-| T03–T05 | Epoch v2 绑定稳定 lineage/production state；日 artifact hash 分离；新建要求已实现 shadow，旧 artifact 只验证 | 实施及独立审查通过 |
+| T01 | naive 按上海时间解释、aware 转换；09:25 实际持久化 ready snapshot；验证本地/UTC 双时间戳和冻结分钟 | 实施完成；最终整分支复审缺口已修，定向与完整 core 回归通过 |
+| T02 | 逐代码真实来源、参考价不冒充实时、持仓降级；canonical snapshot day/schema/hash 回执，禁止 DRL fallback；按来源记录实际 DRL plan 文件 | 实施完成；最终整分支复审缺口已修，定向与完整 core 回归通过 |
+| T03–T05 | Epoch v2 绑定稳定 lineage/production state；日 artifact hash 分离；新建要求已实现 shadow，旧 artifact 只验证；manifest 重复副本一致性校验 | 实施完成；最终整分支复审缺口已修，定向与完整 core 回归通过 |
 | T06 | 历史 PPO 中性情绪/原始 prior；learned/version 与 inference overlay 分离；未知日期保持未知 | 实施及审查补修通过，独立复审通过 |
 | T07–T09 | 三权归一化、attr 全链路、atomic config、next-session/pending、历史 future-config 防护、降级 trace | 实施完成；审查发现逐项修复并自审，最终独立复审代理触及用量上限 |
 | T10 | 单一已证明购入基础按 ex_date-buy_date；aggregate/legacy/非法日期显式 unknown/approximate | 实施完成，独立复审通过 |
@@ -28,10 +28,12 @@ Evidence 与运行数据均不修改；不合并、不关闭 PR、不 force-push
 - T06：隔离 RED 3 failed；CI 分区/provenance RED 2 failed；Value metadata RED 1 failed；初始 37 passed/1 既有 SB3 warning。provenance 补修 RED 2 failed/GREEN 22 passed，独立复审通过。
 - T07–T09：初始 RED 14 failed；future-config RED 1 failed；审查修补 RED 7、日历身份 RED 1、parser/empty-component RED 2；最近联合 focused GREEN 44 passed。最终独立审查代理触及用量上限，controller 自审。
 - T10：GREEN 76 passed，无新增 warning；独立复审通过。
-- 最终稳定代码 core：**2,805 passed, 38 skipped, 4 warnings，exit 0**。
+- 最终整分支复审发现 3 项 P2 provenance 缺口：snapshot 09:25 时间戳未作语义校验；DRL `source` 被误判成 selection；Evidence/OOS manifest 的重复 identity 副本未完全交叉检查。均在 `b030ef9fa4873dba81bd0d98cd5d81ee5e393103` 修复；各自新增 RED→GREEN 回归。
+- 最终修补 focused matrix：**101 passed**；完整 core：**2,818 passed, 38 skipped, 4 warnings，exit 0**。
 - 最终稳定代码 DRL：**173 passed, 9 warnings，exit 0**；h5i：**32 passed，exit 0**。
-- Bandit blocking `-ll -iii`：**PASS**；`secret_scan.py`：**PASS**（549 files/0）；tracked detect-secrets：**PASS**（0 finding files）；敏感配置历史路径检查无命中。
+- Bandit blocking `-ll -iii`：**PASS**；`secret_scan.py`：**PASS**（551 tracked files/0）；本机 detect-secrets 命令未安装，本轮标记 **NOT_RUN**，等待 PR 同 SHA security job；此前 `0ef8181` 上的 tracked scan 为 0 findings。敏感配置历史路径检查无命中。
 - pip-audit：**PASS**，No known vulnerabilities found（requirements.txt 未改）。
+- PR #18 首个 head `0ef8181` 的 GitHub core 3.11/3.12、DRL、h5i 和 static-and-secrets 均通过；`b030ef9` 之后的新 head checks 尚待推送触发。
 
 ## 关键裁定与限制
 
@@ -46,7 +48,7 @@ Evidence 与运行数据均不修改；不合并、不关闭 PR、不 force-push
 
 ## 尚未完成的外部验收
 
-- 推送分支并创建针对 PR #17 分支的审查 PR；同一 SHA 的 GitHub CI/security 检查待运行。
+- 将 `b030ef9fa4873dba81bd0d98cd5d81ee5e393103` 及本报告更新推送到 PR #18；同一最终 head 的 GitHub CI/security 检查待运行。
 - PR 整合与实际部署 SHA 选择、解释器/PID 身份验证。
 - 在该部署身份下冻结 Observation Epoch v2、配置/lineage/production state。
 - 冻结后至少五个连续合格真实交易日的不可变 Evidence/OOS/持仓换手/逐笔成本与差异审查。当前新 epoch 的合格天数为 **0**；旧快照、测试、回放都不计入。

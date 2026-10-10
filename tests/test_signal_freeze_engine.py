@@ -140,6 +140,27 @@ def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path, runtime_
     assert meta["snapshot_hash"] == persisted["snapshot"]["snapshot_hash"]
 
 
+def test_drl_selection_receipt_points_to_consumed_target_plan(engine, monkeypatch, tmp_path):
+    """DRL receipts hash the plan file, not a same-day selection decoy."""
+    root = tmp_path / "repo"
+    data = root / "data"
+    plan = data / "drl" / "20261002" / "target_plan.json"
+    selection_file = data / "daily" / "20261002" / "selection.json"
+    plan.parent.mkdir(parents=True)
+    selection_file.parent.mkdir(parents=True)
+    plan.write_text("{}", encoding="utf-8")
+    selection_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(RE, "_BASE", str(root))
+    monkeypatch.setattr(RE, "DATA_DIR", str(data))
+    selection = {"source": "drl_plan", "top_n": _TARGETS}
+
+    artifacts = engine._snapshot_artifacts("20261002", selection)
+
+    assert engine._snapshot_source_tier(selection) == "drl_plan"
+    assert len(artifacts) == 1
+    assert (root / artifacts[0]["path"]).resolve() == plan.resolve()
+
+
 def test_before_cutoff_keeps_live_resolution_for_preparation(engine, tmp_path, runtime_clock):
     """09:25 前只允许准备候选，不得写出权威冻结结论。"""
     targets, _sel, _source_day, meta = engine._freeze_or_load_targets(runtime_clock(_AT_0924))

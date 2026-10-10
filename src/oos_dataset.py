@@ -466,7 +466,10 @@ def verify_oos_dataset(dataset_path: Path | str) -> dict[str, Any]:
     try:
         verify_epoch_manifest_binding(manifest, identity)
     except ValueError as exc:
-        raise OOSDatasetBuildError("tampered", ["observation_epoch_mismatch"]) from exc
+        reason = ("manifest_identity_mismatch"
+                  if str(exc).startswith("manifest_identity_mismatch")
+                  else "observation_epoch_mismatch")
+        raise OOSDatasetBuildError("tampered", [reason]) from exc
     for relative, expected in (manifest.get("constituent_artifact_hashes") or {}).items():
         file_path = path / relative
         if not file_path.is_file():

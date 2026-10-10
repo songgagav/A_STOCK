@@ -21,6 +21,14 @@ _SHADOW_STATE = {
     "alpha_evidence_status": {"not_promotable"},
     "drl_plan_mode_contract": {"implemented_default_shadow"},
 }
+_MANIFEST_IDENTITY_COPIES = {
+    "schema_version", "trade_day", "generated_at", "run_id", "code_sha",
+    "data_identity", "data_lineage_identity", "config_identity",
+    "snapshot_hash", "experiment_identity", "observation_epoch",
+    "builder_version", "production_state", "reference_equity",
+    "reference_timestamp", "cost_evidence_level",
+    "calendar_identity", "trade_days",
+}
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -163,3 +171,36 @@ def verify_epoch_manifest_binding(manifest: Mapping[str, Any], identity: Mapping
             bound = verified["identity"][key]
             if manifest.get(key) != bound or identity.get(key) != bound:
                 raise ValueError(f"observation_epoch bound {key} mismatch")
+        for key in _MANIFEST_IDENTITY_COPIES:
+            if key in identity and manifest.get(key) != identity[key]:
+                raise ValueError(f"manifest_identity_mismatch:{key}")
+        for outer, parent, inner in (
+            ("data_sha", "data_identity", "data_sha"),
+            ("config_sha", "config_identity", "config_sha"),
+            ("experiment_hash", "experiment_identity", "experiment_hash"),
+        ):
+            if parent in identity or outer in manifest:
+                nested = identity.get(parent)
+                if not isinstance(nested, Mapping) or manifest.get(outer) != nested.get(inner):
+                    raise ValueError(f"manifest_identity_mismatch:{outer}")
+        if "source_artifact_hashes" in identity:
+            raw_artifacts = manifest.get("raw_artifacts")
+            source_hashes = identity["source_artifact_hashes"]
+            if not isinstance(raw_artifacts, Mapping) or not isinstance(source_hashes, Mapping):
+                raise ValueError("manifest_identity_mismatch:source_artifact_hashes")
+            raw_hashes = {
+                name: artifact.get("source_sha256")
+                for name, artifact in raw_artifacts.items()
+                if isinstance(artifact, Mapping)
+            }
+            expected_hashes = {
+                name: artifact.get("expected_sha256")
+                for name, artifact in raw_artifacts.items()
+                if isinstance(artifact, Mapping)
+            }
+            if raw_hashes != dict(source_hashes) or expected_hashes != dict(source_hashes):
+                raise ValueError("manifest_identity_mismatch:source_artifact_hashes")
+            snapshot = raw_artifacts.get("snapshot")
+            if (not isinstance(snapshot, Mapping)
+                    or manifest.get("snapshot_path") != snapshot.get("source_path")):
+                raise ValueError("manifest_identity_mismatch:snapshot_path")

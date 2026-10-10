@@ -26,6 +26,7 @@ POOL = "000001.SZ"
 EXTRA = "600519.SH"
 DAY = "20261009"
 NOW = datetime(2026, 10, 9, 10, 30, tzinfo=SHANGHAI)
+SNAPSHOT_AT = datetime(2026, 10, 9, 9, 25, tzinfo=SHANGHAI)
 TARGETS = [{"canon": HELD, "target_weight": 0.5},
            {"canon": POOL, "target_weight": 0.5}]
 
@@ -307,7 +308,7 @@ def receipt(monkeypatch, tmp_path):
     data.mkdir(parents=True)
     monkeypatch.setattr(RD, "__file__", str(root / "src" / "run_daily.py"))
     monkeypatch.setattr(RD, "DATA_DIR", str(data))
-    snapshot = build_snapshot(DAY, TARGETS, "selection_same_day", DAY, [], NOW, str(root))
+    snapshot = build_snapshot(DAY, TARGETS, "selection_same_day", DAY, [], SNAPSHOT_AT, str(root))
     path = write_snapshot(str(data), snapshot)
     live = {"day": "2026-10-09", "snapshot_status": "ready", "snapshot_ref": path,
             "snapshot_hash": snapshot["snapshot_hash"],
@@ -354,7 +355,7 @@ def test_invalid_snapshot_blocks_even_with_drl_plan(receipt, failure):
         snapshot["targets"][0]["canon"] = EXTRA
     elif failure == "wrong-snapshot-day":
         snapshot = build_snapshot("20261008", TARGETS, "selection_same_day", DAY,
-                                  [], NOW, str(data.parent))
+                                  [], SNAPSHOT_AT, str(data.parent))
         live["snapshot_hash"] = snapshot["snapshot_hash"]
     elif failure == "wrong-live-day":
         live["day"] = "2026-10-08"
