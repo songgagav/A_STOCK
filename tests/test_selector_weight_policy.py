@@ -225,3 +225,11 @@ def test_failed_snapshot_write_leaves_no_authoritative_file(tmp_path, monkeypatc
 
     snapshot_dir = tmp_path / "data" / "evolution" / "selector_weights"
     assert not snapshot_dir.exists() or list(snapshot_dir.iterdir()) == []
+
+
+def test_snapshot_rejects_repo_root_outside_resolver_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "adaptive")
+    monkeypatch.setattr(policy, "REPO_ROOT", tmp_path / "code-checkout")
+
+    with pytest.raises(policy.SelectorWeightPolicyError, match="must match the resolver checkout"):
+        policy.create_frozen_snapshot(str(tmp_path))

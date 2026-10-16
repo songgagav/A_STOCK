@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 from collections import deque
@@ -369,10 +370,30 @@ def test_daily_and_realtime_receipts_preserve_active_experiment_identity(
     runtime, monkeypatch, tmp_path,
 ):
     repo_root = tmp_path / "repo"
+    import selector_weight_policy as SWP
+
+    weight_payload = {
+        "schema_version": SWP.SNAPSHOT_SCHEMA_VERSION,
+        "policy": SWP.SNAPSHOT_POLICY,
+        "captured_at": "2026-10-16T09:00:00+08:00",
+        "weights": {key: 1.0 / len(SWP.FACTOR_KEYS) for key in SWP.FACTOR_KEYS},
+        "provenance": {
+            "source_mode": "adaptive-effective-selector",
+            "weights_json_sha256": None,
+            "factor_health_enabled": True,
+            "factor_health_input_sha256": {},
+        },
+    }
+    weight_raw = SWP._canonical_json_bytes(weight_payload)
+    weight_digest = hashlib.sha256(weight_raw).hexdigest()
+    weight_path = repo_root / "data" / "evolution" / "selector_weights" / f"{weight_digest}.json"
+    weight_path.parent.mkdir(parents=True, exist_ok=True)
+    weight_path.write_bytes(weight_raw)
+    monkeypatch.setattr(SWP, "REPO_ROOT", repo_root)
     experiment_identity = build_observation_experiment_identity({
         "name": "runtime-receipt",
         "selector_weight_mode": "frozen",
-        "selector_weights_snapshot_sha256": "f" * 64,
+        "selector_weights_snapshot_sha256": weight_digest,
     })
     epoch = build_observation_epoch(
         code_sha="code-sha-1",
@@ -398,7 +419,6 @@ def test_daily_and_realtime_receipts_preserve_active_experiment_identity(
     monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
     monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", selector_identity["snapshot_sha256"])
     freeze_observation_epoch(repo_root, epoch)
-    import selector_weight_policy as SWP
     monkeypatch.setattr(SWP, "selector_weight_mode", lambda: "frozen")
     monkeypatch.setattr(
         SWP, "resolve_selector_weight_context",
@@ -409,6 +429,7 @@ def test_daily_and_realtime_receipts_preserve_active_experiment_identity(
         RE, "resolve_selector_weight_context",
         lambda: SimpleNamespace(identity=selector_identity),
     )
+    monkeypatch.setattr(RE, "_BASE", str(repo_root))
     runtime._selector_weight_initial_mode = "frozen"
     runtime._selector_weight_expected_identity = selector_identity
     runtime._selector_weight_failure_latched = False

@@ -22,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--repo-root", default=str(REPO_ROOT),
-        help="repository whose current effective selector weights are captured",
+        help="must identify this resolver code checkout; defaults to this repository",
     )
     args = parser.parse_args()
     result = create_frozen_snapshot(args.repo_root)

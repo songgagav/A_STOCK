@@ -886,6 +886,7 @@ class RealtimeEngine:
             "mode": mode, "status": "ready",
             **({"identity": dict(context.identity)} if context is not None else {}),
         }
+        self.observation_epoch_receipt = self._current_observation_epoch_receipt()
         log("[selector-weight-policy] 显式身份预检通过")
         return self._selector_weight_policy_health_receipt()
 
@@ -897,6 +898,40 @@ class RealtimeEngine:
             "identity": dict(status["identity"]) if isinstance(status.get("identity"), dict) else None,
             "reason": status.get("reason"),
         }
+
+    def _current_observation_epoch_receipt(self) -> dict:
+        """Revalidate the selected epoch against current selector policy state."""
+        epoch_id = os.environ.get("OBSERVATION_EPOCH_ID")
+        if not epoch_id:
+            return {"status": "not_configured", "epoch_id": None}
+        if getattr(self, "_selector_weight_failure_latched", False):
+            status = getattr(self, "selector_weight_policy_status", {})
+            return {
+                "status": "blocked", "epoch_id": epoch_id,
+                "reason": str(status.get("reason") or "selector-weight identity is blocked")[:160],
+            }
+        try:
+            mode = selector_weight_mode()
+            if mode != "frozen":
+                raise SelectorWeightPolicyError("observation epoch requires frozen selector weights")
+            context = resolve_selector_weight_context()
+            expected = getattr(self, "_selector_weight_expected_identity", None)
+            actual = (
+                (self.sel or {}).get("selector_weight_identity")
+                if isinstance(getattr(self, "sel", None), dict) else None
+            )
+            if not expected or context.identity != expected or actual != context.identity:
+                raise SelectorWeightPolicyError(
+                    "active selection or snapshot identity differs from the observation epoch"
+                )
+        except SelectorWeightPolicyError as exc:
+            return {
+                "status": "blocked", "epoch_id": epoch_id,
+                "reason": f"{type(exc).__name__}: {str(exc)[:140]}",
+            }
+        return observation_epoch_runtime_receipt(
+            _BASE, selector_weight_identity=context.identity,
+        )
 
     # ---------- 09:25 信号冻结 ----------
     @staticmethod
@@ -2093,10 +2128,8 @@ class RealtimeEngine:
                 "board_limits": {"主板/ST": "±10%", "创业板/科创板": "±20%", "北交所": "±30%"},
             },
         }
-        observation_receipt = getattr(
-            self, "observation_epoch_receipt",
-            {"status": "not_configured", "epoch_id": None},
-        )
+        observation_receipt = self._current_observation_epoch_receipt()
+        self.observation_epoch_receipt = dict(observation_receipt)
         live["observation_epoch_receipt"] = dict(observation_receipt)
         if observation_receipt.get("status") == "ready":
             live["observation_epoch"] = observation_receipt["observation_epoch"]

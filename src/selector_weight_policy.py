@@ -250,6 +250,10 @@ def create_frozen_snapshot(
     if selector_weight_mode() != "adaptive":
         raise SelectorWeightPolicyError("snapshot creation requires explicit adaptive mode")
     root = Path(repo_root).resolve()
+    if root != REPO_ROOT.resolve():
+        raise SelectorWeightPolicyError(
+            "repo_root must match the resolver checkout so weights and provenance share one source"
+        )
     weights = _validated_weights(_load_adaptive_weights())
     captured = captured_at or datetime.now(ZoneInfo("Asia/Shanghai"))
     if captured.tzinfo is None or captured.utcoffset() is None:

@@ -148,6 +148,72 @@ def test_weight_gate_is_independent_of_signal_freeze_mode(monkeypatch):
     assert re.RealtimeEngine._selector_weight_target_rebalance_ready(engine) is True
 
 
+def test_successful_preflight_refreshes_observation_epoch_receipt(monkeypatch):
+    monkeypatch.setenv("OBSERVATION_EPOCH_ID", "e" * 64)
+    engine = object.__new__(re.RealtimeEngine)
+    engine.pb = SimpleNamespace(trade_date="2026-10-16")
+    engine._selector_weight_initial_mode = "frozen"
+    engine._selector_weight_expected_identity = IDENTITY
+    engine._selector_weight_failure_latched = True
+    engine.selector_weight_policy_status = {"mode": "frozen", "status": "blocked"}
+    engine.sel = {"selector_weight_identity": {"mode": "frozen", "snapshot_sha256": "d" * 64}}
+    engine.observation_epoch_receipt = {"status": "blocked", "epoch_id": "e" * 64}
+    refreshed = {
+        "status": "ready", "epoch_id": "e" * 64,
+        "experiment_identity": {"selector_weight_mode": "frozen"},
+        "observation_epoch": {"epoch_id": "e" * 64},
+    }
+    monkeypatch.setattr(re, "selector_weight_mode", lambda: "frozen", raising=False)
+    monkeypatch.setattr(
+        re, "resolve_selector_weight_context",
+        lambda: policy.SelectorWeightContext({"signal": 1.0}, IDENTITY), raising=False,
+    )
+    monkeypatch.setattr(
+        re, "load_targets",
+        lambda _day: ([{"canon": "600000.SH"}], {
+            "selector_weight_identity": IDENTITY,
+            "selector_weight_policy": {"status": "ready"},
+        }, "20261016"),
+    )
+    receipt_calls = []
+
+    def _receipt(_root, *, selector_weight_identity=None):
+        receipt_calls.append(selector_weight_identity)
+        return refreshed
+
+    monkeypatch.setattr(re, "observation_epoch_runtime_receipt", _receipt)
+
+    result = re.RealtimeEngine.preflight_selector_weight_identity(engine)
+
+    assert result["status"] == "ready"
+    assert receipt_calls == [IDENTITY]
+    assert engine.observation_epoch_receipt == refreshed
+
+
+def test_runtime_epoch_receipt_rechecks_snapshot_after_startup(monkeypatch):
+    epoch_id = "e" * 64
+    monkeypatch.setenv("OBSERVATION_EPOCH_ID", epoch_id)
+    monkeypatch.setattr(re, "selector_weight_mode", lambda: "frozen", raising=False)
+    monkeypatch.setattr(
+        re, "resolve_selector_weight_context",
+        lambda: (_ for _ in ()).throw(policy.SelectorWeightPolicyError("snapshot disappeared")),
+        raising=False,
+    )
+    engine = object.__new__(re.RealtimeEngine)
+    engine._selector_weight_initial_mode = "frozen"
+    engine._selector_weight_expected_identity = IDENTITY
+    engine._selector_weight_failure_latched = False
+    engine.selector_weight_policy_status = {"mode": "frozen", "status": "ready"}
+    engine.sel = {"selector_weight_identity": IDENTITY}
+    engine.observation_epoch_receipt = {"status": "ready", "epoch_id": epoch_id}
+
+    receipt = re.RealtimeEngine._current_observation_epoch_receipt(engine)
+
+    assert receipt["status"] == "blocked"
+    assert receipt["epoch_id"] == epoch_id
+    assert "snapshot disappeared" in receipt["reason"]
+
+
 def test_invalid_frozen_identity_blocks_new_rebalance_and_preserves_book(monkeypatch):
     logs = []
     monkeypatch.setattr(re, "log", logs.append)

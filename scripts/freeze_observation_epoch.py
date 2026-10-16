@@ -22,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--repo-root", default=str(REPO_ROOT),
-        help="repository receiving data/evolution/epochs/<epoch_id>.json",
+        help="must identify this runtime checkout and its active selector snapshot",
     )
     parser.add_argument(
         "--epoch-file", required=True,

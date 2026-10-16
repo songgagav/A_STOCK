@@ -210,6 +210,23 @@ def freeze_observation_epoch(record_root: str | Path, epoch: Mapping[str, Any]) 
         "selector_weights_snapshot_sha256"
     ]:
         raise ValueError("active selector-weight snapshot SHA differs from experiment identity")
+    try:
+        from selector_weight_policy import (
+            REPO_ROOT as selector_resolver_root,
+            SelectorWeightPolicyError,
+            resolve_selector_weight_context,
+        )
+
+        active_context = resolve_selector_weight_context()
+    except SelectorWeightPolicyError as exc:
+        raise ValueError("active selector-weight snapshot is invalid") from exc
+    if active_context.identity != {
+        "mode": "frozen",
+        "snapshot_sha256": experiment_identity["selector_weights_snapshot_sha256"],
+    }:
+        raise ValueError("resolved selector-weight identity differs from experiment identity")
+    if Path(record_root).resolve() != selector_resolver_root.resolve():
+        raise ValueError("record_root must match the resolver checkout containing the active snapshot")
     epoch_id = verified["epoch_id"]
     path = Path(record_root) / "data" / "evolution" / "epochs" / f"{epoch_id}.json"
     raw = (json.dumps(

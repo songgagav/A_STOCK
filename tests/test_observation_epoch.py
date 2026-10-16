@@ -15,6 +15,7 @@ from observation_epoch import (
     validate_observation_epoch_for_observation,
     verify_observation_epoch,
 )
+import selector_weight_policy as selector_policy
 
 
 def _lineage():
@@ -151,6 +152,29 @@ def _frozen_experiment(digest="a" * 64):
     })
 
 
+def _write_frozen_weight_snapshot(root, monkeypatch):
+    payload = {
+        "schema_version": selector_policy.SNAPSHOT_SCHEMA_VERSION,
+        "policy": selector_policy.SNAPSHOT_POLICY,
+        "captured_at": "2026-10-16T09:00:00+08:00",
+        "weights": {key: 1.0 / len(selector_policy.FACTOR_KEYS)
+                    for key in selector_policy.FACTOR_KEYS},
+        "provenance": {
+            "source_mode": "adaptive-effective-selector",
+            "weights_json_sha256": None,
+            "factor_health_enabled": True,
+            "factor_health_input_sha256": {},
+        },
+    }
+    raw = selector_policy._canonical_json_bytes(payload)
+    digest = hashlib.sha256(raw).hexdigest()
+    path = root / "data" / "evolution" / "selector_weights" / f"{digest}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    monkeypatch.setattr(selector_policy, "REPO_ROOT", root)
+    return digest
+
+
 def test_weight_mode_or_snapshot_digest_changes_epoch_id():
     frozen = _frozen_experiment()
     changed_digest = _frozen_experiment("b" * 64)
@@ -184,12 +208,13 @@ def test_observation_freeze_requires_valid_frozen_identity(tmp_path, identity):
 
 
 def test_epoch_record_is_create_only_without_breaking_legacy_verification(tmp_path, monkeypatch):
-    epoch = _epoch(experiment_identity=_frozen_experiment())
+    digest = _write_frozen_weight_snapshot(tmp_path, monkeypatch)
+    epoch = _epoch(experiment_identity=_frozen_experiment(digest))
     verified = validate_observation_epoch_for_observation(epoch)
     monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
     monkeypatch.setenv(
         "SELECTOR_WEIGHT_SNAPSHOT_SHA256",
-        epoch["identity"]["experiment_identity"]["selector_weights_snapshot_sha256"],
+        digest,
     )
 
     path = freeze_observation_epoch(tmp_path, verified)
@@ -225,8 +250,8 @@ def test_epoch_record_is_create_only_without_breaking_legacy_verification(tmp_pa
 
 
 def test_freeze_requires_frozen_runtime_mode_and_matching_snapshot_sha(tmp_path, monkeypatch):
-    epoch = _epoch(experiment_identity=_frozen_experiment())
-    digest = epoch["identity"]["experiment_identity"]["selector_weights_snapshot_sha256"]
+    digest = _write_frozen_weight_snapshot(tmp_path, monkeypatch)
+    epoch = _epoch(experiment_identity=_frozen_experiment(digest))
     monkeypatch.delenv("SELECTOR_WEIGHT_MODE", raising=False)
     monkeypatch.delenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", raising=False)
 
@@ -244,3 +269,34 @@ def test_freeze_requires_frozen_runtime_mode_and_matching_snapshot_sha(tmp_path,
     monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", digest)
     path = freeze_observation_epoch(tmp_path, epoch)
     assert path.is_file()
+
+
+def test_freeze_requires_resolvable_active_weight_snapshot(tmp_path, monkeypatch):
+    digest = "c" * 64
+    epoch = _epoch(experiment_identity=_frozen_experiment(digest))
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", digest)
+    monkeypatch.setattr(selector_policy, "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="active selector-weight snapshot is invalid"):
+        freeze_observation_epoch(tmp_path, epoch)
+
+    snapshot_path = tmp_path / "data" / "evolution" / "selector_weights" / f"{digest}.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text("not a snapshot", encoding="utf-8")
+    with pytest.raises(ValueError, match="active selector-weight snapshot is invalid"):
+        freeze_observation_epoch(tmp_path, epoch)
+
+
+def test_freeze_requires_epoch_record_root_to_match_snapshot_checkout(tmp_path, monkeypatch):
+    resolver_root = tmp_path / "resolver"
+    record_root = tmp_path / "record"
+    digest = _write_frozen_weight_snapshot(resolver_root, monkeypatch)
+    epoch = _epoch(experiment_identity=_frozen_experiment(digest))
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", digest)
+
+    with pytest.raises(ValueError, match="record_root must match the resolver checkout"):
+        freeze_observation_epoch(record_root, epoch)
+
+    assert not (record_root / "data" / "evolution" / "epochs" / f"{epoch['epoch_id']}.json").exists()
