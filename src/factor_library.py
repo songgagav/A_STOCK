@@ -81,7 +81,7 @@ def build_adj_close(df: pd.DataFrame) -> pd.Series:
 #   selector_weights() / score_factor(name, bars) / _pb_rev_score / _roe_score /
 #   _mf_net_score. 语义与旧版一致 (线性裁切映射到 0..1), 使 realtime_engine 可导入.
 # ---------------------------------------------------------------------------
-def selector_weights(as_of: str | None = None) -> dict:
+def _selector_weights_adaptive(as_of: str | None = None) -> dict:
     """Return the single effective selector-weight payload.
 
     as_of (2026-09-13 新增): 历史日期 -> 用**该日及之前**的 IC 曲线判隔离, 消除
@@ -105,6 +105,18 @@ def selector_weights(as_of: str | None = None) -> dict:
     if total > 0:
         W = {key: max(0.0, float(value)) / total for key, value in W.items()}
     return W
+
+
+def selector_weights(as_of: str | None = None) -> dict:
+    """Return selector weights through the explicit policy authority.
+
+    The public dictionary API is retained for existing callers. Live callers
+    in frozen mode resolve only the configured content-addressed snapshot;
+    historical ``as_of`` calls remain on the point-in-time adaptive path.
+    """
+    from selector_weight_policy import resolve_selector_weight_context
+
+    return resolve_selector_weight_context(as_of=as_of).weights
 
 
 # 已打印的隔离原因 (避免同原因重复刷屏)

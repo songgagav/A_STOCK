@@ -117,8 +117,9 @@ def test_factor_health_as_of_slices_curve():
     assert isinstance(load_factor_ic_from_curves(), dict)
 
 
-def test_selector_weights_accepts_as_of():
+def test_selector_weights_accepts_as_of(monkeypatch):
     from factor_library import selector_weights
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "adaptive")
     w = selector_weights(as_of="2022-12-30")
     assert isinstance(w, dict) and "vol" in w
     assert selector_weights(as_of="2018-06-29")["vol"] >= 0.0

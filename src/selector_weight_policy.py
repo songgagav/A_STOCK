@@ -54,9 +54,9 @@ def selector_weight_mode() -> str:
 def _load_adaptive_weights(as_of: str | None = None) -> dict[str, float]:
     """Read the existing effective resolver, retained for adaptive/history use."""
     try:
-        from factor_library import selector_weights
+        from factor_library import _selector_weights_adaptive
 
-        result = selector_weights(as_of=as_of)
+        result = _selector_weights_adaptive(as_of=as_of)
     except Exception as exc:  # noqa: BLE001 - expose a typed policy boundary
         raise SelectorWeightPolicyError(
             f"adaptive selector weights could not be resolved: {type(exc).__name__}"

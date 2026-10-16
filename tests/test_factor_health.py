@@ -104,6 +104,16 @@ class TestFlipThresholdTightening(unittest.TestCase):
 
 
 class TestSelectorHealthOverride(unittest.TestCase):
+    def setUp(self):
+        self._old_selector_weight_mode = os.environ.get("SELECTOR_WEIGHT_MODE")
+        os.environ["SELECTOR_WEIGHT_MODE"] = "adaptive"
+
+    def tearDown(self):
+        if self._old_selector_weight_mode is None:
+            os.environ.pop("SELECTOR_WEIGHT_MODE", None)
+        else:
+            os.environ["SELECTOR_WEIGHT_MODE"] = self._old_selector_weight_mode
+
     def test_isolated_factor_weight_zeroed(self):
         from factor_gate import factor_health_flags
         import factor_library as fl
