@@ -341,6 +341,24 @@ def test_matching_authoritative_snapshot_reports_construction(receipt, relative)
     assert result["deployment_ratio"] == 0.4
 
 
+def test_runtime_provenance_accepts_v2_snapshot_with_weight_identity(receipt):
+    data, live, _snapshot = receipt
+    identity = {"mode": "frozen", "snapshot_sha256": "e" * 64}
+    snapshot = build_snapshot(
+        DAY, TARGETS, "selection_same_day", DAY, [], SNAPSHOT_AT, str(data.parent),
+        selector_weight_identity=identity,
+    )
+    path = write_snapshot(str(data), snapshot)
+    live["snapshot_ref"] = path
+    live["snapshot_hash"] = snapshot["snapshot_hash"]
+    live["selector_weight_identity"] = identity
+
+    result = report_receipt(data, live)
+
+    assert result.get("ok") is True, result
+    assert result["source"] == "signal_snapshot"
+
+
 @pytest.mark.parametrize("failure", ["advertised-mismatch", "missing-hash", "stale-embedded-hash",
     "wrong-snapshot-day", "wrong-live-day", "pending-status", "missing-status",
     "missing-ref", "missing-file", "non-authoritative-ref", "invalid-schema"])

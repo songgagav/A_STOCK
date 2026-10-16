@@ -969,6 +969,23 @@ class RealtimeEngine:
             self._freeze_attempted = True
             try:
                 targets, selection, source_day = load_targets(self.pb.trade_date)
+                policy_mode = selector_weight_mode()
+                expected_weight_identity = None
+                if policy_mode == "frozen":
+                    expected_weight_identity = getattr(
+                        self, "_selector_weight_expected_identity", None,
+                    )
+                    actual_weight_identity = (
+                        selection.get("selector_weight_identity")
+                        if isinstance(selection, dict) else None
+                    )
+                    if (
+                        not expected_weight_identity
+                        or actual_weight_identity != expected_weight_identity
+                    ):
+                        raise SelectorWeightPolicyError(
+                            "09:25 selection does not prove the active frozen selector-weight identity"
+                        )
                 from target_weighting import ensure_target_weights
                 ensure_target_weights(targets, as_of=self.pb.trade_date)
                 source_day = str(source_day).replace("-", "")
@@ -980,9 +997,13 @@ class RealtimeEngine:
                     source_artifacts=self._snapshot_artifacts(source_day, selection),
                     generated_at=now,
                     repo_root=_BASE,
+                    selector_weight_identity=expected_weight_identity,
                 )
                 write_snapshot(DATA_DIR, snapshot)
-                result = read_snapshot(DATA_DIR, day)
+                result = read_snapshot(
+                    DATA_DIR, day,
+                    expected_selector_weight_identity=expected_weight_identity,
+                )
             except Exception as exc:  # noqa: BLE001
                 log(f"[signal-freeze/L2] 09:25 快照生成失败: {type(exc).__name__}: {exc}")
                 result = {"status": "invalid", "snapshot": None,
@@ -993,14 +1014,38 @@ class RealtimeEngine:
                 return frozen["targets"], selection, frozen["source_date"], meta
             return self.targets, self.sel, self.sel_day, meta
 
-        result = read_snapshot(DATA_DIR, day)
+        try:
+            policy_mode = selector_weight_mode()
+            expected_weight_identity = None
+            if policy_mode == "frozen":
+                expected_weight_identity = getattr(
+                    self, "_selector_weight_expected_identity", None,
+                )
+            if policy_mode == "frozen" and not expected_weight_identity:
+                raise SelectorWeightPolicyError(
+                    "active frozen selector-weight identity is unavailable"
+                )
+            result = read_snapshot(
+                DATA_DIR, day,
+                expected_selector_weight_identity=expected_weight_identity,
+            )
+        except SelectorWeightPolicyError as exc:
+            result = {
+                "status": "invalid", "snapshot": None,
+                "reason": f"selector_weight_policy_invalid:{type(exc).__name__}",
+            }
         meta = self._set_snapshot_result(result, day)
         if result.get("status") == "ready":
             frozen = result["snapshot"]
-            return frozen["targets"], {
+            frozen_selection = {
                 "source": "signal_snapshot",
                 "source_tier": frozen["source_tier"],
-            }, frozen["source_date"], meta
+            }
+            if frozen.get("selector_weight_identity") is not None:
+                frozen_selection["selector_weight_identity"] = frozen[
+                    "selector_weight_identity"
+                ]
+            return frozen["targets"], frozen_selection, frozen["source_date"], meta
         level = {"missing": "L1", "invalid": "L2", "tampered": "L3"}.get(
             result.get("status"), "L2")
         log(f"[signal-freeze/{level}] 快照不可用于调仓: {result.get('reason')}")

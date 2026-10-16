@@ -26,6 +26,7 @@ from signal_snapshot import (  # noqa: E402
 
 _SH = ZoneInfo("Asia/Shanghai")
 _FIXED_AT = datetime(2026, 10, 3, 9, 25, tzinfo=_SH)
+_WEIGHT_IDENTITY = {"mode": "frozen", "snapshot_sha256": "a" * 64}
 
 
 def _snapshot(targets: list[dict]) -> dict:
@@ -100,6 +101,83 @@ def test_write_then_read_returns_verified_snapshot(tmp_path):
     assert result["status"] == "ready"
     assert result["snapshot"] == snapshot
     assert result["reason"] is None
+
+
+def test_snapshot_v2_hash_binds_selector_weight_identity(tmp_path):
+    targets = [{"canon": "600000.SH", "target_weight": 1.0}]
+    snapshot = build_snapshot(
+        "20261003", targets, "selection_same_day", "20261002", [], _FIXED_AT, _REPO,
+        selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+
+    assert snapshot["schema_version"] == 2
+    assert snapshot["selector_weight_identity"] == _WEIGHT_IDENTITY
+    assert snapshot["input_hash"] != _snapshot(targets)["input_hash"]
+    write_snapshot(str(tmp_path), snapshot)
+    result = read_snapshot(
+        str(tmp_path), "20261003",
+        expected_selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+
+    assert result["status"] == "ready"
+    assert result["snapshot"]["selector_weight_identity"] == _WEIGHT_IDENTITY
+
+
+def test_v1_snapshot_remains_readable_for_adaptive_mode(tmp_path):
+    snapshot = _snapshot([{"canon": "600000.SH", "target_weight": 1.0}])
+    write_snapshot(str(tmp_path), snapshot)
+
+    result = read_snapshot(str(tmp_path), "20261003")
+
+    assert result["status"] == "ready"
+    assert result["snapshot"]["schema_version"] == 1
+
+
+def test_v1_or_tampered_identity_cannot_authorize_frozen_mode(tmp_path):
+    v1 = _snapshot([{"canon": "600000.SH", "target_weight": 1.0}])
+    write_snapshot(str(tmp_path), v1)
+    legacy = read_snapshot(
+        str(tmp_path), "20261003",
+        expected_selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+    assert legacy["status"] == "invalid"
+
+    v2 = build_snapshot(
+        "20261003", [{"canon": "600000.SH", "target_weight": 1.0}],
+        "selection_same_day", "20261002", [], _FIXED_AT, _REPO,
+        selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+    write_snapshot(str(tmp_path), v2)
+    path = Path(snapshot_path(str(tmp_path), "20261003"))
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["selector_weight_identity"]["snapshot_sha256"] = "b" * 64
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    rejected = read_snapshot(
+        str(tmp_path), "20261003",
+        expected_selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+
+    assert rejected["status"] == "tampered"
+    assert rejected["snapshot"] is None
+
+
+def test_hash_valid_but_different_weight_identity_cannot_authorize_frozen_mode(tmp_path):
+    other_identity = {"mode": "frozen", "snapshot_sha256": "b" * 64}
+    snapshot = build_snapshot(
+        "20261003", [{"canon": "600000.SH", "target_weight": 1.0}],
+        "selection_same_day", "20261002", [], _FIXED_AT, _REPO,
+        selector_weight_identity=other_identity,
+    )
+    write_snapshot(str(tmp_path), snapshot)
+
+    result = read_snapshot(
+        str(tmp_path), "20261003",
+        expected_selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+
+    assert result["status"] == "invalid"
+    assert result["snapshot"] is None
+    assert result["reason"] == "selector_weight_identity_mismatch"
 
 
 def test_read_missing_snapshot_returns_l1_missing(tmp_path):
