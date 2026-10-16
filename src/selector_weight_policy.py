@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -274,3 +274,63 @@ def create_frozen_snapshot(
     path = root / "data" / "evolution" / "selector_weights" / f"{digest}.json"
     _atomic_create_bytes(path, raw)
     return {"snapshot_sha256": digest, "path": str(path), "weights": weights}
+
+
+def persist_optimizer_weights(
+    day: str,
+    optimizer_result: Mapping[str, Any],
+    *,
+    authoritative_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Persist optimizer output according to policy, reporting its authority.
+
+    Adaptive mode retains the legacy ``weights.json`` payload. Frozen mode
+    stores an immutable, content-addressed proposal that the selector never
+    reads as effective weights.
+    """
+    mode = selector_weight_mode()
+    try:
+        from datetime import date
+
+        trading_day = date.fromisoformat(day).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise SelectorWeightPolicyError("optimizer proposal day must be YYYY-MM-DD") from exc
+    if trading_day != day:
+        raise SelectorWeightPolicyError("optimizer proposal day must use canonical YYYY-MM-DD format")
+    if not isinstance(optimizer_result, Mapping):
+        raise SelectorWeightPolicyError("optimizer result must be a mapping")
+    result = dict(optimizer_result)
+
+    if mode == "adaptive":
+        target = Path(authoritative_path) if authoritative_path is not None else (
+            REPO_ROOT / "data" / "weights.json"
+        )
+        try:
+            from utils import atomic_write_json
+
+            atomic_write_json(str(target), result)
+            raw = target.read_bytes()
+        except Exception as exc:  # noqa: BLE001 - typed writer boundary
+            raise SelectorWeightPolicyError(
+                f"adaptive weights.json write failed: {type(exc).__name__}"
+            ) from exc
+        return {
+            "mode": mode, "status": "written", "path": str(target),
+            "sha256": hashlib.sha256(raw).hexdigest(), "authoritative": True,
+        }
+
+    proposal = {
+        "schema_version": 1,
+        "policy": "selector-weight-proposal/v1",
+        "status": "proposal_only",
+        "trading_day": trading_day,
+        "optimizer_result": result,
+    }
+    raw = _canonical_json_bytes(proposal)
+    digest = hashlib.sha256(raw).hexdigest()
+    target = REPO_ROOT / "data" / "weight_proposals" / trading_day / f"{digest}.json"
+    _atomic_create_bytes(target, raw)
+    return {
+        "mode": mode, "status": "proposal_only", "path": str(target),
+        "sha256": digest, "authoritative": False,
+    }

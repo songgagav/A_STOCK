@@ -67,6 +67,7 @@ def self_closed_loop(day: str, day_dir: str, db) -> dict:
     try:
         import ic_track as icm
         from weight_optimizer import optimize_weights, WEIGHTS_FILE
+        from selector_weight_policy import persist_optimizer_weights
 
         # a0) 滞后回填(核心修复): 当天跑当天时未来收益未发生, compute_day_ic 永远
         #     算不出 -> ic_history 从未被管道自动生成. 对已"到期"的历史天(其 signal日
@@ -107,12 +108,22 @@ def self_closed_loop(day: str, day_dir: str, db) -> dict:
         else:
             fb["note"] += " | 当日样本不足(<5只配对未来收益), 未写IC"
 
-        # b) ICIR 驱动权重再平衡 -> 写 data/weights.json (selector 运行时读取)
+        # b) ICIR 权重建议统一经 policy 持久化；frozen 下只能成为非权威 proposal。
         opt = optimize_weights(window=40, alpha_share=0.28)
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(WEIGHTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(opt, f, ensure_ascii=False, indent=2)
-        fb["weights"] = opt["weights"]
+        persistence = persist_optimizer_weights(
+            day, opt, authoritative_path=WEIGHTS_FILE,
+        )
+        fb["weight_persistence"] = persistence
+        if persistence["authoritative"]:
+            fb["weights"] = opt["weights"]
+        else:
+            fb["weights"] = None
+            fb["weight_proposal"] = {
+                "status": "proposal_only",
+                "path": persistence["path"],
+                "sha256": persistence["sha256"],
+            }
+            fb["note"] += " | 权重建议仅 proposal_only, 未改变有效权重"
         fb["icir"] = {k: (v.get("icir") if v.get("icir") == v.get("icir") else None)
                       for k, v in opt["meta"]["icir"].items()}
         fb["generated"] = opt["meta"]["generated"]
