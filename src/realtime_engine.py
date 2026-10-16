@@ -36,6 +36,9 @@ from config import (
 from db import StockDB, is_a_share_symbol as _is_a_share_code
 from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed, reference_price_source
+from selector_weight_policy import (
+    SelectorWeightPolicyError, resolve_selector_weight_context, selector_weight_mode,
+)
 from utils import atomic_write_json as _atomic_write_json
 from signal_snapshot import (
     SHANGHAI,
@@ -531,6 +534,50 @@ def load_targets(day: str):
     global _LT_T0
     _LT_T0 = time.perf_counter()
 
+    policy_mode = "invalid"
+    try:
+        policy_mode = selector_weight_mode()
+    except SelectorWeightPolicyError as exc:
+        state = {"mode": policy_mode, "status": "blocked", "reason": str(exc)[:180]}
+        log(f"[selector-weight-policy] 拒绝加载目标: {state['reason']}")
+        return [], {"selector_weight_policy": state}, d
+
+    weight_context = None
+    if policy_mode == "frozen":
+        try:
+            weight_context = resolve_selector_weight_context()
+        except SelectorWeightPolicyError as exc:
+            state = {"mode": policy_mode, "status": "blocked", "reason": str(exc)[:180]}
+            log(f"[selector-weight-policy] 拒绝加载目标: {state['reason']}")
+            return [], {"selector_weight_policy": state}, d
+
+    policy_state = {"mode": policy_mode, "status": "ready"}
+    expected_identity = weight_context.identity if weight_context is not None else None
+    if expected_identity is not None:
+        policy_state["identity"] = dict(expected_identity)
+
+    def _policy_info(selection):
+        if not isinstance(selection, dict):
+            selection = {}
+        selection["selector_weight_policy"] = dict(policy_state)
+        return selection
+
+    def _selection_matches_policy(selection, source_day):
+        if policy_mode != "frozen":
+            return True
+        actual = selection.get("selector_weight_identity") if isinstance(selection, dict) else None
+        if actual != expected_identity:
+            log(f"[selector-weight-policy] 跳过未绑定/身份不匹配的 selection: {source_day}")
+            return False
+        return True
+
+    def _policy_block(reason):
+        state = {"mode": policy_mode, "status": "blocked", "reason": str(reason)[:180]}
+        if expected_identity is not None:
+            state["identity"] = dict(expected_identity)
+        log(f"[selector-weight-policy] 阻止新增目标: {state['reason']}")
+        return [], {"selector_weight_policy": state}, d
+
     # P8: 消费日的前一实际交易日(跨周末/节假日), 供 DRL plan 正式窗口校验使用
     prev_trade_day = _prev_trade_day(day)
 
@@ -542,7 +589,7 @@ def load_targets(day: str):
     # **兼容旧产物** —— 上线前写出的 plan 没有 consume_day 字段。
     from strategy_contract import drl_plan_is_consumable, drl_plan_mode
     _drl_mode = drl_plan_mode()
-    _drl_allowed = _drl_mode == "enforce"
+    _drl_allowed = _drl_mode == "enforce" and policy_mode != "frozen"
     if _drl_allowed:
         drl_prev_d, top_n, info = _load_daily_plan_for_consume_day(
             d, day, prev_trade_day)
@@ -550,9 +597,11 @@ def load_targets(day: str):
         # approval.  The loader returns the raw plan metadata through info.
         if top_n and drl_plan_is_consumable(info or {}):
             _trace_targets(day, drl_prev_d, "drl_same_day", len(top_n))
-            return top_n, info, drl_prev_d
+            return top_n, _policy_info(info), drl_prev_d
     else:
         log(f"DRL plan mode={_drl_mode}: production target consumption blocked")
+        if policy_mode == "frozen" and _drl_mode == "enforce":
+            log("[selector-weight-policy] frozen 模式拒绝未绑定权重身份的 DRL plan")
 
     # 2) 当日 selection.json
     sel_path = os.path.join(DAILY_DIR, d, "selection.json")
@@ -561,6 +610,8 @@ def load_targets(day: str):
             with open(sel_path, encoding="utf-8") as f:
                 cand_sel = json.load(f)
             if cand_sel and cand_sel.get("top_n"):
+                if not _selection_matches_policy(cand_sel, d):
+                    raise SelectorWeightPolicyError("same-day selection identity mismatch")
                 cand_sel["top_n"] = _keep_a_share(cand_sel["top_n"])
                 if not cand_sel["top_n"]:
                     pass
@@ -568,7 +619,9 @@ def load_targets(day: str):
                     for it in cand_sel["top_n"]:
                         it.setdefault("source", "selection")
                     _trace_targets(day, d, "selection_same_day", len(cand_sel["top_n"]))
-                    return cand_sel["top_n"], cand_sel, d
+                    return cand_sel["top_n"], _policy_info(cand_sel), d
+        except SelectorWeightPolicyError:
+            pass
         except Exception:
             pass
 
@@ -581,7 +634,7 @@ def load_targets(day: str):
         cand, top_n, info = _cross_day_drl_fallback(d, day, prev_trade_day)
         if top_n and drl_plan_is_consumable(info or {}):
             _trace_targets(day, cand, "drl_cross_day", len(top_n))
-            return top_n, info, cand
+            return top_n, _policy_info(info), cand
 
     # 4) 跨日回退 - selection: 最近的 selection.json
     sel = None
@@ -597,6 +650,8 @@ def load_targets(day: str):
                     with open(sp, encoding="utf-8") as f:
                         cand_sel = json.load(f)
                     if "top_n" in cand_sel and cand_sel["top_n"]:
+                        if not _selection_matches_policy(cand_sel, cand):
+                            continue
                         sel, sel_day = cand_sel, cand
                         break
                 except Exception:
@@ -611,15 +666,23 @@ def load_targets(day: str):
         for it in sel.get("top_n", []):
             it.setdefault("source", "selection")
         _trace_targets(day, sel_day, "selection_cross_day", len(sel.get("top_n", [])))
-        return sel.get("top_n", []), sel, sel_day
+        return sel.get("top_n", []), _policy_info(sel), sel_day
 
     # 5) 现场选股
     db = StockDB()
     try:
         sel = RotationSelector(db, n=MAX_STOCKS).select()
+        if not isinstance(sel, dict) or not sel.get("top_n"):
+            if policy_mode == "frozen":
+                return _policy_block("live selection produced no target pool")
+        if not _selection_matches_policy(sel, d):
+            return _policy_block("fresh selection did not resolve the configured frozen identity")
         sel["date"] = day
         sel["source"] = "live_select"
         save_selection(sel, d)
+        sel = _policy_info(sel)
+    except SelectorWeightPolicyError as exc:
+        return _policy_block(exc)
     finally:
         db.close()
     for it in sel.get("top_n", []):
@@ -667,6 +730,14 @@ class RealtimeEngine:
         self.pb.trade_date = _today().strftime("%Y-%m-%d")
         self.pb.day = self.pb.trade_date
         self.targets, self.sel, self.sel_day = load_targets(self.pb.trade_date)
+        _weight_status = (self.sel or {}).get("selector_weight_policy") or {
+            "mode": "invalid", "status": "blocked",
+            "reason": "target loader did not provide selector-weight policy status",
+        }
+        self.selector_weight_policy_status = dict(_weight_status)
+        self._selector_weight_initial_mode = _weight_status.get("mode", "invalid")
+        self._selector_weight_expected_identity = _weight_status.get("identity")
+        self._selector_weight_failure_latched = _weight_status.get("status") != "ready"
         # 09:25 冻结状态仅保存快照引用与完整性状态；候选池本身不写入实时 state。
         self._freeze_attempted = False
         self.snapshot_status = "pending"
@@ -728,6 +799,99 @@ class RealtimeEngine:
         #   本仓同类先例: `FAILS_TO_HALT` 也是"连续 N 次"而非"N 天"。
         self._construction_stall = 0      # 连续"尝试建仓但持仓数无增长"的次数
         self._construction_last_filled = -1   # 上次尝试时的"目标内持仓数"
+
+    def _latch_selector_weight_failure(self, reason: str) -> bool:
+        """Latch a selector-policy failure until an explicit identity preflight."""
+        already_latched = bool(getattr(self, "_selector_weight_failure_latched", False))
+        self._selector_weight_failure_latched = True
+        status = {
+            "mode": getattr(self, "_selector_weight_initial_mode", "invalid"),
+            "status": "blocked",
+            "reason": str(reason)[:180],
+        }
+        identity = getattr(self, "_selector_weight_expected_identity", None)
+        if isinstance(identity, dict):
+            status["identity"] = dict(identity)
+        self.selector_weight_policy_status = status
+        if not already_latched:
+            log(f"[selector-weight-policy] 阻止目标再平衡: {status['reason']}")
+        return False
+
+    def _selector_weight_target_rebalance_ready(self) -> bool:
+        """Validate policy identity independently of signal-freeze mode."""
+        if getattr(self, "_selector_weight_failure_latched", False):
+            return False
+        try:
+            mode = selector_weight_mode()
+        except SelectorWeightPolicyError as exc:
+            return self._latch_selector_weight_failure(exc)
+        initial_mode = getattr(self, "_selector_weight_initial_mode", mode)
+        if initial_mode in (None, "invalid") or mode != initial_mode:
+            return self._latch_selector_weight_failure(
+                f"runtime policy mode changed ({initial_mode!r} -> {mode!r})"
+            )
+        if mode == "adaptive":
+            self.selector_weight_policy_status = {"mode": mode, "status": "ready"}
+            return True
+        try:
+            context = resolve_selector_weight_context()
+        except SelectorWeightPolicyError as exc:
+            return self._latch_selector_weight_failure(exc)
+        expected = getattr(self, "_selector_weight_expected_identity", None)
+        if not expected or context.identity != expected:
+            return self._latch_selector_weight_failure("resolved snapshot identity changed")
+        actual = (self.sel or {}).get("selector_weight_identity") if isinstance(self.sel, dict) else None
+        if actual != context.identity:
+            return self._latch_selector_weight_failure(
+                "active selection does not prove the configured frozen weight identity"
+            )
+        self.selector_weight_policy_status = {
+            "mode": mode, "status": "ready", "identity": dict(context.identity),
+        }
+        return True
+
+    def preflight_selector_weight_identity(self) -> dict:
+        """Explicit operator preflight; the only in-session latch recovery path."""
+        try:
+            mode = selector_weight_mode()
+            old_mode = getattr(self, "_selector_weight_initial_mode", None)
+            if old_mode == "frozen" and mode != "frozen":
+                raise SelectorWeightPolicyError("frozen runtime cannot recover under a different mode")
+            context = resolve_selector_weight_context() if mode == "frozen" else None
+            old_identity = getattr(self, "_selector_weight_expected_identity", None)
+            if old_identity and context is not None and context.identity != old_identity:
+                raise SelectorWeightPolicyError("snapshot SHA changed; a new observation identity is required")
+            targets, selection, source_day = load_targets(self.pb.trade_date)
+            receipt = (selection or {}).get("selector_weight_policy") or {}
+            if receipt.get("status") != "ready":
+                raise SelectorWeightPolicyError(receipt.get("reason") or "target identity preflight failed")
+            if mode == "frozen" and (
+                context is None or selection.get("selector_weight_identity") != context.identity
+            ):
+                raise SelectorWeightPolicyError("selection does not match the active frozen snapshot")
+        except SelectorWeightPolicyError as exc:
+            self._latch_selector_weight_failure(exc)
+            return self._selector_weight_policy_health_receipt()
+
+        self.targets, self.sel, self.sel_day = targets, selection, source_day
+        self._selector_weight_initial_mode = mode
+        self._selector_weight_expected_identity = context.identity if context is not None else None
+        self._selector_weight_failure_latched = False
+        self.selector_weight_policy_status = {
+            "mode": mode, "status": "ready",
+            **({"identity": dict(context.identity)} if context is not None else {}),
+        }
+        log("[selector-weight-policy] 显式身份预检通过")
+        return self._selector_weight_policy_health_receipt()
+
+    def _selector_weight_policy_health_receipt(self) -> dict:
+        status = getattr(self, "selector_weight_policy_status", {})
+        return {
+            "mode": status.get("mode", "invalid"),
+            "status": status.get("status", "blocked"),
+            "identity": dict(status["identity"]) if isinstance(status.get("identity"), dict) else None,
+            "reason": status.get("reason"),
+        }
 
     # ---------- 09:25 信号冻结 ----------
     @staticmethod
@@ -937,12 +1101,14 @@ class RealtimeEngine:
         self.snapshot_ref = snapshot_meta["snapshot_ref"]
         self.snapshot_hash = snapshot_meta["snapshot_hash"]
         self.snapshot_reason = snapshot_meta.get("snapshot_reason")
+        selector_weight_ready = self._selector_weight_target_rebalance_ready()
         session = self.in_session(now)
         tgt_codes = [t["canon"] for t in self.targets]
         all_codes = list(dict.fromkeys(tgt_codes + list(self.pb.positions.keys())))
         # 同步持仓给 feed, 让 watchlist 路径生效 (避免每 tick 全A抓取)
         self.feed.set_snapshot_targets(
-            frozen_targets if mode == "enforce" and self.snapshot_status == "ready" else None,
+            frozen_targets if mode == "enforce" and self.snapshot_status == "ready"
+            and selector_weight_ready else None,
             enforce=(mode == "enforce"),
         )
         self.feed.set_positions(self.pb.positions)
@@ -1025,7 +1191,12 @@ class RealtimeEngine:
 
         # 只在交易时段撮合; 非交易时段只刷新估值不动仓
         if session and self._snapshot_allows_rebalance(mode, self.snapshot_status):
-            self._rebalance(latest)
+            if selector_weight_ready:
+                self._rebalance(latest)
+            else:
+                # `_rebalance` 仍运行止损、组合风控及 kill-switch；仅跳过由目标池驱动的
+                # 离池卖出/补权，避免策略身份损坏时清仓或换仓。
+                self._rebalance(latest, allow_target_rebalance=False)
         elif session:
             log(f"[signal-freeze/{self.snapshot_status}] enforce 下仅估值，拒绝自动调仓")
         else:
@@ -1193,7 +1364,7 @@ class RealtimeEngine:
                 log(f"  [{_tag}] 门控原因: {r}")
         return plan
 
-    def _rebalance(self, latest: dict):
+    def _rebalance(self, latest: dict, *, allow_target_rebalance: bool = True):
         """盘中补仓: 对目标持仓按等权目标市值补足; 目标组合外的持仓卖出.
         约束: 涨停不买 / 跌停不卖 / 停牌跳过 / 保留现金>=CASH_CUSHION.
         止损: 单持仓亏损>8% 强制卖出(可卖部分).
@@ -1278,7 +1449,7 @@ class RealtimeEngine:
 
         # 1) 卖出目标组合外的持仓 (可卖部分; 跌停/停牌跳过)
         min_hold = int(PAPER.get("min_hold_days", 0) or 0)
-        if gate_open:
+        if gate_open and allow_target_rebalance:
             for canon in list(self.pb.positions.keys()):
                 if canon not in target_set:
                     tb, reason = self._tradable(canon)
@@ -1307,6 +1478,8 @@ class RealtimeEngine:
                         self._to_used += mv
                         self._cooled.add(canon)   # 任何卖出 → 当日不再回补(防振荡)
                         log(f"卖出({canon}) 离开目标池 @{pr:.3f}")
+        elif not allow_target_rebalance:
+            log("selector-weight 身份未就绪: 跳过目标池离场/换仓，仅运行止损、风控与紧急检查")
 
         # 2) 单票止损 (可卖部分; 跌停/停牌跳过). 阈值与 config.PAPER.stop_loss 统一 -> -3%.
         #    [路线图 #10] 启用 PAPER.trailing_stop 时改为**移动止损**: 止损线随
@@ -1424,6 +1597,8 @@ class RealtimeEngine:
         except Exception as _e:  # noqa: BLE001
             # 判定异常时**不阻断交易**(否则一个 bug 会让系统静默停手), 但必须响亮报出
             log(f"Kill Switch 判定异常(不阻断, 需排查): {type(_e).__name__}: {_e}")
+        if not allow_target_rebalance:
+            return 0
         if gate_open:
             for t in self.targets:
                 canon = t["canon"]
@@ -1835,6 +2010,7 @@ class RealtimeEngine:
             "snapshot_ref": self.snapshot_ref,
             "snapshot_hash": self.snapshot_hash,
             "snapshot_reason": self.snapshot_reason,
+            "selector_weight_policy": self._selector_weight_policy_health_receipt(),
             "trades_today": self.pb.trades_today,
             "trades_history": self.pb.trades_history,
             "tick": self.tick,

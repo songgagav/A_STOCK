@@ -46,6 +46,7 @@ def runtime_clock(request):
 @pytest.fixture
 def engine(monkeypatch, tmp_path):
     """绕过网络、数据库和 PaperBook 初始化的最小引擎实例。"""
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "adaptive")
     instance = object.__new__(RE.RealtimeEngine)
     instance.pb = SimpleNamespace(
         trade_date="2026-10-03",
