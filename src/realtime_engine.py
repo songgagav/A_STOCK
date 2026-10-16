@@ -39,6 +39,7 @@ from paper_book import PaperBook, PriceFeed, reference_price_source
 from selector_weight_policy import (
     SelectorWeightPolicyError, resolve_selector_weight_context, selector_weight_mode,
 )
+from observation_epoch import observation_epoch_runtime_receipt
 from utils import atomic_write_json as _atomic_write_json
 from signal_snapshot import (
     SHANGHAI,
@@ -738,6 +739,10 @@ class RealtimeEngine:
         self._selector_weight_initial_mode = _weight_status.get("mode", "invalid")
         self._selector_weight_expected_identity = _weight_status.get("identity")
         self._selector_weight_failure_latched = _weight_status.get("status") != "ready"
+        self.observation_epoch_receipt = observation_epoch_runtime_receipt(
+            _BASE,
+            selector_weight_identity=self._selector_weight_expected_identity,
+        )
         # 09:25 冻结状态仅保存快照引用与完整性状态；候选池本身不写入实时 state。
         self._freeze_attempted = False
         self.snapshot_status = "pending"
@@ -2088,6 +2093,14 @@ class RealtimeEngine:
                 "board_limits": {"主板/ST": "±10%", "创业板/科创板": "±20%", "北交所": "±30%"},
             },
         }
+        observation_receipt = getattr(
+            self, "observation_epoch_receipt",
+            {"status": "not_configured", "epoch_id": None},
+        )
+        live["observation_epoch_receipt"] = dict(observation_receipt)
+        if observation_receipt.get("status") == "ready":
+            live["observation_epoch"] = observation_receipt["observation_epoch"]
+            live["experiment_identity"] = observation_receipt["experiment_identity"]
         # (2026-09-08) 成交处理耗时统计 (每 tick 毫秒; 环形缓冲近 ~240 ticks)
         if self._tick_ms:
             _a = np.asarray(list(self._tick_ms), dtype=float)

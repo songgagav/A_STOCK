@@ -23,6 +23,7 @@ from typing import Any
 from evidence_bundle import BundleBuildError, verify_bundle
 from observation_epoch import (
     build_observation_epoch,
+    validate_observation_experiment_identity,
     validate_shadow_production_state,
     verify_epoch_manifest_binding,
 )
@@ -145,6 +146,12 @@ class OOSDatasetRequest:
             raise ValueError("config_identity.config_sha is required")
         if not str(self.experiment_identity.get("experiment_hash") or ""):
             raise ValueError("experiment_identity.experiment_hash is required")
+        if {"selector_weight_mode", "selector_weights_snapshot_sha256"} & set(
+            self.experiment_identity
+        ):
+            object.__setattr__(self, "experiment_identity", validate_observation_experiment_identity(
+                self.experiment_identity
+            ))
         if not str(self.calendar_identity.get("calendar_sha") or ""):
             raise ValueError("calendar_identity.calendar_sha is required")
         if self.calendar_identity.get("trade_days_are_explicit") is not True:

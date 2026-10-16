@@ -19,6 +19,12 @@ import realtime_engine as RE
 import run_daily as RD
 from flow_watchdog import evaluate
 from health_state import assemble
+from observation_epoch import (
+    build_observation_epoch,
+    build_observation_experiment_identity,
+    freeze_observation_epoch,
+    observation_epoch_runtime_receipt,
+)
 from signal_snapshot import SHANGHAI, build_snapshot, read_snapshot, write_snapshot
 
 HELD = "600000.SH"
@@ -357,6 +363,71 @@ def test_runtime_provenance_accepts_v2_snapshot_with_weight_identity(receipt):
 
     assert result.get("ok") is True, result
     assert result["source"] == "signal_snapshot"
+
+
+def test_daily_and_realtime_receipts_preserve_active_experiment_identity(
+    runtime, monkeypatch, tmp_path,
+):
+    repo_root = tmp_path / "repo"
+    experiment_identity = build_observation_experiment_identity({
+        "name": "runtime-receipt",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": "f" * 64,
+    })
+    epoch = build_observation_epoch(
+        code_sha="code-sha-1",
+        data_lineage_identity={
+            "source": "h5i", "schema": "daily-bars-v1", "routing": "h5i-primary",
+            "universe": "a-share-v1", "calendar_source": "official-fixture",
+            "calendar_version": "2026-v1", "lineage_sha": "lineage-sha-1",
+        },
+        config_identity={"config_sha": "config-sha-1"},
+        experiment_identity=experiment_identity,
+        production_state={
+            "RANK_BY_FUSION": "0", "DRL_PLAN_MODE": "shadow",
+            "FUSION_WEIGHT_MODE": "shadow", "TRADE_BROKER": "paper",
+            "alpha_evidence_status": "not_promotable",
+            "drl_plan_mode_contract": "implemented_default_shadow",
+        },
+    )
+    monkeypatch.setenv("OBSERVATION_EPOCH_ID", epoch["epoch_id"])
+    selector_identity = {
+        "mode": "frozen",
+        "snapshot_sha256": experiment_identity["selector_weights_snapshot_sha256"],
+    }
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", selector_identity["snapshot_sha256"])
+    freeze_observation_epoch(repo_root, epoch)
+    import selector_weight_policy as SWP
+    monkeypatch.setattr(SWP, "selector_weight_mode", lambda: "frozen")
+    monkeypatch.setattr(
+        SWP, "resolve_selector_weight_context",
+        lambda: SimpleNamespace(identity=selector_identity),
+    )
+    monkeypatch.setattr(RE, "selector_weight_mode", lambda: "frozen")
+    monkeypatch.setattr(
+        RE, "resolve_selector_weight_context",
+        lambda: SimpleNamespace(identity=selector_identity),
+    )
+    runtime._selector_weight_initial_mode = "frozen"
+    runtime._selector_weight_expected_identity = selector_identity
+    runtime._selector_weight_failure_latched = False
+    runtime.sel["selector_weight_identity"] = selector_identity
+
+    runtime.observation_epoch_receipt = observation_epoch_runtime_receipt(
+        str(repo_root), epoch["epoch_id"], selector_identity,
+    )
+    monkeypatch.setattr(runtime.feed, "_fetch_spot_with_timeout", lambda: {
+        HELD: quote(10), POOL: quote(20),
+    })
+    runtime.run_tick(NOW)
+    live = json.loads((tmp_path / "live_state.json").read_text(encoding="utf-8"))
+    assert live["experiment_identity"] == experiment_identity
+    assert live["observation_epoch"]["epoch_id"] == epoch["epoch_id"]
+
+    daily_report = RD._attach_observation_epoch_identity({}, repo_root=str(repo_root))
+    assert daily_report["experiment_identity"] == experiment_identity
+    assert daily_report["observation_epoch"]["epoch_id"] == epoch["epoch_id"]
 
 
 @pytest.mark.parametrize("failure", ["advertised-mismatch", "missing-hash", "stale-embedded-hash",

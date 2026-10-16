@@ -7,7 +7,14 @@ import pytest
 import hashlib
 import json
 
-from observation_epoch import build_observation_epoch, verify_observation_epoch
+from observation_epoch import (
+    build_observation_epoch,
+    build_observation_experiment_identity,
+    freeze_observation_epoch,
+    observation_epoch_runtime_receipt,
+    validate_observation_epoch_for_observation,
+    verify_observation_epoch,
+)
 
 
 def _lineage():
@@ -134,3 +141,106 @@ def test_legacy_v1_epoch_still_verifies_without_new_production_contract():
     legacy["identity"]["code_sha"] = "changed"
     with pytest.raises(ValueError):
         verify_observation_epoch(legacy)
+
+
+def _frozen_experiment(digest="a" * 64):
+    return build_observation_experiment_identity({
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": digest,
+    })
+
+
+def test_weight_mode_or_snapshot_digest_changes_epoch_id():
+    frozen = _frozen_experiment()
+    changed_digest = _frozen_experiment("b" * 64)
+    adaptive = {
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "adaptive",
+        "selector_weights_snapshot_sha256": "a" * 64,
+        "experiment_hash": "adaptive-experiment",
+    }
+
+    base_id = _epoch(experiment_identity=frozen)["epoch_id"]
+
+    assert _epoch(experiment_identity=changed_digest)["epoch_id"] != base_id
+    assert _epoch(experiment_identity=adaptive)["epoch_id"] != base_id
+
+
+@pytest.mark.parametrize("identity", [
+    {"experiment_hash": "legacy"},
+    {"experiment_hash": "bad", "selector_weight_mode": "adaptive",
+     "selector_weights_snapshot_sha256": "a" * 64},
+    {"experiment_hash": "bad", "selector_weight_mode": "frozen",
+     "selector_weights_snapshot_sha256": "not-a-digest"},
+    {"experiment_hash": "bad", "selector_weight_mode": "frozen",
+     "selector_weights_snapshot_sha256": "a" * 64},
+])
+def test_observation_freeze_requires_valid_frozen_identity(tmp_path, identity):
+    epoch = _epoch(experiment_identity=identity)
+
+    with pytest.raises(ValueError):
+        freeze_observation_epoch(tmp_path, epoch)
+
+
+def test_epoch_record_is_create_only_without_breaking_legacy_verification(tmp_path, monkeypatch):
+    epoch = _epoch(experiment_identity=_frozen_experiment())
+    verified = validate_observation_epoch_for_observation(epoch)
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv(
+        "SELECTOR_WEIGHT_SNAPSHOT_SHA256",
+        epoch["identity"]["experiment_identity"]["selector_weights_snapshot_sha256"],
+    )
+
+    path = freeze_observation_epoch(tmp_path, verified)
+    first_bytes = path.read_bytes()
+    assert path == tmp_path / "data" / "evolution" / "epochs" / f"{epoch['epoch_id']}.json"
+    assert freeze_observation_epoch(tmp_path, epoch) == path
+    assert path.read_bytes() == first_bytes
+    mismatch = observation_epoch_runtime_receipt(
+        tmp_path, epoch["epoch_id"],
+        {"mode": "frozen", "snapshot_sha256": "b" * 64},
+    )
+    assert mismatch["status"] == "blocked"
+
+    path.write_bytes(b"pre-existing conflicting record")
+    with pytest.raises(ValueError, match="refusing to replace"):
+        freeze_observation_epoch(tmp_path, epoch)
+    assert path.read_bytes() == b"pre-existing conflicting record"
+
+    legacy = {
+        "schema_version": 1, "epoch_id": "legacy-id",
+        "identity": {
+            "schema_version": 1, "code_sha": "legacy-code",
+            "data_identity": {"data_sha": "old-daily-sha"},
+            "config_identity": {"config_sha": "old-config"},
+            "experiment_identity": {"experiment_hash": "old-experiment"},
+        },
+    }
+    legacy["epoch_id"] = hashlib.sha256(json.dumps(
+        legacy["identity"], sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+    assert verify_observation_epoch(legacy) == legacy
+
+
+def test_freeze_requires_frozen_runtime_mode_and_matching_snapshot_sha(tmp_path, monkeypatch):
+    epoch = _epoch(experiment_identity=_frozen_experiment())
+    digest = epoch["identity"]["experiment_identity"]["selector_weights_snapshot_sha256"]
+    monkeypatch.delenv("SELECTOR_WEIGHT_MODE", raising=False)
+    monkeypatch.delenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", raising=False)
+
+    with pytest.raises(ValueError, match="SELECTOR_WEIGHT_MODE=frozen"):
+        freeze_observation_epoch(tmp_path, epoch)
+
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    with pytest.raises(ValueError, match="active selector-weight snapshot SHA"):
+        freeze_observation_epoch(tmp_path, epoch)
+
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", "b" * 64)
+    with pytest.raises(ValueError, match="active selector-weight snapshot SHA"):
+        freeze_observation_epoch(tmp_path, epoch)
+
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", digest)
+    path = freeze_observation_epoch(tmp_path, epoch)
+    assert path.is_file()

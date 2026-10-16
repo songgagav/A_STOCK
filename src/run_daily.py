@@ -15,6 +15,9 @@ from selector import RotationSelector, save_selection
 from paper_book import PaperBook, PriceFeed
 from strategy_contract import drl_plan_mode
 from signal_snapshot import read_snapshot, snapshot_path
+from observation_epoch import observation_epoch_runtime_receipt
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class _IngestSkipped(Exception):
@@ -27,6 +30,39 @@ class _IngestSkipped(Exception):
     归因错误) —— 故每个摄入步骤都先 `except _IngestSkipped: pass`。
     """
     pass
+
+
+def _attach_observation_epoch_identity(
+    report: dict, *, repo_root: str | None = None,
+) -> dict:
+    """Bind daily summary to the explicitly selected verified observation epoch."""
+    selected_epoch_id = os.environ.get("OBSERVATION_EPOCH_ID")
+    weight_identity = None
+    if selected_epoch_id:
+        try:
+            from selector_weight_policy import resolve_selector_weight_context, selector_weight_mode
+
+            if selector_weight_mode() == "frozen":
+                weight_identity = resolve_selector_weight_context().identity
+        except Exception as exc:  # noqa: BLE001 - report a blocked receipt, never infer identity
+            report["observation_epoch_receipt"] = {
+                "status": "blocked",
+                "epoch_id": selected_epoch_id,
+                "reason": f"selector_weight_policy_unavailable:{type(exc).__name__}",
+            }
+            return report
+    receipt = observation_epoch_runtime_receipt(
+        repo_root or _REPO_ROOT,
+        selected_epoch_id,
+        selector_weight_identity=weight_identity,
+    )
+    report["observation_epoch_receipt"] = {
+        key: value for key, value in receipt.items() if key != "observation_epoch"
+    }
+    if receipt.get("status") == "ready":
+        report["observation_epoch"] = receipt["observation_epoch"]
+        report["experiment_identity"] = receipt["experiment_identity"]
+    return report
 
 
 def apply_incremental_reward_update(inc: dict, day: str) -> dict:
@@ -642,7 +678,7 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
     os.makedirs(os.path.join(DAILY_DIR, day_dir), exist_ok=True)
 
     db = StockDB()
-    report = {"day": day, "mode": mode, "steps": {}}
+    report = _attach_observation_epoch_identity({"day": day, "mode": mode, "steps": {}})
     try:
         # 0) 盘前健康检查 (08:00~09:00 调度时也兼容执行). 失败不阻塞, 但 WARN/FAIL 写日志.
         #    maint 模式也检查, 便于发现周末数据通道问题.
