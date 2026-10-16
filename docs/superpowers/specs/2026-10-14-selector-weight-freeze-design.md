@@ -1,6 +1,6 @@
 # Selector Weight Freeze for Paper/Shadow Observation
 
-**Status:** Draft for user review. The conversational design is approved; implementation is not authorized until this written specification is reviewed and approved.
+**Status:** User-approved on 2026-10-16. Implementation remains gated on review of the implementation plan.
 
 ## 1. Purpose and constraints
 
