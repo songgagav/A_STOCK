@@ -13,12 +13,15 @@
 
 import os
 import json
+import hashlib
+import re
 import sys
 import glob
 import time
 import subprocess
 import argparse
 from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -822,24 +825,99 @@ def read_perf():
 
 
 def read_weights():
-    """读取自适应因子权重: data/weights.json (weight_optimizer 写入).
-    返回 {weights:{factor:val}, meta:{ic依据, method, updated}}."""
-    p = os.path.join(DATA_DIR, "weights.json")
-    if os.path.exists(p):
+    """Return effective selector weights; optimizer proposals are never authority."""
+    from selector_weight_policy import (
+        SelectorWeightPolicyError,
+        resolve_selector_weight_context,
+        selector_weight_mode,
+    )
+
+    try:
+        mode = selector_weight_mode()
+        context = resolve_selector_weight_context()
+    except SelectorWeightPolicyError as exc:
+        return {
+            "ok": False, "weights": {}, "meta": {},
+            "mode": os.environ.get("SELECTOR_WEIGHT_MODE"),
+            "error": str(exc),
+        }
+
+    meta = {}
+    updated = ""
+    if mode == "adaptive":
+        path = os.path.join(DATA_DIR, "weights.json")
         try:
-            with open(p, encoding="utf-8") as f:
-                w = json.load(f)
-            meta = w.get("meta") or {}
-            weights = w.get("weights") or {}
-            return {
-                "ok": True,
-                "weights": weights,
-                "meta": meta,
-                "updated": w.get("updated") or meta.get("updated") or "",
-            }
-        except Exception:
+            with open(path, encoding="utf-8") as stream:
+                legacy = json.load(stream)
+            meta = legacy.get("meta") or {}
+            updated = legacy.get("updated") or meta.get("updated") or ""
+        except (OSError, json.JSONDecodeError, AttributeError):
             pass
-    return {"ok": False, "weights": {}, "meta": {}}
+        return {
+            "ok": True,
+            "weights": context.weights,
+            "meta": meta,
+            "updated": updated,
+            "mode": mode,
+            "effective_source": "adaptive_selector",
+            "proposal": None,
+        }
+
+    return {
+        "ok": True,
+        "weights": context.weights,
+        "meta": {},
+        "updated": "",
+        "mode": mode,
+        "snapshot_sha256": context.identity["snapshot_sha256"],
+        "effective_source": "frozen_snapshot",
+        "proposal": _read_latest_weight_proposal(),
+    }
+
+
+def _read_latest_weight_proposal():
+    """Read one verified content-addressed proposal for display, never selection."""
+    root = Path(DATA_DIR) / "weight_proposals"
+    if not root.is_dir():
+        return None
+    day_dirs = sorted(
+        (path for path in root.iterdir()
+         if path.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name)),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for day_dir in day_dirs:
+        candidates = sorted(day_dir.glob("*.json"), key=lambda path: path.name)
+        for path in reversed(candidates):
+            try:
+                raw = path.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                proposal = json.loads(raw.decode("utf-8"))
+                if path.stem != digest:
+                    raise ValueError("proposal filename hash mismatch")
+                if (
+                    not isinstance(proposal, dict)
+                    or proposal.get("schema_version") != 1
+                    or proposal.get("policy") != "selector-weight-proposal/v1"
+                    or proposal.get("status") != "proposal_only"
+                    or proposal.get("trading_day") != day_dir.name
+                    or not isinstance(proposal.get("optimizer_result"), dict)
+                ):
+                    raise ValueError("proposal schema or identity mismatch")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                return {
+                    "status": "invalid", "trading_day": day_dir.name,
+                    "path": path.relative_to(Path(DATA_DIR)).as_posix(),
+                    "error": str(exc),
+                }
+            return {
+                "status": "proposal_only",
+                "trading_day": day_dir.name,
+                "path": path.relative_to(Path(DATA_DIR)).as_posix(),
+                "sha256": digest,
+                "result": proposal["optimizer_result"],
+            }
+    return None
 
 
 def _proc_alive(pid):
@@ -4948,11 +5026,12 @@ async function renderWeights(){
   try{ const resp = await fetch('/api/weights'); d = await resp.json(); }
   catch(e){ $w.innerHTML='<span class="empty">权重数据读取失败</span>'; return; }
   if(!d || !d.ok || !Object.keys(d.weights||{}).length){
-    $w.innerHTML='<span class="empty">尚无自适应权重 (weight_optimizer 未运行)</span>';
+    $w.innerHTML='<span class="empty">'+(d&&d.error?'权重策略不可用: '+esc(d.error):'尚无有效权重')+'</span>';
     $m.textContent=''; return;
   }
   const meta = d.meta||{};
   const icir = meta.icir||{};
+  const isFrozen = d.mode === 'frozen';
   // 权重卡片(含 ICIR 依据标注)
   const wt = d.weights||{};
   const cards = Object.keys(wt).map(k=>{
@@ -4964,7 +5043,8 @@ async function renderWeights(){
       hintParts.push('ICIR '+(g.icir!=null?fmt(g.icir,3):'—'));
       hintParts.push('|ICIR| '+(g.icir!=null?fmt(Math.abs(g.icir),3):'—'));
     }
-    hintParts.push('静态 '+fmt((base!=null?base:0)*100,1)+'%');
+    if(base!=null) hintParts.push('静态 '+fmt(base*100,1)+'%');
+    else if(!isFrozen) hintParts.push('静态 0.0%');
     let cls = '';
     if(isAlpha && g.icir!=null) cls = g.icir<0?'down':'up';
     return `<div class="miniCard"><div class="k">${k}${isAlpha?' <span class="sBadge alpha">α</span>':''}</div>
@@ -4972,11 +5052,23 @@ async function renderWeights(){
       <div class="hint">${hintParts.join(' · ')}</div></div>`;
   }).join('');
   $w.innerHTML = cards;
-  // 说明行
-  const updated = d.updated||meta.generated||'';
-  $m.innerHTML = '方法: ' + (meta.note||'') + ' · 窗口 ' + (meta.window||'—')
-    + ' 日 / alpha 占比 ' + fmt((meta.alpha_share!=null?meta.alpha_share*100:0),0) + '%'
-    + (updated?(' · 更新 ' + updated):'');
+  if(isFrozen){
+    const proposal = d.proposal;
+    let note = '有效权重: frozen snapshot · SHA-256 '+(d.snapshot_sha256||'—');
+    if(proposal && proposal.status === 'proposal_only'){
+      note += ' · 独立建议(非生效): '+proposal.trading_day+' · '+proposal.path;
+    }else if(proposal && proposal.status === 'invalid'){
+      note += ' · 建议文件无效: '+(proposal.error||'unknown');
+    }else{
+      note += ' · 暂无优化建议';
+    }
+    $m.textContent = note;
+  }else{
+    const updated = d.updated||meta.generated||'';
+    $m.textContent = '方法: ' + (meta.note||'') + ' · 窗口 ' + (meta.window||'—')
+      + ' 日 / alpha 占比 ' + fmt((meta.alpha_share!=null?meta.alpha_share*100:0),0) + '%'
+      + (updated?(' · 更新 ' + updated):'');
+  }
 }
 
 function apply(s){
