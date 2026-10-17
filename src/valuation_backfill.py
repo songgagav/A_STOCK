@@ -67,8 +67,11 @@ VAL_SCHEMA = pa.schema([
     ("ts", pa.timestamp("us")), ("symbol", pa.string()),
     ("pe_ttm", pa.float64()), ("pb", pa.float64()), ("ps_ttm", pa.float64()),
     ("pcf_ncf_ttm", pa.float64()), ("is_st", pa.bool_()),
-    ("market_cap", pa.float64()), ("free_cap", pa.float64()),
+    ("original_source", pa.string()), ("market_cap", pa.float64()),
+    ("free_cap", pa.float64()),
     ("float_shares", pa.float64()), ("source", pa.string())])
+VAL_SCHEMA_LEGACY = pa.schema([
+    field for field in VAL_SCHEMA if field.name != "original_source"])
 
 
 def _open_db(read_only=False):
@@ -78,6 +81,28 @@ def _open_db(read_only=False):
 
 def _sql(db, q):
     return db.sql(q).to_pandas()
+
+
+def _valuation_schema(db):
+    """Return a supported valuation schema; fail before any destructive rebuild otherwise."""
+    schema = db.schema("valuation")
+    if schema.names not in (VAL_SCHEMA.names, VAL_SCHEMA_LEGACY.names):
+        raise ValueError(f"不支持的 valuation schema: {schema.names}")
+    return schema
+
+
+def _frame_for_valuation_schema(frame: pd.DataFrame, schema) -> pd.DataFrame:
+    """Align generated/existing valuation rows to the live table schema safely."""
+    out = frame.copy()
+    missing = [name for name in schema.names if name not in out.columns]
+    for name in missing:
+        if name != "original_source":
+            raise ValueError(f"valuation 行缺少必需列: {name}")
+        out[name] = None
+    extra = set(out.columns) - set(schema.names)
+    if extra - {"original_source"}:
+        raise ValueError(f"valuation 行包含未知列: {sorted(extra)}")
+    return out[schema.names]
 
 
 def _ts_unit_us(s: pd.Series) -> pd.Series:
@@ -247,6 +272,7 @@ def build_approx_pb_rows(out_parquet: str) -> dict:
                 "ps_ttm": np.full(len(b), np.nan),
                 "pcf_ncf_ttm": np.full(len(b), np.nan),
                 "is_st": pd.array([None] * len(b), dtype="boolean"),
+                "original_source": None,
                 "market_cap": np.full(len(b), np.nan),
                 "free_cap": fc,
                 "float_shares": fs_out,
@@ -334,6 +360,7 @@ def _snap_rows_to_valuation_frame(db, day: pd.Timestamp) -> pd.DataFrame:
         "ps_ttm": np.full(len(df), np.nan),
         "pcf_ncf_ttm": np.full(len(df), np.nan),
         "is_st": pd.array(is_st.to_numpy(), dtype="boolean"),
+        "original_source": SOURCE_SNAPSHOT,
         "market_cap": df["total_mv"].to_numpy(),
         "free_cap": df["float_mv"].to_numpy(),
         "float_shares": pd.to_numeric(df["float_shares"], errors="coerce").to_numpy(),
@@ -346,13 +373,15 @@ def _append_frames(db, frames: list[pd.DataFrame]):
     """按 (ts,symbol) 升序排序后分块 append 到 valuation (30万行/块)."""
     if not frames:
         return 0
+    schema = _valuation_schema(db)
     full = pd.concat(frames, ignore_index=True)
     full["ts"] = _ts_unit_us(full["ts"])
     full = full.sort_values(["ts", "symbol"]).reset_index(drop=True)
     total = 0
     for i in range(0, len(full), APPEND_CHUNK):
         sl = full.iloc[i:i + APPEND_CHUNK]
-        t = pa.Table.from_pandas(sl, schema=VAL_SCHEMA, preserve_index=False)
+        aligned = _frame_for_valuation_schema(sl, schema)
+        t = pa.Table.from_pandas(aligned, schema=schema, preserve_index=False)
         db.append("valuation", t)
         total += len(sl)
     return total
@@ -429,6 +458,9 @@ def rebuild_valuation(approx_parquet: str | None = None) -> dict:
     t0 = time.time()
     db = _open_db()
     try:
+        # Capture and validate the live schema before drop_table; never silently
+        # discard provenance columns during a rebuild.
+        schema = _valuation_schema(db)
         tab = db.read("valuation")
         old_n = tab.num_rows
         print(f"[rebuild] read old valuation rows={old_n}", flush=True)
@@ -475,12 +507,13 @@ def rebuild_valuation(approx_parquet: str | None = None) -> dict:
 
         # 先删旧表再整体重建 (不动同文件其它表)
         db.drop_table("valuation")
-        db.create_table("valuation", VAL_SCHEMA, time_column="ts")
+        db.create_table("valuation", schema, time_column="ts")
         total = 0
         n_chunk = 0
         for i in range(0, len(df), APPEND_CHUNK):
             sl = df.iloc[i:i + APPEND_CHUNK]
-            t = pa.Table.from_pandas(sl, schema=VAL_SCHEMA, preserve_index=False)
+            aligned = _frame_for_valuation_schema(sl, schema)
+            t = pa.Table.from_pandas(aligned, schema=schema, preserve_index=False)
             db.append("valuation", t)
             total += len(sl)
             n_chunk += 1
@@ -591,3 +624,4 @@ if __name__ == "__main__":
         print(json.dumps(rep, ensure_ascii=False, default=str, indent=1))
     else:
         ap.print_help()
+
