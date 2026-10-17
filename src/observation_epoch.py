@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 
 SCHEMA_VERSION = 2
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LINEAGE_KEYS = {
     "source", "schema", "routing", "universe", "calendar_source",
     "calendar_version", "lineage_sha",
@@ -56,6 +61,46 @@ def _copy_identity(name: str, value: Mapping[str, Any], required_key: str) -> di
         raise ValueError(f"{name}.{required_key} is required")
     # Force a finite/canonical JSON check before the identity becomes an epoch.
     _canonical_bytes(copied)
+    return copied
+
+
+def build_observation_experiment_identity(
+    experiment_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal a frozen observation experiment payload with its canonical digest."""
+    if not isinstance(experiment_payload, Mapping):
+        raise ValueError("experiment payload is required")
+    payload = dict(experiment_payload)
+    supplied_hash = payload.pop("experiment_hash", None)
+    if payload.get("selector_weight_mode") != "frozen":
+        raise ValueError("observation experiment requires selector_weight_mode=frozen")
+    snapshot_digest = payload.get("selector_weights_snapshot_sha256")
+    if not isinstance(snapshot_digest, str) or not _SHA256_RE.fullmatch(snapshot_digest):
+        raise ValueError("selector_weights_snapshot_sha256 must be lowercase SHA-256")
+    digest = _digest(payload)
+    if supplied_hash is not None and supplied_hash != digest:
+        raise ValueError("experiment_hash does not match the canonical experiment payload")
+    return {**payload, "experiment_hash": digest}
+
+
+def validate_observation_experiment_identity(
+    experiment_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the observation-only frozen selector identity and self-hash."""
+    copied = _copy_identity("experiment_identity", experiment_identity, "experiment_hash")
+    if copied.get("selector_weight_mode") != "frozen":
+        raise ValueError("observation requires experiment_identity.selector_weight_mode=frozen")
+    snapshot_digest = copied.get("selector_weights_snapshot_sha256")
+    if not isinstance(snapshot_digest, str) or not _SHA256_RE.fullmatch(snapshot_digest):
+        raise ValueError(
+            "experiment_identity.selector_weights_snapshot_sha256 must be lowercase SHA-256"
+        )
+    experiment_hash = copied["experiment_hash"]
+    if not isinstance(experiment_hash, str) or not _SHA256_RE.fullmatch(experiment_hash):
+        raise ValueError("experiment_identity.experiment_hash must be lowercase SHA-256")
+    payload = {key: value for key, value in copied.items() if key != "experiment_hash"}
+    if _digest(payload) != experiment_hash:
+        raise ValueError("experiment_hash does not match the canonical experiment payload")
     return copied
 
 
@@ -141,6 +186,133 @@ def verify_observation_epoch(epoch: Mapping[str, Any]) -> dict[str, Any]:
     return dict(epoch)
 
 
+def validate_observation_epoch_for_observation(epoch: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply stricter frozen-weight requirements only at the observation boundary."""
+    verified = verify_observation_epoch(epoch)
+    if verified.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("new observations require a schema-v2 observation_epoch")
+    verified = dict(verified)
+    verified["identity"] = dict(verified["identity"])
+    identity = verified["identity"]
+    identity["experiment_identity"] = validate_observation_experiment_identity(
+        identity["experiment_identity"]
+    )
+    return verified
+
+
+def freeze_observation_epoch(record_root: str | Path, epoch: Mapping[str, Any]) -> Path:
+    """Verify then atomically create an immutable epoch record without replacement."""
+    verified = validate_observation_epoch_for_observation(epoch)
+    experiment_identity = verified["identity"]["experiment_identity"]
+    if os.environ.get("SELECTOR_WEIGHT_MODE") != "frozen":
+        raise ValueError("freezing an observation epoch requires SELECTOR_WEIGHT_MODE=frozen")
+    if os.environ.get("SELECTOR_WEIGHT_SNAPSHOT_SHA256") != experiment_identity[
+        "selector_weights_snapshot_sha256"
+    ]:
+        raise ValueError("active selector-weight snapshot SHA differs from experiment identity")
+    try:
+        from selector_weight_policy import (
+            REPO_ROOT as selector_resolver_root,
+            SelectorWeightPolicyError,
+            resolve_selector_weight_context,
+        )
+
+        active_context = resolve_selector_weight_context()
+    except SelectorWeightPolicyError as exc:
+        raise ValueError("active selector-weight snapshot is invalid") from exc
+    if active_context.identity != {
+        "mode": "frozen",
+        "snapshot_sha256": experiment_identity["selector_weights_snapshot_sha256"],
+    }:
+        raise ValueError("resolved selector-weight identity differs from experiment identity")
+    if Path(record_root).resolve() != selector_resolver_root.resolve():
+        raise ValueError("record_root must match the resolver checkout containing the active snapshot")
+    epoch_id = verified["epoch_id"]
+    path = Path(record_root) / "data" / "evolution" / "epochs" / f"{epoch_id}.json"
+    raw = (json.dumps(
+        verified, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False,
+    ) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{epoch_id}.", suffix=".tmp",
+            dir=path.parent, delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            if path.read_bytes() != raw:
+                raise ValueError("refusing to replace an existing observation epoch record")
+        except OSError as exc:
+            raise ValueError("atomic create-only observation epoch publish failed") from exc
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("could not prepare observation epoch record") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return path
+
+
+def load_observation_epoch_record(record_root: str | Path, epoch_id: str) -> dict[str, Any]:
+    """Load one explicitly selected observation record and re-verify its identity."""
+    if not isinstance(epoch_id, str) or not _SHA256_RE.fullmatch(epoch_id):
+        raise ValueError("OBSERVATION_EPOCH_ID must be lowercase SHA-256")
+    path = Path(record_root) / "data" / "evolution" / "epochs" / f"{epoch_id}.json"
+    try:
+        epoch = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("selected observation epoch record is unavailable or invalid JSON") from exc
+    verified = validate_observation_epoch_for_observation(epoch)
+    if verified["epoch_id"] != epoch_id:
+        raise ValueError("selected observation epoch id does not match its path")
+    return verified
+
+
+def observation_epoch_runtime_receipt(
+    record_root: str | Path,
+    epoch_id: str | None = None,
+    selector_weight_identity: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return a non-authoritative runtime receipt for one explicitly bound epoch."""
+    selected_id = epoch_id if epoch_id is not None else os.environ.get("OBSERVATION_EPOCH_ID")
+    if not selected_id:
+        return {"status": "not_configured", "epoch_id": None}
+    try:
+        epoch = load_observation_epoch_record(record_root, selected_id)
+    except ValueError as exc:
+        return {
+            "status": "blocked", "epoch_id": str(selected_id),
+            "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+    if (
+        not isinstance(selector_weight_identity, Mapping)
+        or set(selector_weight_identity) != {"mode", "snapshot_sha256"}
+        or selector_weight_identity.get("mode") != "frozen"
+        or selector_weight_identity.get("snapshot_sha256")
+        != epoch["identity"]["experiment_identity"]["selector_weights_snapshot_sha256"]
+    ):
+        return {
+            "status": "blocked", "epoch_id": epoch["epoch_id"],
+            "reason": "active selector-weight identity differs from the observation epoch",
+        }
+    return {
+        "status": "ready",
+        "epoch_id": epoch["epoch_id"],
+        "experiment_identity": dict(epoch["identity"]["experiment_identity"]),
+        "observation_epoch": epoch,
+    }
+
+
 def validate_shadow_production_state(state: Mapping[str, Any]) -> dict[str, Any]:
     """Require evidence producers to record the non-promoted runtime state."""
     if not isinstance(state, Mapping):
@@ -163,6 +335,13 @@ def verify_epoch_manifest_binding(manifest: Mapping[str, Any], identity: Mapping
     verified = verify_observation_epoch(epoch)
     if identity.get("observation_epoch") != verified:
         raise ValueError("manifest observation_epoch differs from artifact identity")
+    experiment_identity = verified["identity"].get("experiment_identity", {})
+    if (
+        isinstance(experiment_identity, Mapping)
+        and {"selector_weight_mode", "selector_weights_snapshot_sha256"}
+        & set(experiment_identity)
+    ):
+        validate_observation_experiment_identity(experiment_identity)
     if has_lineage and verified["schema_version"] != SCHEMA_VERSION:
         raise ValueError("lineage-bearing manifests require a v2 observation_epoch")
     if verified["schema_version"] == SCHEMA_VERSION:

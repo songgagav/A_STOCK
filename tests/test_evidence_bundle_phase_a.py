@@ -22,6 +22,7 @@ from evidence_bundle import (
 )
 from evidence_cost import replay_costs
 from evidence_turnover import compute_turnover
+from observation_epoch import build_observation_experiment_identity
 
 
 def _write_json(path: Path, value) -> str:
@@ -92,7 +93,10 @@ def _fill(*, side="buy", fill_price=10.01, stamp_tax=0.0, embedded=True):
     }
 
 
-def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None, production_state=None):
+def _request(
+    tmp_path: Path, *, run_id="run-1", fills=None, statuses=None,
+    production_state=None, experiment_identity=None,
+):
     raw = tmp_path / "input"
     raw.mkdir(exist_ok=True)
     artifacts = {
@@ -135,7 +139,9 @@ def _request(tmp_path: Path, *, run_id="run-1", fills=None, statuses=None, produ
         config_identity={"config_sha": "config-sha-1", "version": "paper-v1"},
         snapshot=snapshot,
         artifacts=artifacts,
-        experiment_identity={"experiment_hash": "experiment-sha-1", "name": "fixture"},
+        experiment_identity=experiment_identity or {
+            "experiment_hash": "experiment-sha-1", "name": "fixture",
+        },
         production_state=production_state or {
             "RANK_BY_FUSION": "0",
             "DRL_PLAN_MODE": "shadow",
@@ -173,6 +179,34 @@ def test_bundle_is_deterministic_and_contains_raw_and_derived_evidence(tmp_path)
     assert (first.path / "derived" / "turnover.json").is_file()
     assert (first.path / "derived" / "cost_records.jsonl").is_file()
     assert verify_bundle(first.path)["bundle_id"] == first.bundle_id
+
+
+def test_bundle_preserves_exact_frozen_experiment_identity(tmp_path):
+    experiment_identity = build_observation_experiment_identity({
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": "a" * 64,
+    })
+    request = _request(tmp_path, experiment_identity=experiment_identity)
+
+    bundle = build_bundle(request)
+    verified = verify_bundle(bundle.path)
+
+    assert bundle.manifest["experiment_identity"] == experiment_identity
+    assert bundle.manifest["bundle_identity"]["experiment_identity"] == experiment_identity
+    assert verified["experiment_identity"] == experiment_identity
+
+
+def test_bundle_rejects_marked_observation_identity_with_invalid_self_hash(tmp_path):
+    experiment_identity = build_observation_experiment_identity({
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": "a" * 64,
+    })
+    experiment_identity["experiment_hash"] = "0" * 64
+
+    with pytest.raises(ValueError, match="experiment_hash"):
+        _request(tmp_path, experiment_identity=experiment_identity)
 
 
 def _canonical_digest(value):

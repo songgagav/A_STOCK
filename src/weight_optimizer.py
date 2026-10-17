@@ -13,15 +13,15 @@
 #     不因某段 IC 波动剧烈抖动。做"整体缩放 + 仅 alpha 内部再分配"。
 #
 # 输出:
-#   * data/weights.json  -- 自适应权重文件. factor_library.selector_weights()
-#                           优先读取它覆盖 config.SCORE_WEIGHTS (见 selector).
+#   * adaptive: data/weights.json -- 自适应权重文件, selector 运行时读取.
+#   * frozen:   data/weight_proposals/<day>/<sha256>.json -- 非权威建议.
 #   * CLI 预览/干跑     -- 不写文件, 只看建议权重与 IC 依据.
 #
 # 用法:
 #   python weight_optimizer.py --preview              # 只打印建议, 不写入
-#   python weight_optimizer.py --write                # 写入 data/weights.json
+#   python weight_optimizer.py --write                # 按 SELECTOR_WEIGHT_MODE 持久化
 #   python weight_optimizer.py --write --window 40    # 用最近40个IC样点
-#   python weight_optimizer.py --reset                # 删除 weights.json 回退静态
+#   python weight_optimizer.py --reset                # adaptive 下删除 weights.json
 #
 # 精度: ICIR 由 ic_curve_*.csv 的 ic_h20 序列均值/标准差得到; 权重归一化总分 = 1.
 # ============================================================
@@ -36,6 +36,9 @@ import pandas as pd
 
 from config import DATA_DIR, SCORE_WEIGHTS
 from strategy_contract import WeightContractError, normalize_weight_map
+from selector_weight_policy import (
+    SelectorWeightPolicyError, persist_optimizer_weights, selector_weight_mode,
+)
 
 IC_DIR = os.path.join(DATA_DIR, "ic")          # factor_library 之外统一读这里
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
@@ -321,9 +324,10 @@ def _print_report(opt: dict):
 def main():
     ap = argparse.ArgumentParser(description="因子权重自适应(D->B反馈闭环)")
     ap.add_argument("--preview", action="store_true", help="仅预览建议权重, 不写入")
-    ap.add_argument("--write", action="store_true", help="写入 data/weights.json")
-    ap.add_argument("--reset", action="store_true", help="删除 weights.json, 回退静态权重")
+    ap.add_argument("--write", action="store_true", help="按权重策略持久化优化建议")
+    ap.add_argument("--reset", action="store_true", help="adaptive 下删除 weights.json；frozen 下拒绝")
     ap.add_argument("--window", type=int, default=40, help="用于统计的最近IC样点数")
+    ap.add_argument("--day", help="proposal trading day (YYYY-MM-DD); defaults to Shanghai today")
     ap.add_argument("--alpha-share", type=float, default=0.28,
                     help="alpha分量合计权重占比上限")
     ap.add_argument("--hold", type=int, default=DEFAULT_HOLD,
@@ -331,6 +335,14 @@ def main():
     a = ap.parse_args()
 
     if a.reset:
+        try:
+            mode = selector_weight_mode()
+        except SelectorWeightPolicyError as exc:
+            print(f"配置错误: {exc}", file=sys.stderr)
+            return 2
+        if mode == "frozen":
+            print("拒绝 reset: frozen selector weights are immutable", file=sys.stderr)
+            return 2
         if os.path.exists(WEIGHTS_FILE):
             os.remove(WEIGHTS_FILE)
             print("已删除 {}, 回退静态权重".format(WEIGHTS_FILE))
@@ -342,10 +354,26 @@ def main():
     _print_report(opt)
 
     if a.write or not a.preview:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(WEIGHTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(opt, f, ensure_ascii=False, indent=2)
-        print("\n已写: {}".format(WEIGHTS_FILE))
+        try:
+            if a.day:
+                day = a.day
+            else:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+
+                day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+            persisted = persist_optimizer_weights(
+                day, opt, authoritative_path=WEIGHTS_FILE,
+            )
+        except SelectorWeightPolicyError as exc:
+            print(f"\n写入失败: {exc}", file=sys.stderr)
+            return 2
+        if persisted["authoritative"]:
+            print("\n已写: {}".format(persisted["path"]))
+        else:
+            print("\n已写 proposal_only: {} sha256={}".format(
+                persisted["path"], persisted["sha256"],
+            ))
     else:
         print("\n[preview] 未写入 (加 --write 生效)")
     return 0

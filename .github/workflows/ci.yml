@@ -82,6 +82,9 @@ jobs:
           # h5i_db 的原生扩展不在 Python 3.14 核心环境中；该 job
           # 专门验证 h5i 临时库写入与等价性路径，避免 CI 只验证 skip 分支。
           pip install "h5i-db>=0.1.6"
+          # Python 3.10 的 Linux wheel 可用；TA-Lib 0.8.2 目前回退到 sdist，
+          # 而 vn.py 安装会引入 TA-Lib，触发依赖系统头文件的源码编译。
+          pip install "TA-Lib==0.8.1"
           # 与 canonical Python 3.10 runtime 保持执行依赖可探测。
           pip install "vnpy==4.4.0"
       - name: Verify h5i_db is available

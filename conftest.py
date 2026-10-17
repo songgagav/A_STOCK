@@ -11,6 +11,10 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# Selector policy has no implicit default; tests explicitly opt into the
+# legacy adaptive contract unless an individual test overrides it.
+os.environ["SELECTOR_WEIGHT_MODE"] = "adaptive"
+
 # [2026-09-23] 运行时数据目录**永不是**测试来源。
 #
 # 事由(真实事故, 非预防性): `data/_quarantine/tmp_scripts_20260922/_tmp_fork_test.py`

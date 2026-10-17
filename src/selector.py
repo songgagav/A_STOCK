@@ -17,6 +17,7 @@ from p08_signal import (
     last_signal, trend_score, governance_score, liquidity_score,
 )
 from factor_library import selector_weights, score_factor, _pb_rev_score, _roe_score, _mf_net_score
+from selector_weight_policy import resolve_selector_weight_context
 from ml_fusion_bridge import FML_WEIGHT  # 兼容旧 import; f_ml 计算统一走 factor_fusion.fusion_or_fml
 from strategy_contract import (
     FusionContractError, average_rank, fusion_missing_policy, fusion_weight_mode,
@@ -247,6 +248,8 @@ class RotationSelector:
         if hist_day is not None:
             return self._select_hist(hist_day)
 
+        weight_context = resolve_selector_weight_context()
+
         uni = self.db.get_universe()
         if uni.empty:
             return {"error": "empty universe", "universe_total": 0}
@@ -286,8 +289,9 @@ class RotationSelector:
         except Exception:
             pass
 
-        # 权重: 优先 ICIR 自适应(weight_optimizer 生成的 weights.json), 无则静态
-        W = selector_weights()
+        # 权重与身份从同一 policy read 获取，避免 selection provenance 与
+        # 实际参与打分的有效权重之间出现竞态或不一致。
+        W = weight_context.weights
 
         scored = []
         max_amount = pool["amount"].astype(float).max() if len(pool) else 0.0
@@ -453,6 +457,7 @@ class RotationSelector:
             "scored": n_signal_ok,
             "top_n": top_n,
             "basket_signal": round(basket_signal, 4),
+            "selector_weight_identity": dict(weight_context.identity),
             # 全池信号快照: 保留"本轮算过分的所有标的"因分明细,
             # 用于事后 IC 衰减跟踪(对比后续收益), 而非仅存 TopN
             "pool_snapshot": scored,

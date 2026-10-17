@@ -12,7 +12,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from strategy_contract import TargetContractError, normalize_target_contract
@@ -21,8 +21,25 @@ from utils import atomic_write_json
 
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS = 2
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 _LATE_SIGNAL_LOCK = threading.Lock()
+_WEIGHT_IDENTITY_KEYS = {"mode", "snapshot_sha256"}
+
+
+def _canonical_weight_identity(identity: Mapping[str, str] | None) -> dict[str, str] | None:
+    if identity is None:
+        return None
+    if not isinstance(identity, Mapping) or set(identity) != _WEIGHT_IDENTITY_KEYS:
+        raise ValueError("selector_weight_identity 必须包含 mode 和 snapshot_sha256")
+    mode = identity.get("mode")
+    digest = identity.get("snapshot_sha256")
+    if mode != "frozen":
+        raise ValueError("selector_weight_identity.mode 必须为 frozen")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)):
+        raise ValueError("selector_weight_identity.snapshot_sha256 必须为 64 位小写十六进制")
+    return {"mode": "frozen", "snapshot_sha256": digest}
 
 
 def canonical_json_bytes(value: dict[str, Any]) -> bytes:
@@ -101,8 +118,9 @@ def build_snapshot(
     source_artifacts: list[dict[str, Any]],
     generated_at: datetime,
     repo_root: str,
+    selector_weight_identity: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """构造 schema v1 快照，并生成输入与快照完整性哈希。"""
+    """构造 v1 兼容或绑定权重身份的 v2 快照。"""
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
         raise ValueError("generated_at 必须带时区")
     normalized_targets, weights = _normalized_targets(targets)
@@ -111,6 +129,7 @@ def build_snapshot(
     source_date = _require_day(source_date, "source_date")
     if not isinstance(source_tier, str) or not source_tier:
         raise ValueError("source_tier 不能为空")
+    weight_identity = _canonical_weight_identity(selector_weight_identity)
 
     input_payload = {
         "date": day,
@@ -120,9 +139,14 @@ def build_snapshot(
         "source_date": source_date,
         "source_artifacts": artifacts,
     }
+    if weight_identity is not None:
+        input_payload["selector_weight_identity"] = weight_identity
     shanghai_at = generated_at.astimezone(SHANGHAI).replace(microsecond=0)
     snapshot = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": (
+            SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS
+            if weight_identity is not None else SCHEMA_VERSION
+        ),
         **input_payload,
         "generated_at": shanghai_at.isoformat(),
         "generated_at_utc": _iso_utc(generated_at),
@@ -161,11 +185,15 @@ def _required_snapshot_fields(snapshot: dict[str, Any]) -> bool:
         "input_hash",
         "snapshot_hash",
     }
-    return required.issubset(snapshot)
+    if not required.issubset(snapshot):
+        return False
+    if snapshot.get("schema_version") == SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS:
+        return "selector_weight_identity" in snapshot
+    return True
 
 
 def _input_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "date": snapshot["date"],
         "targets": snapshot["targets"],
         "weights": snapshot["weights"],
@@ -173,6 +201,9 @@ def _input_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "source_date": snapshot["source_date"],
         "source_artifacts": snapshot["source_artifacts"],
     }
+    if snapshot.get("schema_version") == SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS:
+        payload["selector_weight_identity"] = snapshot["selector_weight_identity"]
+    return payload
 
 
 def _valid_generation_timestamp(snapshot: dict[str, Any], day: str) -> bool:
@@ -202,8 +233,16 @@ def _validate_snapshot(snapshot: Any, day: str) -> dict[str, Any]:
     """验证已落盘快照；绝不以实时目标池替代失败的快照。"""
     if not isinstance(snapshot, dict) or not _required_snapshot_fields(snapshot):
         return _invalid("missing_required_fields")
-    if snapshot["schema_version"] != SCHEMA_VERSION:
+    if (type(snapshot["schema_version"]) is not int
+            or snapshot["schema_version"] not in {
+                SCHEMA_VERSION, SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS,
+            }):
         return _invalid("unsupported_schema_version")
+    if snapshot["schema_version"] == SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS:
+        try:
+            _canonical_weight_identity(snapshot.get("selector_weight_identity"))
+        except ValueError:
+            return _invalid("invalid_selector_weight_identity")
     if snapshot["date"] != day:
         return _invalid("snapshot_day_mismatch")
     if not isinstance(snapshot["input_hash"], str) or len(snapshot["input_hash"]) != 64:
@@ -241,9 +280,18 @@ def write_snapshot(data_dir: str, snapshot: dict[str, Any]) -> str:
     return path
 
 
-def read_snapshot(data_dir: str, day: str) -> dict[str, Any]:
-    """读取并验证权威快照，明确区分 L1/L2/L3，且不做实时回退。"""
+def read_snapshot(
+    data_dir: str,
+    day: str,
+    *,
+    expected_selector_weight_identity: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """读取权威快照；冻结消费可额外要求严格匹配 selector 权重身份。"""
     day = _require_day(day, "date")
+    try:
+        expected_identity = _canonical_weight_identity(expected_selector_weight_identity)
+    except ValueError:
+        return _invalid("invalid_expected_selector_weight_identity")
     path = Path(snapshot_path(data_dir, day))
     if not path.is_file():
         return {"status": "missing", "snapshot": None, "reason": "snapshot_not_found"}
@@ -251,7 +299,15 @@ def read_snapshot(data_dir: str, day: str) -> dict[str, Any]:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return _invalid("invalid_json")
-    return _validate_snapshot(snapshot, day)
+    result = _validate_snapshot(snapshot, day)
+    if result["status"] != "ready" or expected_identity is None:
+        return result
+    verified = result["snapshot"]
+    if verified.get("schema_version") != SCHEMA_VERSION_WITH_SELECTOR_WEIGHTS:
+        return _invalid("selector_weight_identity_missing")
+    if verified.get("selector_weight_identity") != expected_identity:
+        return _invalid("selector_weight_identity_mismatch")
+    return result
 
 
 def read_mode_control(repo_root: str) -> dict[str, str]:

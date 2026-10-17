@@ -28,6 +28,7 @@ _AT_0924 = datetime(2026, 10, 3, 9, 24, 59, tzinfo=_SH)
 _AT_0925 = datetime(2026, 10, 3, 9, 25, 0, tzinfo=_SH)
 _AFTER_0925 = datetime(2026, 10, 3, 9, 26, 0, tzinfo=_SH)
 _TARGETS = [{"canon": "600000.SH", "target_weight": 1.0}]
+_WEIGHT_IDENTITY = {"mode": "frozen", "snapshot_sha256": "c" * 64}
 
 
 @pytest.fixture(params=["naive", "utc", "shanghai"])
@@ -46,6 +47,7 @@ def runtime_clock(request):
 @pytest.fixture
 def engine(monkeypatch, tmp_path):
     """绕过网络、数据库和 PaperBook 初始化的最小引擎实例。"""
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "adaptive")
     instance = object.__new__(RE.RealtimeEngine)
     instance.pb = SimpleNamespace(
         trade_date="2026-10-03",
@@ -140,6 +142,32 @@ def test_at_0925_engine_freezes_weighted_live_targets(engine, tmp_path, runtime_
     assert meta["snapshot_hash"] == persisted["snapshot"]["snapshot_hash"]
 
 
+def test_at_0925_frozen_snapshot_binds_weight_identity(engine, monkeypatch, tmp_path):
+    """Frozen mode persists the same policy identity used by the live selection."""
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", _WEIGHT_IDENTITY["snapshot_sha256"])
+    monkeypatch.setattr(RE, "selector_weight_mode", lambda: "frozen")
+    monkeypatch.setattr(
+        RE, "resolve_selector_weight_context",
+        lambda: SimpleNamespace(identity=_WEIGHT_IDENTITY),
+    )
+    selection = {"top_n": _TARGETS, "selector_weight_identity": _WEIGHT_IDENTITY}
+    monkeypatch.setattr(RE, "load_targets", lambda _day: (_TARGETS, selection, "20261002"))
+    engine._selector_weight_expected_identity = _WEIGHT_IDENTITY
+
+    _targets, returned_selection, _source_day, meta = engine._freeze_or_load_targets(_AT_0925)
+    persisted = read_snapshot(
+        str(tmp_path), "20261003",
+        expected_selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+
+    assert meta["snapshot_status"] == "ready"
+    assert persisted["status"] == "ready"
+    assert persisted["snapshot"]["schema_version"] == 2
+    assert persisted["snapshot"]["selector_weight_identity"] == _WEIGHT_IDENTITY
+    assert returned_selection["selector_weight_identity"] == _WEIGHT_IDENTITY
+
+
 def test_drl_selection_receipt_points_to_consumed_target_plan(engine, monkeypatch, tmp_path):
     """DRL receipts hash the plan file, not a same-day selection decoy."""
     root = tmp_path / "repo"
@@ -187,6 +215,53 @@ def test_after_cutoff_reads_verified_snapshot_without_live_resolve(
     assert targets == _TARGETS
     assert source_day == "20261002"
     assert meta["snapshot_status"] == "ready"
+
+
+def test_frozen_after_cutoff_rejects_legacy_v1_snapshot(engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", _WEIGHT_IDENTITY["snapshot_sha256"])
+    monkeypatch.setattr(RE, "selector_weight_mode", lambda: "frozen")
+    monkeypatch.setattr(
+        RE, "resolve_selector_weight_context",
+        lambda: SimpleNamespace(identity=_WEIGHT_IDENTITY),
+    )
+    engine._selector_weight_expected_identity = _WEIGHT_IDENTITY
+    legacy = build_snapshot(
+        "20261003", _TARGETS, "selection_same_day", "20261002", [], _AT_0925, _REPO,
+    )
+    write_snapshot(str(tmp_path), legacy)
+    engine._freeze_attempted = True
+
+    _targets, _selection, _source_day, meta = engine._freeze_or_load_targets(_AFTER_0925)
+
+    assert meta["snapshot_status"] == "invalid"
+    assert meta["snapshot_reason"] == "selector_weight_identity_missing"
+
+
+def test_frozen_after_cutoff_carries_verified_identity_into_selection(
+    engine, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "frozen")
+    monkeypatch.setenv("SELECTOR_WEIGHT_SNAPSHOT_SHA256", _WEIGHT_IDENTITY["snapshot_sha256"])
+    monkeypatch.setattr(RE, "selector_weight_mode", lambda: "frozen")
+    monkeypatch.setattr(
+        RE, "resolve_selector_weight_context",
+        lambda: SimpleNamespace(identity=_WEIGHT_IDENTITY),
+    )
+    engine._selector_weight_expected_identity = _WEIGHT_IDENTITY
+    snapshot = build_snapshot(
+        "20261003", _TARGETS, "selection_same_day", "20261002", [], _AT_0925, _REPO,
+        selector_weight_identity=_WEIGHT_IDENTITY,
+    )
+    write_snapshot(str(tmp_path), snapshot)
+    engine._freeze_attempted = True
+
+    targets, selection, source_day, meta = engine._freeze_or_load_targets(_AFTER_0925)
+
+    assert targets == _TARGETS
+    assert source_day == "20261002"
+    assert meta["snapshot_status"] == "ready"
+    assert selection["selector_weight_identity"] == _WEIGHT_IDENTITY
 
 
 def test_run_tick_runtime_clock_persists_and_reads_ready_snapshot(

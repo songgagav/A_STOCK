@@ -42,6 +42,7 @@ from _calendar_support import install_if_missing  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _calendar_is_deterministic_when_cache_is_absent(monkeypatch):
+    monkeypatch.setenv("SELECTOR_WEIGHT_MODE", "adaptive")
     install_if_missing(monkeypatch)
 
 #: 供测试内的 exists 打桩透传用(见 TestLoadTargetsLadderWiring)

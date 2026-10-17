@@ -17,6 +17,7 @@ from oos_dataset import (
     build_oos_dataset,
     verify_oos_dataset,
 )
+from observation_epoch import build_observation_experiment_identity
 
 
 def _canonical_digest(value) -> str:
@@ -80,7 +81,7 @@ def _lineage():
     }
 
 
-def _bundle(tmp_path: Path, trade_day: str) -> Path:
+def _bundle(tmp_path: Path, trade_day: str, experiment_identity=None) -> Path:
     raw = tmp_path / f"raw-{trade_day}"
     raw.mkdir()
     artifacts = {
@@ -104,7 +105,7 @@ def _bundle(tmp_path: Path, trade_day: str) -> Path:
             config_identity={"config_sha": "config-sha-1"},
             snapshot=snapshot,
             artifacts=artifacts,
-            experiment_identity={"experiment_hash": "experiment-sha-1"},
+            experiment_identity=experiment_identity or {"experiment_hash": "experiment-sha-1"},
             production_state={
                 "RANK_BY_FUSION": "0",
                 "DRL_PLAN_MODE": "shadow",
@@ -127,6 +128,7 @@ def _request(
     trade_days: tuple[str, ...] | None = None,
     production_state=None,
     code_sha="code-sha-1",
+    experiment_identity=None,
 ):
     return OOSDatasetRequest(
         output_root=tmp_path / "oos",
@@ -136,7 +138,7 @@ def _request(
         data_identity={"data_sha": "data-sha-1"},
         data_lineage_identity=_lineage(),
         config_identity={"config_sha": "config-sha-1"},
-        experiment_identity={"experiment_hash": "experiment-sha-1"},
+        experiment_identity=experiment_identity or {"experiment_hash": "experiment-sha-1"},
         calendar_identity={"calendar_sha": "calendar-sha-1", "trade_days_are_explicit": True},
         production_state=production_state or {
             "RANK_BY_FUSION": "0",
@@ -188,6 +190,39 @@ def test_same_explicit_days_are_deterministic_and_include_provenance(tmp_path):
     assert (first.path / "raw" / "day_index.jsonl").is_file()
     assert (first.path / "derived" / "daily_metrics.jsonl").is_file()
     assert verify_oos_dataset(first.path)["dataset_id"] == first.dataset_id
+
+
+def test_oos_dataset_preserves_exact_frozen_experiment_identity(tmp_path):
+    experiment_identity = build_observation_experiment_identity({
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": "a" * 64,
+    })
+    bundle = _bundle(tmp_path, "2026-10-07", experiment_identity=experiment_identity)
+    dataset = build_oos_dataset(_request(
+        tmp_path, (_day(bundle, "2026-10-07"),),
+        experiment_identity=experiment_identity,
+    ))
+
+    assert dataset.manifest["experiment_identity"] == experiment_identity
+    assert dataset.manifest["dataset_identity"]["experiment_identity"] == experiment_identity
+    assert verify_oos_dataset(dataset.path)["experiment_identity"] == experiment_identity
+
+
+def test_oos_rejects_marked_observation_identity_with_invalid_self_hash(tmp_path):
+    experiment_identity = build_observation_experiment_identity({
+        "name": "selector-weight-observation",
+        "selector_weight_mode": "frozen",
+        "selector_weights_snapshot_sha256": "a" * 64,
+    })
+    experiment_identity["experiment_hash"] = "0" * 64
+
+    with pytest.raises(ValueError, match="experiment_hash"):
+        _request(
+            tmp_path,
+            (OOSDayInput("2026-10-07", None, None, None, "missing"),),
+            experiment_identity=experiment_identity,
+        )
 
 
 @pytest.mark.parametrize("field", ["calendar_identity", "trade_days", "data_sha"])

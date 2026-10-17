@@ -18,7 +18,7 @@
   若某步卡住，日志最后一行即指向它。
 
 .用法（管理员）
-  pwsh -File ops\install_daemon_service.ps1 -IAcceptUnsignedNssm -Start
+  pwsh -File ops\install_daemon_service.ps1 -SelectorWeightMode adaptive -IAcceptUnsignedNssm -Start
   pwsh -File ops\install_daemon_service.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -27,6 +27,9 @@ param(
   [string]$DisplayName = 'A-STOCK 量化守护 (daemon.py)',
   [string]$StockdbRoot = 'E:\A_stockDB',
   [string]$Interpreter = '310',
+  [ValidateSet('adaptive', 'frozen')]
+  [string]$SelectorWeightMode,
+  [string]$SelectorWeightSnapshotSha256 = '',
   [switch]$Uninstall,
   [switch]$Start,
   [switch]$IAcceptUnsignedNssm
@@ -34,6 +37,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+if (-not $Uninstall) {
+  if (-not $SelectorWeightMode) {
+    throw 'Install/start requires -SelectorWeightMode adaptive|frozen.'
+  }
+  if ($SelectorWeightMode -eq 'frozen') {
+    if ($SelectorWeightSnapshotSha256 -cnotmatch '^[0-9a-f]{64}$') {
+      throw 'Frozen selector weights require -SelectorWeightSnapshotSha256 with 64 lowercase hex characters.'
+    }
+  } elseif ($SelectorWeightSnapshotSha256) {
+    throw '-SelectorWeightSnapshotSha256 is only valid with -SelectorWeightMode frozen.'
+  }
+}
 $LogDir = Join-Path $RepoRoot 'logs'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 $StepLog = Join-Path $LogDir 'install_steps.log'
@@ -175,12 +190,17 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 }
 
 Run $NssmExe @('install', $ServiceName, $py, (Join-Path $RepoRoot 'src\daemon.py')) | Out-Null
+$selectorWeightEnvironment = "SELECTOR_WEIGHT_MODE=$SelectorWeightMode"
+$selectorSnapshotEnvironment = 'SELECTOR_WEIGHT_SNAPSHOT_SHA256='
+if ($SelectorWeightMode -eq 'frozen') {
+  $selectorSnapshotEnvironment = "SELECTOR_WEIGHT_SNAPSHOT_SHA256=$SelectorWeightSnapshotSha256"
+}
 $pairs = @(
   @('AppDirectory', $RepoRoot),
   @('DisplayName', $DisplayName),
   @('Description', 'A股轮动量化守护: 盘前健康检查/盘中引擎/收盘选股; 由 NSSM 托管'),
   @('Start', 'SERVICE_AUTO_START'),
-  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1'),
+  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", $selectorWeightEnvironment, $selectorSnapshotEnvironment, 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1'),
   @('AppStdout', (Join-Path $LogDir 'daemon_service.out.log')),
   @('AppStderr', (Join-Path $LogDir 'daemon_service.err.log')),
   @('AppRotateFiles', '1'),

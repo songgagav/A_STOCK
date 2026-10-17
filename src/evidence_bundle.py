@@ -23,6 +23,7 @@ from evidence_cost import replay_costs
 from evidence_turnover import compute_turnover
 from observation_epoch import (
     build_observation_epoch,
+    validate_observation_experiment_identity,
     validate_shadow_production_state,
     verify_epoch_manifest_binding,
 )
@@ -133,6 +134,12 @@ class EvidenceBundleRequest:
             raise ValueError("config_identity.config_sha is required")
         if not str(self.experiment_identity.get("experiment_hash") or ""):
             raise ValueError("experiment_identity.experiment_hash is required")
+        if {"selector_weight_mode", "selector_weights_snapshot_sha256"} & set(
+            self.experiment_identity
+        ):
+            object.__setattr__(self, "experiment_identity", validate_observation_experiment_identity(
+                self.experiment_identity
+            ))
         validate_shadow_production_state(self.production_state)
         build_observation_epoch(
             code_sha=self.code_sha, data_lineage_identity=self.data_lineage_identity,

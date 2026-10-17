@@ -18,17 +18,21 @@
   （工具调用被取消时，长驻子进程会一起被终止 —— 这是本项目已登记的注意事项）。
 
 .USAGE
-  # 默认用 .venv310（具备 h5i_db + torch）
-  pwsh -File ops/start_daemon.ps1
+  # 用 .venv310（具备 h5i_db + torch），并显式声明自适应权重
+  pwsh -File ops/start_daemon.ps1 -SelectorWeightMode adaptive
   # 回退到旧解释器（5 秒内完成；.venv314 保持原样未动）
-  pwsh -File ops/start_daemon.ps1 -Interpreter 314
+  pwsh -File ops/start_daemon.ps1 -Interpreter 314 -SelectorWeightMode adaptive
   # 只做前置检查、不真正启动
-  pwsh -File ops/start_daemon.ps1 -CheckOnly
+  pwsh -File ops/start_daemon.ps1 -SelectorWeightMode adaptive -CheckOnly
 #>
 [CmdletBinding()]
 param(
   [ValidateSet('310', '314')]
   [string]$Interpreter = '310',
+  [Parameter(Mandatory = $true)]
+  [ValidateSet('adaptive', 'frozen')]
+  [string]$SelectorWeightMode,
+  [string]$SelectorWeightSnapshotSha256 = '',
   # [2026-09-20 P2-LAKEROOT] 行情湖根。free_stockdb_sync._lake_root() 读 STOCKDB_ROOT,
   # 未设置时回退 <repo>/data/stockdb —— 而该路径**不存在**, 真实湖在 E:\A_stockDB。
   # 后果是**静默**的(scanned=0, 看起来只是今天没数据), 故在此显式钉住并打印校验结果。
@@ -42,6 +46,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+
+if ($SelectorWeightMode -eq 'frozen') {
+  if ($SelectorWeightSnapshotSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw 'Frozen selector weights require -SelectorWeightSnapshotSha256 with 64 lowercase hex characters.'
+  }
+  $env:SELECTOR_WEIGHT_SNAPSHOT_SHA256 = $SelectorWeightSnapshotSha256
+} else {
+  Remove-Item Env:SELECTOR_WEIGHT_SNAPSHOT_SHA256 -ErrorAction SilentlyContinue
+}
+$env:SELECTOR_WEIGHT_MODE = $SelectorWeightMode
+Write-Host "  SELECTOR_WEIGHT_MODE = $SelectorWeightMode"
+if ($SelectorWeightMode -eq 'frozen') {
+  Write-Host "  SELECTOR_WEIGHT_SNAPSHOT_SHA256 = $SelectorWeightSnapshotSha256"
+}
 
 $map = @{
   '310' = @{ Dir = '.venv310'; Note = '具备 h5i_db + torch（推荐；DRL 训练可跑）' }
