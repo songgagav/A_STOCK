@@ -304,6 +304,7 @@ def _write_day(day: str, frame, *, db=None) -> dict:
     plan = db.plan_replace_range("daily_bars", start, end, data=tbl,
                                  note=f"backfill {SOURCE} {day}")
     res = plan.apply()
+    h5i_sync._reset_cache()  # 后续验证必须重新读取写入后的 h5i 水位
     return {"rows": int(tbl.num_rows), "summary": plan.summary, "apply": res}
 
 

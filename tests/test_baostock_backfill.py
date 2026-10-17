@@ -405,6 +405,35 @@ class TestWritePathAgainstRealH5i:
         n2 = temp_db.read("daily_bars").num_rows
         assert n1 == n2 == 1200, (n1, n2)
 
+    def test_post_write_verification_reads_the_advanced_watermark(
+            self, temp_db, monkeypatch):
+        """回填后验证必须读到临时 h5i 库的新水位, 不能复用进程内旧缓存。"""
+        import h5i_sync
+
+        class _OpenDatabase:
+            def sql(self, query):
+                return temp_db.sql(query)
+
+            def close(self):
+                # max_bar_date closes its own connection; temp_db belongs to fixture.
+                pass
+
+        monkeypatch.setattr(h5i_sync, "_MAX_CACHE",
+                            {"date": None, "queried": False})
+        monkeypatch.setattr(h5i_sync, "_open_h5i", lambda: _OpenDatabase())
+        BF._write_day("2026-09-22", self._frame(day="2026-09-22"), db=temp_db)
+        before = str(h5i_sync.max_bar_date(force=True))
+        assert before == "2026-09-22"
+
+        monkeypatch.setattr(BF, "_engine_day", lambda: "2026-09-17")
+        BF._write_day("2026-09-23", self._frame(day="2026-09-23"), db=temp_db)
+        result = BF.verify_two_things(
+            h5i_watermark_before=before, engine_day_before="2026-09-17")
+
+        assert result["h5i_watermark_after"] == "2026-09-23", result
+        assert result["engine_unchanged"] is True, result
+        assert result["ok"] is True, result
+
     def test_replace_does_not_touch_other_days(self, temp_db):
         """替换区间**只覆盖那一天** —— 相邻日期必须原样保留。
 
