@@ -86,9 +86,13 @@ def _sql(db, q):
 def _valuation_schema(db):
     """Return a supported valuation schema; fail before any destructive rebuild otherwise."""
     schema = db.schema("valuation")
-    if schema.names not in (VAL_SCHEMA.names, VAL_SCHEMA_LEGACY.names):
-        raise ValueError(f"不支持的 valuation schema: {schema.names}")
-    return schema
+    for expected in (VAL_SCHEMA, VAL_SCHEMA_LEGACY):
+        if schema.names == expected.names and all(
+                actual.type == wanted.type
+                for actual, wanted in zip(schema, expected)):
+            return schema
+    actual_types = [(field.name, str(field.type)) for field in schema]
+    raise ValueError(f"不支持的 valuation schema: {actual_types}")
 
 
 def _frame_for_valuation_schema(frame: pd.DataFrame, schema) -> pd.DataFrame:
@@ -504,6 +508,13 @@ def rebuild_valuation(approx_parquet: str | None = None) -> dict:
         dup_removed = before_dedup - len(df)
         print(f"[rebuild] combined rows={before_dedup} dup_removed={dup_removed}",
               flush=True)
+
+        # Validate every chunk while the original table is still intact. This
+        # catches bad parquet columns and Arrow conversion failures before drop.
+        for i in range(0, len(df), APPEND_CHUNK):
+            sl = df.iloc[i:i + APPEND_CHUNK]
+            aligned = _frame_for_valuation_schema(sl, schema)
+            pa.Table.from_pandas(aligned, schema=schema, preserve_index=False)
 
         # 先删旧表再整体重建 (不动同文件其它表)
         db.drop_table("valuation")
