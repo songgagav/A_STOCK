@@ -40,6 +40,8 @@ def _git_code_sha(repo_root: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         ).stdout.strip()
         status = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -47,6 +49,8 @@ def _git_code_sha(repo_root: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("cannot identify the diagnostic code revision") from exc
