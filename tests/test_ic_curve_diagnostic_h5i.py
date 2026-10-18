@@ -88,7 +88,7 @@ def _tree_digest(path) -> str:
 
 
 def test_read_only_h5i_window_preserves_source_bytes(tmp_path, monkeypatch):
-    import h5i_db
+    h5i_db = pytest.importorskip("h5i_db", reason="h5i_db integration tests require .venv310")
 
     days = _weekdays("2026-06-01", 22)
     h5i_path = tmp_path / "market.db"
@@ -267,7 +267,7 @@ def test_future_calendar_day_after_source_max_is_not_a_gap(tmp_path):
 
 
 def test_changed_calendar_or_queried_rows_fail_revalidation(tmp_path):
-    import h5i_db
+    h5i_db = pytest.importorskip("h5i_db", reason="h5i_db integration tests require .venv310")
     import pyarrow as pa
 
     days = _weekdays("2026-06-01", 23)
