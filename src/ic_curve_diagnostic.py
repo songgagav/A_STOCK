@@ -8,10 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+import csv
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
-from typing import Any, Sequence
+import re
+import shutil
+import tempfile
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -40,6 +46,16 @@ _CURVE_COLUMNS = (
     "n_missing_forward",
 )
 _CALENDAR_PROVENANCE = "local_calendar_unknown_upstream"
+FACTOR_DEFINITION_VERSION = "factor-library-selector-scores-v1"
+_CSV_COLUMNS = (
+    "day", "horizon", "ic", "status", "n_factor", "n_forward_valid",
+    "n_pairs", "n_missing_factor", "n_missing_forward",
+)
+_MANIFEST_REQUIRED_KEYS = (
+    "parameters", "inputs", "formulas", "horizons", "source_max_day",
+    "calendar_due_dates", "last_settled_ic_day", "row_counts", "missingness",
+    "calendar_provenance", "diagnostic_only", "authoritative", "observation_eligible",
+)
 
 
 @dataclass(frozen=True)
@@ -545,3 +561,253 @@ def verify_inputs_unchanged(inputs: DiagnosticInputs) -> None:
         raise ValueError("H5i source max changed after input snapshot")
     if current.queried_rows_sha256 != inputs.queried_rows_sha256:
         raise ValueError("queried H5i rows changed after input snapshot")
+
+
+def _canonical_json(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("identity/manifest values must be finite JSON data") from exc
+
+
+def build_run_identity(
+    parameters: Mapping[str, Any],
+    *,
+    code_sha: str,
+    calendar_sha256: str,
+    schema_fingerprint: str,
+    queried_rows_sha256: str,
+    source_max_day: str,
+) -> tuple[str, dict[str, Any]]:
+    """Return a deterministic identity bound to code, inputs, and formulas."""
+    if not isinstance(parameters, Mapping):
+        raise ValueError("parameters must be a mapping")
+    commit_sha = str(code_sha).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
+        raise ValueError("code_sha must be a full hexadecimal commit SHA")
+    hashes = {
+        "calendar_sha256": calendar_sha256,
+        "schema_fingerprint": schema_fingerprint,
+        "queried_rows_sha256": queried_rows_sha256,
+    }
+    for name, value in hashes.items():
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value).lower()):
+            raise ValueError(f"{name} must be a 64-character SHA-256 digest")
+        hashes[name] = str(value).lower()
+    try:
+        normalized_parameters = json.loads(_canonical_json(dict(parameters)).decode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("parameters must contain finite JSON values") from exc
+    identity = {
+        "identity_schema": "h5i-ic-diagnostic-run-v1",
+        "parameters": normalized_parameters,
+        "code_sha": commit_sha,
+        "factor_definition_version": FACTOR_DEFINITION_VERSION,
+        **hashes,
+        "source_max_day": _day_key(source_max_day),
+    }
+    return hashlib.sha256(_canonical_json(identity)).hexdigest(), identity
+
+
+def _validate_csv(name: str, payload: bytes) -> None:
+    if name not in {f"{factor}.csv" for factor in FACTOR_NAMES}:
+        raise ValueError(f"unexpected diagnostic CSV name: {name}")
+    try:
+        text = payload.decode("utf-8")
+        records = list(csv.reader(io.StringIO(text, newline="")))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError(f"{name} is not a valid UTF-8 CSV") from exc
+    if not records or tuple(records[0]) != _CSV_COLUMNS:
+        raise ValueError(f"{name} has an invalid IC CSV header")
+    previous: tuple[str, int] | None = None
+    if len(records) == 1:
+        raise ValueError(f"{name} has no diagnostic rows")
+    allowed_status = {"settled", "not_mature", "insufficient_pairs", "constant_rank"}
+    for line_number, record in enumerate(records[1:], start=2):
+        if len(record) != len(_CSV_COLUMNS):
+            raise ValueError(f"{name}:{line_number} has an invalid number of fields")
+        row = dict(zip(_CSV_COLUMNS, record))
+        day = row["day"]
+        if not re.fullmatch(r"\d{8}", day) or _day_key(day) != day:
+            raise ValueError(f"{name}:{line_number} day must be YYYYMMDD")
+        try:
+            horizon = int(row["horizon"])
+            if horizon <= 0:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError(f"{name}:{line_number} has an invalid horizon") from exc
+        key = (day, horizon)
+        if previous is not None and key <= previous:
+            raise ValueError(f"{name} rows must be unique and sorted by day,horizon")
+        previous = key
+        if row["status"] not in allowed_status:
+            raise ValueError(f"{name}:{line_number} has an invalid status")
+        if row["status"] == "settled":
+            try:
+                ic = float(row["ic"])
+            except ValueError as exc:
+                raise ValueError(f"{name}:{line_number} settled IC must be finite") from exc
+            if not np.isfinite(ic):
+                raise ValueError(f"{name}:{line_number} settled IC must be finite")
+        elif row["ic"] != "":
+            raise ValueError(f"{name}:{line_number} null IC must be an empty CSV field")
+        try:
+            counts = [
+                int(row[field])
+                for field in (
+                    "n_factor", "n_forward_valid", "n_pairs", "n_missing_factor", "n_missing_forward"
+                )
+            ]
+        except ValueError as exc:
+            raise ValueError(f"{name}:{line_number} has an invalid count") from exc
+        if any(count < 0 for count in counts):
+            raise ValueError(f"{name}:{line_number} counts must be non-negative")
+        n_factor, n_forward_valid, n_pairs = counts[:3]
+        if n_pairs > min(n_factor, n_forward_valid):
+            raise ValueError(f"{name}:{line_number} paired count exceeds a source count")
+
+
+def _prepare_manifest(
+    manifest: Mapping[str, Any], run_id: str, csv_files: Mapping[str, bytes]
+) -> bytes:
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be a mapping")
+    missing = set(_MANIFEST_REQUIRED_KEYS).difference(manifest)
+    if missing:
+        raise ValueError(f"manifest missing required keys: {sorted(missing)}")
+    if manifest.get("calendar_provenance") != _CALENDAR_PROVENANCE:
+        raise ValueError("manifest calendar provenance must be local_calendar_unknown_upstream")
+    expected_flags = {
+        "diagnostic_only": True,
+        "authoritative": False,
+        "observation_eligible": False,
+    }
+    for key, expected in expected_flags.items():
+        if manifest.get(key) is not expected:
+            raise ValueError(f"manifest {key} must be {expected}")
+    if manifest.get("run_id", run_id) != run_id:
+        raise ValueError("manifest run_id does not match the destination")
+
+    csv_hashes = {name: hashlib.sha256(csv_files[name]).hexdigest() for name in sorted(csv_files)}
+    supplied_hashes = manifest.get("csv_sha256")
+    if supplied_hashes is not None and supplied_hashes != csv_hashes:
+        raise ValueError("manifest CSV hashes do not match the supplied bytes")
+    result = dict(manifest)
+    result.update(
+        {
+            "bundle_schema_version": "h5i-ic-diagnostic-bundle-v1",
+            "factor_definition_version": FACTOR_DEFINITION_VERSION,
+            "run_id": run_id,
+            "csv_sha256": csv_hashes,
+        }
+    )
+    return _canonical_json(result) + b"\n"
+
+
+def _assert_safe_output_root(output_root: Path, repo_root: Path) -> Path:
+    resolved_repo = repo_root.expanduser().resolve(strict=True)
+    if not resolved_repo.is_dir():
+        raise ValueError("repo_root must be a directory")
+    try:
+        resolved_output = output_root.expanduser().resolve(strict=False)
+        protected_data = (resolved_repo / "data").resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("output path cannot be resolved safely") from exc
+    if resolved_output == protected_data or protected_data in resolved_output.parents:
+        raise ValueError(f"output_root resolves inside protected live-artifact path: {protected_data}")
+    return resolved_output
+
+
+def _write_bundle_file(path: Path, payload: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _verify_existing_bundle(final_path: Path, expected: Mapping[str, bytes]) -> None:
+    if final_path.is_symlink() or not final_path.is_dir():
+        raise ValueError("existing bundle destination is not a regular directory")
+    actual_names = {item.name for item in final_path.iterdir()}
+    if actual_names != set(expected):
+        raise ValueError("existing bundle has unexpected or missing files")
+    for name, payload in expected.items():
+        existing = final_path / name
+        if existing.is_symlink() or not existing.is_file() or existing.read_bytes() != payload:
+            raise ValueError("existing bundle at run_id conflicts with requested bytes")
+
+
+def finalize_diagnostic_bundle(
+    output_root: Path,
+    *,
+    repo_root: Path,
+    run_id: str,
+    csv_files: Mapping[str, bytes],
+    manifest: Mapping[str, Any],
+) -> Path:
+    """Create a verified, immutable-by-convention bundle using an atomic rename."""
+    if not re.fullmatch(r"[0-9a-f]{64}", str(run_id)):
+        raise ValueError("run_id must be a 64-character lowercase SHA-256 digest")
+    expected_names = {f"{factor}.csv" for factor in FACTOR_NAMES}
+    if set(csv_files) != expected_names:
+        raise ValueError(f"csv_files must contain exactly {sorted(expected_names)}")
+    copied_csvs: dict[str, bytes] = {}
+    for name in sorted(expected_names):
+        payload = csv_files[name]
+        if not isinstance(payload, bytes):
+            raise ValueError(f"{name} content must be bytes")
+        _validate_csv(name, payload)
+        copied_csvs[name] = payload
+    manifest_bytes = _prepare_manifest(manifest, run_id, copied_csvs)
+    expected = {**copied_csvs, "manifest.json": manifest_bytes}
+
+    resolved_root = _assert_safe_output_root(Path(output_root), Path(repo_root))
+    if resolved_root.exists() and not resolved_root.is_dir():
+        raise ValueError("output_root exists and is not a directory")
+    resolved_root.mkdir(parents=True, exist_ok=True)
+    # Re-resolve after creation to fail closed if an ancestor changed into a
+    # symlink/junction between the initial check and the first filesystem write.
+    resolved_root = _assert_safe_output_root(resolved_root, Path(repo_root))
+    final_path = resolved_root / run_id
+
+    if final_path.exists() or final_path.is_symlink():
+        _verify_existing_bundle(final_path, expected)
+        return final_path
+
+    lock_path = resolved_root / f".{run_id}.lock"
+    stage_path: Path | None = None
+    lock_acquired = False
+    try:
+        with lock_path.open("xb") as lock_stream:
+            lock_stream.write(b"diagnostic bundle finalization in progress\n")
+            lock_stream.flush()
+            os.fsync(lock_stream.fileno())
+        lock_acquired = True
+        if final_path.exists() or final_path.is_symlink():
+            _verify_existing_bundle(final_path, expected)
+            return final_path
+
+        stage_path = Path(tempfile.mkdtemp(prefix=f".{run_id}.tmp-", dir=resolved_root))
+        for name in sorted(copied_csvs):
+            _write_bundle_file(stage_path / name, copied_csvs[name])
+        _write_bundle_file(stage_path / "manifest.json", manifest_bytes)
+        try:
+            os.rename(stage_path, final_path)
+        except OSError:
+            if final_path.exists() or final_path.is_symlink():
+                _verify_existing_bundle(final_path, expected)
+                return final_path
+            raise
+        stage_path = None
+        return final_path
+    finally:
+        if stage_path is not None and stage_path.exists():
+            shutil.rmtree(stage_path)
+        if lock_acquired:
+            lock_path.unlink(missing_ok=True)

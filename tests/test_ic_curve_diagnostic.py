@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
+import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import ic_curve_diagnostic as diagnostic
 from ic_curve_diagnostic import (
     DEFAULT_HORIZONS,
     FACTOR_NAMES,
@@ -239,3 +244,251 @@ def test_insufficient_pairs_or_constant_rank_has_null_ic():
     assert pd.isna(curves[FACTOR_NAMES[0]].iloc[0].ic)
     assert curves[FACTOR_NAMES[1]].iloc[0].status == "constant_rank"
     assert pd.isna(curves[FACTOR_NAMES[1]].iloc[0].ic)
+
+
+def _bundle_csv(ic="0.1") -> bytes:
+    return (
+        "day,horizon,ic,status,n_factor,n_forward_valid,n_pairs,n_missing_factor,n_missing_forward\n"
+        f"20260601,1,{ic},settled,6,5,5,0,1\n"
+        "20260601,3,,not_mature,6,0,0,0,0\n"
+    ).encode("utf-8")
+
+
+def _bundle_manifest() -> dict:
+    return {
+        "parameters": {"start": "20260601", "end": "20260630", "horizons": [1, 3]},
+        "inputs": {
+            "h5i_path": "fixture/market.db",
+            "calendar_path": "fixture/calendar.json",
+            "calendar_sha256": "a" * 64,
+            "schema_fingerprint": "b" * 64,
+            "queried_rows_sha256": "c" * 64,
+        },
+        "formulas": {"score": "factor_library.score_factor", "label": "compound next h change_pct"},
+        "horizons": [1, 3],
+        "source_max_day": "20260701",
+        "calendar_due_dates": {"1": "20260602", "3": "20260604"},
+        "last_settled_ic_day": None,
+        "row_counts": {"vol_selector_score_v1": 2, "mom_rev_selector_score_v1": 2},
+        "missingness": {},
+        "calendar_provenance": "local_calendar_unknown_upstream",
+        "diagnostic_only": True,
+        "authoritative": False,
+        "observation_eligible": False,
+    }
+
+
+def _write_bundle(tmp_path: Path, *, run_id="d" * 64, csv=None, manifest=None):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    output_root = tmp_path / "outside" / "diagnostics"
+    payload = _bundle_csv() if csv is None else csv
+    files = {f"{factor}.csv": payload for factor in FACTOR_NAMES}
+    path = diagnostic.finalize_diagnostic_bundle(
+        output_root,
+        repo_root=repo_root,
+        run_id=run_id,
+        csv_files=files,
+        manifest=_bundle_manifest() if manifest is None else manifest,
+    )
+    return path, files, repo_root, output_root
+
+
+def test_run_identity_is_canonical_and_binds_all_sources():
+    inputs = {
+        "code_sha": "1" * 40,
+        "calendar_sha256": "2" * 64,
+        "schema_fingerprint": "3" * 64,
+        "queried_rows_sha256": "4" * 64,
+        "source_max_day": "20260701",
+    }
+    run_id, identity = diagnostic.build_run_identity(
+        {"end": "20260630", "start": "20260601"}, **inputs
+    )
+    reordered_id, _ = diagnostic.build_run_identity(
+        {"start": "20260601", "end": "20260630"}, **inputs
+    )
+
+    assert run_id == reordered_id
+    assert len(run_id) == 64
+    assert identity["factor_definition_version"] == diagnostic.FACTOR_DEFINITION_VERSION
+    assert run_id == hashlib.sha256(
+        json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    for field, replacement in (
+        ("code_sha", "5" * 40),
+        ("calendar_sha256", "5" * 64),
+        ("schema_fingerprint", "5" * 64),
+        ("queried_rows_sha256", "5" * 64),
+        ("source_max_day", "20260702"),
+    ):
+        changed = dict(inputs, **{field: replacement})
+        changed_id, _ = diagnostic.build_run_identity(
+            {"start": "20260601", "end": "20260630"}, **changed
+        )
+        assert changed_id != run_id
+    changed_params, _ = diagnostic.build_run_identity(
+        {"start": "20260602", "end": "20260630"}, **inputs
+    )
+    assert changed_params != run_id
+
+
+def test_manifest_has_required_provenance_and_authority_flags(tmp_path):
+    bundle, _, _, _ = _write_bundle(tmp_path)
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["calendar_provenance"] == "local_calendar_unknown_upstream"
+    assert manifest["diagnostic_only"] is True
+    assert manifest["authoritative"] is False
+    assert manifest["observation_eligible"] is False
+    assert manifest["csv_sha256"] == {
+        f"{factor}.csv": hashlib.sha256((bundle / f"{factor}.csv").read_bytes()).hexdigest()
+        for factor in FACTOR_NAMES
+    }
+    for key in (
+        "parameters", "inputs", "formulas", "horizons", "source_max_day",
+        "calendar_due_dates", "last_settled_ic_day", "row_counts", "missingness",
+    ):
+        assert key in manifest
+
+
+def test_csv_schema_order_dates_nulls_and_hashes_are_exact(tmp_path):
+    bundle, files, _, _ = _write_bundle(tmp_path)
+    expected_names = {"manifest.json", *(f"{factor}.csv" for factor in FACTOR_NAMES)}
+
+    assert {item.name for item in bundle.iterdir()} == expected_names
+    for name, payload in files.items():
+        actual = (bundle / name).read_bytes()
+        assert actual == payload
+        assert hashlib.sha256(actual).hexdigest() == json.loads(
+            (bundle / "manifest.json").read_text(encoding="utf-8")
+        )["csv_sha256"][name]
+        parsed = pd.read_csv(bundle / name, keep_default_na=False, dtype={"day": str, "ic": str})
+        assert list(parsed.columns) == [
+            "day", "horizon", "ic", "status", "n_factor", "n_forward_valid",
+            "n_pairs", "n_missing_factor", "n_missing_forward",
+        ]
+        assert parsed.day.tolist() == ["20260601", "20260601"]
+        assert parsed.ic.tolist() == ["0.1", ""]
+
+
+@pytest.mark.parametrize("relative", [Path("data"), Path("data/ic/nested")])
+def test_output_root_equal_to_or_nested_in_protected_path_is_rejected(tmp_path, relative):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    output_root = repo_root / relative
+    with pytest.raises(ValueError, match="protected"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id="e" * 64,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+    assert not output_root.exists()
+
+
+def test_output_root_through_junction_or_symlink_is_rejected(tmp_path):
+    repo_root = tmp_path / "repo"
+    protected = repo_root / "data" / "ic"
+    protected.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(protected, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="protected"):
+        diagnostic.finalize_diagnostic_bundle(
+            alias / "diagnostics",
+            repo_root=repo_root,
+            run_id="f" * 64,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+    assert not (protected / "diagnostics").exists()
+
+
+def test_existing_identical_bundle_is_verified_without_rewrite(tmp_path):
+    bundle, files, repo_root, output_root = _write_bundle(tmp_path)
+    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in bundle.iterdir()}
+    second = diagnostic.finalize_diagnostic_bundle(
+        output_root,
+        repo_root=repo_root,
+        run_id=bundle.name,
+        csv_files=files,
+        manifest=_bundle_manifest(),
+    )
+
+    assert second == bundle
+    assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in bundle.iterdir()} == before
+
+
+def test_existing_conflicting_bundle_is_rejected(tmp_path):
+    bundle, _, repo_root, output_root = _write_bundle(tmp_path)
+    before = {path.name: path.read_bytes() for path in bundle.iterdir()}
+    conflicting = {f"{factor}.csv": _bundle_csv("0.2") for factor in FACTOR_NAMES}
+
+    with pytest.raises(ValueError, match="existing bundle.*conflicts"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id=bundle.name,
+            csv_files=conflicting,
+            manifest=_bundle_manifest(),
+        )
+    assert {path.name: path.read_bytes() for path in bundle.iterdir()} == before
+
+
+def test_concurrent_destination_collision_never_overwrites(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    output_root = tmp_path / "outside"
+    run_id = "a" * 64
+
+    def write(value):
+        files = {f"{factor}.csv": _bundle_csv(value) for factor in FACTOR_NAMES}
+        try:
+            return diagnostic.finalize_diagnostic_bundle(
+                output_root, repo_root=repo_root, run_id=run_id,
+                csv_files=files, manifest=_bundle_manifest(),
+            )
+        except (FileExistsError, ValueError) as exc:
+            return exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ("0.1", "0.2")))
+
+    bundle = output_root / run_id
+    assert bundle.is_dir()
+    assert sum(isinstance(result, Path) for result in results) == 1
+    assert sum(isinstance(result, Exception) for result in results) == 1
+    winning_ic = (bundle / f"{FACTOR_NAMES[0]}.csv").read_text(encoding="utf-8").splitlines()[1].split(",")[2]
+    assert winning_ic in {"0.1", "0.2"}
+    assert not list(output_root.glob(f".{run_id}.tmp-*"))
+
+
+def test_finalize_failure_never_exposes_final_bundle(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    output_root = tmp_path / "outside"
+    run_id = "b" * 64
+    write_file = diagnostic._write_bundle_file
+
+    def fail_manifest(path, payload):
+        if path.name == "manifest.json":
+            raise OSError("injected manifest write failure")
+        write_file(path, payload)
+
+    monkeypatch.setattr(diagnostic, "_write_bundle_file", fail_manifest)
+    with pytest.raises(OSError, match="injected"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id=run_id,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+
+    assert not (output_root / run_id).exists()
+    assert not list(output_root.glob(f".{run_id}.tmp-*"))
