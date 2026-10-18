@@ -1,6 +1,6 @@
 # H5i technical-factor IC diagnostic contract
 
-**Status:** Conversational scope approved 2026-10-18; written specification awaiting user review. This document does not authorize implementation or production promotion.
+**Status:** Approved by user 2026-10-18. This document does not authorize implementation or production promotion.
 
 ## 1. Purpose and boundary
 
@@ -44,3 +44,4 @@ Implement with tests first. Synthetic fixtures must prove: no lookahead in 21-cl
 Run focused `.venv310` tests, then the full applicable suite. Report PASS/FAIL/SKIP/NOT_RUN separately; skipped H5i/data cases are not passes. Test against a bounded real H5i window read-only and compare summary shape/direction with the legacy files **as a difference report, not a parity or promotion gate**. Before and after the real-data diagnostic, verify byte hashes for `data/ic`, `data/weights.json`, the frozen selector snapshot, and the existing Epoch; check the branch diff excludes all runtime/production paths named in section 1.
 
 This phase is complete only when its own diagnostic bundle is reproducible and immutable, its tests and protected-path checks pass, and the result is explicitly labeled diagnostic. A separate, later decision is required to define PIT source contracts for `pb_rev`/`roe`/individual-stock `mf_net`, reconcile optimizer source-sign and H5-versus-H20 consumer semantics, replace the authoritative producer, alter health policy, deploy code, or freeze a new Observation Epoch. No result from this phase advances the five-qualified-day count.
+
