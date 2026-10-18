@@ -109,15 +109,14 @@ def _last_settled_days(curves: dict[str, object]) -> dict[str, dict[str, str | N
     return result
 
 
-def _eligible_counts(inputs: diagnostic.DiagnosticInputs) -> dict[str, int]:
-    rows = inputs.bars
-    values = pd.to_numeric(rows["close"], errors="coerce")
-    numeric = values.to_numpy(dtype=float, na_value=np.nan)
-    valid = np.isfinite(numeric) & (numeric > 0.0)
-    result = {}
-    for day in inputs.signal_days:
-        result[day] = int(((rows["day"] == day) & valid).sum())
-    return result
+def _eligible_counts(
+    inputs: diagnostic.DiagnosticInputs, factor_scores: pd.DataFrame
+) -> dict[str, int]:
+    primary_factor = factor_scores.loc[
+        factor_scores["factor"] == diagnostic.FACTOR_NAMES[0], ["day", "symbol"]
+    ]
+    counts = primary_factor.groupby("day")["symbol"].nunique().to_dict()
+    return {day: int(counts.get(day, 0)) for day in inputs.signal_days}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -212,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "calendar_due_dates": _calendar_due_dates(inputs),
             "last_settled_ic_day": _last_settled_days(curves),
             "row_counts": {factor: int(len(curves[factor])) for factor in diagnostic.FACTOR_NAMES},
-            "eligible_counts_by_day": _eligible_counts(inputs),
+            "eligible_counts_by_day": _eligible_counts(inputs, factor_scores),
             "missingness": {
                 "factor_by_day_reason": factor_missingness,
                 "forward_by_day_reason": forward_missingness,

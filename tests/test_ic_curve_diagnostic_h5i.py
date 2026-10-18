@@ -141,6 +141,23 @@ def test_h5i_query_is_bounded_and_includes_twenty_pre_start_valid_closes(tmp_pat
     assert result.bars.day.max() == future_days[20].replace("-", "")
 
 
+def test_duplicate_pre_start_key_at_lookback_cutoff_fails_closed(tmp_path):
+    start = "2026-06-01"
+    prior_days = _previous_weekdays(start, 20)
+    future_days = _weekdays(start, 21)
+    rows = _rows_for_symbol(prior_days + future_days)
+    rows.append(dict(rows[0]))
+    h5i_path = tmp_path / "market.db"
+    calendar_path = tmp_path / "calendar.json"
+    _write_h5i(h5i_path, rows)
+    _write_calendar(calendar_path, future_days)
+
+    with pytest.raises(ValueError, match="duplicate day/symbol"):
+        diagnostic.read_diagnostic_inputs(
+            h5i_path, calendar_path, start=future_days[0], end=future_days[0]
+        )
+
+
 def test_end_after_source_max_fails_closed(tmp_path):
     days = _weekdays("2026-06-01", 24)
     h5i_path = tmp_path / "market.db"

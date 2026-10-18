@@ -134,6 +134,48 @@ def test_cli_success_emits_machine_readable_final_manifest_path(tmp_path, monkey
     assert manifest["observation_eligible"] is False
 
 
+def test_manifest_eligible_counts_exclude_symbols_without_full_history(tmp_path, monkeypatch, capsys):
+    h5i_db = pytest.importorskip(
+        "h5i_db", reason="CLI integration fixture requires the Python 3.10 H5i runtime"
+    )
+    import pyarrow as pa
+
+    _install_clean_code_sha(monkeypatch)
+    h5i_path, calendar_path, start = _write_fixture(tmp_path, source_count=1)
+    db = h5i_db.Database(str(h5i_path))
+    try:
+        schema = pa.schema(
+            [
+                pa.field("ts", pa.timestamp("us")),
+                pa.field("symbol", pa.string()),
+                pa.field("close", pa.float64()),
+                pa.field("change_pct", pa.float64()),
+            ]
+        )
+        db.append(
+            "daily_bars",
+            pa.Table.from_pydict(
+                {
+                    "ts": [datetime.combine(date.fromisoformat(start), datetime.min.time())],
+                    "symbol": ["SHORT_HISTORY"],
+                    "close": [12.0],
+                    "change_pct": [0.0],
+                },
+                schema=schema,
+            ),
+        )
+    finally:
+        db.close()
+    output_root = tmp_path / "external-output"
+
+    result = cli.main(_args(h5i_path, calendar_path, start, start, output_root))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["eligible_counts_by_day"][start.replace("-", "")] == 5
+
+
 def test_cli_failure_is_nonzero_and_leaves_no_final_bundle(tmp_path, monkeypatch, capsys):
     _install_clean_code_sha(monkeypatch)
     h5i_path, calendar_path, start = _write_fixture(tmp_path, calendar_count=30, source_count=2)

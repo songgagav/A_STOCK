@@ -136,6 +136,20 @@ def _count(missing: dict[str, dict[str, int]], day: str, reason: str) -> None:
     by_reason[reason] = by_reason.get(reason, 0) + 1
 
 
+def _positive_history_by_symbol(
+    normalized: pd.DataFrame, finite_positive: np.ndarray
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Index each symbol's ordered positive-close history once for PIT lookups."""
+    positive = normalized.loc[finite_positive, ["day", "symbol", "close"]]
+    histories: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for symbol, group in positive.groupby("symbol", sort=False):
+        histories[str(symbol)] = (
+            group["day"].to_numpy(dtype=str),
+            group["close"].to_numpy(dtype=float),
+        )
+    return histories
+
+
 def compute_factor_scores(
     bars: pd.DataFrame, signal_days: Sequence[str]
 ) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
@@ -148,6 +162,7 @@ def compute_factor_scores(
     finite_positive = np.isfinite(normalized["close"].to_numpy(dtype=float)) & (
         normalized["close"].to_numpy(dtype=float) > 0.0
     )
+    history_by_symbol = _positive_history_by_symbol(normalized, finite_positive)
     for day in days:
         day_rows = normalized.loc[normalized["day"] == day]
         for row in day_rows.itertuples(index=False):
@@ -155,16 +170,14 @@ def compute_factor_scores(
                 _count(missing, day, "invalid_signal_close")
                 continue
 
-            symbol_rows = normalized.loc[
-                (normalized["symbol"] == row.symbol)
-                & (normalized["day"] <= day)
-                & finite_positive
-            ].tail(21)
-            if len(symbol_rows) < 21:
+            symbol_days, symbol_closes = history_by_symbol[str(row.symbol)]
+            end = int(np.searchsorted(symbol_days, day, side="right"))
+            history_closes = symbol_closes[max(0, end - 21) : end]
+            if len(history_closes) < 21:
                 _count(missing, day, "insufficient_history")
                 continue
 
-            as_of_bars = symbol_rows.loc[:, ["close"]].reset_index(drop=True)
+            as_of_bars = pd.DataFrame({"close": history_closes})
             for factor_name, source_name in _FACTOR_SOURCE_NAMES.items():
                 value = float(score_factor(source_name, as_of_bars))
                 if not np.isfinite(value):
@@ -436,35 +449,42 @@ def _query_h5i_window(
         query_end_day = min(max_future_due_day, source_max_day)
 
         query = f"""
-            WITH pre_start_ranked AS (
+            WITH pre_start_counts AS (
                 SELECT CAST(ts AS DATE) AS day,
                        TRIM(CAST(symbol AS VARCHAR)) AS symbol,
                        close,
                        change_pct,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY symbol ORDER BY CAST(ts AS DATE) DESC
-                       ) AS row_number
+                       COUNT(*) OVER (
+                           PARTITION BY TRIM(CAST(symbol AS VARCHAR)), CAST(ts AS DATE)
+                       ) AS duplicate_count
                 FROM daily_bars
                 WHERE CAST(ts AS DATE) < DATE '{start_day[:4]}-{start_day[4:6]}-{start_day[6:]}'
-                  AND close IS NOT NULL
+            ), pre_start_ranked AS (
+                SELECT day, symbol, close, change_pct, duplicate_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY day DESC
+                       ) AS row_number
+                FROM pre_start_counts
+                WHERE close IS NOT NULL
                   AND close > 0
                   AND NOT isnan(close)
                   AND close < 1e308
             ), bounded_rows AS (
-                SELECT day, symbol, close, change_pct
+                SELECT day, symbol, close, change_pct, duplicate_count
                 FROM pre_start_ranked
                 WHERE row_number <= 20
                 UNION ALL
                 SELECT CAST(ts AS DATE) AS day,
                        TRIM(CAST(symbol AS VARCHAR)) AS symbol,
                        close,
-                       change_pct
+                       change_pct,
+                       1 AS duplicate_count
                 FROM daily_bars
                 WHERE CAST(ts AS DATE) BETWEEN
                       DATE '{start_day[:4]}-{start_day[4:6]}-{start_day[6:]}'
                       AND DATE '{query_end_day[:4]}-{query_end_day[4:6]}-{query_end_day[6:]}'
             )
-            SELECT day, symbol, close, change_pct
+            SELECT day, symbol, close, change_pct, duplicate_count
             FROM bounded_rows
             ORDER BY day, symbol
         """
@@ -472,6 +492,11 @@ def _query_h5i_window(
     finally:
         database.close()
 
+    if "duplicate_count" in frame.columns:
+        duplicate_rows = pd.to_numeric(frame["duplicate_count"], errors="coerce").gt(1)
+        if duplicate_rows.any():
+            raise ValueError("duplicate day/symbol bar rows")
+        frame = frame.drop(columns=["duplicate_count"])
     frame = frame.rename(columns={"day": "day", "symbol": "symbol"})
     frame = _normalize_bars(frame)
     return frame, source_max_day, fingerprint, query_end_day
@@ -719,6 +744,8 @@ def _assert_safe_output_root(output_root: Path, repo_root: Path) -> Path:
         protected_data = (resolved_repo / "data").resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         raise ValueError("output path cannot be resolved safely") from exc
+    if resolved_output == resolved_repo or resolved_repo in resolved_output.parents:
+        raise ValueError(f"output_root resolves inside protected repository root: {resolved_repo}")
     if resolved_output == protected_data or protected_data in resolved_output.parents:
         raise ValueError(f"output_root resolves inside protected live-artifact path: {protected_data}")
     return resolved_output

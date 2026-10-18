@@ -107,6 +107,29 @@ def test_lower_vol_and_lower_momentum_map_to_higher_named_scores():
     assert DEFAULT_HORIZONS == (1, 3, 5, 10, 20)
 
 
+def test_factor_scoring_does_not_scan_full_frame_once_per_symbol(monkeypatch):
+    days = _calendar("2026-05-01", 22)
+    rows = [
+        (day, f"S{symbol:03}", 20.0 + symbol + day_index * 0.01, 0.0)
+        for symbol in range(30)
+        for day_index, day in enumerate(days[:21])
+    ]
+    prepare_history = getattr(diagnostic, "_positive_history_by_symbol", None)
+    assert prepare_history is not None
+    calls = []
+
+    def record_prepare(*args, **kwargs):
+        calls.append(True)
+        return prepare_history(*args, **kwargs)
+
+    monkeypatch.setattr(diagnostic, "_positive_history_by_symbol", record_prepare)
+
+    scores, _ = compute_factor_scores(_bars(rows), [days[20]])
+
+    assert len(scores) == 60
+    assert calls == [True]
+
+
 def test_forward_label_compounds_exactly_next_h_rows():
     days = _calendar("2026-06-01", 4)
     bars = _bars(
@@ -386,6 +409,45 @@ def test_output_root_equal_to_or_nested_in_protected_path_is_rejected(tmp_path, 
             manifest=_bundle_manifest(),
         )
     assert not output_root.exists()
+
+
+@pytest.mark.parametrize("relative", [Path("."), Path("research-output")])
+def test_output_root_inside_repository_is_rejected(tmp_path, relative):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    output_root = repo_root / relative
+
+    with pytest.raises(ValueError, match="repository"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id="a" * 64,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+
+    assert not (repo_root / "research-output").exists()
+
+
+def test_output_root_symlink_into_repository_is_rejected(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    alias = tmp_path / "repo-alias"
+    try:
+        alias.symlink_to(repo_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="repository"):
+        diagnostic.finalize_diagnostic_bundle(
+            alias / "research-output",
+            repo_root=repo_root,
+            run_id="b" * 64,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+
+    assert not (repo_root / "research-output").exists()
 
 
 def test_output_root_through_junction_or_symlink_is_rejected(tmp_path):
