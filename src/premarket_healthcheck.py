@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -671,10 +672,9 @@ def _norm_date(v):
 def check_ic_history() -> dict:
     """断言① ic_history 行数与新鲜度: 检出 ic_history 从未被管道生成的静默断层.
 
-    ic_history 记录信号日的未来收益 IC. 判定"已到期"的天 = 距数据库最新 bar 至少
-    max_hold 个交易日的 selection 天(此后 max_hold 收益已全部发生), 此类天必须在
-    ic_history.csv 有对应行, 否则说明滞后结算闭环断裂(本修复前 ic_history 从未
-    由管道自动生成, 正是此类盲区). 阈值: 文件缺失/覆盖不足/最新结算日陈旧 -> FAIL.
+    ic_history 记录信号日的未来收益 IC. 已到期且有非空 top_n 的 selection 天
+    必须在 ic_history.csv 有对应行; 空选股池无法计算 IC, 不要求伪造行, 但以
+    WARN 明确留痕其数据质量/信号缺口. 非空池缺行或文件缺失仍为 FAIL.
     最新 bar 日取自行情主源 h5i(DuckDB 已退役, 仅文件存在时作回退).
     """
     t0 = time.time()
@@ -714,35 +714,67 @@ def check_ic_history() -> dict:
                             "latest_bar": latest_bar, "prev_trade_day": prev_trade_day},
                            t0)
 
+        eligible_due_days = []
+        empty_selection_days = []
+        for d in due_days:
+            selection_path = os.path.join(icm.DAILY_DIR, d, "selection.json")
+            with open(selection_path, encoding="utf-8") as f:
+                selection = json.load(f)
+            if not isinstance(selection, dict) or not isinstance(selection.get("top_n"), list):
+                raise ValueError(f"{selection_path}: selection.top_n 缺失或非列表")
+            if selection["top_n"]:
+                for item in selection["top_n"]:
+                    if (not isinstance(item, dict)
+                            or not isinstance(item.get("canon"), str)
+                            or not item["canon"].strip()):
+                        raise ValueError(f"{selection_path}: selection.top_n 含无效标的")
+                    signal = item.get("signal")
+                    if signal is None or isinstance(signal, bool):
+                        raise ValueError(f"{selection_path}: selection.top_n 含无效信号")
+                    try:
+                        signal = float(signal)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{selection_path}: selection.top_n 含无效信号") from exc
+                    if not math.isfinite(signal):
+                        raise ValueError(f"{selection_path}: selection.top_n 含非有限信号")
+                eligible_due_days.append(d)
+            else:
+                empty_selection_days.append(d)
+
         # 统计 ic_history 覆盖
         rows = icm._read_history_rows()
         hist_rows = rows[1] if rows[0] is not None else []
         hist_days = {r.split(",")[0] for r in hist_rows if r.strip()}
-        missing = [d for d in due_days if d not in hist_days]
+        missing = [d for d in eligible_due_days if d not in hist_days]
         # 新鲜度: ic_history 应有最近一个"可结算天"的记录
         latest_hist_day = max(hist_days) if hist_days else None
         hold_cols = [int(c.split("ic_h", 1)[1]) for c in rows[0].split(",")[1:]] if rows[0] else []
         # 完整性: 对已完整到期(h = MAX_HOLD 收益已发生)的天, 是否都有其 IC 深度的列
-        complete_due = [d for d in due_days
+        complete_due = [d for d in eligible_due_days
                         if len(trade_days) >= MAX_HOLD + 1
                         and d <= trade_days[-1 - MAX_HOLD]]
         full_depth = all(h in hold_cols for h in [1, 3, 5, 10])
 
         problems = []
-        if latest_hist_day is None:
+        if latest_hist_day is None and eligible_due_days:
             problems.append("ic_history 无任何数据行")
         if missing:
             problems.append(f"以下已可结算天无 IC 行: {missing}")
+        if empty_selection_days:
+            problems.append(f"以下已到期天选股池为空, 无法计算 IC: {empty_selection_days}")
         if complete_due and not full_depth:
             problems.append(f"完全到期天 {len(complete_due)} 个但表头缺持有期列 "
                             f"(现有 {hold_cols}), 未做滞后补全")
         # 门槛: 任一故障 -> FAIL; 仅"列深度不足但行齐全" -> WARN
-        hard_fail = bool(problems) and (missing or latest_hist_day is None)
+        hard_fail = bool(missing or (eligible_due_days and latest_hist_day is None))
         status = "FAIL" if hard_fail else ("WARN" if problems else "OK")
         return _record(name, status,
                        {"source": bar_src,
                         "latest_bar": latest_bar,
-                        "due_days": len(due_days), "hist_rows": len(hist_rows),
+                        "due_days": len(due_days),
+                        "eligible_due_days": len(eligible_due_days),
+                        "empty_selection_days": empty_selection_days,
+                        "hist_rows": len(hist_rows),
                         "latest_hist_day": latest_hist_day,
                         "prev_trade_day": prev_trade_day,
                         "complete_due": len(complete_due),
