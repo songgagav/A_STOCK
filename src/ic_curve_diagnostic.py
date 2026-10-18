@@ -6,7 +6,11 @@ are added by later tasks in this diagnostic branch.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
+import hashlib
+import json
+from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
@@ -35,6 +39,27 @@ _CURVE_COLUMNS = (
     "n_missing_factor",
     "n_missing_forward",
 )
+_CALENDAR_PROVENANCE = "local_calendar_unknown_upstream"
+
+
+@dataclass(frozen=True)
+class DiagnosticInputs:
+    """Bounded, read-only snapshot and the identities needed to revalidate it."""
+
+    bars: pd.DataFrame
+    calendar_days: tuple[str, ...]
+    signal_days: tuple[str, ...]
+    source_max_day: str
+    calendar_sha256: str
+    schema_fingerprint: str
+    queried_rows_sha256: str
+    source_path: Path
+    calendar_path: Path
+    start_day: str
+    end_day: str
+    max_future_due_day: str
+    query_bounds: dict[str, str]
+    calendar_provenance: str = _CALENDAR_PROVENANCE
 
 
 def _day_key(value: Any) -> str:
@@ -307,3 +332,216 @@ def build_ic_curves(
                 )
         curves[factor] = pd.DataFrame(rows, columns=_CURVE_COLUMNS)
     return curves
+
+
+def _schema_fingerprint(schema: Any) -> str:
+    description = [
+        {"name": field.name, "type": str(field.type), "nullable": bool(field.nullable)}
+        for field in schema
+    ]
+    payload = json.dumps(description, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_digest(bars: pd.DataFrame) -> str:
+    digest = hashlib.sha256()
+    for row in bars.sort_values(["day", "symbol"], kind="mergesort").itertuples(index=False):
+        values: list[Any] = [str(row.day), str(row.symbol)]
+        for value in (row.close, row.change_pct):
+            if pd.isna(value):
+                values.append(None)
+            else:
+                values.append(float(value).hex())
+        digest.update(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _calendar_from_bytes(payload: bytes) -> list[str]:
+    try:
+        data = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("calendar file is not valid UTF-8 JSON") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("days"), list):
+        raise ValueError("calendar JSON must contain a days array")
+    return _calendar_days(data["days"])
+
+
+def _is_weekday(day: str) -> bool:
+    return datetime.strptime(day, "%Y%m%d").weekday() < 5
+
+
+def _validate_daily_bars_schema(schema: Any) -> None:
+    try:
+        import pyarrow as pa
+    except ImportError as exc:  # pragma: no cover - h5i runtime includes pyarrow
+        raise RuntimeError("pyarrow is required to validate the H5i schema") from exc
+
+    fields = {field.name: field for field in schema}
+    required = {"ts", "symbol", "close", "change_pct"}
+    if not required.issubset(fields):
+        raise ValueError(f"daily_bars schema missing columns: {sorted(required - set(fields))}")
+    symbol_type = fields["symbol"].type
+    if not (pa.types.is_string(symbol_type) or pa.types.is_large_string(symbol_type)):
+        raise ValueError("daily_bars schema has incompatible symbol type")
+    if not (pa.types.is_timestamp(fields["ts"].type) or pa.types.is_date(fields["ts"].type)):
+        raise ValueError("daily_bars schema has incompatible ts type")
+    for name in ("close", "change_pct"):
+        value_type = fields[name].type
+        if not (pa.types.is_integer(value_type) or pa.types.is_floating(value_type) or pa.types.is_decimal(value_type)):
+            raise ValueError(f"daily_bars schema has incompatible {name} type")
+
+
+def _query_h5i_window(
+    source_path: Path, start_day: str, end_day: str, max_future_due_day: str
+) -> tuple[pd.DataFrame, str, str, str]:
+    try:
+        import h5i_db
+    except ImportError as exc:
+        raise RuntimeError("h5i_db is required; no alternate data source is allowed") from exc
+
+    database = h5i_db.Database(str(source_path), read_only=True)
+    try:
+        try:
+            schema = database.schema("daily_bars")
+        except Exception as exc:
+            raise ValueError("daily_bars schema is unavailable") from exc
+        _validate_daily_bars_schema(schema)
+        fingerprint = _schema_fingerprint(schema)
+
+        watermark = database.sql(
+            "SELECT MAX(CAST(ts AS DATE)) AS source_max_day FROM daily_bars"
+        ).to_pandas()
+        if watermark.empty or pd.isna(watermark.iloc[0]["source_max_day"]):
+            raise ValueError("daily_bars has no source watermark")
+        source_max_day = _day_key(watermark.iloc[0]["source_max_day"])
+        if end_day > source_max_day:
+            raise ValueError(f"end {end_day} is later than source max {source_max_day}")
+        query_end_day = min(max_future_due_day, source_max_day)
+
+        query = f"""
+            WITH pre_start_ranked AS (
+                SELECT CAST(ts AS DATE) AS day,
+                       TRIM(CAST(symbol AS VARCHAR)) AS symbol,
+                       close,
+                       change_pct,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY CAST(ts AS DATE) DESC
+                       ) AS row_number
+                FROM daily_bars
+                WHERE CAST(ts AS DATE) < DATE '{start_day[:4]}-{start_day[4:6]}-{start_day[6:]}'
+                  AND close IS NOT NULL
+                  AND close > 0
+                  AND NOT isnan(close)
+                  AND close < 1e308
+            ), bounded_rows AS (
+                SELECT day, symbol, close, change_pct
+                FROM pre_start_ranked
+                WHERE row_number <= 20
+                UNION ALL
+                SELECT CAST(ts AS DATE) AS day,
+                       TRIM(CAST(symbol AS VARCHAR)) AS symbol,
+                       close,
+                       change_pct
+                FROM daily_bars
+                WHERE CAST(ts AS DATE) BETWEEN
+                      DATE '{start_day[:4]}-{start_day[4:6]}-{start_day[6:]}'
+                      AND DATE '{query_end_day[:4]}-{query_end_day[4:6]}-{query_end_day[6:]}'
+            )
+            SELECT day, symbol, close, change_pct
+            FROM bounded_rows
+            ORDER BY day, symbol
+        """
+        frame = database.sql(query).to_pandas()
+    finally:
+        database.close()
+
+    frame = frame.rename(columns={"day": "day", "symbol": "symbol"})
+    frame = _normalize_bars(frame)
+    return frame, source_max_day, fingerprint, query_end_day
+
+
+def read_diagnostic_inputs(
+    h5i_path: Path, calendar_path: Path, *, start: str, end: str
+) -> DiagnosticInputs:
+    """Read only a 20-close lookback and bounded requested/future H5i window."""
+    source_path = Path(h5i_path).expanduser().resolve(strict=True)
+    resolved_calendar_path = Path(calendar_path).expanduser().resolve(strict=True)
+    start_day, end_day = _day_key(start), _day_key(end)
+    if start_day > end_day:
+        raise ValueError("start must be on or before end")
+
+    calendar_bytes = resolved_calendar_path.read_bytes()
+    full_calendar = _calendar_from_bytes(calendar_bytes)
+    weekday_days = [day for day in full_calendar if _is_weekday(day)]
+    signal_days = [day for day in weekday_days if start_day <= day <= end_day]
+    if not signal_days:
+        raise ValueError("calendar has no weekdays in the requested interval")
+    future_days = [day for day in weekday_days if day > end_day]
+    if len(future_days) < 20:
+        raise ValueError("calendar must cover 20 future weekdays after end")
+    max_future_due_day = future_days[19]
+
+    # The single read-only connection obtains the watermark with an aggregate,
+    # then caps the bounded row query before reading any data rows.
+    bars, source_max_day, schema_fingerprint, query_end_day = _query_h5i_window(
+        source_path, start_day, end_day, max_future_due_day
+    )
+
+    calendar_window = tuple(
+        day for day in weekday_days if start_day <= day <= max_future_due_day
+    )
+    window_days = set(calendar_window)
+    queried_days = set(bars.loc[bars["day"] >= start_day, "day"].astype(str))
+    off_calendar = sorted(queried_days - window_days)
+    if off_calendar:
+        raise ValueError(f"H5i rows fall on dates absent from the supplied calendar: {off_calendar[:5]}")
+
+    expected_past_days = [day for day in calendar_window if day <= source_max_day]
+    missing_days = sorted(set(expected_past_days) - queried_days)
+    if missing_days:
+        raise ValueError(f"past calendar days without H5i bars: {missing_days[:10]}")
+
+    query_bounds = {
+        "data_start": start_day,
+        "data_end": query_end_day,
+        "pre_start_lookback": "last_20_finite_positive_closes_per_symbol",
+    }
+    return DiagnosticInputs(
+        bars=bars,
+        calendar_days=calendar_window,
+        signal_days=tuple(signal_days),
+        source_max_day=source_max_day,
+        calendar_sha256=hashlib.sha256(calendar_bytes).hexdigest(),
+        schema_fingerprint=schema_fingerprint,
+        queried_rows_sha256=_row_digest(bars),
+        source_path=source_path,
+        calendar_path=resolved_calendar_path,
+        start_day=start_day,
+        end_day=end_day,
+        max_future_due_day=max_future_due_day,
+        query_bounds=query_bounds,
+    )
+
+
+def verify_inputs_unchanged(inputs: DiagnosticInputs) -> None:
+    """Reopen the same read-only inputs and reject any identity or row drift."""
+    try:
+        calendar_sha = hashlib.sha256(inputs.calendar_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError("calendar file disappeared or became unreadable") from exc
+    if calendar_sha != inputs.calendar_sha256:
+        raise ValueError("calendar bytes changed after input snapshot")
+
+    current = read_diagnostic_inputs(
+        inputs.source_path,
+        inputs.calendar_path,
+        start=inputs.start_day,
+        end=inputs.end_day,
+    )
+    if current.schema_fingerprint != inputs.schema_fingerprint:
+        raise ValueError("H5i daily_bars schema changed after input snapshot")
+    if current.source_max_day != inputs.source_max_day:
+        raise ValueError("H5i source max changed after input snapshot")
+    if current.queried_rows_sha256 != inputs.queried_rows_sha256:
+        raise ValueError("queried H5i rows changed after input snapshot")
