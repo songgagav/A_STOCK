@@ -1,6 +1,6 @@
 # H5i technical-factor IC diagnostic contract
 
-**Status:** Conversational scope approved 2026-10-18; written specification awaiting user review. This document does not authorize implementation or production promotion.
+**Status:** Approved by user 2026-10-18. This document does not authorize implementation or production promotion.
 
 ## 1. Purpose and boundary
 
