@@ -471,6 +471,31 @@ def test_output_root_through_junction_or_symlink_is_rejected(tmp_path):
     assert not (protected / "diagnostics").exists()
 
 
+@pytest.mark.parametrize("child", ["ic", "evolution", "daily"])
+def test_protected_child_symlink_to_external_output_is_rejected(tmp_path, child):
+    repo_root = tmp_path / "repo"
+    protected = repo_root / "data" / child
+    protected.parent.mkdir(parents=True)
+    external_target = tmp_path / "external-target"
+    external_target.mkdir()
+    try:
+        protected.symlink_to(external_target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    output_root = protected / "diagnostics"
+    with pytest.raises(ValueError, match="protected"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id="c" * 64,
+            csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+            manifest=_bundle_manifest(),
+        )
+
+    assert not (external_target / "diagnostics").exists()
+
+
 def test_existing_identical_bundle_is_verified_without_rewrite(tmp_path):
     bundle, files, repo_root, output_root = _write_bundle(tmp_path)
     before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in bundle.iterdir()}

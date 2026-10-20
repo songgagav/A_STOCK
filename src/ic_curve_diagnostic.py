@@ -741,13 +741,25 @@ def _assert_safe_output_root(output_root: Path, repo_root: Path) -> Path:
         raise ValueError("repo_root must be a directory")
     try:
         resolved_output = output_root.expanduser().resolve(strict=False)
-        protected_data = (resolved_repo / "data").resolve(strict=False)
+        protected_paths = (
+            ("live-artifact path", (resolved_repo / "data").resolve(strict=False)),
+            ("live IC artifact path", (resolved_repo / "data" / "ic").resolve(strict=False)),
+            (
+                "live evolution artifact path",
+                (resolved_repo / "data" / "evolution").resolve(strict=False),
+            ),
+            (
+                "live daily artifact path",
+                (resolved_repo / "data" / "daily").resolve(strict=False),
+            ),
+        )
     except (OSError, RuntimeError) as exc:
         raise ValueError("output path cannot be resolved safely") from exc
     if resolved_output == resolved_repo or resolved_repo in resolved_output.parents:
         raise ValueError(f"output_root resolves inside protected repository root: {resolved_repo}")
-    if resolved_output == protected_data or protected_data in resolved_output.parents:
-        raise ValueError(f"output_root resolves inside protected live-artifact path: {protected_data}")
+    for label, protected_path in protected_paths:
+        if resolved_output == protected_path or protected_path in resolved_output.parents:
+            raise ValueError(f"output_root resolves inside protected {label}: {protected_path}")
     return resolved_output
 
 
