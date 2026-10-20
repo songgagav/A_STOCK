@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -471,6 +472,111 @@ def test_output_root_through_junction_or_symlink_is_rejected(tmp_path):
     assert not (protected / "diagnostics").exists()
 
 
+def test_ancestor_swap_before_first_directory_write_never_touches_protected(
+    tmp_path, monkeypatch
+):
+    repo_root = tmp_path / "repo"
+    protected = repo_root / "data" / "ic"
+    protected.mkdir(parents=True)
+    safe_parent = tmp_path / "safe-parent"
+    safe_parent.mkdir()
+    moved_parent = tmp_path / "safe-parent-original"
+    output_root = safe_parent / "nested" / "diagnostics"
+    original_validate = diagnostic._assert_safe_output_root
+    swapped = False
+
+    def validate_then_swap(path, root):
+        nonlocal swapped
+        result = original_validate(path, root)
+        if not swapped:
+            safe_parent.rename(moved_parent)
+            try:
+                safe_parent.symlink_to(protected, target_is_directory=True)
+            except OSError as exc:
+                moved_parent.rename(safe_parent)
+                pytest.skip(f"directory symlink creation is unavailable: {exc}")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(diagnostic, "_assert_safe_output_root", validate_then_swap)
+    try:
+        with pytest.raises(ValueError, match="protected"):
+            diagnostic.finalize_diagnostic_bundle(
+                output_root,
+                repo_root=repo_root,
+                run_id="d" * 64,
+                csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+                manifest=_bundle_manifest(),
+            )
+        assert swapped
+        assert not (protected / "nested" / "diagnostics").exists()
+    finally:
+        if safe_parent.is_symlink():
+            safe_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(safe_parent)
+
+
+def test_ancestor_swap_after_directory_anchor_never_writes_through_link(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    protected = repo_root / "data" / "ic"
+    protected.mkdir(parents=True)
+    safe_parent = tmp_path / "safe-parent"
+    safe_parent.mkdir()
+    moved_parent = tmp_path / "safe-parent-original"
+    output_root = safe_parent / "nested" / "diagnostics"
+    original_acquire = diagnostic._acquire_output_directory
+    swapped = False
+    rename_blocked = False
+
+    def acquire_then_swap(path, **kwargs):
+        nonlocal swapped, rename_blocked
+        anchor = original_acquire(path, **kwargs)
+        if Path(path) == output_root and kwargs.get("add_children") and not swapped:
+            try:
+                safe_parent.rename(moved_parent)
+            except OSError:
+                rename_blocked = True
+            else:
+                try:
+                    safe_parent.symlink_to(protected, target_is_directory=True)
+                except OSError as exc:
+                    moved_parent.rename(safe_parent)
+                    anchor.close()
+                    pytest.skip(f"directory symlink creation is unavailable: {exc}")
+                swapped = True
+        return anchor
+
+    monkeypatch.setattr(diagnostic, "_acquire_output_directory", acquire_then_swap)
+    try:
+        if os.name == "nt":
+            bundle = diagnostic.finalize_diagnostic_bundle(
+                output_root,
+                repo_root=repo_root,
+                run_id="e" * 64,
+                csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+                manifest=_bundle_manifest(),
+            )
+            assert rename_blocked
+            assert bundle.is_dir()
+        else:
+            with pytest.raises(ValueError, match="changed after safe directory anchoring"):
+                diagnostic.finalize_diagnostic_bundle(
+                    output_root,
+                    repo_root=repo_root,
+                    run_id="e" * 64,
+                    csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+                    manifest=_bundle_manifest(),
+                )
+            assert swapped
+        assert not (protected / "nested" / "diagnostics").exists()
+    finally:
+        if safe_parent.is_symlink():
+            safe_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(safe_parent)
+
+
 @pytest.mark.parametrize("child", ["ic", "evolution", "daily"])
 def test_protected_child_symlink_to_external_output_is_rejected(tmp_path, child):
     repo_root = tmp_path / "repo"
@@ -560,14 +666,14 @@ def test_finalize_failure_never_exposes_final_bundle(tmp_path, monkeypatch):
     repo_root.mkdir()
     output_root = tmp_path / "outside"
     run_id = "b" * 64
-    write_file = diagnostic._write_bundle_file
+    write_file = diagnostic._write_bundle_file_at
 
-    def fail_manifest(path, payload):
-        if path.name == "manifest.json":
+    def fail_manifest(directory, name, payload):
+        if name == "manifest.json":
             raise OSError("injected manifest write failure")
-        write_file(path, payload)
+        write_file(directory, name, payload)
 
-    monkeypatch.setattr(diagnostic, "_write_bundle_file", fail_manifest)
+    monkeypatch.setattr(diagnostic, "_write_bundle_file_at", fail_manifest)
     with pytest.raises(OSError, match="injected"):
         diagnostic.finalize_diagnostic_bundle(
             output_root,

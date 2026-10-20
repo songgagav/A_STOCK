@@ -9,14 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 import csv
+import ctypes
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
-import shutil
-import tempfile
+import secrets
+import stat
+import sys
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -740,7 +742,8 @@ def _assert_safe_output_root(output_root: Path, repo_root: Path) -> Path:
     if not resolved_repo.is_dir():
         raise ValueError("repo_root must be a directory")
     try:
-        resolved_output = output_root.expanduser().resolve(strict=False)
+        candidate = Path(os.path.abspath(output_root.expanduser()))
+        resolved_output = candidate.resolve(strict=False)
         protected_paths = (
             ("live-artifact path", (resolved_repo / "data").resolve(strict=False)),
             ("live IC artifact path", (resolved_repo / "data" / "ic").resolve(strict=False)),
@@ -760,26 +763,331 @@ def _assert_safe_output_root(output_root: Path, repo_root: Path) -> Path:
     for label, protected_path in protected_paths:
         if resolved_output == protected_path or protected_path in resolved_output.parents:
             raise ValueError(f"output_root resolves inside protected {label}: {protected_path}")
-    return resolved_output
+    # Keep the caller's lexical path for no-follow, handle-relative traversal.
+    # Returning resolve() here would silently convert an external symlink into
+    # its target and make later path operations raceable again.
+    return candidate
 
 
-def _write_bundle_file(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
+@dataclass
+class _OutputDirectoryAnchor:
+    path: Path
+    fd: int | None = None
+    handles: list[int] | None = None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.handles:
+            _kernel32().CloseHandle.argtypes = [ctypes.c_void_p]
+            _kernel32().CloseHandle.restype = ctypes.c_int
+            for handle in reversed(self.handles):
+                _kernel32().CloseHandle(ctypes.c_void_p(handle))
+            self.handles.clear()
+
+
+def _kernel32():
+    if os.name != "nt":
+        raise RuntimeError("Windows directory handles are unavailable on this platform")
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _open_windows_directory(path: Path, *, access: int) -> int:
+    from ctypes import wintypes
+
+    kernel32 = _kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        access,
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deny rename/delete.
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    raw_handle = ctypes.cast(handle, ctypes.c_void_p).value
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(path))
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    info = _AttributeTagInfo()
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):  # FileAttributeTagInfo
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise OSError(error, ctypes.FormatError(error), str(path))
+    if not info.FileAttributes & 0x10 or info.FileAttributes & 0x400:
+        kernel32.CloseHandle(handle)
+        raise ValueError(f"output path contains a non-directory or reparse point: {path}")
+    return int(raw_handle)
+
+
+def _acquire_output_directory(
+    path: Path, *, create: bool, delete_final: bool = False, add_children: bool = False
+) -> _OutputDirectoryAnchor:
+    absolute = Path(os.path.abspath(path))
+    if os.name == "nt":
+        if not absolute.anchor or absolute.anchor.startswith("\\\\"):
+            raise ValueError("UNC output roots are not supported by the safe writer")
+        handles: list[int] = []
+        prefix = Path(absolute.anchor)
+        try:
+            parts = absolute.parts
+            for index, part in enumerate(parts):
+                if index == 0:
+                    current = prefix
+                else:
+                    current = current / part
+                final = index == len(parts) - 1
+                access = 0x00000080  # FILE_READ_ATTRIBUTES
+                if final and delete_final:
+                    access |= 0x00010000  # DELETE, required for handle-based rename.
+                if final and add_children:
+                    access |= 0x00000002 | 0x00000004  # FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
+                try:
+                    handle = _open_windows_directory(current, access=access)
+                except OSError as exc:
+                    error_code = getattr(exc, "winerror", None) or exc.errno
+                    if not create or error_code not in (2, 3):
+                        raise
+                    try:
+                        os.mkdir(current)
+                    except FileExistsError:
+                        pass
+                    handle = _open_windows_directory(current, access=access)
+                handles.append(handle)
+            return _OutputDirectoryAnchor(absolute, handles=handles)
+        except Exception:
+            _OutputDirectoryAnchor(absolute, handles=handles).close()
+            raise
+
+    required = ("O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required):
+        raise RuntimeError("safe no-follow directory traversal is unavailable")
+    if os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd:
+        raise RuntimeError("handle-relative directory operations are unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(absolute.anchor, flags)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return _OutputDirectoryAnchor(absolute, fd=current_fd)
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _write_bundle_file_at(directory: _OutputDirectoryAnchor, name: str, payload: bytes) -> None:
+    if directory.fd is not None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open(name, flags, 0o600, dir_fd=directory.fd)
+        stream = os.fdopen(fd, "wb")
+    else:
+        stream = (directory.path / name).open("xb")
+    with stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def _verify_existing_bundle(final_path: Path, expected: Mapping[str, bytes]) -> None:
-    if final_path.is_symlink() or not final_path.is_dir():
-        raise ValueError("existing bundle destination is not a regular directory")
-    actual_names = {item.name for item in final_path.iterdir()}
-    if actual_names != set(expected):
-        raise ValueError("existing bundle has unexpected or missing files")
-    for name, payload in expected.items():
-        existing = final_path / name
-        if existing.is_symlink() or not existing.is_file() or existing.read_bytes() != payload:
-            raise ValueError("existing bundle at run_id conflicts with requested bytes")
+def _verify_existing_bundle(
+    root: _OutputDirectoryAnchor, name: str, expected: Mapping[str, bytes]
+) -> None:
+    bundle = _acquire_output_directory(root.path / name, create=False)
+    try:
+        if bundle.fd is not None:
+            actual_names = set(os.listdir(bundle.fd))
+            if actual_names != set(expected):
+                raise ValueError("existing bundle has unexpected or missing files")
+            for filename, payload in expected.items():
+                flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                try:
+                    fd = os.open(filename, flags, dir_fd=bundle.fd)
+                except OSError as exc:
+                    raise ValueError("existing bundle contains a non-regular file") from exc
+                with os.fdopen(fd, "rb") as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode) or stream.read() != payload:
+                        raise ValueError("existing bundle at run_id conflicts with requested bytes")
+            return
+
+        final_path = bundle.path
+        actual_names = {item.name for item in final_path.iterdir()}
+        if actual_names != set(expected):
+            raise ValueError("existing bundle has unexpected or missing files")
+        for filename, payload in expected.items():
+            existing = final_path / filename
+            if existing.is_symlink() or not existing.is_file() or existing.read_bytes() != payload:
+                raise ValueError("existing bundle at run_id conflicts with requested bytes")
+    finally:
+        bundle.close()
+
+
+def _rename_posix_noreplace(root_fd: int, source: str, destination: str) -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("atomic no-replace directory rename is unavailable on this platform")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("libc renameat2 is required for immutable bundle publication")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(root_fd, os.fsencode(source), root_fd, os.fsencode(destination), 1)  # RENAME_NOREPLACE
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _rename_windows_by_handle(stage: _OutputDirectoryAnchor, destination: Path) -> None:
+    from ctypes import wintypes
+
+    if not stage.handles:
+        raise RuntimeError("Windows rename requires an anchored staging directory handle")
+    class _RenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    encoded_name = str(destination).encode("utf-16-le")
+    offset = _RenameInfo.FileName.offset
+    buffer_size = ctypes.sizeof(_RenameInfo) + len(encoded_name)
+    buffer = ctypes.create_string_buffer(buffer_size)
+    info = ctypes.cast(buffer, ctypes.POINTER(_RenameInfo)).contents
+    info.Flags = 0  # ReplaceIfExists = FALSE.
+    # An absolute target is resolved while all destination ancestors are held
+    # without FILE_SHARE_DELETE; the source itself remains bound by its handle.
+    info.RootDirectory = None
+    info.FileNameLength = len(encoded_name)
+    ctypes.memmove(ctypes.addressof(buffer) + offset, encoded_name, len(encoded_name))
+    kernel32 = _kernel32()
+    rename_by_handle = kernel32.SetFileInformationByHandle
+    rename_by_handle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    rename_by_handle.restype = wintypes.BOOL
+    if not rename_by_handle(
+        wintypes.HANDLE(stage.handles[-1]), 3, buffer, buffer_size  # FileRenameInfo
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(destination))
+
+
+def _mark_windows_directory_for_delete(anchor: _OutputDirectoryAnchor) -> None:
+    from ctypes import wintypes
+
+    if not anchor.handles:
+        return
+
+    class _DispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+    info = _DispositionInfo(True)
+    kernel32 = _kernel32()
+    set_info = kernel32.SetFileInformationByHandle
+    set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    set_info.restype = wintypes.BOOL
+    if not set_info(
+        wintypes.HANDLE(anchor.handles[-1]), 4, ctypes.byref(info), ctypes.sizeof(info)
+    ):  # FileDispositionInfo
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(anchor.path))
+
+
+def _output_entry_exists(root: _OutputDirectoryAnchor, name: str) -> bool:
+    if root.fd is not None:
+        try:
+            os.stat(name, dir_fd=root.fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+    path = root.path / name
+    return path.exists() or path.is_symlink()
+
+
+def _assert_anchor_path_stable(root: _OutputDirectoryAnchor) -> None:
+    if root.fd is None:
+        # Windows ancestors are held open without FILE_SHARE_DELETE, so their
+        # directory entries cannot be replaced while this anchor is alive.
+        return
+    try:
+        anchored = os.fstat(root.fd)
+        current = os.stat(root.path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("output_root changed after safe directory anchoring") from exc
+    if (anchored.st_dev, anchored.st_ino) != (current.st_dev, current.st_ino):
+        raise ValueError("output_root changed after safe directory anchoring")
+
+
+def _create_stage_directory(root: _OutputDirectoryAnchor, run_id: str) -> tuple[str, _OutputDirectoryAnchor]:
+    for _ in range(10):
+        name = f".{run_id}.tmp-{secrets.token_hex(8)}"
+        path = root.path / name
+        try:
+            if root.fd is not None:
+                os.mkdir(name, mode=0o700, dir_fd=root.fd)
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(name, flags, dir_fd=root.fd)
+                return name, _OutputDirectoryAnchor(path, fd=fd)
+            os.mkdir(path)
+            return name, _acquire_output_directory(path, create=False, delete_final=True)
+        except FileExistsError:
+            continue
+    raise FileExistsError("could not allocate a unique diagnostic staging directory")
+
+
+def _cleanup_stage(
+    root: _OutputDirectoryAnchor,
+    name: str,
+    stage: _OutputDirectoryAnchor,
+    filenames: Sequence[str],
+) -> None:
+    if stage.fd is not None:
+        for filename in filenames:
+            try:
+                os.unlink(filename, dir_fd=stage.fd)
+            except FileNotFoundError:
+                pass
+        stage.close()
+        os.rmdir(name, dir_fd=root.fd)
+        return
+
+    for filename in filenames:
+        try:
+            (stage.path / filename).unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        _mark_windows_directory_for_delete(stage)
+    finally:
+        stage.close()
 
 
 def finalize_diagnostic_bundle(
@@ -806,47 +1114,86 @@ def finalize_diagnostic_bundle(
     manifest_bytes = _prepare_manifest(manifest, run_id, copied_csvs)
     expected = {**copied_csvs, "manifest.json": manifest_bytes}
 
-    resolved_root = _assert_safe_output_root(Path(output_root), Path(repo_root))
-    if resolved_root.exists() and not resolved_root.is_dir():
-        raise ValueError("output_root exists and is not a directory")
-    resolved_root.mkdir(parents=True, exist_ok=True)
-    # Re-resolve after creation to fail closed if an ancestor changed into a
-    # symlink/junction between the initial check and the first filesystem write.
-    resolved_root = _assert_safe_output_root(resolved_root, Path(repo_root))
-    final_path = resolved_root / run_id
-
-    if final_path.exists() or final_path.is_symlink():
-        _verify_existing_bundle(final_path, expected)
-        return final_path
-
-    lock_path = resolved_root / f".{run_id}.lock"
-    stage_path: Path | None = None
-    lock_acquired = False
+    safe_root = _assert_safe_output_root(Path(output_root), Path(repo_root))
     try:
-        with lock_path.open("xb") as lock_stream:
+        root = _acquire_output_directory(safe_root, create=True, add_children=True)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"output_root failed protected-path handle validation: {exc}") from exc
+
+    final_path = root.path / run_id
+    lock_name = f".{run_id}.lock"
+    lock_stream = None
+    lock_fd: int | None = None
+    lock_acquired = False
+    stage_name: str | None = None
+    stage: _OutputDirectoryAnchor | None = None
+    try:
+        _assert_anchor_path_stable(root)
+        if _output_entry_exists(root, run_id):
+            _verify_existing_bundle(root, run_id, expected)
+            _assert_anchor_path_stable(root)
+            return final_path
+
+        if root.fd is not None:
+            lock_fd = os.open(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root.fd,
+            )
+            lock_stream = os.fdopen(lock_fd, "wb")
+            lock_fd = None
+        else:
+            lock_stream = (root.path / lock_name).open("xb")
+        lock_acquired = True
+        with lock_stream:
             lock_stream.write(b"diagnostic bundle finalization in progress\n")
             lock_stream.flush()
             os.fsync(lock_stream.fileno())
-        lock_acquired = True
-        if final_path.exists() or final_path.is_symlink():
-            _verify_existing_bundle(final_path, expected)
+        lock_stream = None
+
+        if _output_entry_exists(root, run_id):
+            _verify_existing_bundle(root, run_id, expected)
+            _assert_anchor_path_stable(root)
             return final_path
 
-        stage_path = Path(tempfile.mkdtemp(prefix=f".{run_id}.tmp-", dir=resolved_root))
+        stage_name, stage = _create_stage_directory(root, run_id)
         for name in sorted(copied_csvs):
-            _write_bundle_file(stage_path / name, copied_csvs[name])
-        _write_bundle_file(stage_path / "manifest.json", manifest_bytes)
+            _write_bundle_file_at(stage, name, copied_csvs[name])
+        _write_bundle_file_at(stage, "manifest.json", manifest_bytes)
+        if stage.fd is not None:
+            os.fsync(stage.fd)
+        _assert_anchor_path_stable(root)
         try:
-            os.rename(stage_path, final_path)
+            if root.fd is not None:
+                _rename_posix_noreplace(root.fd, stage_name, run_id)
+            else:
+                _rename_windows_by_handle(stage, final_path)
         except OSError:
-            if final_path.exists() or final_path.is_symlink():
-                _verify_existing_bundle(final_path, expected)
+            if _output_entry_exists(root, run_id):
+                _verify_existing_bundle(root, run_id, expected)
+                _assert_anchor_path_stable(root)
                 return final_path
             raise
-        stage_path = None
+        stage_name = None
+        stage.close()
+        stage = None
+        _assert_anchor_path_stable(root)
         return final_path
     finally:
-        if stage_path is not None and stage_path.exists():
-            shutil.rmtree(stage_path)
-        if lock_acquired:
-            lock_path.unlink(missing_ok=True)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if lock_stream is not None:
+            lock_stream.close()
+        try:
+            if stage_name is not None and stage is not None:
+                _cleanup_stage(root, stage_name, stage, list(expected))
+        finally:
+            try:
+                if lock_acquired:
+                    if root.fd is not None:
+                        os.unlink(lock_name, dir_fd=root.fd)
+                    else:
+                        (root.path / lock_name).unlink(missing_ok=True)
+            finally:
+                root.close()
