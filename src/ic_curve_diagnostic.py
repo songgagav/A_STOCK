@@ -1032,7 +1032,9 @@ def _output_entry_exists(root: _OutputDirectoryAnchor, name: str) -> bool:
     return path.exists() or path.is_symlink()
 
 
-def _assert_anchor_path_stable(root: _OutputDirectoryAnchor) -> None:
+def _assert_anchor_path_stable(
+    root: _OutputDirectoryAnchor, *, repo_root: Path
+) -> None:
     if root.fd is None:
         # Windows ancestors are held open without FILE_SHARE_DELETE, so their
         # directory entries cannot be replaced while this anchor is alive.
@@ -1040,10 +1042,57 @@ def _assert_anchor_path_stable(root: _OutputDirectoryAnchor) -> None:
     try:
         anchored = os.fstat(root.fd)
         current = os.stat(root.path, follow_symlinks=False)
+        # An fd pins an inode, not its ancestry. A parent directory can be
+        # renamed while the fd remains open, and the old lexical path can be
+        # redirected back to the same inode through a symlink. Resolve the
+        # fd's current kernel path and fail closed if that inode has moved into
+        # the repository after the initial output-root policy check.
+        # This detects a completed move; it is not a kernel lock against a
+        # same-identity process that can also write the protected repository.
+        # Such a process can mutate those files directly and must be excluded
+        # by the caller's OS-level trust boundary (separate identity/sandbox).
+        fd_path = os.fsdecode(os.readlink(f"/proc/self/fd/{root.fd}"))
+        if fd_path.endswith(" (deleted)") or not Path(fd_path).is_absolute():
+            raise ValueError("anchored output_root has no stable Linux path")
+        anchored_path = Path(fd_path).resolve(strict=True)
+        protected_repo = Path(repo_root).resolve(strict=True)
     except OSError as exc:
         raise ValueError("output_root changed after safe directory anchoring") from exc
     if (anchored.st_dev, anchored.st_ino) != (current.st_dev, current.st_ino):
         raise ValueError("output_root changed after safe directory anchoring")
+    if anchored_path == protected_repo or protected_repo in anchored_path.parents:
+        raise ValueError("anchored output_root moved inside protected repository root")
+
+
+def _stage_name_matches_anchor(
+    root: _OutputDirectoryAnchor, name: str, stage: _OutputDirectoryAnchor
+) -> bool:
+    """Return whether the temporary name still identifies the staged inode.
+
+    After atomic publication the source name is gone. In that case cleanup must
+    only close the handle; deleting by the still-open staging fd would mutate
+    the now-final immutable bundle.
+    """
+    if stage.fd is not None and root.fd is not None:
+        try:
+            named = os.stat(name, dir_fd=root.fd, follow_symlinks=False)
+            anchored = os.fstat(stage.fd)
+        except OSError:
+            return False
+        return stat.S_ISDIR(named.st_mode) and (
+            named.st_dev,
+            named.st_ino,
+        ) == (anchored.st_dev, anchored.st_ino)
+
+    if stage.handles:
+        # Windows ancestor/staging handles deny external rename/delete. A
+        # successful handle-relative publication removes the old source name.
+        path = root.path / name
+        try:
+            return path.is_dir() and not path.is_symlink()
+        except OSError:
+            return False
+    return False
 
 
 def _create_stage_directory(root: _OutputDirectoryAnchor, run_id: str) -> tuple[str, _OutputDirectoryAnchor]:
@@ -1128,10 +1177,10 @@ def finalize_diagnostic_bundle(
     stage_name: str | None = None
     stage: _OutputDirectoryAnchor | None = None
     try:
-        _assert_anchor_path_stable(root)
+        _assert_anchor_path_stable(root, repo_root=repo_root)
         if _output_entry_exists(root, run_id):
             _verify_existing_bundle(root, run_id, expected)
-            _assert_anchor_path_stable(root)
+            _assert_anchor_path_stable(root, repo_root=repo_root)
             return final_path
 
         if root.fd is not None:
@@ -1154,16 +1203,18 @@ def finalize_diagnostic_bundle(
 
         if _output_entry_exists(root, run_id):
             _verify_existing_bundle(root, run_id, expected)
-            _assert_anchor_path_stable(root)
+            _assert_anchor_path_stable(root, repo_root=repo_root)
             return final_path
 
         stage_name, stage = _create_stage_directory(root, run_id)
         for name in sorted(copied_csvs):
+            _assert_anchor_path_stable(root, repo_root=repo_root)
             _write_bundle_file_at(stage, name, copied_csvs[name])
+        _assert_anchor_path_stable(root, repo_root=repo_root)
         _write_bundle_file_at(stage, "manifest.json", manifest_bytes)
         if stage.fd is not None:
             os.fsync(stage.fd)
-        _assert_anchor_path_stable(root)
+        _assert_anchor_path_stable(root, repo_root=repo_root)
         try:
             if root.fd is not None:
                 _rename_posix_noreplace(root.fd, stage_name, run_id)
@@ -1172,13 +1223,13 @@ def finalize_diagnostic_bundle(
         except OSError:
             if _output_entry_exists(root, run_id):
                 _verify_existing_bundle(root, run_id, expected)
-                _assert_anchor_path_stable(root)
+                _assert_anchor_path_stable(root, repo_root=repo_root)
                 return final_path
             raise
         stage_name = None
         stage.close()
         stage = None
-        _assert_anchor_path_stable(root)
+        _assert_anchor_path_stable(root, repo_root=repo_root)
         return final_path
     finally:
         if lock_fd is not None:
@@ -1187,7 +1238,10 @@ def finalize_diagnostic_bundle(
             lock_stream.close()
         try:
             if stage_name is not None and stage is not None:
-                _cleanup_stage(root, stage_name, stage, list(expected))
+                if _stage_name_matches_anchor(root, stage_name, stage):
+                    _cleanup_stage(root, stage_name, stage, list(expected))
+                else:
+                    stage.close()
         finally:
             try:
                 if lock_acquired:
