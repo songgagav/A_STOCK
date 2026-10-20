@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -577,6 +578,46 @@ def test_ancestor_swap_after_directory_anchor_never_writes_through_link(tmp_path
             moved_parent.rename(safe_parent)
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux directory-FD ancestry check")
+def test_anchored_parent_moved_inside_repository_is_rejected(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    protected = repo_root / "data" / "ic"
+    protected.mkdir(parents=True)
+    safe_parent = tmp_path / "safe-parent"
+    safe_parent.mkdir()
+    moved_parent = protected / "moved-parent"
+    output_root = safe_parent / "nested" / "diagnostics"
+    original_acquire = diagnostic._acquire_output_directory
+    moved = False
+
+    def acquire_then_move_under_protected(path, **kwargs):
+        nonlocal moved
+        anchor = original_acquire(path, **kwargs)
+        if Path(path) == output_root and kwargs.get("add_children") and not moved:
+            safe_parent.rename(moved_parent)
+            safe_parent.symlink_to(moved_parent, target_is_directory=True)
+            moved = True
+        return anchor
+
+    monkeypatch.setattr(diagnostic, "_acquire_output_directory", acquire_then_move_under_protected)
+    try:
+        with pytest.raises(ValueError, match="protected"):
+            diagnostic.finalize_diagnostic_bundle(
+                output_root,
+                repo_root=repo_root,
+                run_id="f" * 64,
+                csv_files={f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES},
+                manifest=_bundle_manifest(),
+            )
+        assert moved
+        assert not (moved_parent / "nested" / "diagnostics" / ("f" * 64)).exists()
+    finally:
+        if safe_parent.is_symlink():
+            safe_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(safe_parent)
+
+
 @pytest.mark.parametrize("child", ["ic", "evolution", "daily"])
 def test_protected_child_symlink_to_external_output_is_rejected(tmp_path, child):
     repo_root = tmp_path / "repo"
@@ -684,4 +725,47 @@ def test_finalize_failure_never_exposes_final_bundle(tmp_path, monkeypatch):
         )
 
     assert not (output_root / run_id).exists()
+    assert not list(output_root.glob(f".{run_id}.tmp-*"))
+
+
+def test_interrupt_after_publish_preserves_complete_final_bundle(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    output_root = tmp_path / "outside"
+    run_id = "c" * 64
+    csv_files = {f"{factor}.csv": _bundle_csv() for factor in FACTOR_NAMES}
+    expected = {
+        **csv_files,
+        "manifest.json": diagnostic._prepare_manifest(_bundle_manifest(), run_id, csv_files),
+    }
+
+    if os.name == "nt":
+        publish = diagnostic._rename_windows_by_handle
+
+        def publish_then_interrupt(stage, destination):
+            publish(stage, destination)
+            raise KeyboardInterrupt("injected after atomic publication")
+
+        monkeypatch.setattr(diagnostic, "_rename_windows_by_handle", publish_then_interrupt)
+    else:
+        publish = diagnostic._rename_posix_noreplace
+
+        def publish_then_interrupt(root_fd, source, destination):
+            publish(root_fd, source, destination)
+            raise KeyboardInterrupt("injected after atomic publication")
+
+        monkeypatch.setattr(diagnostic, "_rename_posix_noreplace", publish_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after atomic publication"):
+        diagnostic.finalize_diagnostic_bundle(
+            output_root,
+            repo_root=repo_root,
+            run_id=run_id,
+            csv_files=csv_files,
+            manifest=_bundle_manifest(),
+        )
+
+    final_bundle = output_root / run_id
+    assert final_bundle.is_dir()
+    assert {item.name: item.read_bytes() for item in final_bundle.iterdir()} == expected
     assert not list(output_root.glob(f".{run_id}.tmp-*"))
