@@ -1,6 +1,6 @@
 # H5i PIT Selector-Factor IC Contract
 
-**Status:** Draft for user review. The user approved the recommended architecture direction on 2026-10-21; this written specification must still be reviewed and approved before an implementation plan or product-code work begins.
+**Status:** Approved by the user on 2026-10-21. Implementation remains limited to the separately approved diagnostic-only plan; this specification does not authorize production consumer changes.
 
 ## 1. Purpose
 

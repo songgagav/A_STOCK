@@ -277,6 +277,10 @@ def test_cli_builds_and_verifies_external_diagnostic_bundle(tmp_path, monkeypatc
     assert identity["calendar_upstream_source_verified"] is False
     assert identity["vol_legacy_parity"].startswith("unresolved")
     assert identity["signal_range"] == ["2026-10-01", "2026-10-02"]
+    assert identity["universe_definition"].startswith("proxy:")
+    assert identity["live_selector_universe_comparison"] == (
+        "not_performed; equivalence to the live selector universe is unverified"
+    )
     assert identity["paperbook_fill_replay"] is False
     assert identity["coverage_summary"][0]["factor"] == "roe"
     assert identity["coverage_summary"][0]["status"] == "unsupported"

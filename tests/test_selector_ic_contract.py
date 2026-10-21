@@ -165,6 +165,14 @@ def test_rank_ic_requires_five_finite_pairs_and_excludes_nonfinite_inputs():
     assert enough.ic == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("min_pairs", [2, 4])
+def test_rank_ic_rejects_minimum_pair_threshold_below_contract(min_pairs):
+    rank_ic = _require("rank_ic")
+
+    with pytest.raises(ValueError, match="min_pairs must be an integer >= 5"):
+        rank_ic({"a": 1.0, "b": 2.0}, {"a": 1.0, "b": 2.0}, min_pairs=min_pairs)
+
+
 def test_rank_ic_marks_constant_rank_null():
     rank_ic = _require("rank_ic")
 
