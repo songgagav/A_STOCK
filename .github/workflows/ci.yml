@@ -96,4 +96,6 @@ jobs:
           python -m pytest \
             tests/test_baostock_backfill.py \
             tests/test_h5i_accel_equivalence.py \
+            tests/test_ic_curve_diagnostic_h5i.py \
+            tests/test_ic_curve_diagnostic_cli.py \
             -q -rs
