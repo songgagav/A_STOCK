@@ -184,4 +184,3 @@ def test_mom_rev_direction_is_applied_once_to_raw_mom20_ic():
     assert raw.ic == pytest.approx(1.0)
     assert apply_expected_direction("mom_rev", raw.ic) == pytest.approx(-1.0)
     assert apply_expected_direction("vol", raw.ic) == pytest.approx(1.0)
-

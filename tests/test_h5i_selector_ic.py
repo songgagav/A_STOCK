@@ -353,4 +353,3 @@ def test_diagnostic_panel_rejects_duplicate_calendar_sessions():
 
     with pytest.raises(error_type, match="unique"):
         builder(object(), ["2026-10-20", "2026-10-20"], "2026-10-20", "2026-10-20")
-

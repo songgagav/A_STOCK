@@ -211,4 +211,3 @@ def test_verifier_binds_artifact_manifest_to_bundle_identity(tmp_path):
 
     with pytest.raises(error, match="bundle hash mismatch"):
         verify(bundle)
-
