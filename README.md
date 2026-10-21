@@ -35,6 +35,7 @@ A 股规则纸面撮合
 | 风控层 | IC 门控、因子健康隔离、回撤/波动/CVaR 约束、策略退化防御 |
 | 执行层 | A 股 T+1、整手、涨跌停、停牌、滑点、佣金、印花税与止损模拟 |
 | 评估层 | 回测、滚动样本外验证、CPCV/PBO、压力测试、收益归因 |
+| 证据层 | Observation Epoch、信号快照、Evidence Bundle、连续 OOS 与持仓/成本证据 |
 | 运行层 | 日频调度、盘中模拟引擎、健康检查、Web 看板、Prometheus 指标 |
 
 ## 核心设计原则
@@ -44,6 +45,7 @@ A 股规则纸面撮合
 3. **风险优先**：因子失效、IC 漂移、Sharpe 变点、组合回撤等情况可以降低暴露或冻结新买入。
 4. **安全默认值**：实时引擎默认使用 PaperBook；未知数据、日历异常和策略降级会记录状态。
 5. **可审计运行**：选股结果、目标权重、成交、净值、门控状态和训练元数据均支持落盘。
+6. **观测身份一致**：冻结选股权重的快照身份贯穿选股、信号快照、Observation Epoch、证据包和运行回执；身份缺失或不匹配时拒绝继续构建新目标。
 
 ## 架构
 
@@ -57,6 +59,8 @@ A 股规则纸面撮合
 执行层       paper_book.py / realtime_engine.py / backtest_engine.py
 评估层       performance_report.py / attribution_analysis.py
              overfitting_test.py / strategy_validation.py
+证据层       evidence_bundle.py / observation_epoch.py / oos_dataset.py
+              signal_snapshot.py / daily_execution_evidence.py
 运维层       daemon.py / run_services.py / dashboard.py
              health_check.py / metrics_server.py
 ```
@@ -70,8 +74,14 @@ A 股规则纸面撮合
 | `src/backtest_engine.py` | 连续交易日撮合回放 |
 | `src/factor_gate.py` | IC 门控、因子漂移和状态机 |
 | `src/drl_train.py` | CVaR-PPO 因子权重训练 |
+| `src/premarket_healthcheck.py` | 盘前数据、新鲜度和 IC 历史资格检查 |
+| `src/selector_weight_policy.py` | 自适应/冻结选股权重策略与哈希校验 |
+| `src/observation_epoch.py` | Observation Epoch v2 与实验身份校验 |
+| `src/evidence_bundle.py` | 每日证据包构建、固化和完整性验证 |
 | `src/overfitting_test.py` | 稳健性与过拟合检测 |
 | `src/dashboard.py` | 本地 Web 看板 |
+| `scripts/freeze_selector_weights.py` | 创建不可变选股权重快照 |
+| `scripts/freeze_observation_epoch.py` | 创建 Observation Epoch 记录 |
 | `scripts/check_data_completeness.py` | 数据完整性巡检 |
 | `scripts/nonoverlap_rerun.py` | 非重叠窗口样本外重跑 |
 
@@ -97,6 +107,11 @@ A_stock_rotation/
 │   ├── factor_mine/                   # 遗传规划因子挖掘/筛选/OOS
 │   │
 │   ├── selector.py                    # 候选池过滤、打分与 Top-N
+│   ├── selector_weight_policy.py      # 自适应/冻结选股权重与身份
+│   ├── observation_epoch.py            # 连续观测窗口身份
+│   ├── signal_snapshot.py              # 09:25 信号快照与哈希
+│   ├── evidence_bundle.py              # 每日证据包与完整性验证
+│   ├── daily_execution_evidence.py    # 持仓、换手和成本证据
 │   ├── target_weighting.py            # 目标权重归一化与加权
 │   ├── drl_train.py                   # CVaR-PPO 与 FactorValueEnv
 │   ├── explainable_rl.py              # DRL 可解释性分析
@@ -128,6 +143,8 @@ A_stock_rotation/
 ├── scripts/                           # 数据补录、诊断、回测和验证
 │   ├── backfill_pe_ttm.py             # PE(TTM) PIT 补丁与双源回退
 │   ├── backfill_valuation.py          # 估值快照补录
+│   ├── freeze_selector_weights.py      # 创建不可变选股权重快照
+│   ├── freeze_observation_epoch.py     # 固化观测窗口身份
 │   ├── check_data_completeness.py     # 数据完整性巡检
 │   ├── nonoverlap_rerun.py            # 非重叠窗口样本外重跑
 │   ├── diag_data.py                   # 数据诊断
@@ -203,6 +220,7 @@ Copy-Item .env.example .env
 
 | 变量 | 说明 |
 | --- | --- |
+| `BAR_STORE` | 行情后端；默认 `h5i`，`duck` 仅用于显式对照 |
 | `STOCKDB_ROOT` | 本地行情镜像或 free-stockdb 根目录 |
 | `ARCTIC_URI` | ArcticDB 地址；未配置时使用可用的本地后端 |
 | `PYBAO_DIR` | 可选的本地行情 SDK 路径 |
@@ -213,10 +231,12 @@ Copy-Item .env.example .env
 | `FACTOR_HEALTH_ENABLED` | 因子健康隔离开关，默认开启 |
 | `OVERFIT_RESULTS_FILE` | 覆盖过拟合检测使用的结果文件 |
 
-不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
+策略/观测运行还需要显式声明 `SELECTOR_WEIGHT_MODE=adaptive|frozen`。冻结模式必须同时提供
+`SELECTOR_WEIGHT_SNAPSHOT_SHA256`；新的 Observation Epoch 还需要 `OBSERVATION_EPOCH_ID`。
 
-本项目当前以环境变量作为运行时配置接口，`.env.example` 是公开配置模板；没有运行时
-`config.toml` 解析器，因此不提供一个会误导使用者的 `config.example.toml`。
+当前生产和观察契约保持 `RANK_BY_FUSION=0`、`DRL_PLAN_MODE=shadow`、
+`FUSION_WEIGHT_MODE=shadow`、`TRADE_BROKER=paper` 和
+`alpha_evidence_status=not_promotable`。环境变量模板见 [`.env.example`](.env.example)。
 
 ## 常用命令
 
@@ -239,6 +259,8 @@ CI 分为两部分：
 
 - `regression-core`：不依赖 GPU 的核心逻辑全量回归，运行于 Python 3.11/3.12；
 - `regression-drl`：包含 PyTorch、Stable-Baselines3 和 Gymnasium 的 DRL 回归。
+- `regression-h5i`：Python 3.10 下的 h5i 写入、读取和等价性回归；
+- `security-scans`：独立执行 Bandit、依赖审计、秘密扫描和历史敏感路径检查。
 
 ### 日频、回测和过拟合检测
 
@@ -287,8 +309,7 @@ CI 分为两部分：
 .venv310\Scripts\python.exe src/dashboard.py --port 8000
 ```
 
-> ⚠️ **解释器要求（2026-10-06 更新）**：`.venv314`（Python 3.14）**没有 `h5i_db` 或 `vnpy`**。
-> DuckDB 退役后 h5i 是**主数据源**，盘中/看板/回测必须使用已验收完整依赖的 `.venv310`：
+> **解释器要求**：`.venv314`（Python 3.14）不包含 `h5i_db` 或 `vnpy`。h5i 是主数据源，盘中、看板和回测应使用 `.venv310`：
 >
 > ```powershell
 > $env:BAR_STORE = 'h5i'
@@ -298,44 +319,14 @@ CI 分为两部分：
 > 验证方式：`& .venv310\Scripts\python.exe -c "import h5i_db, vnpy; print('ok')"`，以及看板
 > `http://localhost:8000/api/health` 的 `deps.bar_store` 应为 `h5i`。
 
-### ✅ 推荐解释器：`.venv310`（同时具备 h5i_db、torch 与 vn.py）
+### 推荐解释器：`.venv310`
 
-> **2026-10-06 更新**：`.venv310` 是唯一 canonical runtime，当前已安装并验收 `vnpy==4.4.0`。
-> `.venv314` 继续用于纯 Python 研究和兼容性测试；不要通过 `PYTHONPATH` 混用两个环境的 site-packages。
->
-> **2026-09-20 新增（解决 `P0-DRLDEP`）**。此前项目面临一个**无法回避的两难**：
->
-> | 解释器 | h5i_db | torch | 后果 |
-> |---|---|---|---|
-> | `.venv314`（Python 3.14） | ❌ | ✅ | DRL 训练起不来（读不了主源） |
-> | 原 3.10 共享工具解释器 | ✅ | ❌ | DRL 训练起不来（缺 torch），且**没有 `venv`/`ensurepip`**、装了会污染 Agent 工具链 |
->
-> 根因：`h5i_db` 的原生扩展**仅支持 CPython 3.10**（见本文件上方说明），而 torch 装不进 3.14 的
-> `h5i_db` —— 两者**必须在同一个解释器**里，而当时没有任何一个解释器同时具备。
->
-> **解法**：下载一个独立的 Python 3.10.11，在其上建干净 venv 并把两面都装齐。
->
-> ```powershell
-> # 一条命令完成：校验 SHA256 + Authenticode 签名 → 静默安装 3.10.11 →
-> # 建 .venv310 → 装 h5i-db / vnpy / 核心依赖 / torch(CPU) / gymnasium / stable-baselines3 → 验收
-> pwsh -File scripts/setup_py310_drl_venv.ps1
-> ```
->
-> 装好后请把 `run_daily` / daemon / 看板指向它：
->
-> ```powershell
-> $env:BAR_STORE = 'h5i'
-> & .venv310\Scripts\python.exe src\run_daily.py
-> & .venv310\Scripts\python.exe src\dashboard.py --port 8000
-> ```
->
-> **实测收益（可复核）**：
-> - `drl_degrade.probe_runtime()` → `ok=True`（核心依赖全 True），DRL 训练与 `target_plan` 生成恢复；
-> - 全量测试 **682 passed / 1 skipped**（`.venv314` 下为 **664 / 19**）—— 多出的 18 个正是
->   原先因 `h5i-db 不可用` 而被跳过的 `tests/test_integration_f68.py` 用例，现在真的跑起来了；
-> - `scripts/preflight_drl_h5i_realrun.py` 从 `[BLOCKED]` 变为 **21/21 PASS**。
->
-> `h5i_db` 的原生扩展是 `cp39-abi3` wheel，故 3.10 可直接 `pip install h5i-db`；vn.py 固定为 `4.4.0`。
+`.venv310` 用于 h5i、vn.py、PyTorch、DRL 和完整盘中/看板运行；`.venv314` 保留给纯 Python
+研究和兼容性回归。两套环境不要通过 `PYTHONPATH` 混用 site-packages。
+
+没有 `.venv310` 时，可运行 `pwsh -File scripts/setup_py310_drl_venv.ps1` 创建并验收完整运行时。
+守护进程应通过 `ops/start_daemon.ps1` 启动，并显式指定 `-SelectorWeightMode adaptive` 或
+`-SelectorWeightMode frozen -SelectorWeightSnapshotSha256 <64 位小写 SHA-256>`。
 
 浏览器访问 `http://localhost:8000`。看板通常读取 `data/live_state.json`、`data/state.json` 和每日运行产物。
 
@@ -357,9 +348,17 @@ powershell -ExecutionPolicy Bypass -File ops/start_obs_stack.ps1
 | 9101 | metrics_server | `/metrics` 暴露端 |
 | 6379 | Redis | Celery broker/backend（看板“全量数据库更新”依赖） |
 | — | Celery worker | 全量数据更新任务（solo pool） |
-| — | 估值补丁观察 | 当前公开 checkout 未包含自动哨兵；按 `docs/patch-retirement-watch.md` 验收 |
+| — | 估值补丁观察 | 自动哨兵未包含在当前代码；按 `docs/patch-retirement-watch.md` 验收 |
 
 各常驻服务日志在 `logs/`：`dashboard.log`、`sentinel_daemon.log`、`alert_hook.log`、`alerts.log`。
+
+## 当前状态与运行边界
+
+- `h5i` 是默认行情主源；DuckDB 仅保留为显式对照路径。
+- 冻结权重模式使用不可变、内容寻址的选股权重快照；选股、信号快照、Observation Epoch、Evidence Bundle 和运行回执必须携带匹配的权重身份。
+- Evidence/OOS 路径是离线旁路证据层，不改变选股排序、目标权重、PaperBook、券商路由、实时交易或 DRL 生产消费。
+- 当前策略契约仍是 `RANK_BY_FUSION=0`、DRL/Fusion `shadow`、`TRADE_BROKER=paper`，Alpha 证据为 `not_promotable`；没有自动 promotion。
+- Signal Freeze 进入 paper-only `enforce` 仍需要同一 Observation Epoch 下至少五个连续合格真实交易日、完整证据和人工批准。
 
 ## 数据与 Point-in-Time 口径
 
@@ -412,6 +411,11 @@ PaperBook/盘中模拟默认实现以下 A 股规则：
 - [`docs/deployment.md`](docs/deployment.md)：安装、环境变量和运行部署；
 - [`docs/api_reference.md`](docs/api_reference.md)：主要模块和接口；
 - [`docs/pit-valuation.md`](docs/pit-valuation.md)：PIT 估值与数据缺口台账；
+- [`docs/evolution/evidence-bundle-phase-a.md`](docs/evolution/evidence-bundle-phase-a.md)：离线证据包、换手和成本证据契约；
+- [`docs/evolution/oos-and-execution-evidence-phase-c.md`](docs/evolution/oos-and-execution-evidence-phase-c.md)：连续 OOS、Observation Epoch 与执行证据；
+- [`docs/evolution/pre-observation-hardening-report.md`](docs/evolution/pre-observation-hardening-report.md)：观测前硬化验收报告；
+- [`docs/evolution/pre-observation-hardening-runbook.md`](docs/evolution/pre-observation-hardening-runbook.md)：真实观察窗口的冻结和验收流程；
+- [`docs/evolution/signal-freeze-promotion.md`](docs/evolution/signal-freeze-promotion.md)：Signal Freeze 的 paper-only promotion 台账；
 - [`docs/evolution/alpha-shadow-design.md`](docs/evolution/alpha-shadow-design.md)：Alpha shadow arm、实验哈希和运行时边界；
 - [`docs/hist-window-protocol.md`](docs/hist-window-protocol.md)：**历史窗口扩展与"环境外"窗口处理协议**
   （判据标定 / 必报项 / 技术前置检查；扩展历史窗口前必读）；
