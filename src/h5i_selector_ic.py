@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+import inspect
 import math
 from pathlib import Path
+import re
 from typing import Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -31,6 +33,9 @@ _REQUIRED_COLUMNS = {
 }
 _BAR_COLUMNS = ("session_date", "symbol", "open", "high", "low", "close",
                 "volume", "amount", "change_pct", "turnover")
+_SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_SQL_TIMEOUT_SECONDS = 60.0
+_SQL_MAX_ROWS = 1_000_000
 
 
 class H5iInputError(ValueError):
@@ -51,7 +56,8 @@ def _as_day(value: str | date) -> str:
 
 
 def _default_database_factory(path: str, *, read_only: bool):
-    if not Path(path).is_file():
+    database_path = Path(path)
+    if not (database_path.is_file() or database_path.is_dir()):
         raise FileNotFoundError(f"H5i database does not exist: {path}")
     import h5i_db
 
@@ -90,7 +96,20 @@ class H5iReadOnlySource:
     def _frame(self, query: str) -> pd.DataFrame:
         if self._db is None:
             raise RuntimeError("H5i source must be used inside a context manager")
-        result = self._db.sql(query)
+        sql_method = self._db.sql
+        try:
+            parameters = inspect.signature(sql_method).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                               for parameter in parameters)
+        options = {}
+        if accepts_keywords or "timeout" in parameter_names:
+            options["timeout"] = _SQL_TIMEOUT_SECONDS
+        if accepts_keywords or "max_rows" in parameter_names:
+            options["max_rows"] = _SQL_MAX_ROWS
+        result = sql_method(query, **options)
         if hasattr(result, "to_pandas"):
             result = result.to_pandas()
         if not isinstance(result, pd.DataFrame):
@@ -109,19 +128,44 @@ class H5iReadOnlySource:
     def schema(self) -> dict[str, list[str]]:
         if self._schema is not None:
             return {table: list(columns) for table, columns in self._schema.items()}
-        tables_frame = self._frame("SHOW TABLES")
-        if tables_frame.empty:
-            raise H5iSchemaError("H5i database has no tables")
-        table_col = next((c for c in ("name", "table_name", "name_1")
-                          if c in tables_frame.columns), tables_frame.columns[0])
-        tables = {str(value).lower() for value in tables_frame[table_col].dropna().tolist()}
+        native_tables = getattr(self._db, "tables", None)
+        native_schema = getattr(self._db, "schema", None)
+        if callable(native_tables) and callable(native_schema):
+            table_values = native_tables()
+            if not isinstance(table_values, (list, tuple)):
+                raise H5iSchemaError("H5i native tables() did not return a list")
+            table_names = {str(value).lower(): str(value) for value in table_values}
+            if len(table_names) != len(table_values):
+                raise H5iSchemaError("H5i database contains duplicate table names")
+            tables = set(table_names)
+        else:
+            tables_frame = self._frame("SHOW TABLES")
+            if tables_frame.empty:
+                raise H5iSchemaError("H5i database has no tables")
+            table_col = next((c for c in ("name", "table_name", "name_1")
+                              if c in tables_frame.columns), tables_frame.columns[0])
+            table_names = {str(value).lower(): str(value)
+                           for value in tables_frame[table_col].dropna().tolist()}
+            tables = set(table_names)
         missing = sorted(set(_REQUIRED_COLUMNS) - tables)
         if missing:
             raise H5iSchemaError(f"missing required H5i tables: {','.join(missing)}")
         schema: dict[str, list[str]] = {}
         for table in sorted(tables):
-            described = self._frame(f"DESCRIBE {table}")
-            schema[table] = self._column_names(described)
+            if callable(native_tables) and callable(native_schema):
+                described = native_schema(table_names[table])
+                columns = getattr(described, "names", None)
+                if columns is None:
+                    try:
+                        columns = [field.name for field in described]
+                    except (TypeError, AttributeError) as exc:
+                        raise H5iSchemaError(
+                            f"H5i native schema() did not return a named schema for {table}"
+                        ) from exc
+                schema[table] = [str(column).lower() for column in columns]
+            else:
+                described = self._frame(f"DESCRIBE {table}")
+                schema[table] = self._column_names(described)
         for table, required in _REQUIRED_COLUMNS.items():
             absent = sorted(required - set(schema.get(table, [])))
             if absent:
@@ -137,8 +181,9 @@ class H5iReadOnlySource:
         query = (
             "SELECT CAST(ts AS DATE) AS session_date, symbol, open, high, low, close, "
             "volume, amount, change_pct, turnover FROM daily_bars "
-            f"WHERE CAST(ts AS DATE) >= DATE '{start_day}' "
-            f"AND CAST(ts AS DATE) <= DATE '{end_day}' ORDER BY session_date, symbol"
+            f"WHERE ts >= TIMESTAMP '{start_day} 00:00:00' "
+            f"AND ts < TIMESTAMP '{(date.fromisoformat(end_day) + timedelta(days=1)).isoformat()} 00:00:00' "
+            "ORDER BY session_date, symbol"
         )
         frame = self._frame(query)
         if frame.empty:
@@ -161,8 +206,9 @@ class H5iReadOnlySource:
         self.schema()
         query = (
             "SELECT DISTINCT CAST(ts AS DATE) AS session_date FROM daily_bars "
-            f"WHERE CAST(ts AS DATE) >= DATE '{start_day}' "
-            f"AND CAST(ts AS DATE) <= DATE '{end_day}' ORDER BY session_date"
+            f"WHERE ts >= TIMESTAMP '{start_day} 00:00:00' "
+            f"AND ts < TIMESTAMP '{(date.fromisoformat(end_day) + timedelta(days=1)).isoformat()} 00:00:00' "
+            "ORDER BY session_date"
         )
         frame = self._frame(query)
         if frame.empty:
@@ -211,21 +257,35 @@ class H5iReadOnlySource:
         local_cutoff = cutoff.astimezone(SHANGHAI)
         cutoff_text = local_cutoff.strftime("%Y-%m-%d %H:%M:%S")
         cutoff_day = local_cutoff.date().isoformat()
+        earliest_day = (local_cutoff.date() - timedelta(days=400)).isoformat()
+        if symbols is None:
+            requested = None
+        else:
+            raw_symbols = [symbols] if isinstance(symbols, str) else list(symbols)
+            if any(not isinstance(symbol, str) or not _SYMBOL_RE.fullmatch(symbol)
+                   for symbol in raw_symbols):
+                raise H5iInputError("valuation symbols contain an invalid SQL identifier")
+            requested = sorted(set(raw_symbols))
+            if not requested:
+                return pd.DataFrame(columns=["ts", "symbol", "pb"])
+        symbol_predicate = (
+            "" if requested is None else
+            " AND symbol IN (" + ",".join(f"'{symbol}'" for symbol in requested) + ")"
+        )
         query = (
             "SELECT ts, symbol, pb FROM (SELECT ts, symbol, pb, "
             "ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn "
             "FROM valuation "
             f"WHERE ts <= TIMESTAMP '{cutoff_text}' "
-            f"AND CAST(ts AS DATE) >= DATE '{cutoff_day}' - INTERVAL 400 DAY "
-            f"AND NOT (CAST(ts AS DATE) = DATE '{cutoff_day}' "
-            "AND CAST(ts AS TIME) = TIME '00:00:00')) WHERE rn = 1 ORDER BY symbol"
+            f"AND ts >= TIMESTAMP '{earliest_day} 00:00:00' "
+            f"AND ts <> TIMESTAMP '{cutoff_day} 00:00:00'"
+            f"{symbol_predicate}) WHERE rn = 1 ORDER BY symbol"
         )
         frame = self._frame(query)
         if not {"ts", "symbol", "pb"}.issubset(frame.columns):
             raise H5iSchemaError("valuation result must retain ts, symbol, and pb")
         if frame.empty:
             return pd.DataFrame(columns=["ts", "symbol", "pb"])
-        requested = set(map(str, symbols)) if symbols is not None else None
         selected = []
         for _, row in frame.iterrows():
             symbol = str(row["symbol"])

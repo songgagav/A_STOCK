@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import builtins
 from datetime import date, timedelta
+import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -35,10 +37,12 @@ class _FakeDatabase:
     def __init__(self, frames=None):
         self.frames = frames or {}
         self.queries = []
+        self.sql_options = []
         self.closed = False
 
-    def sql(self, query):
+    def sql(self, query, **options):
         self.queries.append(query)
+        self.sql_options.append(options)
         if query == "SHOW TABLES":
             return _Query(pd.DataFrame({"name": ["daily_bars", "valuation", "financials"]}))
         if query.startswith("DESCRIBE "):
@@ -76,6 +80,41 @@ def test_h5i_source_opens_explicit_database_read_only_and_closes_it():
     assert db.closed is True
 
 
+def test_schema_uses_h5i_native_read_only_schema_api_when_available():
+    source_type = _require("H5iReadOnlySource")
+
+    class NativeSchema:
+        def __init__(self, names):
+            self.names = names
+
+    class NativeMetadataDatabase(_FakeDatabase):
+        def __init__(self):
+            super().__init__()
+            self.native_schema_calls = []
+
+        def tables(self):
+            return ["daily_bars", "valuation", "financials"]
+
+        def schema(self, table):
+            self.native_schema_calls.append(table)
+            columns = {
+                "daily_bars": ["ts", "symbol", "open", "close", "change_pct"],
+                "valuation": ["ts", "symbol", "pb"],
+                "financials": ["ts", "symbol", "roe"],
+            }
+            return NativeSchema(columns[table])
+
+    db = NativeMetadataDatabase()
+    with source_type("fake.db", database_factory=lambda *_a, **_k: db) as source:
+        schema = source.schema()
+
+    assert schema["daily_bars"] == ["ts", "symbol", "open", "close", "change_pct"]
+    assert set(schema) == {"daily_bars", "valuation", "financials"}
+    assert db.native_schema_calls == ["daily_bars", "financials", "valuation"]
+    assert db.queries == []
+    assert db.closed is True
+
+
 def test_h5i_daily_bar_query_is_bounded_and_preserves_calendar_session_date():
     source_type = _require("H5iReadOnlySource")
     frame = pd.DataFrame({
@@ -90,8 +129,14 @@ def test_h5i_daily_bar_query_is_bounded_and_preserves_calendar_session_date():
         result = source.bars_for_sessions("2026-10-19", "2026-10-21")
 
     query = next(q for q in db.queries if q.startswith("SELECT CAST(ts AS DATE) AS session_date"))
-    assert "DATE '2026-10-19'" in query
-    assert "DATE '2026-10-21'" in query
+    assert "ts >= TIMESTAMP '2026-10-19 00:00:00'" in query
+    assert "ts < TIMESTAMP '2026-10-22 00:00:00'" in query
+    assert "CAST(ts AS DATE) >= " not in query
+    options = db.sql_options[db.queries.index(query)]
+    assert options == {"timeout": 60.0, "max_rows": 1_000_000}
+    options = db.sql_options[db.queries.index(query)]
+    assert options["timeout"] == 60.0
+    assert options["max_rows"] == 1_000_000
     assert result.iloc[0]["session_date"] == date(2026, 10, 20)
     assert result.iloc[0]["symbol"] == "600000"
 
@@ -111,8 +156,8 @@ def test_h5i_observed_sessions_are_bounded_and_sorted():
 
     assert result == ["2026-10-20", "2026-10-21"]
     query = next(q for q in db.queries if q.startswith("SELECT DISTINCT"))
-    assert "DATE '2026-10-20'" in query
-    assert "DATE '2026-10-21'" in query
+    assert "ts >= TIMESTAMP '2026-10-20 00:00:00'" in query
+    assert "ts < TIMESTAMP '2026-10-22 00:00:00'" in query
 
 
 def test_valuation_asof_keeps_source_ts_and_excludes_late_or_date_only_signal_day_rows():
@@ -125,12 +170,24 @@ def test_valuation_asof_keeps_source_ts_and_excludes_late_or_date_only_signal_da
     })
     db = _FakeDatabase({"SELECT ts, symbol, pb": frame})
     with source_type("fake.db", database_factory=lambda *_a, **_k: db) as source:
-        rows = source.valuation_asof(_api().signal_cutoff("2026-10-21"))
+        rows = source.valuation_asof(_api().signal_cutoff("2026-10-21"), ["600000", "000003"])
 
     assert set(rows["symbol"]) == {"600000", "000003"}
     assert "ts" in rows.columns
     assert rows.set_index("symbol").loc["600000", "pb"] == 1.1
     assert any("TIMESTAMP '2026-10-21 09:25:00'" in q for q in db.queries)
+    query = next(q for q in db.queries if q.startswith("SELECT ts, symbol, pb"))
+    assert "symbol IN ('000003','600000')" in query
+    assert "CAST(ts AS DATE) >= " not in query
+
+
+def test_valuation_symbol_filter_rejects_sql_fragments_before_query():
+    source_type = _require("H5iReadOnlySource")
+    db = _FakeDatabase({"SELECT ts, symbol, pb": pd.DataFrame()})
+    with source_type("fake.db", database_factory=lambda *_a, **_k: db) as source:
+        with pytest.raises(_require("H5iInputError"), match="symbol"):
+            source.valuation_asof(_api().signal_cutoff("2026-10-21"), ["600000' OR 1=1--"])
+    assert not any(q.startswith("SELECT ts, symbol, pb") for q in db.queries)
 
 
 def test_h5i_source_closes_connection_when_query_raises():
@@ -183,6 +240,26 @@ def test_missing_h5i_dependency_surfaces_without_legacy_duckdb_fallback(monkeypa
         with source_type(str(db_path)):
             pass
     assert seen == []
+
+
+def test_default_factory_accepts_directory_backed_h5i_and_still_opens_read_only(monkeypatch, tmp_path):
+    source_type = _require("H5iReadOnlySource")
+    db_path = tmp_path / "market.db"
+    db_path.mkdir()
+    (db_path / "catalog").mkdir()
+    db = _FakeDatabase()
+    calls = []
+
+    def database(path, *, read_only):
+        calls.append((path, read_only))
+        return db
+
+    monkeypatch.setitem(sys.modules, "h5i_db", SimpleNamespace(Database=database))
+    with source_type(str(db_path)) as source:
+        assert source.schema()["daily_bars"]
+
+    assert calls == [(str(db_path), True)]
+    assert db.closed is True
 
 
 def test_diagnostic_panels_use_prior_session_universe_and_keep_roe_mf_unsupported():
