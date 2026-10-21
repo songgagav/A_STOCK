@@ -128,6 +128,7 @@ def test_pb_reverse_score_is_inverse_clipped_and_missing_is_not_neutral():
 
     assert pb_rev_signal(0.5).value == 1.0
     assert pb_rev_signal(3.0).value == 0.0
+    assert pb_rev_signal(-0.1).value == 1.0
     missing = pb_rev_signal(None)
     assert missing.status == "missing"
     assert missing.value is None

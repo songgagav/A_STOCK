@@ -170,14 +170,12 @@ def momentum_signal(closes: Sequence[object]) -> FactorValue:
 
 
 def pb_rev_signal(pb: object) -> FactorValue:
-    """Return low-PB selector score; missing or nonpositive PB is never neutralized."""
+    """Return the live inverse-clipped PB score; missing data is never neutralized."""
     value = _finite_number(pb)
     if pb is None:
         return FactorValue(None, "missing", "missing_pb")
     if value is None:
         return FactorValue(None, "invalid", "non_finite_or_non_numeric_pb")
-    if value <= 0:
-        return FactorValue(None, "invalid", "nonpositive_pb")
     score = _clip_score(value, 0.5, 3.0, invert=True)
     return FactorValue(score, "ok", raw_value=value)
 
