@@ -161,10 +161,28 @@ def test_calendar_requires_unique_iso_sessions_and_explicit_provenance(tmp_path)
         cli.load_calendar(calendar)
 
     calendar.write_text(json.dumps({"days": ["2026-10-01"]}), encoding="utf-8")
-    sessions, provenance, digest = cli.load_calendar(calendar)
+    sessions, provenance, digest, session_field = cli.load_calendar(calendar)
     assert sessions == ["2026-10-01"]
     assert provenance == "unknown"
     assert digest == hashlib.sha256(calendar.read_bytes()).hexdigest()
+    assert session_field == "days"
+
+
+def test_calendar_prefers_canonical_trading_days_and_normalizes_yyyymmdd(tmp_path):
+    cli = _cli()
+    calendar = tmp_path / "calendar.json"
+    payload = {
+        "days": ["20261001", "20261002", "20261003"],
+        "trading_days": ["2026-10-01", "2026-10-02"],
+        "source": "caller-claimed-source",
+    }
+    calendar.write_text(json.dumps(payload), encoding="utf-8")
+
+    sessions, provenance, _digest, field = cli.load_calendar(calendar)
+
+    assert sessions == ["2026-10-01", "2026-10-02"]
+    assert provenance == "caller-claimed-source"
+    assert field == "trading_days"
 
 
 def test_cli_enforces_bounded_signal_range(tmp_path):
@@ -180,7 +198,9 @@ def test_cli_enforces_bounded_signal_range(tmp_path):
 def test_cli_builds_and_verifies_external_diagnostic_bundle(tmp_path, monkeypatch, capsys):
     cli = _cli()
     db = tmp_path / "market.db"
-    db.write_bytes(b"fake read-only H5i identity")
+    db.mkdir()
+    (db / "catalog").mkdir()
+    (db / "catalog" / "metadata.bin").write_bytes(b"fake read-only H5i identity")
     calendar = tmp_path / "calendar.json"
     sessions = _write_calendar(calendar, source="fixture-exchange-calendar-v1")
     out = tmp_path / "staging"
@@ -210,7 +230,9 @@ def test_cli_builds_and_verifies_external_diagnostic_bundle(tmp_path, monkeypatc
     output = next(out.iterdir())
     manifest = cli.verify_diagnostic_bundle(output)
     identity = manifest["identity"]
-    assert identity["h5i_db_sha256"] == hashlib.sha256(db.read_bytes()).hexdigest()
+    assert identity["h5i_db_sha256"] == cli._source_identity(db)["sha256"]
+    assert identity["h5i_db_kind"] == "directory"
+    assert identity["h5i_db_file_count"] == 1
     assert identity["calendar_sha256"] == hashlib.sha256(calendar.read_bytes()).hexdigest()
     assert identity["calendar_provenance"] == "fixture-exchange-calendar-v1"
     assert identity["calendar_upstream_source_verified"] is False

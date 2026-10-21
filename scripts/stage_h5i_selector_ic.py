@@ -82,6 +82,37 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_identity(path: Path) -> dict[str, int | str]:
+    """Content-hash an explicit file or directory-backed H5i database."""
+    entries = []
+    if path.is_file():
+        entries.append({"path": path.name, "size_bytes": path.stat().st_size,
+                        "sha256": _sha256_file(path)})
+        kind = "file"
+    elif path.is_dir():
+        kind = "directory"
+        for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+            if child.is_symlink():
+                raise CliInputError(f"H5i database directory contains a symlink: {child}")
+            if child.is_file():
+                entries.append({
+                    "path": child.relative_to(path).as_posix(),
+                    "size_bytes": child.stat().st_size,
+                    "sha256": _sha256_file(child),
+                })
+        if not entries:
+            raise CliInputError("H5i database directory contains no regular files")
+    else:
+        raise CliInputError("H5i database path is not a regular file or directory")
+    total_bytes = sum(int(entry["size_bytes"]) for entry in entries)
+    return {
+        "kind": kind,
+        "sha256": _sha256_bytes(_canonical_json({"kind": kind, "files": entries})),
+        "size_bytes": total_bytes,
+        "file_count": len(entries),
+    }
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                       allow_nan=False).encode("utf-8")
@@ -100,6 +131,19 @@ def _explicit_file(value: str, label: str) -> Path:
     return resolved
 
 
+def _explicit_h5i_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise CliInputError("H5i database path must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CliInputError(f"H5i database path does not exist or cannot be resolved: {path}") from exc
+    if not (resolved.is_file() or resolved.is_dir()):
+        raise CliInputError(f"H5i database path is not a file or directory: {resolved}")
+    return resolved
+
+
 def _strict_day(value: str, label: str) -> str:
     if not isinstance(value, str) or not DATE_RE.fullmatch(value):
         raise CliInputError(f"{label} must use ISO YYYY-MM-DD format")
@@ -109,8 +153,25 @@ def _strict_day(value: str, label: str) -> str:
         raise CliInputError(f"{label} is not a valid calendar date") from exc
 
 
-def load_calendar(path: str | Path) -> tuple[list[str], str, str]:
-    """Read an explicit session calendar and return sessions, provenance, and file hash."""
+def _calendar_day(value: object) -> str:
+    if not isinstance(value, str):
+        raise CliInputError("calendar sessions must be strings in YYYY-MM-DD or YYYYMMDD format")
+    if DATE_RE.fullmatch(value):
+        return _strict_day(value, "calendar session")
+    if re.fullmatch(r"\d{8}", value):
+        try:
+            return date(int(value[:4]), int(value[4:6]), int(value[6:8])).isoformat()
+        except ValueError as exc:
+            raise CliInputError("calendar session is not a valid YYYYMMDD date") from exc
+    raise CliInputError("calendar sessions must use YYYY-MM-DD or YYYYMMDD format")
+
+
+def load_calendar(path: str | Path) -> tuple[list[str], str, str, str]:
+    """Read an explicit calendar and return sessions, claim, file hash, and chosen field.
+
+    When both historical fields exist, ``trading_days`` is canonical; ``days`` may
+    contain a broader union and is not silently substituted for observed sessions.
+    """
     calendar_path = _explicit_file(str(path), "calendar")
     try:
         payload = json.loads(calendar_path.read_text(encoding="utf-8"))
@@ -118,13 +179,13 @@ def load_calendar(path: str | Path) -> tuple[list[str], str, str]:
         raise CliInputError(f"calendar JSON cannot be read: {exc}") from exc
     if not isinstance(payload, dict):
         raise CliInputError("calendar JSON must be an object")
-    choices = [key for key in ("days", "trading_days") if key in payload]
-    if len(choices) != 1:
-        raise CliInputError("calendar JSON must contain exactly one days or trading_days array")
-    raw_sessions = payload[choices[0]]
+    session_field = "trading_days" if "trading_days" in payload else "days"
+    if session_field not in payload:
+        raise CliInputError("calendar JSON must contain a days or trading_days array")
+    raw_sessions = payload[session_field]
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise CliInputError("calendar session array must be a non-empty list")
-    sessions = [_strict_day(value, "calendar session") for value in raw_sessions]
+    sessions = [_calendar_day(value) for value in raw_sessions]
     if len(sessions) != len(set(sessions)):
         raise CliInputError("calendar sessions must be unique")
     if sessions != sorted(sessions):
@@ -137,11 +198,11 @@ def load_calendar(path: str | Path) -> tuple[list[str], str, str]:
         provenance = json.dumps(provenance, ensure_ascii=False, sort_keys=True)
     elif not isinstance(provenance, str):
         provenance = str(provenance)
-    return sessions, provenance, _sha256_file(calendar_path)
+    return sessions, provenance, _sha256_file(calendar_path), session_field
 
 
 def validate_signal_range(calendar_path: str | Path, start: str, end: str) -> tuple[list[str], int]:
-    sessions, _provenance, _digest = load_calendar(calendar_path)
+    sessions, _provenance, _digest, _session_field = load_calendar(calendar_path)
     start_day = _strict_day(start, "start")
     end_day = _strict_day(end, "end")
     if start_day > end_day:
@@ -267,17 +328,19 @@ def _coverage_summary(frame) -> list[dict[str, int | str | None]]:
 
 
 def _execute(args: argparse.Namespace) -> Path:
-    h5i_path = _explicit_file(args.h5i_db, "H5i database")
+    h5i_path = _explicit_h5i_path(args.h5i_db)
     calendar_path = _explicit_file(args.calendar_json, "calendar")
     output_root = _external_output_root(args.output_root)
     sessions, signal_count = validate_signal_range(calendar_path, args.start, args.end)
     start_day = _strict_day(args.start, "start")
     end_day = _strict_day(args.end, "end")
-    calendar_sessions, calendar_provenance, calendar_sha = load_calendar(calendar_path)
+    calendar_sessions, calendar_provenance, calendar_sha, calendar_session_field = load_calendar(
+        calendar_path
+    )
     if calendar_sessions != sessions:
         raise CliInputError("calendar changed while inputs were being validated")
 
-    h5i_sha = _sha256_file(h5i_path)
+    h5i_identity = _source_identity(h5i_path)
     code_files, code_sha = _code_identity()
     fetch_start, fetch_end = _session_fetch_bounds(sessions, start_day, end_day)
 
@@ -288,7 +351,7 @@ def _execute(args: argparse.Namespace) -> Path:
 
     # Re-hash source inputs before finalization so a changed input cannot be mislabeled
     # with the initial identity. Opening the database is explicitly read-only.
-    if _sha256_file(h5i_path) != h5i_sha:
+    if _source_identity(h5i_path) != h5i_identity:
         raise CliInputError("H5i source changed during the read-only diagnostic")
     if _sha256_file(calendar_path) != calendar_sha:
         raise CliInputError("calendar file changed during the diagnostic")
@@ -296,10 +359,13 @@ def _execute(args: argparse.Namespace) -> Path:
     identity = {
         "diagnostic_name": "h5i_selector_factor_ic",
         "h5i_db_name": h5i_path.name,
-        "h5i_db_size_bytes": h5i_path.stat().st_size,
-        "h5i_db_sha256": h5i_sha,
+        "h5i_db_kind": h5i_identity["kind"],
+        "h5i_db_file_count": h5i_identity["file_count"],
+        "h5i_db_size_bytes": h5i_identity["size_bytes"],
+        "h5i_db_sha256": h5i_identity["sha256"],
         "calendar_name": calendar_path.name,
         "calendar_sha256": calendar_sha,
+        "calendar_session_field": calendar_session_field,
         "calendar_provenance": calendar_provenance,
         "calendar_upstream_source_verified": False,
         "calendar_provenance_note": (
