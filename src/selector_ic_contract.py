@@ -198,8 +198,8 @@ def _average_ranks(values: Mapping[str, float]) -> dict[str, float]:
 def rank_ic(signal_values: Mapping[str, object], forward_returns: Mapping[str, object],
             min_pairs: int = 5) -> ICResult:
     """Calculate finite-pair Spearman IC using average ranks for ties."""
-    if isinstance(min_pairs, bool) or not isinstance(min_pairs, int) or min_pairs < 2:
-        raise ValueError("min_pairs must be an integer >= 2")
+    if isinstance(min_pairs, bool) or not isinstance(min_pairs, int) or min_pairs < 5:
+        raise ValueError("min_pairs must be an integer >= 5")
     x: dict[str, float] = {}
     y: dict[str, float] = {}
     for symbol in signal_values.keys() & forward_returns.keys():

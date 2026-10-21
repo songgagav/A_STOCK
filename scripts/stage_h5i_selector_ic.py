@@ -374,7 +374,10 @@ def _execute(args: argparse.Namespace) -> Path:
         "horizons": list(HORIZONS),
         "timezone": "Asia/Shanghai",
         "feature_cutoff": "09:25; immediately preceding completed calendar session",
-        "universe_definition": "symbols with valid daily bar on the prior calendar session",
+        "universe_definition": "proxy: symbols with valid daily bar on the prior calendar session",
+        "live_selector_universe_comparison": (
+            "not_performed; equivalence to the live selector universe is unverified"
+        ),
         "label_version": LABEL_VERSION,
         "entry_proxy": "daily_open[D]",
         "horizon_exit": "close[D+h-1]",
