@@ -42,6 +42,40 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _repository_roots() -> tuple[Path, ...]:
+    """Return this checkout and its primary checkout when running in a worktree."""
+    repo = _repo_root().resolve()
+    roots = {repo}
+    marker = repo / ".git"
+    try:
+        if marker.is_dir():
+            return tuple(sorted(roots, key=str))
+        if not marker.is_file():
+            raise DiagnosticBundleError("cannot identify repository metadata for output guard")
+        pointer = marker.read_text(encoding="utf-8").strip()
+        if not pointer.lower().startswith("gitdir:"):
+            raise DiagnosticBundleError("cannot parse linked-worktree repository metadata")
+        git_dir = Path(pointer.split(":", 1)[1].strip())
+        if not git_dir.is_absolute():
+            git_dir = repo / git_dir
+        git_dir = git_dir.resolve(strict=True)
+        common_dir_file = git_dir / "commondir"
+        common_dir_text = common_dir_file.read_text(encoding="utf-8").strip()
+        if not common_dir_text:
+            raise DiagnosticBundleError("linked-worktree common directory is empty")
+        common_dir = Path(common_dir_text)
+        if not common_dir.is_absolute():
+            common_dir = git_dir / common_dir
+        roots.add(common_dir.resolve(strict=True).parent)
+    except DiagnosticBundleError:
+        raise
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise DiagnosticBundleError(
+            f"cannot resolve repository metadata for output guard: {exc}"
+        ) from exc
+    return tuple(sorted(roots, key=str))
+
+
 def _is_within(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -51,27 +85,55 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 
 def _reject_repository_path(path: Path) -> Path:
-    repo = _repo_root().resolve()
     try:
         lexical = Path(os.path.abspath(str(path)))
         resolved = path.resolve(strict=False)
+        repositories = _repository_roots()
     except (OSError, RuntimeError) as exc:
         raise DiagnosticBundleError(f"cannot resolve output path: {exc}") from exc
-    if _is_within(lexical, repo) or _is_within(resolved, repo):
-        raise DiagnosticBundleError("output path must be outside the repository and protected data")
+    for repo in repositories:
+        if _is_within(lexical, repo) or _is_within(resolved, repo):
+            raise DiagnosticBundleError(
+                "output path must be outside the repository and protected data"
+            )
     return resolved
 
 
-def _validate_root(output_root: str | os.PathLike[str]) -> Path:
+def validate_external_output_root(output_root: str | os.PathLike[str]) -> Path:
+    """Validate and resolve a caller-selected path without creating it."""
     root = Path(output_root)
     if not root.is_absolute():
         raise DiagnosticBundleError("output_root must be an absolute caller-selected path")
-    resolved = _reject_repository_path(root)
-    # Resolve again after creation so an existing ancestor junction/symlink cannot route
-    # the writer into the repository between the initial validation and directory use.
+    return _reject_repository_path(root)
+
+
+def _assert_root_still_safe(root: Path, *, require_directory: bool = True) -> Path:
+    # Boundary rechecks detect path swaps between writer phases. These pathname-based
+    # operations are not a handle-relative defense against a swap inside one syscall.
+    checked = validate_external_output_root(root)
+    if checked != root:
+        raise DiagnosticBundleError("output_root changed after validation")
+    if require_directory and not checked.is_dir():
+        raise DiagnosticBundleError("output_root is not a directory")
+    return checked
+
+
+def _assert_partial_still_safe(partial: Path, root: Path) -> None:
+    _assert_root_still_safe(root)
     try:
+        resolved = partial.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DiagnosticBundleError(f"partial bundle path changed: {exc}") from exc
+    if partial.is_symlink() or not partial.is_dir() or not _is_within(resolved, root):
+        raise DiagnosticBundleError("partial bundle path changed after creation")
+
+
+def _validate_root(output_root: str | os.PathLike[str]) -> Path:
+    resolved = validate_external_output_root(output_root)
+    try:
+        _assert_root_still_safe(resolved, require_directory=False)
         resolved.mkdir(parents=True, exist_ok=True)
-        resolved = _reject_repository_path(resolved)
+        _assert_root_still_safe(resolved)
     except DiagnosticBundleError:
         raise
     except OSError as exc:
@@ -146,33 +208,35 @@ def write_diagnostic_bundle(
     identity_prefix = f"{_FINAL_PREFIX}{identity_sha256[:16]}"
     final_name = f"{identity_prefix}-{bundle_sha256[:16]}"
     root = _validate_root(output_root)
+    _assert_root_still_safe(root)
     final_path = root / final_name
     lock_path = root / f".{identity_prefix}.lock"
     partial_prefix = f".{identity_prefix}.partial-"
     owned_lock = False
     partial_path: Path | None = None
-
-    if final_path.exists() or final_path.is_symlink():
-        raise DiagnosticBundleError(f"bundle already exists: {final_path}")
     lock_fd = None
     try:
+        _assert_root_still_safe(root)
+        if final_path.exists() or final_path.is_symlink():
+            raise DiagnosticBundleError(f"bundle already exists: {final_path}")
+        _assert_root_still_safe(root)
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         owned_lock = True
+        _assert_root_still_safe(root)
         os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
-    except FileExistsError as exc:
-        raise DiagnosticBundleError(f"bundle finalize already in progress: {final_path}") from exc
-    finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
-
-    try:
+        os.close(lock_fd)
+        lock_fd = None
+        _assert_root_still_safe(root)
         if any(root.glob(f"{identity_prefix}-*")):
             raise DiagnosticBundleError(f"bundle already exists for this run identity: {identity_prefix}")
         if any(root.glob(f"{partial_prefix}*")):
             raise DiagnosticBundleError(f"partial bundle collision for {final_path}")
+        _assert_root_still_safe(root)
         partial_path = Path(tempfile.mkdtemp(prefix=partial_prefix, dir=str(root)))
+        _assert_partial_still_safe(partial_path, root)
 
         for name, content in sorted(artifact_bytes.items()):
+            _assert_partial_still_safe(partial_path, root)
             _write_file(partial_path / name, content)
 
         manifest = {
@@ -187,22 +251,41 @@ def write_diagnostic_bundle(
             "artifacts": artifact_manifest,
         }
         # Manifest is deliberately the last file written into the hidden partial dir.
+        _assert_partial_still_safe(partial_path, root)
         _write_file(partial_path / "manifest.json", _canonical_json(manifest) + b"\n")
 
         # Atomic same-parent rename makes the complete bundle visible all at once.
+        _assert_partial_still_safe(partial_path, root)
+        _assert_root_still_safe(root)
         if final_path.exists() or final_path.is_symlink():
             raise DiagnosticBundleError(f"bundle already exists: {final_path}")
+        _assert_root_still_safe(root)
         os.replace(partial_path, final_path)
         partial_path = None
         return final_path
+    except FileExistsError as exc:
+        raise DiagnosticBundleError(f"bundle finalize already in progress: {final_path}") from exc
     except DiagnosticBundleError:
         raise
     except Exception as exc:  # noqa: BLE001 - convert filesystem failures to a stable API
         raise DiagnosticBundleError(f"bundle finalize failed: {type(exc).__name__}: {exc}") from exc
     finally:
-        if partial_path is not None:
-            _cleanup_owned_partial(partial_path)
-        if owned_lock:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        try:
+            _assert_root_still_safe(root)
+            cleanup_safe = True
+        except DiagnosticBundleError:
+            cleanup_safe = False
+        if cleanup_safe and partial_path is not None:
+            try:
+                _assert_partial_still_safe(partial_path, root)
+                _cleanup_owned_partial(partial_path)
+            except OSError:
+                pass
+            except DiagnosticBundleError:
+                pass
+        if cleanup_safe and owned_lock:
             try:
                 lock_path.unlink(missing_ok=True)
             except OSError:

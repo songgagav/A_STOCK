@@ -38,6 +38,23 @@ def _artifacts():
     return {"ic.csv": "factor,horizon,ic\nvol,5,0.25\n", "coverage.json": b'{"n":5}\n'}
 
 
+def _primary_checkout_root(repo: Path) -> Path:
+    marker = repo / ".git"
+    if marker.is_dir():
+        return repo.resolve()
+    pointer = marker.read_text(encoding="utf-8").strip()
+    assert pointer.startswith("gitdir:")
+    git_dir = Path(pointer.split(":", 1)[1].strip())
+    if not git_dir.is_absolute():
+        git_dir = repo / git_dir
+    git_dir = git_dir.resolve()
+    common_dir_text = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+    common_dir = Path(common_dir_text)
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir.resolve().parent
+
+
 def test_bundle_requires_absolute_output_root_and_rejects_repository_paths(tmp_path):
     writer = _require("write_diagnostic_bundle")
     error = _require("DiagnosticBundleError")
@@ -47,6 +64,15 @@ def test_bundle_requires_absolute_output_root_and_rejects_repository_paths(tmp_p
         writer("relative-output", _identity(), _artifacts())
     with pytest.raises(error, match="repository"):
         writer(repo / "data" / "ic", _identity(), _artifacts())
+
+
+def test_bundle_output_guard_also_rejects_primary_checkout_from_linked_worktree():
+    api = _api()
+    error = _require("DiagnosticBundleError")
+    primary = _primary_checkout_root(Path(__file__).resolve().parents[1])
+
+    with pytest.raises(error, match="repository"):
+        api.validate_external_output_root(primary / "data" / "ic")
 
 
 def test_bundle_refuses_identity_that_claims_production_authority(tmp_path):
@@ -156,6 +182,31 @@ def test_stale_partial_collision_is_refused_and_preserved(tmp_path):
 
     assert sentinel.read_text(encoding="utf-8") == "orphan evidence"
     assert not list(root.glob(".ic-diagnostic-*.lock"))
+
+
+def test_writer_rechecks_root_after_validation_before_creating_lock(tmp_path, monkeypatch):
+    api = _api()
+    error = api.DiagnosticBundleError
+    requested = tmp_path / "route" / "staging"
+    protected = tmp_path / "protected-repository"
+    protected.mkdir()
+    route = requested.parent
+    real_validate = api._validate_root
+
+    monkeypatch.setattr(api, "_repository_roots", lambda: (protected.resolve(),))
+
+    def replace_ancestor_after_validation(path):
+        resolved = real_validate(path)
+        moved = tmp_path / "route-before-replacement"
+        route.rename(moved)
+        route.symlink_to(protected, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(api, "_validate_root", replace_ancestor_after_validation)
+    with pytest.raises(error, match="repository"):
+        api.write_diagnostic_bundle(requested, _identity(), _artifacts())
+
+    assert list(protected.iterdir()) == []
 
 
 def test_repeated_identity_refuses_overwrite_and_preserves_existing_bytes(tmp_path):

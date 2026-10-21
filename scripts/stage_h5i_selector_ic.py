@@ -23,6 +23,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from diagnostic_ic_bundle import (  # noqa: E402
     DiagnosticBundleError,
+    validate_external_output_root,
     verify_diagnostic_bundle,
     write_diagnostic_bundle,
 )
@@ -221,15 +222,9 @@ def _external_output_root(value: str) -> Path:
     if not path.is_absolute():
         raise CliInputError("output-root path must be absolute")
     try:
-        resolved = path.resolve(strict=False)
-        repo = REPO_ROOT.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise CliInputError(f"output-root path cannot be resolved: {path}") from exc
-    try:
-        resolved.relative_to(repo)
-    except ValueError:
-        return resolved
-    raise CliInputError("output-root must be outside the repository and protected data")
+        return validate_external_output_root(path)
+    except DiagnosticBundleError as exc:
+        raise CliInputError(str(exc)) from exc
 
 
 def _schema_identity(schema: dict[str, list[str]]) -> tuple[dict[str, list[str]], str]:

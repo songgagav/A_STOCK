@@ -40,6 +40,22 @@ def _write_calendar(path: Path, *, source="unknown"):
     return sessions
 
 
+def _primary_checkout_root(repo: Path) -> Path:
+    marker = repo / ".git"
+    if marker.is_dir():
+        return repo.resolve()
+    pointer = marker.read_text(encoding="utf-8").strip()
+    assert pointer.startswith("gitdir:")
+    git_dir = Path(pointer.split(":", 1)[1].strip())
+    if not git_dir.is_absolute():
+        git_dir = repo / git_dir
+    git_dir = git_dir.resolve()
+    common_dir = Path((git_dir / "commondir").read_text(encoding="utf-8").strip())
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir.resolve().parent
+
+
 class _FakeSource:
     def __init__(self, path):
         self.path = path
@@ -150,6 +166,29 @@ def test_cli_rejects_repository_protected_output_root_before_opening_h5i(tmp_pat
     result = cli.main(_args(db, calendar, REPO))
 
     assert result != 0
+
+
+def test_cli_rejects_primary_checkout_output_root_before_opening_h5i(
+    tmp_path, monkeypatch, capsys,
+):
+    cli = _cli()
+    db = tmp_path / "market.db"
+    db.write_bytes(b"fixture")
+    calendar = tmp_path / "calendar.json"
+    _write_calendar(calendar)
+    primary = _primary_checkout_root(REPO)
+    opened = []
+
+    def forbidden_source(_path):
+        opened.append(True)
+        raise cli.CliInputError("H5i source should not be opened")
+
+    monkeypatch.setattr(cli, "H5iReadOnlySource", forbidden_source)
+    result = cli.main(_args(db, calendar, primary / "data" / "ic"))
+
+    assert result == 1
+    assert opened == []
+    assert "outside the repository" in capsys.readouterr().err
 
 
 def test_calendar_requires_unique_iso_sessions_and_explicit_provenance(tmp_path):
