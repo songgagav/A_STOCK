@@ -15,6 +15,7 @@ import pandas as pd
 from selector_ic_contract import (
     FACTOR_CONTRACTS,
     HORIZONS,
+    SessionCalendar,
     apply_expected_direction,
     forward_return_for_symbol,
     momentum_signal,
@@ -310,17 +311,21 @@ def build_diagnostic_panels(source, calendar: Sequence[str | date],
     rows and never receive synthetic neutral values.
     """
     normalized_sessions = [_as_day(day) for day in calendar]
-    if len(normalized_sessions) != len(set(normalized_sessions)):
-        raise H5iInputError("calendar sessions must be unique")
-    sessions = sorted(normalized_sessions)
-    if not sessions:
+    if not normalized_sessions:
         raise H5iInputError("calendar has no sessions")
+    try:
+        session_calendar = SessionCalendar._from_normalized(normalized_sessions)
+    except ValueError as exc:
+        raise H5iInputError("calendar sessions must be unique") from exc
+    sessions = session_calendar.sessions
     start_day, end_day = _as_day(start), _as_day(end)
     if start_day > end_day:
         raise H5iInputError("signal range start must be <= end")
-    if start_day not in sessions or end_day not in sessions:
-        raise H5iInputError("signal range bounds must be calendar sessions")
-    start_index, end_index = sessions.index(start_day), sessions.index(end_day)
+    try:
+        start_index = session_calendar.index_of(start_day)
+        end_index = session_calendar.index_of(end_day)
+    except ValueError as exc:
+        raise H5iInputError("signal range bounds must be calendar sessions") from exc
     signal_days = sessions[start_index:end_index + 1]
     if not signal_days:
         raise H5iInputError("signal range contains no sessions")
@@ -366,8 +371,8 @@ def build_diagnostic_panels(source, calendar: Sequence[str | date],
     coverage_records: list[dict] = []
 
     for signal_day in signal_days:
-        prior_day = previous_session(signal_day, sessions)
-        prior_index = sessions.index(prior_day)
+        prior_day = previous_session(signal_day, session_calendar)
+        prior_index = session_calendar.index_of(prior_day)
         universe = sorted({
             symbol for (bar_day, symbol), row in bar_map.items()
             if bar_day == prior_day and _finite_positive(row.get("close"))
@@ -436,7 +441,9 @@ def build_diagnostic_panels(source, calendar: Sequence[str | date],
         for horizon in HORIZONS:
             labels_for_symbols = {}
             for symbol in universe:
-                label = forward_return_for_symbol(bar_map, symbol, signal_day, horizon, sessions)
+                label = forward_return_for_symbol(
+                    bar_map, symbol, signal_day, horizon, session_calendar
+                )
                 record = {
                     "signal_date": signal_day,
                     "symbol": symbol,
