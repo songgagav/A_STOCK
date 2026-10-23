@@ -1328,13 +1328,6 @@ def run_daily(day: str = None, download_prices: bool = True, mode: str = "full")
         if mode == "full":
             pb = PaperBook()
             pb.restore(load_state())   # 只读恢复盘中引擎的实时现金/持仓
-            target = [
-                {
-                    "canon": t["canon"],
-                    "price": t["price"],
-                }
-                for t in sel.get("top_n", [])
-            ]
             snap = pb.snapshot()
             pb.save_daily(day_dir)
             report["steps"]["paper"] = snap
