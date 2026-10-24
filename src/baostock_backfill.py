@@ -27,13 +27,15 @@ plan_replace_range -> 只替换给定 ts 区间, 其余段保留; 且**对同一
 
 故本模块用 `h5i_db.Database.plan_replace_range(...).apply()`。
 
-## 三道安全闸门(缺一不可)
+## 四道安全闸门(缺一不可)
 
 1. **默认 dry-run**: 不带 `--write` 时**一个字节都不写**。补数会改动生产行情库,
    必须是一次显式动作。
-2. **逐日结构哨兵**: 复用 `bars_ingest.normalize`(源无关归一化 + 单位换算契约)
+2. **抓取覆盖门禁**: `partial`/`failed` 或仍有抓取失败的批次整批拒写;
+   明确不可取的北交所标的单独列出, 不冒充沪深抓取失败。
+3. **逐日结构哨兵**: 复用 `bars_ingest.normalize`(源无关归一化 + 单位换算契约)
    与 `data_quality_guard` —— OHLC 关系/非正价/负量/核心 NaN 的日**整日拒写**。
-3. **来源留痕(`provenance`)**: `daily_bars` **没有 `source` 列**, 混入的行从表内
+4. **来源留痕(`provenance`)**: `daily_bars` **没有 `source` 列**, 混入的行从表内
    **无法区分来源**。故每次写入都把「哪天、来自 Baostock、多少行、覆盖哪个市场区间」
    追加到 `data/backfill_provenance.jsonl`。不这么做就是本仓明令禁止的**口径漂移**:
    数据看着正常, 只是你永远不知道哪几行不是引擎给的。
@@ -150,18 +152,20 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
     # **流式聚合**: 每取到一只立刻折成记录按日累加, 不把 5481 只 DataFrame
     # 同时留在内存里(见 baostock_adapter.fetch_range 的 on_row 说明)。
     per_day: dict[str, list] = {d: [] for d in todo}
+    per_day_symbols: dict[str, set] = {d: set() for d in todo}
     counters = {"symbols": 0, "records": 0}
 
     def _on_row(bare, df):
         counters["symbols"] += 1
         try:
             recs = df.to_dict("records")
-        except Exception:  # noqa: BLE001
-            return
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Baostock row conversion failed for {bare}") from e
         for r in recs:
             d = str(r.get("date") or "")[:10]
             if d in per_day:
                 per_day[d].append(r)
+                per_day_symbols[d].add(str(bare))
                 counters["records"] += 1
 
     fr = fetch_range(sorted(set(_symbols(symbols_df))), start=start, end=end,
@@ -177,10 +181,25 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
                         f"failed={list((fr.get('failed') or {}).items())[:3]}")
         return out
 
+    # A structurally valid 1,000+ row slice can still be a truncated fetch.
+    # `unfillable_gap` is acceptable only when the missing symbols are the
+    # explicitly excluded BJ set; any per-symbol fetch failure is not.
+    if fr.get("status") not in (_BA.APPENDED, _BA.UNFILLABLE) or fr.get("failed"):
+        out["error"] = ("Baostock 抓取覆盖不完整，拒绝按日替换: "
+                        f"status={fr.get('status')}, failed={out['fetch_failed_n']}")
+        out["days"] = {d: {"status": "rejected_by_coverage"} for d in todo}
+        return out
+
     _db = db
     for d in todo:
         recs = per_day.get(d) or []
-        info = {"n_symbols": len(recs)}
+        info = {"n_symbols": len(recs), "fetch_symbols": len(per_day_symbols[d]),
+                "expected_fetch_symbols": counters["symbols"]}
+        if info["fetch_symbols"] != info["expected_fetch_symbols"]:
+            info["status"] = "rejected_by_coverage"
+            info["note"] = "该日未覆盖全部已抓取的沪深标的，拒绝按日替换"
+            out["days"][d] = info
+            continue
         if not recs:
             info["status"] = "empty"
             info["note"] = "该日 Baostock 无行(停牌/非交易日/未取到)"
@@ -256,8 +275,9 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
             except Exception:  # noqa: BLE001
                 pass
 
-    out["ok"] = bool(out["written"]) or (not write and all(
-        (v.get("status") == "ready") for v in out["days"].values()))
+    expected_status = "written" if write else "ready"
+    out["ok"] = all(
+        out["days"].get(d, {}).get("status") == expected_status for d in todo)
     # [2026-09-25 第 8 项] 写入模式下给出**整体**的两件事验证结论
     # (逐日的结论已在 `days[day]["verify"]` 里)。
     if write and out["written"]:
