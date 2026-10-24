@@ -124,6 +124,120 @@ class TestWriteUsesRangeReplaceNotAppendOrWrite:
 
 
 class TestWholeDayRejection:
+    def test_partial_fetch_above_row_floor_cannot_replace_day(self, monkeypatch, tmp_path):
+        """A 1,870-row partial response must not overwrite a complete day."""
+        monkeypatch.setattr(BF, "PROVENANCE_FP", str(tmp_path / "provenance.jsonl"))
+        monkeypatch.setattr(BF, "_write_day", lambda *args, **kwargs: pytest.fail(
+            "partial fetch reached H5i range replacement"))
+        syms = [f"6{i:05d}" for i in range(2000)]
+        base = _fake_fetch_range(1870, ["2026-09-23"])
+
+        def partial(symbols, **kwargs):
+            result = base(symbols, **kwargs)
+            result.update(status="partial", got=1870, missing=130)
+            return result
+
+        result = BF.backfill_days(["2026-09-23"], write=True,
+                                  symbols_df=_Symbols(syms), fetch_range=partial)
+        assert result["ok"] is False
+        assert result["written"] == []
+        assert result["days"]["2026-09-23"]["status"] == "rejected_by_coverage"
+        assert not (tmp_path / "provenance.jsonl").exists()
+
+    def test_failed_symbols_cannot_hide_behind_unfillable_bj_status(self, monkeypatch, tmp_path):
+        """Adapter classification may say BJ-only gap even with a failed SH symbol."""
+        monkeypatch.setattr(BF, "PROVENANCE_FP", str(tmp_path / "provenance.jsonl"))
+        monkeypatch.setattr(BF, "_write_day", lambda *args, **kwargs: pytest.fail(
+            "failed symbol reached H5i range replacement"))
+        syms = [f"6{i:05d}" for i in range(1201)] + ["920000", "920001"]
+        base = _fake_fetch_range(1200, ["2026-09-23"])
+
+        def misleading(symbols, **kwargs):
+            result = base(symbols, **kwargs)
+            result.update(status="unfillable_gap", got=1200, missing=3,
+                          failed={"601200": "request timed out"},
+                          not_requested=["920000", "920001"])
+            return result
+
+        result = BF.backfill_days(["2026-09-23"], write=True,
+                                  symbols_df=_Symbols(syms), fetch_range=misleading)
+        assert result["fetch_failed_n"] == 1
+        assert result["days"]["2026-09-23"]["status"] == "rejected_by_coverage"
+        assert result["written"] == []
+        assert not (tmp_path / "provenance.jsonl").exists()
+
+    def test_explicit_bj_exclusion_keeps_complete_sh_sz_dry_run_ready(self):
+        syms = [f"6{i:05d}" for i in range(1200)] + ["920000"]
+        base = _fake_fetch_range(1200, ["2026-09-23"], not_requested=["920000"])
+
+        def bj_only(symbols, **kwargs):
+            result = base(symbols, **kwargs)
+            result.update(status="unfillable_gap", got=1200, missing=1)
+            return result
+
+        result = BF.backfill_days(["2026-09-23"], write=False,
+                                  symbols_df=_Symbols(syms), fetch_range=bj_only)
+        assert result["ok"] is True
+        assert result["days"]["2026-09-23"]["status"] == "ready"
+        assert result["bj_not_requested"] == ["920000"]
+
+    def test_complete_batch_with_partial_first_day_rejects_only_that_day(self):
+        """A range-wide appended status does not prove each day's coverage."""
+        days = ["2026-09-23", "2026-09-24"]
+        syms = [f"6{i:05d}" for i in range(2000)]
+
+        def uneven(symbols, *, on_row=None, **kwargs):
+            for i, sym in enumerate(symbols):
+                dates = days if i < 1870 else days[1:]
+                on_row(sym, _frame([_rec(f"sh.{sym}", d) for d in dates]))
+            return {"status": "appended", "requested": 2000, "got": 2000,
+                    "missing": 0, "failed": {}, "not_requested": [], "limiter": {}}
+
+        result = BF.backfill_days(days, write=False, symbols_df=_Symbols(syms),
+                                  fetch_range=uneven)
+        assert result["days"][days[0]]["status"] == "rejected_by_coverage"
+        assert result["days"][days[1]]["status"] == "ready"
+        assert result["ok"] is False
+
+    def test_partial_multi_day_write_does_not_report_overall_success(self, monkeypatch, tmp_path):
+        days = ["2026-09-23", "2026-09-24"]
+        syms = [f"6{i:05d}" for i in range(1200)]
+        monkeypatch.setattr(BF, "PROVENANCE_FP", str(tmp_path / "provenance.jsonl"))
+        monkeypatch.setattr(BF, "_write_day", lambda day, frame, **kwargs: {
+            "rows": len(frame)})
+        monkeypatch.setattr(BF, "verify_two_things", lambda **kwargs: {"ok": True})
+
+        def uneven(symbols, *, on_row=None, **kwargs):
+            for i, sym in enumerate(symbols):
+                dates = days if i < 1100 else days[1:]
+                on_row(sym, _frame([_rec(f"sh.{sym}", d) for d in dates]))
+            return {"status": "appended", "requested": 1200, "got": 1200,
+                    "missing": 0, "failed": {}, "not_requested": [], "limiter": {}}
+
+        result = BF.backfill_days(days, write=True, symbols_df=_Symbols(syms),
+                                  fetch_range=uneven)
+        assert result["written"] == [days[1]]
+        assert result["days"][days[0]]["status"] == "rejected_by_coverage"
+        assert result["ok"] is False
+
+    def test_row_conversion_failure_is_not_silently_skipped(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(BF, "PROVENANCE_FP", str(tmp_path / "provenance.jsonl"))
+        monkeypatch.setattr(BF, "_write_day", lambda *args, **kwargs: pytest.fail(
+            "conversion failure reached H5i range replacement"))
+
+        class BrokenFrame:
+            def to_dict(self, *args):
+                raise ValueError("invalid frame")
+
+        def broken(symbols, *, on_row=None, **kwargs):
+            on_row(symbols[0], BrokenFrame())
+            return {"status": "appended", "failed": {}, "not_requested": []}
+
+        with pytest.raises(RuntimeError, match="row conversion failed"):
+            BF.backfill_days(["2026-09-23"], write=True,
+                             symbols_df=_Symbols(["600000"]), fetch_range=broken)
+        assert not (tmp_path / "provenance.jsonl").exists()
+
     def test_too_few_rows_rejects_the_whole_day(self, monkeypatch):
         """残截面(行数低于阈值)**整日拒写** —— 不写半截。
 
