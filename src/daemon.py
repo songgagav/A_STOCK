@@ -141,6 +141,7 @@ _state = {
     "last_close_day": None,     # 最后一次收盘选股的交易日
     "last_maint_day": None,     # 最后一次非交易日维护的日期
     "last_p08_close_day": None,  # 最后一次 P08 收盘汇总已执行的交易日
+    "last_p08_close_status": None,  # OK / NO_FRAME / NO_DAY / ERROR / NOT_CONFIGURED
     "last_health_day": None,     # 最后一次盘前健康检查已执行的交易日
     "last_error": None,
 }
@@ -701,6 +702,24 @@ def _run_premarket_healthcheck(day: date):
     _write_state()
 
 
+def _p08_close_result_status(returncode: int, output: str) -> str:
+    """Classify the explicit P08 close payload without treating no-frame as OK."""
+    payloads = []
+    for line in (output or "").splitlines():
+        try:
+            value = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict) and value.get("status"):
+            payloads.append(str(value["status"]))
+    if payloads:
+        status = payloads[-1]
+        if status in {"NO_FRAME", "NO_DAY", "OK"}:
+            return status if status != "OK" or returncode == 0 else "ERROR"
+        return status
+    return "OK" if returncode == 0 else "ERROR"
+
+
 def _run_p08_close_summary(day: date):
     """P08 模拟盘收盘汇总: 读取 P08 落盘帧聚合出每日回执.
     独立于本守护项目, 依赖 research_trader/.venv-vnpy 的 python 运行
@@ -708,6 +727,9 @@ def _run_p08_close_summary(day: date):
     tag = "P08收盘汇总"
     if not os.path.exists(P08_CLOSE):
         _log(f"{day} {tag} 脚本不存在({P08_CLOSE}), 跳过", "p08")
+        _state["last_p08_close_day"] = day.strftime("%Y-%m-%d")
+        _state["last_p08_close_status"] = "NOT_CONFIGURED"
+        _write_state()
         return
     _log(f"{day} {tag} daily_close.py")
     try:
@@ -722,14 +744,20 @@ def _run_p08_close_summary(day: date):
             p.kill()
             p.wait(timeout=30)
             _log(f"{day} {tag} 超时(>600s), 已终止")
+            _state["last_p08_close_day"] = day.strftime("%Y-%m-%d")
+            _state["last_p08_close_status"] = "TIMEOUT"
+            _write_state()
             return
         for ln in out.splitlines():
             if ln.strip():
                 _log(ln, "p08")
-        _log(f"{day} {tag} 完成 exit={p.returncode}")
+        status = _p08_close_result_status(p.returncode, out)
+        _log(f"{day} {tag} 完成 exit={p.returncode} status={status}")
     except Exception as e:
         _log(f"{day} {tag} 异常: {e}", "p08")
+        status = "ERROR"
     _state["last_p08_close_day"] = day.strftime("%Y-%m-%d")
+    _state["last_p08_close_status"] = status
     _write_state()
 
 
@@ -904,7 +932,8 @@ def _status():
         print(f"  引擎pid    : {st.get('engine_pid')} "
               f"({'运行中' if _proc_alive(st.get('engine_pid')) else '已停止'})")
         print(f"  最后收盘日  : {st.get('last_close_day')}")
-        print(f"  P08收盘汇总 : {st.get('last_p08_close_day') or '未执行'}")
+        print(f"  P08收盘汇总 : {st.get('last_p08_close_day') or '未执行'} "
+              f"[{st.get('last_p08_close_status') or 'UNKNOWN'}]")
         print(f"  盘前健康检查: {st.get('last_health_day') or '未执行'}")
         print(f"  最后错误    : {st.get('last_error')}")
     except Exception as e:

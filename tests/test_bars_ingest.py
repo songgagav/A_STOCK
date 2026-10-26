@@ -484,6 +484,13 @@ class TestRealDataWritePath:
     @staticmethod
     @pytest.fixture(scope="class")
     def bs_frames():
+        if os.environ.get("RUN_NETWORK_TESTS", "0").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            pytest.skip(
+                "真实 Baostock 测试默认禁用；设置 RUN_NETWORK_TESTS=1 后显式运行，"
+                "避免外部数据源无超时阻塞全量回归"
+            )
         try:
             import baostock_adapter as BA
         except Exception as e:  # noqa: BLE001

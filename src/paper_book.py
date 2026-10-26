@@ -692,6 +692,11 @@ class PaperBook:
                 str(d): list(items)
                 for d, items in state["trades_history"].items()
             }
+        # 盘中重启/收盘汇总会重新实例化 PaperBook; 当前日成交已经持久化在
+        # trades_history 中，必须重建当日视图，否则 live_state 与 daily_summary
+        # 会出现“有成交/零成交”的分叉。
+        self.trades_today = list(self.trades_history.get(self.trade_date, []))
+        self.today_trades = len(self.trades_today)
         # 旧存档缺费用字段: 持仓/现金恢复完成后再补算, 使归因恒等式成立
         if getattr(self, "_legacy_fee_backfill", False):
             self._backfill_fees_from_history(state)
@@ -817,6 +822,7 @@ class PriceFeed:
         self.quotes = {}     # canon -> {price, limit_up, limit_down, volume, suspended}
         self._ts = 0.0
         self._last_error = None
+        self._fetch_attempts = []  # 最近一次行情刷新各来源的可审计尝试结果
         self._total_fetch = 0
         self.positions = {}  # 由外部 set_positions 注入, 用于构建 watchlist
         self._snapshot_targets: set[str] = set()
@@ -897,6 +903,7 @@ class PriceFeed:
         """
         import akshare as ak
         out: dict = {}
+        attempts = []
 
         # 静默 akshare 内部的 tqdm 进度条
         try:
@@ -912,7 +919,13 @@ class PriceFeed:
             if watch:
                 try:
                     codes_sina = [self._canon_to_sina(c) for c in watch if c]
-                    out.update(self._fetch_sina_spot(codes_sina))
+                    sina_out = self._fetch_sina_spot(codes_sina)
+                    if sina_out:
+                        attempts.append({"source": "sina_spot", "status": "ok",
+                                         "count": len(sina_out)})
+                    else:
+                        attempts.append({"source": "sina_spot", "status": "empty"})
+                    out.update(sina_out)
                     if out:
                         self._last_error = None
                         fallback_close = self._fetch_from_duckdb(symbols=list(out))
@@ -923,6 +936,11 @@ class PriceFeed:
                                 out[canon]["limit_up"], out[canon]["limit_down"] = \
                                     _limit_prices(canon, last)
                 except Exception as e:
+                    attempts.append({
+                        "source": "sina_spot",
+                        "status": "error",
+                        "reason": f"{type(e).__name__}: {str(e)[:120]}",
+                    })
                     self._last_error = f"sina spot: {type(e).__name__}: {str(e)[:80]}"
 
             # 2) 全 A 备选 - 仅在新浪空时
@@ -930,19 +948,54 @@ class PriceFeed:
                 df = None
                 try:
                     df = ak.stock_zh_a_spot_em()
-                except Exception:
+                except Exception as e:
+                    attempts.append({
+                        "source": "akshare_spot",
+                        "status": "error",
+                        "reason": f"{type(e).__name__}: {str(e)[:120]}",
+                    })
                     df = None
                 if df is not None and not getattr(df, "empty", True):
                     out = self._ak_to_dict(df)
+                    attempts.append({"source": "akshare_spot", "status": "ok",
+                                     "count": len(out)})
+                elif not attempts or attempts[-1].get("source") != "akshare_spot":
+                    attempts.append({"source": "akshare_spot", "status": "empty"})
 
             # 3) DuckDB 兜底
             if watch:
                 missing = [c for c in watch if c not in out]
                 if missing:
                     fb = self._fetch_from_duckdb(symbols=missing)
+                    source_counts = {}
+                    for q in fb.values():
+                        source = q.get("price_source") or q.get("fallback_source") or "reference_price"
+                        source_counts[source] = source_counts.get(source, 0) + 1
+                    if source_counts:
+                        for source, count in sorted(source_counts.items()):
+                            attempts.append({"source": source, "status": "ok", "count": count})
+                    else:
+                        attempts.append({"source": "reference_price", "status": "empty"})
                     for c, q in fb.items():
                         if c not in out:
                             out[c] = q
+            self._fetch_attempts = attempts
+            live_sources = {
+                str(q.get("price_source") or "")
+                for q in out.values()
+                if not q.get("fallback")
+            }
+            if out and not live_sources:
+                self._last_error = "live_source_unavailable; fallback=" + ",".join(
+                    sorted({str(q.get("price_source") or q.get("fallback_source") or "reference_price")
+                            for q in out.values()})
+                )
+            elif out:
+                self._last_error = None
+            elif attempts:
+                self._last_error = "spot_empty; attempts=" + ",".join(
+                    f"{item['source']}:{item['status']}" for item in attempts
+                )
             return out
 
         # ---- fetch_all=True ----
@@ -1201,7 +1254,6 @@ class PriceFeed:
                 self.quotes = snap
                 self._ts = now
                 self._total_fetch += 1
-                self._last_error = None
             # 拉取失败/超时: 保留旧快照, 不刷新时间戳 -> 下一次 tick 会重试
         quoted = {c: self.quotes.get(c) for c in symbols}
         return {c: q["price"] for c, q in quoted.items() if q and q.get("price", 0) > 0}
@@ -1219,7 +1271,6 @@ class PriceFeed:
                 fut = ex.submit(self._fetch_spot, fetch_all)
                 snap = fut.result(timeout=SPOT_TIMEOUT)
             if snap:
-                self._last_error = None
                 return snap
             self._last_error = "spot empty"
         except concurrent.futures.TimeoutError:
@@ -1237,6 +1288,11 @@ class PriceFeed:
     @property
     def last_error(self) -> str:
         return self._last_error or ""
+
+    @property
+    def fetch_attempts(self) -> list:
+        """最近一次行情刷新来源尝试; 返回副本避免调用方改写运行时证据。"""
+        return [dict(item) for item in self._fetch_attempts]
 
     @property
     def total_fetch(self) -> int:

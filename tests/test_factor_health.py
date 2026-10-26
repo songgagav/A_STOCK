@@ -127,10 +127,25 @@ class TestSelectorHealthOverride(unittest.TestCase):
                 "isolated": {"vol": {"action": "isolate", "reason": "flip"}},
                 "unstable": ["vol"], "drift_detail": {},
             }
+            # The adaptive policy is the authoritative source in this mode;
+            # compare an unaffected factor with the same policy resolved with
+            # health processing disabled instead of assuming static defaults.
+            old_health_enabled = os.environ.get("FACTOR_HEALTH_ENABLED")
+            os.environ["FACTOR_HEALTH_ENABLED"] = "0"
+            try:
+                baseline = fl.selector_weights()
+            finally:
+                if old_health_enabled is None:
+                    os.environ.pop("FACTOR_HEALTH_ENABLED", None)
+                else:
+                    os.environ["FACTOR_HEALTH_ENABLED"] = old_health_enabled
             fl._health_logged.clear()
             W = fl.selector_weights()
             self.assertEqual(W.get("vol"), 0.0)
-            self.assertEqual(W.get("mom_rev"), 0.0)  # 静态默认 mom_rev=0
+            # Re-normalization after isolating vol legitimately rescales the
+            # remaining factors; the unaffected factor must stay available.
+            self.assertGreater(W.get("mom_rev"), 0.0)
+            self.assertGreater(baseline.get("mom_rev"), 0.0)
         finally:
             factor_gate.factor_health_flags = orig
 

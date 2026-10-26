@@ -27,7 +27,7 @@ import datetime
 import numpy as np
 import pandas as pd
 
-from config import DUCKDB_PATH, DATA_DIR
+from config import DATA_DIR
 
 if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,30 +45,13 @@ ALPHA_FACTORS = {"vol": "vol", "mom_rev": "mom_20"}
 
 def _latest_settled_day():
     """daily_bars 最新交易日(用于 ic_h20 需要未来20日的收益, 实际可用样本会更早)。"""
-    import duckdb
-    con = duckdb.connect(DUCKDB_PATH, read_only=True)
-    try:
-        row = con.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-        return row[0] if row and row[0] else None
-    finally:
-        con.close()
+    return ic_backtest.latest_daily_bar_date()
 
 
 def _window_start(latest, days=WINDOW_DAYS):
     """增量区间的起始日: 往前数 days 个(去重)交易日。缺 GROUP BY 时直接 MIN 会被
     同一日期的高频行淹没, 故子查询先 GROUP BY 成"每交易日一行"再取倒数第 days 个。"""
-    import duckdb
-    con = duckdb.connect(DUCKDB_PATH, read_only=True)
-    try:
-        rows = con.execute("""
-            SELECT MIN(date) FROM (
-                SELECT date FROM daily_bars WHERE change_pct IS NOT NULL
-                 AND date <= ? GROUP BY date ORDER BY date DESC LIMIT ?
-            )
-        """, [latest, days]).fetchone()
-    finally:
-        con.close()
-    return rows[0] if rows and rows[0] else None
+    return ic_backtest.window_start(latest, days)
 
 
 def _read_curve(factor):

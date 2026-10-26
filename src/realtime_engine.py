@@ -2066,6 +2066,7 @@ class RealtimeEngine:
             "price_sources": self.price_sources,
             "price_update_mode": "retained" if retained else "fetched",
             "feed_error": self.feed.last_error or "",
+            "feed_attempts": list(getattr(self.feed, "fetch_attempts", []) or []),
             # updated 是状态写入时间；data_ts 只代表实际 spot 抓取时间。
             "data_ts": (
                 datetime.fromtimestamp(self.feed._ts).strftime("%Y-%m-%d %H:%M:%S")
