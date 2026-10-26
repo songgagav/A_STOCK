@@ -37,9 +37,9 @@ function Step([string]$Message) {
   Write-Host $line
 }
 
-function Run([string]$Exe, [string[]]$Args) {
-  Step ("执行: {0} {1}" -f (Split-Path $Exe -Leaf), ($Args -join ' '))
-  $output = & $Exe @Args 2>&1 | Out-String
+function Run([string]$Exe, [string[]]$ArgList) {
+  Step ("执行: {0} {1}" -f (Split-Path $Exe -Leaf), ($ArgList -join ' '))
+  $output = & $Exe @ArgList 2>&1 | Out-String
   $code = $LASTEXITCODE
   if ($output.Trim()) { Step ("输出: " + (($output.Trim() -replace "`r?`n", ' | ') -replace "`0", '')) }
   Step ("退出码: {0}" -f $code)

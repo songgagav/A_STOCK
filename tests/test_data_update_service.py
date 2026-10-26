@@ -48,3 +48,11 @@ def test_daemon_daily_stage_uses_primary_first_completion_orchestration():
     assert "_primary_daily_sync" in src
     assert "_run_backfill_subprocess" in src
     assert "scripts/backfill_daily.py" not in src
+
+
+def test_installer_run_wrapper_does_not_shadow_powershell_automatic_args():
+    src = _source()
+    assert "[string[]]$ArgList" in src
+    assert "& $Exe @ArgList" in src
+    assert "[string[]]$Args" not in src
+    assert "& $Exe @Args" not in src
