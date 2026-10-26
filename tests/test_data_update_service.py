@@ -1,0 +1,50 @@
+"""AStockDataUpdate Windows service contract tests."""
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "ops" / "install_data_update_service.ps1"
+
+
+def _source() -> str:
+    assert SCRIPT.is_file(), "数据更新服务安装脚本必须存在"
+    return SCRIPT.read_text(encoding="utf-8-sig")
+
+
+def test_service_uses_dedicated_data_update_entrypoint_and_venv310():
+    src = _source()
+    assert "AStockDataUpdate" in src
+    assert ".venv$Interpreter\\Scripts\\python.exe" in src
+    assert "src\\data_update_daemon.py" in src
+    assert "daemon.py" not in src.replace("data_update_daemon.py", "")
+    assert "run_daily.py" not in src
+
+
+def test_service_persists_explicit_environment_and_logs():
+    src = _source()
+    assert "STOCKDB_ROOT=$StockdbRoot" in src
+    assert "PYTHONIOENCODING=utf-8" in src
+    assert "PYTHONUTF8=1" in src
+    assert "data_update_service.out.log" in src
+    assert "data_update_service.err.log" in src
+    assert "AppDirectory" in src
+    assert "SERVICE_AUTO_START" in src
+
+
+def test_service_keeps_nssm_hash_and_unsigned_acceptance_gate():
+    src = _source()
+    assert "Get-FileHash" in src
+    assert "NSSM_ZIP_SHA256" in src
+    assert "NSSM_EXE_SHA256" in src
+    assert "IAcceptUnsignedNssm" in src
+    assert "Authenticode" in src
+
+
+def test_daemon_daily_stage_uses_primary_first_completion_orchestration():
+    daemon = ROOT / "src" / "data_update_daemon.py"
+    src = daemon.read_text(encoding="utf-8")
+    assert "run_daily_completion(" in src
+    assert "_primary_daily_sync" in src
+    assert "_run_backfill_subprocess" in src
+    assert "scripts/backfill_daily.py" not in src
