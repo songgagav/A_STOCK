@@ -105,7 +105,7 @@ $pairs = @(
   @('DisplayName', $DisplayName),
   @('Description', 'A股日线数据自动补全: StockDB主链 + 双缺口Baostock回补'),
   @('Start', 'SERVICE_AUTO_START'),
-  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1'),
+  @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1', 'DATA_UPDATE_BACKFILL_TIMEOUT_S=900'),
   @('AppStdout', (Join-Path $LogDir 'data_update_service.out.log')),
   @('AppStderr', (Join-Path $LogDir 'data_update_service.err.log')),
   @('AppRotateFiles', '1'),

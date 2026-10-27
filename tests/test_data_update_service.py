@@ -30,6 +30,7 @@ def test_service_persists_explicit_environment_and_logs():
     assert "data_update_service.err.log" in src
     assert "AppDirectory" in src
     assert "SERVICE_AUTO_START" in src
+    assert "DATA_UPDATE_BACKFILL_TIMEOUT_S=900" in src
 
 
 def test_service_keeps_nssm_hash_and_unsigned_acceptance_gate():

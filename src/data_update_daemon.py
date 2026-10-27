@@ -49,6 +49,7 @@ T_MARGIN = 17 * 60 + 20      # 两融 (SSE 当日可见; 深/京 T+1 由次日�
 T_CLOSE_HINT = 19 * 60 + 10
 # 阶段失败后的重试节流(秒)
 FAIL_THROTTLE_S = int(os.environ.get("DATA_UPDATE_FAIL_THROTTLE_S", "1800"))
+BACKFILL_TIMEOUT_S = int(os.environ.get("DATA_UPDATE_BACKFILL_TIMEOUT_S", "900"))
 
 
 def _log(msg: str) -> None:
@@ -186,7 +187,8 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
     try:
         proc = subprocess.run(
             cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", timeout=5400,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=BACKFILL_TIMEOUT_S,
         )
         result = {
             "ok": proc.returncode == 0,
@@ -195,6 +197,8 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
             "missing_days": days,
             "out_fp": out_fp,
             "written": [],
+            "timeout_s": BACKFILL_TIMEOUT_S,
+            "output_tail": (proc.stdout or "")[-2000:],
         }
         try:
             with open(out_fp, encoding="utf-8-sig") as f:
@@ -205,9 +209,21 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
             result["provenance_fp"] = full.get("provenance_fp")
         except Exception as exc:  # noqa: BLE001
             result["read_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
-        if proc.returncode != 0:
-            result["tail"] = (proc.stdout or "")[-400:]
         return result
+    except subprocess.TimeoutExpired as exc:
+        captured = exc.stdout or exc.output or ""
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "error": (f"TimeoutExpired: Baostock 回补超过 {BACKFILL_TIMEOUT_S}s"),
+            "interpreter": exe,
+            "missing_days": days,
+            "out_fp": out_fp,
+            "written": [],
+            "timeout_s": BACKFILL_TIMEOUT_S,
+            "output_tail": str(captured)[-2000:],
+        }
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -216,6 +232,8 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
             "missing_days": days,
             "out_fp": out_fp,
             "written": [],
+            "timeout_s": BACKFILL_TIMEOUT_S,
+            "output_tail": "",
         }
 
 
@@ -308,6 +326,8 @@ def run_round(force: bool = False) -> dict:
     # without changing the execution result or any production state.
     st["last_round_at"] = datetime.now().isoformat()
     st["last_round"] = json.loads(json.dumps(out, ensure_ascii=False, default=str))
+    if "daily" in st["last_round"]:
+        st["daily_last"] = st["last_round"]["daily"]
     _save(st)
     return out
 
@@ -326,7 +346,10 @@ def main() -> None:
             rep = run_round()
             for k, v in rep.items():
                 if isinstance(v, dict) and "ok" in v:
-                    tail = (v.get("out") or v.get("err") or "")[:90]
+                    if k == "daily":
+                        tail = json.dumps(v, ensure_ascii=False, default=str)[-1200:]
+                    else:
+                        tail = (v.get("out") or v.get("err") or "")[:90]
                     _log(f"{k}: ok={v['ok']} ({tail})")
         except Exception as e:  # noqa: BLE001
             _log(f"轮询异常: {e}")

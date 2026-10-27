@@ -1,6 +1,8 @@
 """每日行情自动补全的先行契约测试。"""
 
 import os
+import json
+import subprocess
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -247,3 +249,54 @@ def test_run_round_persists_primary_fallback_receipt(tmp_path, monkeypatch):
     assert '"last_round"' in saved
     assert '"daily"' in saved
     assert '"20261026"' in saved
+
+
+def test_backfill_timeout_preserves_subprocess_output_for_diagnosis(monkeypatch):
+    monkeypatch.setattr(D, "_backfill_interpreter", lambda: "python.exe")
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            args[0], kwargs["timeout"], output="baostock login blocked")
+
+    monkeypatch.setattr(D.subprocess, "run", timeout)
+
+    result = D._run_backfill_subprocess(["20261026"])
+
+    assert result["ok"] is False
+    assert "TimeoutExpired" in result["error"]
+    assert "baostock login blocked" in result["output_tail"]
+    assert result["timeout_s"] == D.BACKFILL_TIMEOUT_S
+
+
+def test_daily_failure_receipt_survives_later_round_without_daily_stage(
+    tmp_path, monkeypatch
+):
+    mark = tmp_path / "data_update_last.json"
+    monkeypatch.setattr(D, "MARK", str(mark))
+    monkeypatch.setattr(D, "_now_min", lambda: D.T_CLOSE_HINT)
+    monkeypatch.setattr(D, "_primary_daily_sync", lambda: _primary_result())
+    monkeypatch.setattr(
+        D,
+        "_run_backfill_subprocess",
+        lambda days: {"ok": False, "written": [], "error": "login timeout"},
+    )
+    monkeypatch.setattr(D, "_valu_stale_day", lambda: None)
+    monkeypatch.setattr(
+        D,
+        "_run_once",
+        lambda stage, args, day=None: {
+            "ok": True,
+            "stage": stage,
+            "out": '{"missing_legs": {}}',
+        },
+    )
+
+    first = D.run_round()
+    first_saved = json.loads(mark.read_text(encoding="utf-8"))
+    assert first["daily"]["ok"] is False
+    assert first_saved["daily_last"]["error"]
+
+    second = D.run_round()
+    second_saved = json.loads(mark.read_text(encoding="utf-8"))
+    assert "daily" not in second
+    assert second_saved["daily_last"] == first_saved["daily_last"]
