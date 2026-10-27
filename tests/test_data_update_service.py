@@ -33,6 +33,13 @@ def test_service_persists_explicit_environment_and_logs():
     assert "DATA_UPDATE_BACKFILL_TIMEOUT_S=900" in src
 
 
+def test_service_defaults_to_manual_start_until_explicitly_enabled():
+    src = _source()
+    assert "[switch]$AutoStart" in src
+    assert "SERVICE_DEMAND_START" in src
+    assert "$startMode" in src
+
+
 def test_service_keeps_nssm_hash_and_unsigned_acceptance_gate():
     src = _source()
     assert "Get-FileHash" in src

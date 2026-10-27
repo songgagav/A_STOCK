@@ -16,6 +16,7 @@ param(
   [string]$Interpreter = '310',
   [switch]$Uninstall,
   [switch]$Start,
+  [switch]$AutoStart,
   [switch]$IAcceptUnsignedNssm
 )
 
@@ -50,7 +51,7 @@ function Run([string]$Exe, [string[]]$ArgList) {
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole(
   [Security.Principal.WindowsBuiltInRole]::Administrator)
-Step "用户=$($identity.Name) 管理员=$isAdmin Service=$ServiceName Uninstall=$Uninstall Start=$Start"
+Step "用户=$($identity.Name) 管理员=$isAdmin Service=$ServiceName Uninstall=$Uninstall Start=$Start AutoStart=$AutoStart"
 if (-not $isAdmin) { throw '需要管理员权限' }
 
 if (-not (Test-Path $NssmExe)) {
@@ -100,12 +101,13 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
   Start-Sleep -Seconds 2
 }
 
+$startMode = if ($AutoStart) { 'SERVICE_AUTO_START' } else { 'SERVICE_DEMAND_START' }
 Run $NssmExe @('install', $ServiceName, $py, $entry) | Out-Null
 $pairs = @(
   @('AppDirectory', $RepoRoot),
   @('DisplayName', $DisplayName),
   @('Description', 'A股日线数据自动补全: StockDB主链 + 双缺口Baostock回补'),
-  @('Start', 'SERVICE_AUTO_START'),
+  @('Start', $startMode),
   @('AppEnvironmentExtra', "STOCKDB_ROOT=$StockdbRoot", 'PYTHONIOENCODING=utf-8', 'PYTHONUTF8=1', 'DATA_UPDATE_BACKFILL_TIMEOUT_S=900'),
   @('AppStdout', (Join-Path $LogDir 'data_update_service.out.log')),
   @('AppStderr', (Join-Path $LogDir 'data_update_service.err.log')),
