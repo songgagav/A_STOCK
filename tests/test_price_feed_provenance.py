@@ -1,10 +1,13 @@
-import akshare
+import sys
+from types import SimpleNamespace
 
 from paper_book import PriceFeed
 
 
 def test_reference_fallback_keeps_source_attempt_provenance(monkeypatch):
     feed = PriceFeed()
+    akshare = SimpleNamespace(stock_zh_a_spot_em=None)
+    monkeypatch.setitem(sys.modules, "akshare", akshare)
     monkeypatch.setattr(feed, "watchlist_codes", lambda: ["600000.SH"])
     monkeypatch.setattr(feed, "_fetch_sina_spot", lambda codes: {})
     monkeypatch.setattr(

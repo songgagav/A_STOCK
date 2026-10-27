@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   用 NSSM 把每日行情数据自动补全守护注册为 Windows 服务。
 
