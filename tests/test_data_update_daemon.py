@@ -2,6 +2,7 @@
 
 import os
 import json
+import pytest
 import subprocess
 import sys
 
@@ -11,6 +12,26 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import data_update_daemon as D  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_completion_inputs(monkeypatch):
+    """Keep contract tests independent of ignored runtime data files.
+
+    The production planner must refuse to invent dates when the official
+    calendar is unavailable.  These tests exercise the positive path, so they
+    inject the small calendar explicitly instead of relying on a developer's
+    local ``data/trade_calendar.json``.  The round tests likewise explicitly
+    enable the write-capable fallback they are testing.
+    """
+    import trading_calendar
+
+    monkeypatch.setattr(
+        trading_calendar,
+        "_calendar_days",
+        lambda: {"20261023", "20261026"},
+    )
+    monkeypatch.setenv("BACKFILL_ENABLED", "1")
 
 
 def _plan(*, engine_day, h5i_watermark, expected_day, enabled=True):
