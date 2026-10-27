@@ -43,6 +43,7 @@ function Run([string]$Exe, [string[]]$ArgList) {
   $code = $LASTEXITCODE
   if ($output.Trim()) { Step ("输出: " + (($output.Trim() -replace "`r?`n", ' | ') -replace "`0", '')) }
   Step ("退出码: {0}" -f $code)
+  if ($code -ne 0) { throw "NSSM command failed (exit code $code): $Exe" }
   return $code
 }
 

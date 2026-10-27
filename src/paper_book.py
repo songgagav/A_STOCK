@@ -106,6 +106,22 @@ class PaperBook:
         # 兼容旧字段
         self.trade_log.append(trade)
 
+    def set_trade_date(self, day: str) -> None:
+        """Move the intraday ledger view to ``day`` without touching history.
+
+        A restored book may still carry the previous session's date. Runtime
+        startup changes the active day before the first tick, so the derived
+        ``trades_today`` view must be rebuilt at that boundary rather than
+        retaining the prior session's trades.
+        """
+        next_day = str(day or "").strip()
+        if not next_day:
+            raise ValueError("trade date must be non-empty")
+        self.trade_date = next_day
+        self.day = next_day
+        self.trades_today = list(self.trades_history.get(next_day, []))
+        self.today_trades = len(self.trades_today)
+
     @staticmethod
     def _position_acquisition_basis(position: dict) -> dict:
         """只有新账本记录的取得依据可用；旧聚合仓位不能推断完整历史。"""
@@ -901,6 +917,9 @@ class PriceFeed:
           2) akshare stock_zh_a_spot_em 全 A (备选)
           3) DuckDB 全 A 最近收盘价兜底
         """
+        # Clear the previous refresh receipt before any optional source import
+        # can fail; a failed refresh must never expose an older attempt list.
+        self._fetch_attempts = []
         import akshare as ak
         out: dict = {}
         attempts = []
@@ -1266,6 +1285,23 @@ class PriceFeed:
         东财接口无内置超时, 极端情况下会无限阻塞 -> 用线程 + 超时兜底.
         """
         import concurrent.futures
+
+        def append_fallback_attempt(fallback: dict) -> None:
+            counts = {}
+            for quote in fallback.values():
+                source = (quote.get("price_source") or
+                          quote.get("fallback_source") or "reference_price")
+                counts[source] = counts.get(source, 0) + 1
+            if counts:
+                self._fetch_attempts.extend(
+                    {"source": source, "status": "fallback", "count": count}
+                    for source, count in sorted(counts.items())
+                )
+            else:
+                self._fetch_attempts.append(
+                    {"source": "reference_price", "status": "empty"}
+                )
+
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(self._fetch_spot, fetch_all)
@@ -1275,14 +1311,23 @@ class PriceFeed:
             self._last_error = "spot empty"
         except concurrent.futures.TimeoutError:
             self._last_error = f"spot fetch timeout>{SPOT_TIMEOUT}s"
+            self._fetch_attempts = [{
+                "source": "spot_fetch", "status": "timeout",
+                "reason": self._last_error,
+            }]
         except Exception as e:
             self._last_error = str(e)
+            self._fetch_attempts = [{
+                "source": "spot_fetch", "status": "error",
+                "reason": f"{type(e).__name__}: {str(e)[:120]}",
+            }]
         # tick fallback 仅覆盖既有 watchlist；全市场路径保留原 DuckDB 输入。
         fallback = self._fetch_from_duckdb(
             symbols=None if fetch_all else sorted(self.watchlist_codes()),
         )
         if fallback:
             self._last_error = (self._last_error or "") + " (db fallback)"
+        append_fallback_attempt(fallback)
         return fallback
 
     @property

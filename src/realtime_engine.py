@@ -728,8 +728,7 @@ class RealtimeEngine:
         self.push_only_in_session = intraday_only
         self.pb = PaperBook()
         self.pb.restore(load_state())           # 延续历史现金/持仓
-        self.pb.trade_date = _today().strftime("%Y-%m-%d")
-        self.pb.day = self.pb.trade_date
+        self.pb.set_trade_date(_today().strftime("%Y-%m-%d"))
         self.targets, self.sel, self.sel_day = load_targets(self.pb.trade_date)
         _weight_status = (self.sel or {}).get("selector_weight_policy") or {
             "mode": "invalid", "status": "blocked",

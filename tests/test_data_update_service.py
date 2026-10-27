@@ -57,3 +57,9 @@ def test_installer_run_wrapper_does_not_shadow_powershell_automatic_args():
     assert "& $Exe @ArgList" in src
     assert "[string[]]$Args" not in src
     assert "& $Exe @Args" not in src
+
+
+def test_installer_aborts_on_nssm_failure_instead_of_logging_success():
+    src = _source()
+    assert "if ($code -ne 0)" in src
+    assert "throw \"NSSM command failed" in src
