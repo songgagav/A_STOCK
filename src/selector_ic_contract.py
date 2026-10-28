@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import date, datetime, time
 import math
@@ -68,8 +69,73 @@ def _ordered_sessions(sessions: Sequence[str | date]) -> list[str]:
     return sorted(normalized)
 
 
-def previous_session(day: str | date, sessions: Sequence[str | date]) -> str:
+def _validate_horizon(horizon: int) -> None:
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
+        raise ValueError("horizon must be a positive integer")
+
+
+class SessionCalendar:
+    """Normalized session calendar with indexed, reusable horizon paths."""
+
+    def __init__(self, sessions: Sequence[str | date]) -> None:
+        self._initialize(_ordered_sessions(sessions))
+
+    @classmethod
+    def _from_normalized(cls, sessions: Sequence[str]) -> SessionCalendar:
+        """Build from ISO days already normalized by a validated caller."""
+        normalized = list(sessions)
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("calendar sessions must be unique")
+        instance = cls.__new__(cls)
+        instance._initialize(sorted(normalized))
+        return instance
+
+    def _initialize(self, ordered_sessions: Sequence[str]) -> None:
+        self._sessions = tuple(ordered_sessions)
+        self._indices = {session: index for index, session in enumerate(self._sessions)}
+        self._horizon_paths: dict[tuple[str, int], tuple[str, ...] | None] = {}
+
+    @property
+    def sessions(self) -> tuple[str, ...]:
+        return self._sessions
+
+    def index_of(self, day: str | date) -> int:
+        signal_day = _iso_day(day)
+        try:
+            return self._indices[signal_day]
+        except KeyError as exc:
+            raise ValueError(f"session day is not a calendar session: {signal_day}") from exc
+
+    def previous_session(self, day: str | date) -> str:
+        signal_day = _iso_day(day)
+        previous_index = bisect_left(self._sessions, signal_day) - 1
+        if previous_index < 0:
+            raise ValueError(f"no prior session for {signal_day}")
+        return self._sessions[previous_index]
+
+    def horizon_path(self, day: str | date, horizon: int) -> tuple[str, ...] | None:
+        _validate_horizon(horizon)
+        signal_day = _iso_day(day)
+        normalized_horizon = int(horizon)
+        key = (signal_day, normalized_horizon)
+        if key in self._horizon_paths:
+            return self._horizon_paths[key]
+
+        start = self._indices.get(signal_day)
+        if start is None:
+            raise ValueError(f"signal day is not a calendar session: {signal_day}")
+        end = start + normalized_horizon
+        path = self._sessions[start:end] if end <= len(self._sessions) else None
+        self._horizon_paths[key] = path
+        return path
+
+
+def previous_session(
+    day: str | date, sessions: Sequence[str | date] | SessionCalendar
+) -> str:
     """Return the latest calendar session strictly before ``day``."""
+    if isinstance(sessions, SessionCalendar):
+        return sessions.previous_session(day)
     signal_day = _iso_day(day)
     prior = [session for session in _ordered_sessions(sessions) if session < signal_day]
     if not prior:
@@ -78,20 +144,13 @@ def previous_session(day: str | date, sessions: Sequence[str | date]) -> str:
 
 
 def horizon_sessions(day: str | date, horizon: int,
-                     sessions: Sequence[str | date]) -> list[str] | None:
+                     sessions: Sequence[str | date] | SessionCalendar) -> list[str] | None:
     """Return [signal day, ..., exit day] or None until all sessions mature."""
-    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
-        raise ValueError("horizon must be a positive integer")
+    _validate_horizon(horizon)
     signal_day = _iso_day(day)
-    ordered = _ordered_sessions(sessions)
-    try:
-        start = ordered.index(signal_day)
-    except ValueError as exc:
-        raise ValueError(f"signal day is not a calendar session: {signal_day}") from exc
-    end = start + horizon
-    if end > len(ordered):
-        return None
-    return ordered[start:end]
+    calendar = sessions if isinstance(sessions, SessionCalendar) else SessionCalendar(sessions)
+    path = calendar.horizon_path(signal_day, horizon)
+    return list(path) if path is not None else None
 
 
 @dataclass(frozen=True)
@@ -244,10 +303,13 @@ def forward_return_for_symbol(
     symbol: str,
     day: str | date,
     horizon: int,
-    sessions: Sequence[str | date],
+    sessions: Sequence[str | date] | SessionCalendar,
 ) -> LabelResult:
     """Compute the diagnostic 09:25-open proxy return without shortening labels."""
-    path = horizon_sessions(day, horizon, sessions)
+    _validate_horizon(horizon)
+    signal_day = _iso_day(day)
+    calendar = sessions if isinstance(sessions, SessionCalendar) else SessionCalendar(sessions)
+    path = calendar.horizon_path(signal_day, horizon)
     if path is None:
         return LabelResult(None, "not_mature", "horizon_not_settled", None)
 
