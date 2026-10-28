@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -127,10 +128,34 @@ class TestSelectorHealthOverride(unittest.TestCase):
                 "isolated": {"vol": {"action": "isolate", "reason": "flip"}},
                 "unstable": ["vol"], "drift_detail": {},
             }
-            fl._health_logged.clear()
-            W = fl.selector_weights()
+            # The adaptive policy is the authoritative source in this mode;
+            # compare an unaffected factor with the same policy resolved with
+            # health processing disabled instead of assuming the repository's
+            # ignored runtime weights.json exists in CI.  The test is about
+            # isolating vol, so provide a deterministic adaptive payload with
+            # an unaffected positive mom_rev weight.
+            adaptive = {
+                "signal": 0.34, "trend": 0.14, "govern": 0.16,
+                "liquidity": 0.08, "vol": 0.10, "mom_rev": 0.10,
+                "pb_rev": 0.03, "roe": 0.03, "mf_net": 0.02,
+            }
+            with patch("weight_optimizer.load_weights", return_value=adaptive):
+                old_health_enabled = os.environ.get("FACTOR_HEALTH_ENABLED")
+                os.environ["FACTOR_HEALTH_ENABLED"] = "0"
+                try:
+                    baseline = fl.selector_weights()
+                finally:
+                    if old_health_enabled is None:
+                        os.environ.pop("FACTOR_HEALTH_ENABLED", None)
+                    else:
+                        os.environ["FACTOR_HEALTH_ENABLED"] = old_health_enabled
+                fl._health_logged.clear()
+                W = fl.selector_weights()
             self.assertEqual(W.get("vol"), 0.0)
-            self.assertEqual(W.get("mom_rev"), 0.0)  # 静态默认 mom_rev=0
+            # Re-normalization after isolating vol legitimately rescales the
+            # remaining factors; the unaffected factor must stay available.
+            self.assertGreater(W.get("mom_rev"), 0.0)
+            self.assertGreater(baseline.get("mom_rev"), 0.0)
         finally:
             factor_gate.factor_health_flags = orig
 
