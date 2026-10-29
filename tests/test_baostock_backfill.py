@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import os
 import sys
@@ -900,3 +901,19 @@ class TestBeijingIsExplicitNotSilent:
                                symbols_df=_Symbols(["600000"]), fetch_range=_empty)
         assert res["ok"] is False and res["error"], res
         assert res["written"] == []
+
+
+def test_cli_summary_is_safe_for_legacy_windows_console(tmp_path, monkeypatch):
+    sink = io.TextIOWrapper(io.BytesIO(), encoding="cp936")
+    monkeypatch.setattr(BF.sys, "stdout", sink)
+    monkeypatch.setattr(BF, "_HERE", str(tmp_path / "src" / "baostock_backfill.py"))
+    monkeypatch.setattr(BF, "backfill_days", lambda *args, **kwargs: {
+        "ok": True, "written": [], "note": "⇒", "bj_not_requested": [],
+    })
+    output = tmp_path / "结果⇒.json"
+
+    assert BF.main(["--days", "2026-10-26", "--out", str(output)]) == 0
+    sink.flush()
+
+    assert output.is_file()
+    assert b"\\u21d2" in sink.buffer.getvalue()

@@ -1,6 +1,7 @@
 """每日行情自动补全的先行契约测试。"""
 
 import os
+import io
 import json
 import pytest
 import subprocess
@@ -346,6 +347,45 @@ def test_failed_symbol_details_survive_failed_backfill_receipt(tmp_path, monkeyp
     assert result["ok"] is False
     assert result["written"] == []
     assert result["fetch_failed"] == {"601200": "request timed out"}
+
+
+def test_verified_result_file_survives_post_write_console_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "__file__", str(tmp_path / "src" / "data_update_daemon.py"))
+    monkeypatch.setattr(D, "_backfill_interpreter", lambda: "python.exe")
+
+    def wrote_then_console_failed(cmd, **kwargs):
+        assert kwargs["env"]["PYTHONIOENCODING"] == "utf-8"
+        assert kwargs["env"]["PYTHONUTF8"] == "1"
+        Path(cmd[-1]).write_text(json.dumps({
+            "ok": True,
+            "written": ["2026-10-26"],
+            "verify": {"ok": True, "h5i_advanced": True,
+                       "engine_unchanged": True},
+            "days": {"2026-10-26": {"status": "written"}},
+            "fetch_failed": {},
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="UnicodeEncodeError after result file was written")
+
+    monkeypatch.setattr(D.subprocess, "run", wrote_then_console_failed)
+    result = D._run_backfill_subprocess(["20261026"])
+
+    assert result["ok"] is True
+    assert result["exit"] == 1
+    assert result["written"] == ["2026-10-26"]
+    assert "nonzero" in result["process_warning"].lower()
+
+
+def test_once_summary_is_safe_for_legacy_windows_console(monkeypatch):
+    sink = io.TextIOWrapper(io.BytesIO(), encoding="cp936")
+    monkeypatch.setattr(D.sys, "stdout", sink)
+    monkeypatch.setattr(D.sys, "argv", ["data_update_daemon.py", "--once"])
+    monkeypatch.setattr(D, "run_round", lambda force=True: {"note": "⇒"})
+
+    D.main()
+    sink.flush()
+
+    assert b"\\u21d2" in sink.buffer.getvalue()
 
 
 def test_daily_failure_receipt_survives_later_round_without_daily_stage(

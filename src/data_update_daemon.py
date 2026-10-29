@@ -187,14 +187,19 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
     cmd = [exe, os.path.join(root, "src", "baostock_backfill.py"),
            "--days", *pretty, "--write", "--out", out_fp]
     try:
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
         proc = subprocess.run(
             cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
+            env=child_env,
             timeout=BACKFILL_TIMEOUT_S,
         )
         result = {
-            "ok": proc.returncode == 0,
+            "ok": False,
             "exit": proc.returncode,
+            "process_ok": proc.returncode == 0,
             "interpreter": exe,
             "missing_days": days,
             "out_fp": out_fp,
@@ -207,9 +212,26 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
                 full = json.load(f)
             result["written"] = full.get("written") or []
             result["verify"] = full.get("verify")
+            result["child_ok"] = full.get("ok")
             result["days"] = full.get("days")
             result["fetch_failed"] = full.get("fetch_failed")
             result["provenance_fp"] = full.get("provenance_fp")
+            requested = {day.replace("-", "") for day in days}
+            written = {str(day).replace("-", "")
+                       for day in result["written"]}
+            verified = (isinstance(result["verify"], dict)
+                        and result["verify"].get("ok") is True)
+            child_success = full.get("ok") is True
+            artifact_complete = requested.issubset(written) and verified
+            result["ok"] = artifact_complete and (
+                proc.returncode == 0 or child_success
+            ) and full.get("ok") is not False
+            if proc.returncode != 0:
+                result["process_warning"] = (
+                    "child exited nonzero after writing a verified success result"
+                    if result["ok"] else
+                    f"child exited nonzero and success evidence is incomplete (exit={proc.returncode})"
+                )
         except Exception as exc:  # noqa: BLE001
             result["read_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return result
@@ -341,7 +363,9 @@ def main() -> None:
     args = ap.parse_args()
     if args.once:
         rep = run_round(force=True)
-        print(json.dumps(rep, ensure_ascii=False, indent=2, default=str))
+        # `ensure_ascii` keeps one-shot output printable under legacy Windows
+        # console encodings even when result strings contain arrows or paths.
+        print(json.dumps(rep, ensure_ascii=True, indent=2, default=str))
         return
     _log(f"启动 (interval={INTERVAL_S}s) 窗口: 日线15:45 / 估值16:40 / 收盘由主daemon")
     while True:

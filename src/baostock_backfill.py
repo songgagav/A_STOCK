@@ -599,10 +599,10 @@ def main(argv=None) -> int:
         if os.path.isfile(p):
             symbols_df = pd.read_parquet(p)
     except Exception as e:  # noqa: BLE001
-        print(f"[backfill] symbols.parquet 读取失败(北交所将无法显式归类): {e}", flush=True)
+        print(f"[backfill] symbols.parquet 读取失败(北交所将无法显式归类): {ascii(str(e))}", flush=True)
 
     def _prog(d, info):
-        print(f"  {d}: {info.get('status')} {json.dumps({k: v for k, v in info.items() if k != 'guard'}, ensure_ascii=False)[:200]}", flush=True)
+        print(f"  {d}: {info.get('status')} {json.dumps({k: v for k, v in info.items() if k != 'guard'}, ensure_ascii=True)[:200]}", flush=True)
 
     res = backfill_days(a.days, write=a.write, symbols_df=symbols_df, progress=_prog)
     # [2026-09-25] **结果落盘成 JSON 文件**, 不只打到 stdout。
@@ -618,11 +618,13 @@ def main(argv=None) -> int:
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with open(fp, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
-        print(f"[backfill] 完整结果已写入 {fp}", flush=True)
+        print(f"[backfill] 完整结果已写入 {ascii(str(fp))}", flush=True)
     except Exception as e:  # noqa: BLE001
-        print(f"[backfill] 结果落盘失败(不影响判定): {type(e).__name__}: {e}", flush=True)
+        print(f"[backfill] 结果落盘失败(不影响判定): {type(e).__name__}: {ascii(str(e))}", flush=True)
     brief = {k: v for k, v in res.items() if k != "bj_not_requested"}
-    print(json.dumps(brief, ensure_ascii=False, indent=2)[:3000])
+    # The structured file above is UTF-8. Keep console output ASCII-safe so
+    # cp936 Windows shells cannot turn a successful write into exit code 1.
+    print(json.dumps(brief, ensure_ascii=True, indent=2)[:3000])
     if res.get("bj_not_requested"):
         print(f"\n北交所 {len(res['bj_not_requested'])} 只**不在此路覆盖**: Baostock 仅沪深 "
               f"(显式报出, 不静默少写; 完整清单见落盘 JSON)", flush=True)
