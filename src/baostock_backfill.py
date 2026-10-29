@@ -59,6 +59,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 SOURCE = "baostock"
+MAX_DELIST_STATUS_LOOKUPS = 50
 PROVENANCE_FP = os.path.join(os.path.dirname(_HERE), "data", "backfill_provenance.jsonl")
 
 
@@ -210,32 +211,40 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
                                   for s in missing})
     status_by_symbol = {}
     if missing_candidates:
-        market_by_symbol = {}
-        try:
-            if symbols_df is not None and "market" in getattr(symbols_df, "columns", []):
-                market_by_symbol = {
-                    str(symbol): str(market)
-                    for symbol, market in zip(symbols_df["symbol"], symbols_df["market"])
-                }
-        except Exception:  # noqa: BLE001
-            market_by_symbol = {}
-        lookup = basic_status_lookup or _BA._query_stock_basic_status
-        lookup_codes = [_BA.to_baostock_code(s, market_by_symbol.get(s))
-                        for s in missing_candidates]
-        try:
-            raw_statuses = lookup(lookup_codes) or {}
-            for code, evidence in raw_statuses.items():
-                if isinstance(evidence, dict):
-                    status_by_symbol[str(code).split(".")[-1]] = evidence
-        except Exception as e:  # noqa: BLE001
+        if len(missing_candidates) > MAX_DELIST_STATUS_LOOKUPS:
             out["delisting_status_lookup"] = {
-                "status": "error", "error": f"{type(e).__name__}: {str(e)[:160]}",
-                "symbols": missing_candidates,
+                "status": "skipped_too_many_candidates",
+                "count": len(missing_candidates),
+                "limit": MAX_DELIST_STATUS_LOOKUPS,
+                "sample": missing_candidates[:10],
             }
         else:
-            out["delisting_status_lookup"] = {
-                "status": "checked", "symbols": lookup_codes,
-            }
+            market_by_symbol = {}
+            try:
+                if symbols_df is not None and "market" in getattr(symbols_df, "columns", []):
+                    market_by_symbol = {
+                        str(symbol): str(market)
+                        for symbol, market in zip(symbols_df["symbol"], symbols_df["market"])
+                    }
+            except Exception:  # noqa: BLE001
+                market_by_symbol = {}
+            lookup = basic_status_lookup or _BA._query_stock_basic_status
+            lookup_codes = [_BA.to_baostock_code(s, market_by_symbol.get(s))
+                            for s in missing_candidates]
+            try:
+                raw_statuses = lookup(lookup_codes) or {}
+                for code, evidence in raw_statuses.items():
+                    if isinstance(evidence, dict):
+                        status_by_symbol[str(code).split(".")[-1]] = evidence
+            except Exception as e:  # noqa: BLE001
+                out["delisting_status_lookup"] = {
+                    "status": "error", "error": f"{type(e).__name__}: {str(e)[:160]}",
+                    "symbols": missing_candidates,
+                }
+            else:
+                out["delisting_status_lookup"] = {
+                    "status": "checked", "symbols": lookup_codes,
+                }
 
     _db = db
     for d in todo:

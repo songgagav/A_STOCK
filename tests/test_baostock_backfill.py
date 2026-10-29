@@ -286,6 +286,32 @@ class TestWholeDayRejection:
         assert result["days"]["2026-10-28"]["missing_symbols"] == ["301139"]
         assert result["days"]["2026-10-28"]["not_applicable_symbols"] == []
 
+    def test_large_missing_set_skips_per_symbol_status_queries(self):
+        days = ["2026-10-26", "2026-10-27", "2026-10-28"]
+        symbols = [f"6{i:05d}" for i in range(1200)]
+        missing = set(symbols[-51:])
+
+        def partial_last_day(codes, *, on_row=None, **kwargs):
+            for sym in codes:
+                present_days = days[:2] if sym in missing else days
+                on_row(sym, _frame([_rec(f"sh.{sym}", day) for day in present_days]))
+            return {"status": "appended", "requested": len(codes),
+                    "got": len(codes), "missing": 0, "failed": {},
+                    "not_requested": [], "limiter": {}}
+
+        def unexpected_lookup(codes):
+            pytest.fail("large missing set must not cause sequential status lookups")
+
+        result = BF.backfill_days(
+            days, write=False, symbols_df=_Symbols(symbols),
+            fetch_range=partial_last_day, basic_status_lookup=unexpected_lookup)
+
+        assert result["ok"] is False
+        assert result["delisting_status_lookup"]["status"] == "skipped_too_many_candidates"
+        assert result["delisting_status_lookup"]["count"] == 51
+        assert result["days"]["2026-10-28"]["status"] == "rejected_by_coverage"
+        assert result["days"]["2026-10-28"]["missing_symbols"] == sorted(missing)
+
     def test_partial_multi_day_write_does_not_report_overall_success(self, monkeypatch, tmp_path):
         days = ["2026-09-23", "2026-09-24"]
         syms = [f"6{i:05d}" for i in range(1200)]
