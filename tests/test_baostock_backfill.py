@@ -779,6 +779,28 @@ class TestDryRunWritesNothing:
         assert rec["day"] == "2026-09-23" and rec["source"] == "baostock"
         assert rec["rows"] > 900
 
+    def test_provenance_failure_does_not_report_overall_success(self, monkeypatch):
+        monkeypatch.setattr(BF, "_write_day", lambda day, frame, **kwargs: {
+            "rows": len(frame)})
+        monkeypatch.setattr(BF, "verify_two_things", lambda **kwargs: {"ok": True})
+
+        def failed_provenance(day, rows, ctx):
+            ctx.setdefault("provenance_errors", []).append({
+                "day": day, "_write_error": "OSError: disk full"})
+
+        monkeypatch.setattr(BF, "_append_provenance", failed_provenance)
+        symbols = [f"6{i:05d}" for i in range(1200)]
+
+        result = BF.backfill_days(
+            ["2026-09-23"], write=True, symbols_df=_Symbols(symbols),
+            fetch_range=_fake_fetch_range(len(symbols), ["2026-09-23"]))
+
+        assert result["written"] == ["2026-09-23"]
+        assert result["days"]["2026-09-23"]["verify"]["ok"] is True
+        assert result["days"]["2026-09-23"]["status"] == "provenance_failed"
+        assert result["days"]["2026-09-23"]["provenance_ok"] is False
+        assert result["ok"] is False
+
 
 class TestBackfillTriggerToWriteSimulation:
     """用本地假源重放“触发 -> 回填 -> 写入 -> 留痕”，不联网、不碰生产库。"""

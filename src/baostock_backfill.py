@@ -333,7 +333,16 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
                 info["write"] = _write_day(d, norm, db=_db)
                 info["status"] = "written"
                 out["written"].append(d)
+                provenance_errors_before = len(out.get("provenance_errors") or [])
                 _append_provenance(d, len(norm), out)
+                provenance_errors = out.get("provenance_errors") or []
+                day_provenance_errors = provenance_errors[provenance_errors_before:]
+                info["provenance_ok"] = not day_provenance_errors
+                if day_provenance_errors:
+                    info["status"] = "provenance_failed"
+                    info["error"] = str(
+                        day_provenance_errors[-1].get("_write_error")
+                        or "provenance append failed")
             except Exception as e:  # noqa: BLE001
                 info["status"] = "write_failed"
                 info["error"] = f"{type(e).__name__}: {str(e)[:200]}"
@@ -343,7 +352,7 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
             # 让"回填成功"这件事自带证据, 而不是等人工去两边各查一次
             # (只查一边必然误判: 只查 ① 会以为选股也能用新数据;
             #  只查 ② 会以为回填没生效)。
-            if info["status"] == "written":
+            if info["status"] in ("written", "provenance_failed"):
                 info["verify"] = verify_two_things(
                     h5i_watermark_before=out.get("h5i_watermark_before"),
                     engine_day_before=out.get("engine_day_before"))
