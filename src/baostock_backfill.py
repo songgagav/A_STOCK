@@ -117,7 +117,7 @@ def missing_days(days, present) -> list:
 def backfill_days(days, *, write: bool = False, symbols_df=None,
                   fetch_range=None, normalize=None, guard=None,
                   db=None, max_days: int | None = None,
-                  progress=None) -> dict:
+                  progress=None, basic_status_lookup=None) -> dict:
     """把 `days` 从 Baostock 补进 `h5i.daily_bars`。
 
     **依赖可注入**(`fetch_range` / `normalize` / `guard` / `db`): 让"归一化 -> 哨兵 ->
@@ -136,7 +136,9 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
 
     out = {"ok": False, "source": SOURCE, "write": bool(write), "written": [],
            "days": {}, "bj_not_requested": [], "error": None,
-           "provenance_fp": PROVENANCE_FP}
+           "provenance_fp": PROVENANCE_FP, "fetch_failed_raw": {},
+           "fetch_failed_raw_n": 0, "delisted_before_range": {},
+           "not_applicable_by_day": {}}
     # [2026-09-25 第 8 项] **回填前**先取一次基准, 才能事后判"水位是否前进 / 引擎是否不变"。
     # 取不到就是 None —— verify_two_things 会据 None 判为"判不出", 而不是判通过。
     out["h5i_watermark_before"] = _h5i_watermark()
@@ -153,10 +155,12 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
     # 同时留在内存里(见 baostock_adapter.fetch_range 的 on_row 说明)。
     per_day: dict[str, list] = {d: [] for d in todo}
     per_day_symbols: dict[str, set] = {d: set() for d in todo}
+    range_symbols: set[str] = set()
     counters = {"symbols": 0, "records": 0}
 
     def _on_row(bare, df):
         counters["symbols"] += 1
+        range_symbols.add(str(bare))
         try:
             recs = df.to_dict("records")
         except Exception as e:  # noqa: BLE001
@@ -174,6 +178,9 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
     out["fetch_status"] = fr.get("status")
     out["fetch_failed_n"] = len(fr.get("failed") or {})
     out["fetch_failed"] = dict(fr.get("failed") or {})
+    out["fetch_failed_raw"] = dict(fr.get("fetch_failed_raw") or fr.get("failed") or {})
+    out["fetch_failed_raw_n"] = len(out["fetch_failed_raw"])
+    out["delisted_before_range"] = dict(fr.get("delisted_before_range") or {})
     out["limiter"] = fr.get("limiter")
     out["symbols_with_data"] = counters["symbols"]
 
@@ -191,13 +198,75 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
         out["days"] = {d: {"status": "rejected_by_coverage"} for d in todo}
         return out
 
+    # Some symbols may have history for earlier dates in the requested range,
+    # then be delisted on a later session. Resolve only symbols missing from at
+    # least one requested day. An unconfirmed or active symbol remains a hard
+    # coverage failure; provider lookup errors never relax the gate.
+    missing_by_day = {
+        d: sorted(range_symbols - per_day_symbols[d])
+        for d in todo
+    }
+    missing_candidates = sorted({s for missing in missing_by_day.values()
+                                  for s in missing})
+    status_by_symbol = {}
+    if missing_candidates:
+        market_by_symbol = {}
+        try:
+            if symbols_df is not None and "market" in getattr(symbols_df, "columns", []):
+                market_by_symbol = {
+                    str(symbol): str(market)
+                    for symbol, market in zip(symbols_df["symbol"], symbols_df["market"])
+                }
+        except Exception:  # noqa: BLE001
+            market_by_symbol = {}
+        lookup = basic_status_lookup or _BA._query_stock_basic_status
+        lookup_codes = [_BA.to_baostock_code(s, market_by_symbol.get(s))
+                        for s in missing_candidates]
+        try:
+            raw_statuses = lookup(lookup_codes) or {}
+            for code, evidence in raw_statuses.items():
+                if isinstance(evidence, dict):
+                    status_by_symbol[str(code).split(".")[-1]] = evidence
+        except Exception as e:  # noqa: BLE001
+            out["delisting_status_lookup"] = {
+                "status": "error", "error": f"{type(e).__name__}: {str(e)[:160]}",
+                "symbols": missing_candidates,
+            }
+        else:
+            out["delisting_status_lookup"] = {
+                "status": "checked", "symbols": lookup_codes,
+            }
+
     _db = db
     for d in todo:
         recs = per_day.get(d) or []
+        raw_missing = missing_by_day[d]
+        not_applicable = {}
+        for symbol in raw_missing:
+            evidence = status_by_symbol.get(symbol) or {}
+            out_date = str(evidence.get("outDate") or "").strip()[:10]
+            try:
+                out_date = dt.date.fromisoformat(out_date).isoformat()
+            except ValueError:
+                continue
+            if str(evidence.get("status") or "") == "0" and out_date <= d:
+                not_applicable[symbol] = {
+                    "status": "0", "outDate": out_date,
+                    "source": "baostock.query_stock_basic",
+                    "reason_code": "delisted_on_or_before_session",
+                }
+        out["not_applicable_by_day"][d] = not_applicable
+        eligible_missing = sorted(set(raw_missing) - set(not_applicable))
         info = {"n_symbols": len(recs), "fetch_symbols": len(per_day_symbols[d]),
-                "expected_fetch_symbols": counters["symbols"]}
-        if info["fetch_symbols"] != info["expected_fetch_symbols"]:
+                "expected_symbols_before_not_applicable": len(range_symbols),
+                "expected_fetch_symbols": len(range_symbols) - len(not_applicable),
+                "raw_missing_symbols": raw_missing,
+                "not_applicable_symbols": sorted(not_applicable),
+                "not_applicable_count": len(not_applicable),
+                "missing_symbols": eligible_missing}
+        if eligible_missing:
             info["status"] = "rejected_by_coverage"
+            info["missing_symbols_count"] = len(eligible_missing)
             info["note"] = "该日未覆盖全部已抓取的沪深标的，拒绝按日替换"
             out["days"][d] = info
             continue
@@ -398,20 +467,21 @@ def verify_two_things(*, h5i_watermark_before=None, engine_day_before=None) -> d
 
 
 def _append_provenance(day: str, rows: int, ctx: dict) -> None:
-    """把"这天来自 Baostock"写进留痕文件。**失败不阻断写入**(但会记进返回)。
+    """把来源、selection input 影响与校验基准写进留痕文件。
+    **留痕失败不阻断写入**(但会记进返回)。
 
     ## 为什么必须有 `engine_probe_unchanged` 与 `h5i_watermark_after`
 
-    用户 2026-09-25 指出的**语义澄清**: 回填改的是 **h5i 的水位**,
-    而**引擎探针读的是厂商引擎** —— 回填**不解决选股滞后**。
-    若不显式记下这一点, 下次(09-28)看到 `target_plan.data_lag_days = 3` 的人
-    会**误以为回填失败**, 而实际是"回填本来就不改选股口径, 只能等厂商发布"。
+    回填只改 H5i 行情数据, 不改选股逻辑；但当 `BAR_STORE=h5i` 时，
+    新日线会改变后续选股的输入。引擎探针仍单独反映厂商 StockDB 水位，
+    所以必须分别记录两个数据源的状态。
 
     故每条留痕都记:
       · `h5i_watermark_after` —— 回填后水位, 供核对"我确实补进去了";
       · `engine_day_at_backfill` / `engine_probe_unchanged` —— 厂商引擎当时在哪一天;
         两者一起说明「即使水位前进了, 引擎探针仍在旧日期」;
-      · `affects_selection` —— **明文写 false**, 这是给未来读日志的人看的结论。
+      · `selection_logic_changed` —— 明文写 false；
+      · `selection_data_changed` / `affects_selection` —— 记录当前 backend 下的实际影响。
 
     **为什么记 `engine_probe_unchanged: true` 是安全的**: 本次回填**不碰引擎**,
     它只写 h5i。若将来有人让回填也去改引擎侧的东西, 这个字段就必须重新审视 ——
@@ -429,6 +499,22 @@ def _append_provenance(day: str, rows: int, ctx: dict) -> None:
     # 同时记 `unfillable_reason`(机器可读的稳定标识): 只有中文说明的话,
     # 下游没法按原因归类统计。
     _bj = sorted(str(s) for s in (ctx.get("bj_not_requested") or []))
+    _delisted = {
+        str(symbol): dict(evidence)
+        for symbol, evidence in (ctx.get("delisted_before_range") or {}).items()
+        if isinstance(evidence, dict)
+    }
+    _delisted_by_day = {
+        str(day): {
+            str(symbol): dict(evidence)
+            for symbol, evidence in (items or {}).items()
+            if isinstance(evidence, dict)
+        }
+        for day, items in (ctx.get("not_applicable_by_day") or {}).items()
+        if isinstance(items, dict) and items
+    }
+    selection_backend = os.environ.get("BAR_STORE", "h5i").strip().lower()
+    selection_data_changed = bool(rows) and selection_backend == "h5i"
     rec = {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "day": day,
            "action": "backfill",
            "source": SOURCE, "rows": int(rows),
@@ -437,17 +523,35 @@ def _append_provenance(day: str, rows: int, ctx: dict) -> None:
            "h5i_watermark_after": wm,
            "engine_day_at_backfill": eng,
            "engine_probe_unchanged": True,
-           "affects_selection": False,
+           "selection_backend": selection_backend,
+           "selection_logic_changed": False,
+           "selection_data_changed": selection_data_changed,
+           "affects_selection": selection_data_changed,
            # ---- 补不到的标的(用户清单第 3 项) ----
            "unfillable_symbols": _bj,
            "unfillable_count": len(_bj),
            "unfillable_reason": ("baostock_no_bj_data" if _bj else None),
-           "note": ("厂商引擎未发布该日; 本行来自 Baostock, 非引擎口径。"
-                    "**回填不改变选股口径** —— 引擎探针仍看厂商引擎, "
-                    "故 target_plan.section_as_of / data_lag_days 在厂商发布前不会改善; "
-                    "本次回填的受益方是读 h5i 的下游(回测/因子/IC)。"
+           "not_applicable_delisted": _delisted,
+           "not_applicable_delisted_count": len(_delisted),
+           "not_applicable_delisted_reason": (
+               "baostock_out_date_before_range" if _delisted else None),
+           "not_applicable_delisted_by_day": _delisted_by_day,
+           "not_applicable_delisted_by_day_count": sum(
+               len(items) for items in _delisted_by_day.values()),
+           "not_applicable_delisted_by_day_reason": (
+               "baostock_out_date_on_or_before_session" if _delisted_by_day else None),
+           "note": ("厂商 StockDB 未发布该日; 本行来自 Baostock, 非引擎口径。"
+                    "回填不改变选股逻辑，但当 selection_backend=h5i 时会更新后续选股输入；"
+                    "引擎探针仍只反映厂商 StockDB 水位，须与 H5i 水位分别核对。"
                     + (f" 另有 {len(_bj)} 只北交所标的**原理上补不到**"
-                       f"(Baostock 无 bj 数据), 见 unfillable_symbols。" if _bj else "")),
+                       f"(Baostock 无 bj 数据), 见 unfillable_symbols。" if _bj else "")
+                    + (f" 另有 {len(_delisted)} 只由供应方确认在区间前退市，"
+                       "标为 not_applicable，详见 not_applicable_delisted。"
+                       if _delisted else "")
+                    + (f" 另有 {sum(len(items) for items in _delisted_by_day.values())} 个逐日缺口"
+                       "由供应方确认于对应交易日或此前退市，详见"
+                       " not_applicable_delisted_by_day。"
+                       if _delisted_by_day else "")),
            "bj_not_requested": len(_bj)}
     try:
         os.makedirs(os.path.dirname(PROVENANCE_FP), exist_ok=True)

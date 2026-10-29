@@ -21,8 +21,8 @@ Baostock 是**逐 symbol** 接口(`query_all_stock` 只给代码不给 OHLCV), �
    那会让全市场从 13.7 分钟变成 2.28 小时。)
 
 **契约二 个股/ETF 区分**: 用 **h5i `symbols.parquet` 的 `market` 列**,
-  **不调 `query_stock_basic`** —— 后者需要逐个请求(6897 次), 而 symbols.parquet
-  已是本仓权威标的表且**已在进程内缓存**(`db._h5i_symbols_df`)。
+  不对全市场逐只调 `query_stock_basic`; 只在历史抓取返回空结果时，定点核验该
+  标的是否已在区间开始前退市。symbols.parquet 仍负责市场分类并已在进程内缓存。
   实测该表 `market ∈ {sh:2315, sz:2897, bj:339}`。
 
 **契约三 缺口分类**: `status ∈ {appended, partial, unfillable_gap, failed}`。
@@ -139,9 +139,36 @@ def make_baostock_fetcher(*, start: str, end: str, adjustflag: str = "3",
     return fetch
 
 
+def _query_stock_basic_status(codes: list[str]) -> dict:
+    """只核验历史查询为空的少数代码；查询失败时由调用方保留原失败状态。"""
+    import baostock as bs
+
+    login = bs.login()
+    if str(getattr(login, "error_code", "1")) != "0":
+        return {}
+    out = {}
+    try:
+        for code in codes:
+            rs = bs.query_stock_basic(code=code)
+            if str(getattr(rs, "error_code", "1")) != "0":
+                continue
+            fields = list(getattr(rs, "fields", []) or [])
+            while rs.next():
+                row = rs.get_row_data()
+                out[code] = dict(zip(fields, row))
+                break
+    finally:
+        try:
+            bs.logout()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
                 limiter: RateLimiter | None = None, adjustflag: str = "3",
-                fetch_one=None, fetcher=None, on_row=None) -> dict:
+                fetch_one=None, fetcher=None, on_row=None,
+                basic_status_lookup=None) -> dict:
     """**定向补数**入口: 按 symbol 列表取指定区间, 返回契约三的归类结果。
 
     `symbols` 为 h5i 裸代码列表(如 `["600000","000001"]`)。
@@ -200,6 +227,11 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
                           (lambda code, df: on_row(
                               code.split(".")[-1] if "." in code else code, df))
                           if on_row is not None else None))
+    if f is not None and hasattr(f, "close"):
+        try:
+            f.close()
+        except Exception:  # noqa: BLE001
+            pass
     # 把结果键从 baostock 代码折回裸代码, 便于与引擎/ h5i 对齐
     rows = {}
     for k, v in got["rows"].items():
@@ -210,17 +242,45 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
         bare = k.split(".")[-1] if "." in k else k
         failed[bare] = v
 
-    out = classify_outcome(requested=len(syms), got=len(rows), unfetchable=unfetchable)
-    out.update({"rows": rows, "failed": failed, "limiter": got["limiter"],
+    raw_failed = dict(failed)
+    empty_codes = [k for k, v in got["failed"].items()
+                   if str(v).startswith("空数据(")]
+    delisted = {}
+    if empty_codes:
+        try:
+            lookup = basic_status_lookup or _query_stock_basic_status
+            statuses = lookup(empty_codes) or {}
+        except Exception:  # noqa: BLE001
+            statuses = {}
+        for code in empty_codes:
+            status = statuses.get(code) or {}
+            out_date = str(status.get("outDate") or "").strip()
+            if (str(status.get("status") or "") == "0" and out_date
+                    and out_date < str(start)[:10]):
+                bare = code.split(".")[-1] if "." in code else code
+                delisted[bare] = {
+                    "status": str(status.get("status")),
+                    "outDate": out_date,
+                    "history_result": raw_failed[bare],
+                }
+                failed.pop(bare, None)
+
+    all_unfetchable = dict(unfetchable)
+    if delisted:
+        all_unfetchable["delisted_before_range"] = {
+            "symbols": sorted(delisted), "count": len(delisted),
+            "reason": "Baostock query_stock_basic 确认 status=0 且 outDate 早于区间开始日",
+            "action": "标记 not_applicable，不作为当日抓取覆盖失败",
+        }
+
+    out = classify_outcome(requested=len(syms), got=len(rows),
+                           unfetchable=all_unfetchable)
+    out.update({"rows": rows, "failed": failed, "fetch_failed_raw": raw_failed,
+                "delisted_before_range": delisted, "limiter": got["limiter"],
                 "interval_ms": got["interval_ms"],
                 "start": start, "end": end, "adjustflag": adjustflag})
     # 北交所那些"没去请求"的标的, 计入 failed 会误导 —— 单列
     out["not_requested"] = sorted(unfetchable.get("bj", {}).get("symbols", []))
-    if f is not None and hasattr(f, "close"):
-        try:
-            f.close()
-        except Exception:  # noqa: BLE001
-            pass
     return out
 
 
