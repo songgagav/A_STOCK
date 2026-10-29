@@ -162,6 +162,7 @@ class TestWholeDayRejection:
         result = BF.backfill_days(["2026-09-23"], write=True,
                                   symbols_df=_Symbols(syms), fetch_range=misleading)
         assert result["fetch_failed_n"] == 1
+        assert result["fetch_failed"] == {"601200": "request timed out"}
         assert result["days"]["2026-09-23"]["status"] == "rejected_by_coverage"
         assert result["written"] == []
         assert not (tmp_path / "provenance.jsonl").exists()

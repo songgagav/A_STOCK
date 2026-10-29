@@ -5,6 +5,8 @@ import json
 import pytest
 import subprocess
 import sys
+import importlib
+from pathlib import Path
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_ROOT, "src")
@@ -287,6 +289,63 @@ def test_backfill_timeout_preserves_subprocess_output_for_diagnosis(monkeypatch)
     assert "TimeoutExpired" in result["error"]
     assert "baostock login blocked" in result["output_tail"]
     assert result["timeout_s"] == D.BACKFILL_TIMEOUT_S
+
+
+def test_default_backfill_timeout_allows_full_market_rate_limited_fetch(tmp_path, monkeypatch):
+    # 5,212 targets at 200ms require at least 1,042s before processing.
+    monkeypatch.setattr(D, "BACKFILL_TIMEOUT_S", D.BACKFILL_TIMEOUT_S)
+    monkeypatch.delenv("DATA_UPDATE_BACKFILL_TIMEOUT_S", raising=False)
+    importlib.reload(D)
+    monkeypatch.setattr(D, "__file__", str(tmp_path / "src" / "data_update_daemon.py"))
+    monkeypatch.setattr(D, "_backfill_interpreter", lambda: "python.exe")
+
+    def completed_after_market_fetch(cmd, **kwargs):
+        if kwargs["timeout"] < 1100:
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        Path(cmd[-1]).write_text(json.dumps({
+            "written": ["2026-10-26"], "verify": {"ok": True}, "fetch_failed": {},
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="done")
+
+    monkeypatch.setattr(D.subprocess, "run", completed_after_market_fetch)
+    result = D._run_backfill_subprocess(["20261026"])
+    assert result["ok"] is True
+    assert result["written"] == ["2026-10-26"]
+    assert result["fetch_failed"] == {}
+
+
+def test_explicit_backfill_timeout_remains_honored(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BACKFILL_TIMEOUT_S", D.BACKFILL_TIMEOUT_S)
+    monkeypatch.setenv("DATA_UPDATE_BACKFILL_TIMEOUT_S", "30")
+    importlib.reload(D)
+    monkeypatch.setattr(D, "__file__", str(tmp_path / "src" / "data_update_daemon.py"))
+    monkeypatch.setattr(D, "_backfill_interpreter", lambda: "python.exe")
+
+    def timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(D.subprocess, "run", timeout)
+    result = D._run_backfill_subprocess(["20261026"])
+    assert result["ok"] is False
+    assert result["timeout_s"] == 30
+
+
+def test_failed_symbol_details_survive_failed_backfill_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "__file__", str(tmp_path / "src" / "data_update_daemon.py"))
+    monkeypatch.setattr(D, "_backfill_interpreter", lambda: "python.exe")
+
+    def rejected(cmd, **kwargs):
+        Path(cmd[-1]).write_text(json.dumps({
+            "written": [], "days": {"2026-10-26": {"status": "rejected_by_coverage"}},
+            "fetch_failed": {"601200": "request timed out"},
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 1, stdout="incomplete")
+
+    monkeypatch.setattr(D.subprocess, "run", rejected)
+    result = D._run_backfill_subprocess(["20261026"])
+    assert result["ok"] is False
+    assert result["written"] == []
+    assert result["fetch_failed"] == {"601200": "request timed out"}
 
 
 def test_daily_failure_receipt_survives_later_round_without_daily_stage(

@@ -173,6 +173,7 @@ def backfill_days(days, *, write: bool = False, symbols_df=None,
     out["bj_not_requested"] = fr.get("not_requested") or []
     out["fetch_status"] = fr.get("status")
     out["fetch_failed_n"] = len(fr.get("failed") or {})
+    out["fetch_failed"] = dict(fr.get("failed") or {})
     out["limiter"] = fr.get("limiter")
     out["symbols_with_data"] = counters["symbols"]
 

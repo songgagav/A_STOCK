@@ -49,7 +49,9 @@ T_MARGIN = 17 * 60 + 20      # 两融 (SSE 当日可见; 深/京 T+1 由次日�
 T_CLOSE_HINT = 19 * 60 + 10
 # 阶段失败后的重试节流(秒)
 FAIL_THROTTLE_S = int(os.environ.get("DATA_UPDATE_FAIL_THROTTLE_S", "1800"))
-BACKFILL_TIMEOUT_S = int(os.environ.get("DATA_UPDATE_BACKFILL_TIMEOUT_S", "900"))
+# Match run_daily's 90-minute ceiling: a full 5,000+ symbol fetch at the
+# adapter's 200ms request interval alone takes more than 15 minutes.
+BACKFILL_TIMEOUT_S = int(os.environ.get("DATA_UPDATE_BACKFILL_TIMEOUT_S", "5400"))
 
 
 def _log(msg: str) -> None:
@@ -206,6 +208,7 @@ def _run_backfill_subprocess(missing_days: list[str]) -> dict:
             result["written"] = full.get("written") or []
             result["verify"] = full.get("verify")
             result["days"] = full.get("days")
+            result["fetch_failed"] = full.get("fetch_failed")
             result["provenance_fp"] = full.get("provenance_fp")
         except Exception as exc:  # noqa: BLE001
             result["read_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
