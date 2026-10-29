@@ -236,7 +236,7 @@ def _start_engine(day: date):
     """启动盘中引擎, 输出重定向到 ENGINE_LOG, 记录 pid."""
     out = open(ENGINE_LOG, "a", encoding="utf-8")
     p = subprocess.Popen([PY, os.path.join(_BASE, "src", "realtime_engine.py"),
-                          "--interval", "15"],
+                          "--interval", "15", "--execution-mode", "observe"],
                          cwd=_BASE, stdout=out, stderr=out,
                          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     _state["engine_pid"] = p.pid
@@ -258,7 +258,8 @@ def _start_engine(day: date):
     if not _proc_alive(p.pid):
         _log(f"{day} 启动盘中引擎失败: pid={p.pid} 启动后立即退出(见 {ENGINE_LOG}); 下一轮将自动重试")
     else:
-        _log(f"{day} 开盘前 | 启动盘中引擎 pid={p.pid} (刷新实时快照, 盘中自动撮合/午间重选)")
+        _log(f"{day} 开盘前 | 启动盘中引擎 pid={p.pid} execution_mode=observe "
+             "(刷新实时行情/09:25快照, 不撮合)")
     _write_state()
 
 

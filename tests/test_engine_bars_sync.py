@@ -451,6 +451,26 @@ class TestFreshness:
         assert f["ok"] is False and f["lag_trading_days"] == 1
         assert "落后" in f["error"]
 
+    def test_after_market_close_expects_today_for_a_trading_day(self, fake_cal):
+        """After the cash session closes, today's bars are due in the daily pipeline."""
+        now = dt.datetime(2026, 9, 21, 15, 1)
+        f = E.freshness("20260918", today="2026-09-21", now=now)
+        assert f["ok"] is False
+        assert f["expected_day"] == "20260921"
+        assert f["lag_trading_days"] == 1
+
+    def test_before_market_close_still_expects_previous_session(self, fake_cal):
+        now = dt.datetime(2026, 9, 21, 14, 59)
+        f = E.freshness("20260918", today="2026-09-21", now=now)
+        assert f["ok"] is True
+        assert f["expected_day"] == "20260918"
+
+    def test_after_close_on_weekend_still_expects_previous_session(self, fake_cal):
+        now = dt.datetime(2026, 9, 20, 16, 0)
+        f = E.freshness("20260918", today="2026-09-20", now=now)
+        assert f["ok"] is True
+        assert f["expected_day"] == "20260918"
+
     def test_weekend_today_still_expects_friday(self, fake_cal):
         for t in ("2026-09-19", "2026-09-20"):
             f = E.freshness("20260918", today=t)

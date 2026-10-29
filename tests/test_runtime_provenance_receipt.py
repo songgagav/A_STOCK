@@ -51,6 +51,8 @@ def quote(price, source="akshare_spot"):
 def runtime(monkeypatch, tmp_path):
     """Real feed cache, PaperBook, run_tick and persisted state; no external IO."""
     engine = object.__new__(RE.RealtimeEngine)
+    # Exercise the existing execution path; production defaults to observation.
+    engine.execution_mode = "paper"
     engine.pb = PB.PaperBook()
     engine.pb.trade_date = "2026-10-09"
     engine.pb.positions = {HELD: {"qty": 100, "avg_cost": 9.0,
