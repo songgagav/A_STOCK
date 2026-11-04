@@ -113,15 +113,15 @@ class StockDBClient:
         """
         if not start and not end:
             return "*"
-
+        
         # 精确单日查询优化：如果 start 存在，且 (end 不存在 或 start 与 end 相同)，直接返回日期进行单次点查询
         if start and (not end or start == end):
             return start
-
+            
         op = "<" if desc else ">"
         s_val = start if start else "N"
         e_val = end if end else "N"
-
+        
         return f"{s_val}{op}{e_val}"
 
     def _filter_fields(self, data_list: List[Dict[str, Any]], fields: Optional[Union[str, List[str]]]) -> List[List[Any]]:
@@ -130,10 +130,10 @@ class StockDBClient:
         """
         if not fields:
             return data_list
-
+        
         if isinstance(fields, str):
             fields = [f.strip() for f in fields.split(',')]
-
+            
         filtered = []
         for item in data_list:
             # 提取指定字段的值列表，保证顺序和 fields 一致
@@ -168,10 +168,10 @@ class StockDBClient:
                         record_dict = r.copy()
                     record_dict['code'] = code
                     all_records.append(record_dict)
-
+            
             if not all_records:
                 return pd.DataFrame()
-
+            
             df = pd.DataFrame(all_records)
             # 调整 code 列到最前面
             cols = ['code'] + [col for col in df.columns if col != 'code']
@@ -180,7 +180,7 @@ class StockDBClient:
             # 单只股票模式
             if not data:
                 return pd.DataFrame()
-
+            
             # 如果是二维列表
             if isinstance(data[0], list):
                 return pd.DataFrame(data, columns=fields_list)
@@ -205,7 +205,7 @@ class StockDBClient:
             date_val = item.get('date')
             if not date_val:
                 continue
-
+            
             date_str = str(date_val)
             try:
                 dt = datetime.datetime.strptime(date_str, "%Y%m%d")
@@ -314,7 +314,7 @@ class StockDBClient:
 
         # LevelDB 天然按时间升序，无需排序
         sorted_min = minute_data
-
+        
         interval = int(frequency[:-1]) # '5m' -> 5, '15m' -> 15, '30m' -> 30, '60m' -> 60
 
         def trading_elapsed(minute_of_day: int) -> Optional[int]:
@@ -341,12 +341,12 @@ class StockDBClient:
             date_val = item.get('date')
             if not date_val:
                 continue
-
+            
             try:
                 date_int = int(date_val)
             except (TypeError, ValueError):
                 continue
-
+                
             if date_int < 10000000000000:
                 continue
 
@@ -363,7 +363,7 @@ class StockDBClient:
             else:
                 group_idx = (elapsed - 1) // interval
                 group_end_elapsed = (group_idx + 1) * interval
-
+            
             # 使用对齐结束时间点作为分组键
             key = (ymd, group_end_elapsed)
             grouped[key].append(item)
@@ -387,12 +387,12 @@ class StockDBClient:
             end_minute_of_day = elapsed_to_minute_of_day(end_elapsed)
             end_hour = end_minute_of_day // 60
             end_minute = end_minute_of_day % 60
-
+            
             # 溢出保护
             if end_hour >= 24:
                 end_hour = 23
                 end_minute = 59
-
+                
             aligned_date_int = ymd * 1000000 + end_hour * 10000 + end_minute * 100
 
             merged_item = {
@@ -501,7 +501,7 @@ class StockDBClient:
         """
         is_batch = isinstance(code, list)
         codes = code if is_batch else [code]
-
+        
         # 1. 确定底层查询的表名与时间表达式
         # 如果是周K或月K，底层先查询日K数据
         table = "分钟k" if frequency in ('1m', '5m', '15m', '30m', '60m') else "日k"
@@ -525,39 +525,39 @@ class StockDBClient:
             raw = pp.do()
             if not isinstance(raw, list):
                 raw = [raw]
-
+            
             for c, items in zip(codes, raw):
                 data_dict[c] = [items] if isinstance(items, dict) else ([item[1] for item in items if isinstance(item, (list, tuple)) and len(item) > 1] if isinstance(items, list) else [])
 
         # 3. 处理数据排序、截取、周期合并与字段过滤
         for c in codes:
             records = data_dict[c]
-
+            
             # 剔除无效值（None、空列表等非dict记录）
             records = [r for r in records if isinstance(r, dict)]
-
+            
             # 在内存中执行动态前/后复权折算
             if fq in ('qfq', 'hfq'):
                 records = self._apply_fq_in_memory(c, records, fq)
-
+            
             # 运行合并逻辑
             if frequency in ('1w', '1M'):
                 records = self._merge_to_period(records, frequency)
             elif frequency in ('5m', '15m', '30m', '60m'):
                 records = self._merge_minutes_to_period(records, frequency)
-
+            
             # LevelDB 天然有序，仅在需要降序时反转
             if desc and requires_aggregation:
                 records = records[::-1]
-
+            
             # 限额截取
             if limit is not None:
                 records = records[:limit]
-
+                
             # 字段投影过滤
             if fields:
                 records = self._filter_fields(records, fields)
-
+                
             data_dict[c] = records
 
         # 4. 返回格式封装
@@ -590,7 +590,7 @@ class StockDBClient:
         """
         is_batch = isinstance(code, list)
         codes = code if is_batch else [code]
-
+        
         table = "分钟k" if frequency in ('1m', '5m', '15m', '30m', '60m') else "日k"
         requires_aggregation = frequency in ('5m', '15m', '30m', '60m', '1w', '1M')
         # Aggregation consumes chronological records; keep LevelDB's ascending range order.
@@ -612,35 +612,35 @@ class StockDBClient:
             raw = await pp
             if not isinstance(raw, list):
                 raw = [raw]
-
+            
             for c, items in zip(codes, raw):
                 data_dict[c] = [items] if isinstance(items, dict) else ([item[1] for item in items if isinstance(item, (list, tuple)) and len(item) > 1] if isinstance(items, list) else [])
 
         # 2. 转换与合并
         for c in codes:
             records = data_dict[c]
-
+            
             # 剔除无效值（None、空列表等非dict记录）
             records = [r for r in records if isinstance(r, dict)]
-
+            
             # 在内存中执行动态前/后复权折算
             if fq in ('qfq', 'hfq'):
                 records = self._apply_fq_in_memory(c, records, fq)
-
+            
             if frequency in ('1w', '1M'):
                 records = self._merge_to_period(records, frequency)
             elif frequency in ('5m', '15m', '30m', '60m'):
                 records = self._merge_minutes_to_period(records, frequency)
-
+                
             if desc and requires_aggregation:
                 records = records[::-1]
-
+            
             if limit is not None:
                 records = records[:limit]
-
+                
             if fields:
                 records = self._filter_fields(records, fields)
-
+                
             data_dict[c] = records
 
         # 3. 封装返回
@@ -675,7 +675,7 @@ class StockDBClientProxy:
     def __init__(self, raw_rd, gp_client):
         object.__setattr__(self, "_raw_rd", raw_rd)
         object.__setattr__(self, "_gp_client", gp_client)
-
+        
         # 性能优化：一次性将原生二进制连接的所有方法和属性直接绑定到代理实例上。
         # 这样在后续的高频调用（如 rd.vals）中可以直接从 __dict__ 极速获取，性能与原生二进制 100% 相同。
         for attr in dir(raw_rd):
@@ -704,7 +704,7 @@ class StockDBClientProxy:
     def __dir__(self):
         # 融合属性列表以支持交互式命令补全
         return sorted(set(dir(self._raw_rd) + dir(self.__class__) + list(self.__dict__.keys())))
-
+        
     def __repr__(self):
         return repr(self._raw_rd)
 

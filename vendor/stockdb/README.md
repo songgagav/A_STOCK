@@ -8,6 +8,8 @@ This directory pins the StockDB Python interface used by the project:
 - `pybao/zhibiao.py`
 - `bin/stockdb.exe`
 
+The interface contract follows the vendor's [Python API documentation](http://a.123128.xyz/docs/AI策略python开发接口文档.md). The pinned files and SHA-256 values were refreshed from `E:\A_stockDB` on 2026-11-04; see `manifest.json`.
+
 The market database itself is deliberately not stored in Git. `stockdb.exe`
 must run with the deployment data root (normally `E:\A_stockDB`) as its working
 directory so that its `data`, `data1`, `mydb`, and `stockdb.conf` remain outside
