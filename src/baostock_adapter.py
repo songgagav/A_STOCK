@@ -36,6 +36,7 @@ import time
 #: 契约一: 默认请求间隔(毫秒)与限流退避后的间隔。
 DEFAULT_INTERVAL_MS = 200
 BACKOFF_INTERVAL_MS = 1500
+MAX_DELIST_STATUS_LOOKUPS = 50
 #: 连续多少次"限流特征"才触发退避(单次抖动不退避, 与数据源门禁同思路:
 #: 交替出现的偶发失败不该改变策略, 持续出现的才该)。
 BACKOFF_AFTER_FAILS = 2
@@ -243,16 +244,29 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
         failed[bare] = v
 
     raw_failed = dict(failed)
-    empty_codes = [k for k, v in got["failed"].items()
-                   if str(v).startswith("空数据(")]
+    empty_codes = sorted(k for k, v in got["failed"].items()
+                         if str(v).startswith("空数据("))
     delisted = {}
+    delisting_status_lookup = {
+        "status": "not_needed", "requested": 0, "queried": 0,
+        "limit": MAX_DELIST_STATUS_LOOKUPS,
+    }
     if empty_codes:
+        lookup_codes = empty_codes[:MAX_DELIST_STATUS_LOOKUPS]
+        delisting_status_lookup.update({
+            "status": "checked" if len(empty_codes) <= MAX_DELIST_STATUS_LOOKUPS else "truncated_at_limit",
+            "requested": len(empty_codes),
+            "queried": len(lookup_codes),
+            "unqueried": len(empty_codes) - len(lookup_codes),
+        })
         try:
             lookup = basic_status_lookup or _query_stock_basic_status
-            statuses = lookup(empty_codes) or {}
-        except Exception:  # noqa: BLE001
+            statuses = lookup(lookup_codes) or {}
+        except Exception as exc:  # noqa: BLE001
             statuses = {}
-        for code in empty_codes:
+            delisting_status_lookup["status"] = "error"
+            delisting_status_lookup["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        for code in lookup_codes:
             status = statuses.get(code) or {}
             out_date = str(status.get("outDate") or "").strip()
             if (str(status.get("status") or "") == "0" and out_date
@@ -276,7 +290,9 @@ def fetch_range(symbols, *, start: str, end: str, symbols_df=None,
     out = classify_outcome(requested=len(syms), got=len(rows),
                            unfetchable=all_unfetchable)
     out.update({"rows": rows, "failed": failed, "fetch_failed_raw": raw_failed,
-                "delisted_before_range": delisted, "limiter": got["limiter"],
+                "delisted_before_range": delisted,
+                "delisting_status_lookup": delisting_status_lookup,
+                "limiter": got["limiter"],
                 "interval_ms": got["interval_ms"],
                 "start": start, "end": end, "adjustflag": adjustflag})
     # 北交所那些"没去请求"的标的, 计入 failed 会误导 —— 单列

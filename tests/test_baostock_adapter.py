@@ -408,6 +408,30 @@ class TestRealFetcherContract:
         assert "601059" in result["failed"]
         assert result["delisted_before_range"] == {}
 
+    def test_delisting_status_lookups_are_bounded_and_unchecked_symbols_stay_failed(
+            self, monkeypatch):
+        """Large empty-result sets must not trigger an unbounded per-symbol status scan."""
+        import pandas as pd
+        symbols = [f"{600000 + i:06d}" for i in range(51)]
+        frame = pd.DataFrame({"symbol": symbols, "market": ["sh"] * len(symbols)})
+        calls = []
+
+        def lookup(codes):
+            calls.append(list(codes))
+            return {code: {"status": "0", "outDate": "2020-01-01"}
+                    for code in codes}
+
+        monkeypatch.setattr(BA, "_query_stock_basic_status", lookup)
+        result = BA.fetch_range(
+            symbols, start="2026-10-26", end="2026-10-28", symbols_df=frame,
+            fetch_one=lambda code: [], limiter=BA.RateLimiter(sleep=lambda _: None),
+        )
+
+        assert len(calls) == 1
+        assert len(calls[0]) == 50
+        assert "600000" not in result["failed"]
+        assert "600050" in result["failed"]
+
 
 class TestCrossValidateCriteria:
     """交叉校验: 判据是**写死的预期等式**, 不是"看着接近"。"""
