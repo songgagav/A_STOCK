@@ -221,9 +221,11 @@ Copy-Item .env.example .env
 | 变量 | 说明 |
 | --- | --- |
 | `BAR_STORE` | 行情后端；默认 `h5i`，`duck` 仅用于显式对照 |
-| `STOCKDB_ROOT` | 本地行情镜像或 free-stockdb 根目录 |
-| `ARCTIC_URI` | ArcticDB 地址；未配置时使用可用的本地后端 |
-| `PYBAO_DIR` | 可选的本地行情 SDK 路径 |
+| `STOCKDB_ROOT` | StockDB/free-stockdb 部署数据根目录；不提交到 Git |
+| `STOCKDB_PYBAO_DIR` | 可选的明确 SDK 覆盖路径；默认优先使用项目内 `vendor/stockdb/pybao` |
+| `STOCKDB_ENGINE` | StockDB 本地端点，默认 `127.0.0.1:7899` |
+| `ARCTIC_URI` | 遗留 ArcticDB 兼容层地址；主数据链路不依赖，未迁移的历史退化分析才可能使用 |
+| `PYBAO_DIR` | 旧版外部 SDK 路径，仅作项目 bundle 缺失时的兼容回退 |
 | `TRAE_PYTHON` | 守护任务调用的外部 Python 解释器 |
 | `OPENAI_BASE_URL` | 可选的 LLM 服务地址 |
 | `OPENAI_API_KEY` | LLM API 密钥，只通过环境变量提供 |
@@ -237,6 +239,13 @@ Copy-Item .env.example .env
 当前生产和观察契约保持 `RANK_BY_FUSION=0`、`DRL_PLAN_MODE=shadow`、
 `FUSION_WEIGHT_MODE=shadow`、`TRADE_BROKER=paper` 和
 `alpha_evidence_status=not_promotable`。环境变量模板见 [`.env.example`](.env.example)。
+
+不要把 `.env`、token、数据库、行情文件、日志或模型权重提交到 Git。仓库的 `.gitignore` 已覆盖常见敏感配置和运行产物，但提交前仍应检查 `git status`。
+
+StockDB 的 Python 接口已固定在 [`vendor/stockdb`](vendor/stockdb/README.md)。项目只提交可运行的接口文件和服务程序，不提交其 `data`、`data1`、`mydb`、行情镜像或日志；服务注册时工作目录仍必须指向部署数据根目录。所有 `rd` 加载经过 `src/stockdb_runtime.py`，以避免不同终端的 `PYBAO_DIR` 静默改变数据源。
+
+本项目当前以环境变量作为运行时配置接口，`.env.example` 是公开配置模板；没有运行时
+`config.toml` 解析器，因此不提供一个会误导使用者的 `config.example.toml`。
 
 ## 常用命令
 

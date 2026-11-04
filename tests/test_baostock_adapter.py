@@ -365,6 +365,73 @@ class TestRealFetcherContract:
                              fetch_one=lambda code: [{"x": 1}])
         assert list(res["rows"]) == ["600000"], res["rows"].keys()
 
+    def test_empty_history_for_confirmed_delisted_symbol_is_not_a_fetch_failure(
+            self, monkeypatch):
+        """仅供应方确认在区间开始前退市时，空历史才属于 not_applicable。"""
+        import pandas as pd
+        symbols = pd.DataFrame({"symbol": ["600000", "601059"],
+                                "market": ["sh", "sh"]})
+        monkeypatch.setattr(
+            BA, "_query_stock_basic_status",
+            lambda codes: {"sh.601059": {"status": "0", "outDate": "2026-10-19"}},
+            raising=False,
+        )
+
+        result = BA.fetch_range(
+            ["600000", "601059"], start="2026-10-26", end="2026-10-28",
+            symbols_df=symbols,
+            fetch_one=lambda code: [] if code == "sh.601059" else [{"x": 1}],
+        )
+
+        assert result["status"] == BA.UNFILLABLE
+        assert result["failed"] == {}
+        assert result["delisted_before_range"]["601059"]["outDate"] == "2026-10-19"
+        assert result["unfetchable"]["delisted_before_range"]["count"] == 1
+
+    def test_empty_history_for_active_symbol_remains_a_coverage_failure(self, monkeypatch):
+        import pandas as pd
+        symbols = pd.DataFrame({"symbol": ["600000", "601059"],
+                                "market": ["sh", "sh"]})
+        monkeypatch.setattr(
+            BA, "_query_stock_basic_status",
+            lambda codes: {"sh.601059": {"status": "1", "outDate": ""}},
+            raising=False,
+        )
+
+        result = BA.fetch_range(
+            ["600000", "601059"], start="2026-10-26", end="2026-10-28",
+            symbols_df=symbols,
+            fetch_one=lambda code: [] if code == "sh.601059" else [{"x": 1}],
+        )
+
+        assert result["status"] == BA.PARTIAL
+        assert "601059" in result["failed"]
+        assert result["delisted_before_range"] == {}
+
+    def test_delisting_status_lookups_are_bounded_and_unchecked_symbols_stay_failed(
+            self, monkeypatch):
+        """Large empty-result sets must not trigger an unbounded per-symbol status scan."""
+        import pandas as pd
+        symbols = [f"{600000 + i:06d}" for i in range(51)]
+        frame = pd.DataFrame({"symbol": symbols, "market": ["sh"] * len(symbols)})
+        calls = []
+
+        def lookup(codes):
+            calls.append(list(codes))
+            return {code: {"status": "0", "outDate": "2020-01-01"}
+                    for code in codes}
+
+        monkeypatch.setattr(BA, "_query_stock_basic_status", lookup)
+        result = BA.fetch_range(
+            symbols, start="2026-10-26", end="2026-10-28", symbols_df=frame,
+            fetch_one=lambda code: [], limiter=BA.RateLimiter(sleep=lambda _: None),
+        )
+
+        assert len(calls) == 1
+        assert len(calls[0]) == 50
+        assert "600000" not in result["failed"]
+        assert "600050" in result["failed"]
+
 
 class TestCrossValidateCriteria:
     """交叉校验: 判据是**写死的预期等式**, 不是"看着接近"。"""

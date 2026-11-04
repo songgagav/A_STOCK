@@ -47,6 +47,8 @@ import datetime as dt
 import os
 import sys
 
+import stockdb_runtime
+
 _APP = os.path.dirname(os.path.abspath(__file__))
 if _APP not in sys.path:
     sys.path.insert(0, _APP)
@@ -100,7 +102,10 @@ def _lake_root() -> str:
     return root
 
 
-PYBAO_DIR = os.environ.get("PYBAO_DIR", "").strip() or os.path.join(_lake_root(), "pybao")
+PYBAO_DIR = str(stockdb_runtime.resolve_pybao_dir(
+    repo_root=os.path.dirname(_APP),
+    external_root=_lake_root(),
+))
 ENGINE_ENDPOINT = os.environ.get("STOCKDB_ENGINE", "127.0.0.1:7899")
 
 
@@ -110,15 +115,15 @@ def _log(msg: str) -> None:
 
 
 def load_rd():
-    """把 pybao 加入 sys.path 并返回厂商 SDK 的 rd 句柄。失败一律抛 EngineUnavailable。"""
-    if PYBAO_DIR not in sys.path:
-        sys.path.insert(0, PYBAO_DIR)
+    """通过项目内 StockDB 边界加载 rd；失败一律抛 EngineUnavailable。"""
     try:
-        from stock_sdk import rd  # noqa: F401
+        return stockdb_runtime.load_rd(
+            pybao_dir=PYBAO_DIR,
+            repo_root=os.path.dirname(_APP),
+        )
     except Exception as e:  # noqa: BLE001
         raise EngineUnavailable(
             f"厂商 SDK 不可用: {type(e).__name__}: {e} (PYBAO_DIR={PYBAO_DIR})") from e
-    return rd
 
 
 # 健康探针/交易日历用的参考股票: 均为长期活跃的大盘股, 取并集可规避单只停牌缺口。
@@ -372,7 +377,7 @@ def sync_to_latest(rd=None, apply: bool = True, max_days: int = 30,
     return res
 
 
-def freshness(engine_day: str | None = None, today=None) -> dict:
+def freshness(engine_day: str | None = None, today=None, now=None) -> dict:
     """引擎数据是否追平"最后一个**已收盘**的交易日"。
 
     **为什么不是与 `trade_calendar.days[-1]` 比**（闸门初版的实际故障）:
@@ -383,8 +388,8 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
     这正是本项目 METHOD-1 说的: 判据要基于"该值发生时的下游表现",
     而不是拿一个语义不同的字段硬比。
 
-    正确判据: 引擎至少应覆盖**今天之前的最后一个交易日**。
-    （今天若已收盘, 引擎通常会覆盖今天, 那也满足 >= 该下界。）
+    正确判据: 收盘前至少覆盖上一个交易日；当前交易日 15:00 收盘后，
+    当日日线也进入应有水位。这个边界使 15:45 的数据补全任务能发现当天缺口。
 
     [2026-09-22 P0 修] **同时输出日历判据的来源与强度**(`calendar_source` /
     `calendar_strength`)。为什么必须暴露这层:
@@ -401,7 +406,8 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
     out = {"ok": False, "engine_day": str(engine_day) if engine_day else None,
            "expected_day": None, "lag_trading_days": None, "today": None, "error": None,
            "calendar_source": None, "calendar_strength": None}
-    today = today or _dt.date.today()
+    current = now or _dt.datetime.now()
+    today = today or current.date()
     if isinstance(today, str):
         today = _dt.date.fromisoformat(today.replace("/", "-"))
     out["today"] = today.isoformat()
@@ -411,7 +417,13 @@ def freshness(engine_day: str | None = None, today=None) -> dict:
         prov = TC.calendar_provenance()
         out["calendar_source"] = prov.get("source")
         out["calendar_strength"] = prov.get("strength")
-        expected = TC.latest_calendar_day(today - _dt.timedelta(days=1))
+        include_today = (
+            current.date() == today
+            and current.time() >= _dt.time(15, 0)
+            and TC.is_trading_day(today)
+        )
+        target_date = today if include_today else today - _dt.timedelta(days=1)
+        expected = TC.latest_calendar_day(target_date)
     except Exception as e:  # noqa: BLE001
         out["error"] = f"交易日历不可用: {type(e).__name__}: {e}"
         return out

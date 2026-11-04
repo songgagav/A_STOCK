@@ -72,6 +72,9 @@ StockDB 引擎日不变，并追加 provenance。该方案解决当前问题，�
 - 每个交易日和每个补全日期幂等，只在状态未成功时重试；
 - 服务只写数据更新回执、H5i 行情库和 provenance，不写 selector、target、
   PaperBook、DRL pointer 或 broker 状态；
+- 不直接改选股代码或 selector artifact，不等于选股输入不受影响：当
+  `BAR_STORE=h5i` 时，补入的日线会成为后续选股数据；provenance 必须分别记录
+  `selection_logic_changed=false`、`selection_data_changed` 和 `affects_selection`；
 - 失败写入 `data/data_update_last.json`，不伪造成功状态。
 
 ### 2. 主链与备用链顺序
@@ -117,8 +120,10 @@ StockDB 引擎日不变，并追加 provenance。该方案解决当前问题，�
 - `h5i_watermark_after`、`engine_day_after`、`engine_probe_unchanged`；
 - 错误原因和下一次重试依据。
 
-Baostock 既有 `data/backfill_provenance.jsonl` 继续作为逐日来源记录；任何
-备用源行都必须明确 `source=baostock`、`affects_selection=false`。
+Baostock 既有 `data/backfill_provenance.jsonl` 继续作为逐日来源记录。备用源行必须
+明确 `source=baostock` 和 `selection_logic_changed=false`；`selection_data_changed`
+与 `affects_selection` 按实际 selector backend 记录。默认 `BAR_STORE=h5i` 时两者
+都必须为 `true`，不能因为没有直接写 selector artifact 就标成 `false`。
 
 ### 5. 测试验收
 

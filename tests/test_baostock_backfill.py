@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import os
 import sys
@@ -162,6 +163,7 @@ class TestWholeDayRejection:
         result = BF.backfill_days(["2026-09-23"], write=True,
                                   symbols_df=_Symbols(syms), fetch_range=misleading)
         assert result["fetch_failed_n"] == 1
+        assert result["fetch_failed"] == {"601200": "request timed out"}
         assert result["days"]["2026-09-23"]["status"] == "rejected_by_coverage"
         assert result["written"] == []
         assert not (tmp_path / "provenance.jsonl").exists()
@@ -181,6 +183,32 @@ class TestWholeDayRejection:
         assert result["days"]["2026-09-23"]["status"] == "ready"
         assert result["bj_not_requested"] == ["920000"]
 
+    def test_confirmed_delisted_before_range_is_retained_as_not_applicable(self):
+        syms = [f"6{i:05d}" for i in range(1200)] + ["601200"]
+        base = _fake_fetch_range(1200, ["2026-10-26"])
+
+        def delisted_gap(symbols, **kwargs):
+            result = base(symbols, **kwargs)
+            result.update(
+                status="unfillable_gap", requested=1201, got=1200, missing=1,
+                failed={},
+                fetch_failed_raw={"601200": "空数据(停牌/退市/该日无成交)"},
+                delisted_before_range={"601200": {
+                    "status": "0", "outDate": "2026-10-19",
+                    "history_result": "空数据(停牌/退市/该日无成交)",
+                }},
+            )
+            return result
+
+        result = BF.backfill_days(["2026-10-26"], write=False,
+                                  symbols_df=_Symbols(syms), fetch_range=delisted_gap)
+
+        assert result["ok"] is True
+        assert result["fetch_failed_n"] == 0
+        assert result["fetch_failed_raw_n"] == 1
+        assert result["delisted_before_range"]["601200"]["outDate"] == "2026-10-19"
+        assert result["days"]["2026-10-26"]["status"] == "ready"
+
     def test_complete_batch_with_partial_first_day_rejects_only_that_day(self):
         """A range-wide appended status does not prove each day's coverage."""
         days = ["2026-09-23", "2026-09-24"]
@@ -194,10 +222,96 @@ class TestWholeDayRejection:
                     "missing": 0, "failed": {}, "not_requested": [], "limiter": {}}
 
         result = BF.backfill_days(days, write=False, symbols_df=_Symbols(syms),
-                                  fetch_range=uneven)
+                                  fetch_range=uneven,
+                                  basic_status_lookup=lambda codes: {})
         assert result["days"][days[0]]["status"] == "rejected_by_coverage"
+        assert result["days"][days[0]].get("missing_symbols") == sorted(syms[1870:])
+        assert result["days"][days[0]].get("missing_symbols_count") == 130
         assert result["days"][days[1]]["status"] == "ready"
         assert result["ok"] is False
+
+    def test_confirmed_delisting_on_session_is_not_a_coverage_gap(self):
+        days = ["2026-10-26", "2026-10-27", "2026-10-28"]
+        symbols = [f"6{i:05d}" for i in range(1200)] + ["301139"]
+
+        def delisted_on_last_day(codes, *, on_row=None, **kwargs):
+            for sym in codes:
+                present_days = days[:2] if sym == "301139" else days
+                on_row(sym, _frame([_rec(f"sz.{sym}", day) for day in present_days]))
+            return {"status": "appended", "requested": len(codes),
+                    "got": len(codes), "missing": 0, "failed": {},
+                    "not_requested": [], "limiter": {}}
+
+        lookup_calls = []
+
+        def lookup(codes):
+            lookup_calls.append(list(codes))
+            return {"sz.301139": {"status": "0", "outDate": "2026-10-28"}}
+
+        result = BF.backfill_days(
+            days, write=False, symbols_df=_Symbols(symbols),
+            fetch_range=delisted_on_last_day, basic_status_lookup=lookup)
+
+        assert result["ok"] is True
+        assert lookup_calls == [["sz.301139"]]
+        assert result["days"]["2026-10-28"]["status"] == "ready"
+        assert result["days"]["2026-10-28"]["not_applicable_symbols"] == ["301139"]
+        assert result["days"]["2026-10-28"]["raw_missing_symbols"] == ["301139"]
+        assert result["days"]["2026-10-28"]["missing_symbols"] == []
+        assert result["not_applicable_by_day"]["2026-10-28"]["301139"] == {
+            "status": "0", "outDate": "2026-10-28",
+            "source": "baostock.query_stock_basic",
+            "reason_code": "delisted_on_or_before_session",
+        }
+
+    def test_unconfirmed_or_active_missing_symbol_still_blocks_coverage(self):
+        days = ["2026-10-26", "2026-10-27", "2026-10-28"]
+        symbols = [f"6{i:05d}" for i in range(1200)] + ["301139"]
+
+        def missing_on_last_day(codes, *, on_row=None, **kwargs):
+            for sym in codes:
+                present_days = days[:2] if sym == "301139" else days
+                on_row(sym, _frame([_rec(f"sz.{sym}", day) for day in present_days]))
+            return {"status": "appended", "requested": len(codes),
+                    "got": len(codes), "missing": 0, "failed": {},
+                    "not_requested": [], "limiter": {}}
+
+        result = BF.backfill_days(
+            days, write=False, symbols_df=_Symbols(symbols),
+            fetch_range=missing_on_last_day,
+            basic_status_lookup=lambda codes: {
+                "sz.301139": {"status": "1", "outDate": ""}})
+
+        assert result["ok"] is False
+        assert result["days"]["2026-10-28"]["status"] == "rejected_by_coverage"
+        assert result["days"]["2026-10-28"]["missing_symbols"] == ["301139"]
+        assert result["days"]["2026-10-28"]["not_applicable_symbols"] == []
+
+    def test_large_missing_set_skips_per_symbol_status_queries(self):
+        days = ["2026-10-26", "2026-10-27", "2026-10-28"]
+        symbols = [f"6{i:05d}" for i in range(1200)]
+        missing = set(symbols[-51:])
+
+        def partial_last_day(codes, *, on_row=None, **kwargs):
+            for sym in codes:
+                present_days = days[:2] if sym in missing else days
+                on_row(sym, _frame([_rec(f"sh.{sym}", day) for day in present_days]))
+            return {"status": "appended", "requested": len(codes),
+                    "got": len(codes), "missing": 0, "failed": {},
+                    "not_requested": [], "limiter": {}}
+
+        def unexpected_lookup(codes):
+            pytest.fail("large missing set must not cause sequential status lookups")
+
+        result = BF.backfill_days(
+            days, write=False, symbols_df=_Symbols(symbols),
+            fetch_range=partial_last_day, basic_status_lookup=unexpected_lookup)
+
+        assert result["ok"] is False
+        assert result["delisting_status_lookup"]["status"] == "skipped_too_many_candidates"
+        assert result["delisting_status_lookup"]["count"] == 51
+        assert result["days"]["2026-10-28"]["status"] == "rejected_by_coverage"
+        assert result["days"]["2026-10-28"]["missing_symbols"] == sorted(missing)
 
     def test_partial_multi_day_write_does_not_report_overall_success(self, monkeypatch, tmp_path):
         days = ["2026-09-23", "2026-09-24"]
@@ -215,7 +329,8 @@ class TestWholeDayRejection:
                     "missing": 0, "failed": {}, "not_requested": [], "limiter": {}}
 
         result = BF.backfill_days(days, write=True, symbols_df=_Symbols(syms),
-                                  fetch_range=uneven)
+                                  fetch_range=uneven,
+                                  basic_status_lookup=lambda codes: {})
         assert result["written"] == [days[1]]
         assert result["days"][days[0]]["status"] == "rejected_by_coverage"
         assert result["ok"] is False
@@ -280,16 +395,18 @@ class TestProvenanceCarriesTheSemanticClarification:
         import io as _io
         fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
         monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        monkeypatch.setenv("BAR_STORE", "h5i")
         BF._append_provenance("2026-09-23", 5200, {"bj_not_requested": [None] * 339})
         rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
         assert rec["action"] == "backfill"
-        assert rec["affects_selection"] is False, (
-            "必须**明文**写 false —— 这是给未来读日志的人看的结论, "
-            "不能靠他自己推断")
+        assert rec["selection_backend"] == "h5i"
+        assert rec["selection_logic_changed"] is False
+        assert rec["selection_data_changed"] is True
+        assert rec["affects_selection"] is True
         assert rec["engine_probe_unchanged"] is True
         assert "h5i_watermark_after" in rec
         assert "engine_day_at_backfill" in rec
-        assert "不改变选股口径" in rec["note"], rec["note"][:120]
+        assert "不改变选股逻辑" in rec["note"], rec["note"][:120]
         assert rec["bj_not_requested"] == 339
 
     def test_helpers_never_invent_a_date(self, monkeypatch):
@@ -345,6 +462,73 @@ class TestProvenanceCarriesTheSemanticClarification:
         assert rec["unfillable_reason"] == "baostock_no_bj_data", (
             "原因必须是**机器可读的稳定标识**, 不能只有中文说明")
         assert "北交所" in rec["note"], "note 应向人说明这 339 只为什么补不到"
+
+    def test_confirmed_delist_evidence_is_preserved_in_provenance(self, monkeypatch):
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        delisted = {"601059": {"status": "0", "outDate": "2026-10-19",
+                               "history_result": "empty result"}}
+
+        BF._append_provenance("2026-10-26", 5209,
+                              {"delisted_before_range": delisted})
+
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["not_applicable_delisted"] == delisted
+        assert rec["not_applicable_delisted_count"] == 1
+        assert rec["not_applicable_delisted_reason"] == "baostock_out_date_before_range"
+
+    def test_session_delist_evidence_is_preserved_in_provenance(self, monkeypatch):
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        by_day = {"2026-10-28": {"301139": {
+            "status": "0", "outDate": "2026-10-28",
+            "source": "baostock.query_stock_basic",
+            "reason_code": "delisted_on_or_before_session",
+        }}}
+
+        BF._append_provenance("2026-10-28", 5208,
+                              {"not_applicable_by_day": by_day})
+
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["not_applicable_delisted_by_day"] == by_day
+        assert rec["not_applicable_delisted_by_day_count"] == 1
+        assert rec["not_applicable_delisted_by_day_reason"] == \
+            "baostock_out_date_on_or_before_session"
+
+    def test_empty_daily_not_applicable_map_does_not_claim_a_delisting(self, monkeypatch):
+        import tempfile
+        import io as _io
+        fp = os.path.join(tempfile.mkdtemp(), "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+
+        BF._append_provenance(
+            "2026-10-28", 5209,
+            {"not_applicable_by_day": {"2026-10-28": {}}})
+
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["not_applicable_delisted_by_day"] == {}
+        assert rec["not_applicable_delisted_by_day_count"] == 0
+        assert rec["not_applicable_delisted_by_day_reason"] is None
+
+    def test_h5i_backfill_is_recorded_as_selector_input_change(self, monkeypatch, tmp_path):
+        import io as _io
+        fp = os.path.join(tmp_path, "p.jsonl")
+        monkeypatch.setattr(BF, "PROVENANCE_FP", fp)
+        monkeypatch.setattr(BF, "_engine_day", lambda: "2026-10-23")
+        monkeypatch.setattr(BF, "_h5i_watermark", lambda: "2026-10-23")
+        monkeypatch.setenv("BAR_STORE", "h5i")
+
+        BF._append_provenance("2026-10-26", 5209, {})
+
+        rec = json.loads(_io.open(fp, encoding="utf-8").read().strip())
+        assert rec["selection_backend"] == "h5i"
+        assert rec["selection_logic_changed"] is False
+        assert rec["selection_data_changed"] is True
+        assert rec["affects_selection"] is True
 
     def test_no_unfillable_means_none_not_a_placeholder(self, monkeypatch):
         """没有补不到的标的时, `unfillable_reason` 应为 **None**, 不得编造占位符。
@@ -596,6 +780,28 @@ class TestDryRunWritesNothing:
         assert rec["day"] == "2026-09-23" and rec["source"] == "baostock"
         assert rec["rows"] > 900
 
+    def test_provenance_failure_does_not_report_overall_success(self, monkeypatch):
+        monkeypatch.setattr(BF, "_write_day", lambda day, frame, **kwargs: {
+            "rows": len(frame)})
+        monkeypatch.setattr(BF, "verify_two_things", lambda **kwargs: {"ok": True})
+
+        def failed_provenance(day, rows, ctx):
+            ctx.setdefault("provenance_errors", []).append({
+                "day": day, "_write_error": "OSError: disk full"})
+
+        monkeypatch.setattr(BF, "_append_provenance", failed_provenance)
+        symbols = [f"6{i:05d}" for i in range(1200)]
+
+        result = BF.backfill_days(
+            ["2026-09-23"], write=True, symbols_df=_Symbols(symbols),
+            fetch_range=_fake_fetch_range(len(symbols), ["2026-09-23"]))
+
+        assert result["written"] == ["2026-09-23"]
+        assert result["days"]["2026-09-23"]["verify"]["ok"] is True
+        assert result["days"]["2026-09-23"]["status"] == "provenance_failed"
+        assert result["days"]["2026-09-23"]["provenance_ok"] is False
+        assert result["ok"] is False
+
 
 class TestBackfillTriggerToWriteSimulation:
     """用本地假源重放“触发 -> 回填 -> 写入 -> 留痕”，不联网、不碰生产库。"""
@@ -622,6 +828,7 @@ class TestBackfillTriggerToWriteSimulation:
         days = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in decision["missing_days"]]
         syms = [f"6{i:05d}" for i in range(1200)]
         provenance = tmp_path / "backfill_provenance.jsonl"
+        monkeypatch.setenv("BAR_STORE", "h5i")
 
         # h5i_db 只在生产/专用回填解释器中提供；普通 CI 解释器应显式跳过，
         # 不能把可选集成能力缺失伪装成回填逻辑失败。
@@ -660,7 +867,10 @@ class TestBackfillTriggerToWriteSimulation:
         records = [json.loads(line) for line in provenance.read_text(encoding="utf-8").splitlines()]
         assert [r["day"] for r in records] == days
         assert all(r["source"] == "baostock" for r in records)
-        assert all(r["affects_selection"] is False for r in records)
+        assert all(r["selection_backend"] == "h5i" for r in records)
+        assert all(r["selection_logic_changed"] is False for r in records)
+        assert all(r["selection_data_changed"] is True for r in records)
+        assert all(r["affects_selection"] is True for r in records)
 
 
 class TestBeijingIsExplicitNotSilent:
@@ -691,3 +901,19 @@ class TestBeijingIsExplicitNotSilent:
                                symbols_df=_Symbols(["600000"]), fetch_range=_empty)
         assert res["ok"] is False and res["error"], res
         assert res["written"] == []
+
+
+def test_cli_summary_is_safe_for_legacy_windows_console(tmp_path, monkeypatch):
+    sink = io.TextIOWrapper(io.BytesIO(), encoding="cp936")
+    monkeypatch.setattr(BF.sys, "stdout", sink)
+    monkeypatch.setattr(BF, "_HERE", str(tmp_path / "src" / "baostock_backfill.py"))
+    monkeypatch.setattr(BF, "backfill_days", lambda *args, **kwargs: {
+        "ok": True, "written": [], "note": "⇒", "bj_not_requested": [],
+    })
+    output = tmp_path / "结果⇒.json"
+
+    assert BF.main(["--days", "2026-10-26", "--out", str(output)]) == 0
+    sink.flush()
+
+    assert output.is_file()
+    assert b"\\u21d2" in sink.buffer.getvalue()

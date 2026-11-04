@@ -718,9 +718,20 @@ def _live_src_label(held_missing, pool_missing, reference_source=None) -> str:
     return reference_source or "akshare_spot"
 
 
+def _resolve_execution_mode(value: str | None = None) -> str:
+    """Fail closed to read-only observation until paper execution is explicit."""
+    raw = os.environ.get("PAPER_EXECUTION_MODE", "observe") if value is None else value
+    mode = str(raw).strip().lower()
+    if mode not in {"observe", "paper"}:
+        raise ValueError("PAPER_EXECUTION_MODE must be 'observe' or 'paper'")
+    return mode
+
+
 class RealtimeEngine:
-    def __init__(self, interval: float = 15.0, intraday_only: bool = True):
+    def __init__(self, interval: float = 15.0, intraday_only: bool = True,
+                 execution_mode: str | None = None):
         self.interval = interval
+        self.execution_mode = _resolve_execution_mode(execution_mode)
         # (2026-09-08) 成交处理耗时埋点: 每 tick 处理毫秒环形缓冲(近 ~1h),
         # 由 _write_state 计算 p50/p90/p95/p99 写入 live_state.ops.tick_ms.
         from collections import deque
@@ -1152,6 +1163,39 @@ class RealtimeEngine:
             log(f"[P2分红] 入账异常: {e}")
             import traceback; traceback.print_exc()
 
+    def _run_paper_execution_phase(
+        self,
+        latest: dict,
+        *,
+        session: bool,
+        selector_weight_ready: bool,
+        mode: str,
+    ) -> None:
+        """Run PaperBook mutations only in explicitly enabled paper mode."""
+        if self.execution_mode == "observe":
+            log("[仅观察] 跳过 PaperBook 分红入账、风险控制、买卖撮合和账本回写")
+            return
+
+        if self._ca_applied_day != self.pb.trade_date:
+            self._apply_corporate_actions()
+
+        if session and self._snapshot_allows_rebalance(mode, self.snapshot_status):
+            if selector_weight_ready:
+                self._rebalance(latest)
+            else:
+                # `_rebalance` 仍运行止损、组合风控及 kill-switch；仅跳过由目标池驱动的
+                # 离池卖出/补权，避免策略身份损坏时清仓或换仓。
+                self._rebalance(latest, allow_target_rebalance=False)
+        elif session:
+            log(f"[signal-freeze/{self.snapshot_status}] enforce 下仅估值，拒绝自动调仓")
+        else:
+            log(f"[{'交易时段' if session else '非交易时段'}] tick#{self.tick} 刷新价格, 不动仓")
+
+    def _persist_paper_state(self, state: dict) -> None:
+        """Observation ticks must not rewrite the authoritative PaperBook state."""
+        if self.execution_mode == "paper":
+            _atomic_write_json(STATE_FILE, state)
+
     # ---------- 一次 tick ----------
     def run_tick(self, now: datetime | None = None):
         self.tick += 1
@@ -1269,22 +1313,12 @@ class RealtimeEngine:
         # 用实时价更新账面撮合价
         self.pb.d_price = {c: latest[c] for c in latest if latest.get(c) and latest[c] > 0}
 
-        # P2: 每日一次把到期除权/分红事件入账, 防止除权日账面市值骤降出现虚假亏损.
-        if self._ca_applied_day != self.pb.trade_date:
-            self._apply_corporate_actions()
-
-        # 只在交易时段撮合; 非交易时段只刷新估值不动仓
-        if session and self._snapshot_allows_rebalance(mode, self.snapshot_status):
-            if selector_weight_ready:
-                self._rebalance(latest)
-            else:
-                # `_rebalance` 仍运行止损、组合风控及 kill-switch；仅跳过由目标池驱动的
-                # 离池卖出/补权，避免策略身份损坏时清仓或换仓。
-                self._rebalance(latest, allow_target_rebalance=False)
-        elif session:
-            log(f"[signal-freeze/{self.snapshot_status}] enforce 下仅估值，拒绝自动调仓")
-        else:
-            log(f"[{'交易时段' if session else '非交易时段'}] tick#{self.tick} 刷新价格, 不动仓")
+        self._run_paper_execution_phase(
+            latest,
+            session=session,
+            selector_weight_ready=selector_weight_ready,
+            mode=mode,
+        )
 
         # ---- 午间重选触发 (11:28, 上午盘尚未结束, 拉到快照后下午按新池调仓) ----
         hm = now.hour * 60 + now.minute
@@ -2059,7 +2093,13 @@ class RealtimeEngine:
         live = {
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "day": self.pb.trade_date,
-            "mode": "盘中实时撮合" if session else "待机/收盘(仅价格刷新)",
+            "mode": (
+                "盘中仅观察(不撮合)" if session and self.execution_mode == "observe"
+                else "待机/观察(仅行情刷新)" if self.execution_mode == "observe"
+                else "盘中实时撮合" if session else "待机/收盘(仅价格刷新)"
+            ),
+            "execution_mode": self.execution_mode,
+            "paper_execution_enabled": self.execution_mode == "paper",
             "in_session": session,
             "live_source": live_src,
             "price_sources": self.price_sources,
@@ -2174,10 +2214,11 @@ class RealtimeEngine:
             "peak_equity": self.pb.peak_equity,
             "risk_state": self.pb.state,
         }
-        _atomic_write_json(STATE_FILE, state)
+        self._persist_paper_state(state)
 
     def loop(self):
-        log(f"盘中引擎启动 | 目标池 {len(self.targets)}只 | interval={self.interval}s | 收盘15:05自动停止")
+        log(f"盘中引擎启动 | execution_mode={self.execution_mode} | 目标池 {len(self.targets)}只 | "
+            f"interval={self.interval}s | 收盘15:05自动停止")
         _cal_warned = False
         try:
             while True:
@@ -2221,6 +2262,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="单次运行")
     ap.add_argument("--interval", type=float, default=15.0, help="tick间隔(秒)")
+    ap.add_argument("--execution-mode", choices=("observe", "paper"), default=None,
+                    help="观察模式不撮合且不回写 PaperBook；paper 必须显式指定")
     ap.add_argument("--allow-offsheet", action="store_true",
                     help="非交易时段也尝试刷新实时价(默认每tick拉, 失败即静默)")
     # [2026-09-19] 覆盖消费日, 供**可复现的交易日 dry-run** 使用。
@@ -2234,7 +2277,11 @@ def main():
         _DAY_OVERRIDE = date.fromisoformat(args.date)
         log(f"[date] 消费日已被 --date 覆盖为 {_DAY_OVERRIDE.isoformat()}")
 
-    eng = RealtimeEngine(interval=args.interval, intraday_only=not args.allow_offsheet)
+    eng = RealtimeEngine(
+        interval=args.interval,
+        intraday_only=not args.allow_offsheet,
+        execution_mode=args.execution_mode,
+    )
     if args.once:
         eng.run_tick()
         log("once 完成, live_state 已更新: " + LIVE_STATE)

@@ -35,9 +35,12 @@
 param(
   [string]$ServiceName = 'AStockStockdb',
   [string]$DisplayName = 'A-STOCK 行情引擎 (stockdb.exe)',
-  # 工作目录必须与 exe 同目录: stockdb.conf 里 work_dir/pidfile 都是 **相对路径**
-  # （./data、./data1、./log.txt、./lgdb.pid）。换了工作目录它就读不到库。
+  # 工作目录必须是 StockdbRoot: stockdb.conf 里 work_dir/pidfile 都是 **相对路径**
+  # （./data、./data1、./log.txt、./lgdb.pid）。固定版本 exe 可以位于仓库 vendor 目录，
+  # 但不能改变数据工作目录。
   [string]$StockdbRoot = 'E:\A_stockDB',
+  # 可选服务程序路径。默认优先使用仓库内固定版本，数据工作目录仍是 StockdbRoot。
+  [string]$StockdbExe = '',
   [switch]$Uninstall,
   [switch]$Start,
   [switch]$IAcceptUnsignedNssm
@@ -55,7 +58,8 @@ function Bad($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red }
 $ToolsDir = Join-Path (Split-Path -Parent $RepoRoot) '_tools'
 $NssmExe = Join-Path $ToolsDir 'nssm-2.24\win64\nssm.exe'
 if (-not (Test-Path $NssmExe)) { $NssmExe = Join-Path $ToolsDir 'nssm-2.24\win32\nssm.exe' }
-$Exe = Join-Path $StockdbRoot 'stockdb.exe'
+$BundledExe = Join-Path $RepoRoot 'vendor\stockdb\bin\stockdb.exe'
+$Exe = if ($StockdbExe) { $StockdbExe } elseif (Test-Path $BundledExe) { $BundledExe } else { Join-Path $StockdbRoot 'stockdb.exe' }
 $LogDir = Join-Path $RepoRoot 'logs'
 
 function Run($file, $argv) {
@@ -85,7 +89,7 @@ Ok "stockdb.exe: $Exe ($([math]::Round((Get-Item $Exe).Length/1MB,2)) MB)"
 if (-not (Test-Path (Join-Path $StockdbRoot 'stockdb.conf'))) {
   Bad "stockdb.conf 不存在于 $StockdbRoot —— 工作目录错了就读不到库"; exit 9
 }
-Ok 'stockdb.conf 就位（work_dir/pidfile 为相对路径 ⇒ AppDirectory 必须是此处）'
+Ok "stockdb.conf 就位（work_dir/pidfile 为相对路径 ⇒ AppDirectory=$StockdbRoot）"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
 # ---- 卸载 ----
