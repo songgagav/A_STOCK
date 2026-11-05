@@ -49,6 +49,39 @@ def test_previous_session_is_strictly_before_signal_date():
     assert previous_session("2026-10-21", sessions) == "2026-10-20"
 
 
+def test_horizon_sessions_preserves_list_contract_for_prepared_calendar():
+    api = _api()
+    calendar = _require("SessionCalendar")(
+        ["2026-10-21", "2026-10-19", "2026-10-20"]
+    )
+
+    result = api.horizon_sessions("2026-10-19", 2, calendar)
+    result.append("2099-01-01")
+
+    assert result == ["2026-10-19", "2026-10-20", "2099-01-01"]
+    assert api.horizon_sessions("2026-10-19", 2, calendar) == [
+        "2026-10-19", "2026-10-20"
+    ]
+
+
+def test_horizon_sessions_validates_horizon_before_normalizing_calendar():
+    horizon_sessions = _require("horizon_sessions")
+
+    with pytest.raises(ValueError, match="horizon must be a positive integer"):
+        horizon_sessions("not-a-day", 0, ["also-not-a-day"])
+
+
+def test_horizon_sessions_accepts_unhashable_positive_int_subclasses():
+    horizon_sessions = _require("horizon_sessions")
+
+    class UnhashableInt(int):
+        __hash__ = None
+
+    assert horizon_sessions(
+        "2026-10-19", UnhashableInt(2), ["2026-10-21", "2026-10-19", "2026-10-20"]
+    ) == ["2026-10-19", "2026-10-20"]
+
+
 @pytest.mark.parametrize("horizon", [1, 3, 5, 20])
 def test_forward_return_uses_signal_day_open_and_horizon_close(horizon):
     forward = _require("forward_return_for_symbol")

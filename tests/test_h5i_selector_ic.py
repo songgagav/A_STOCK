@@ -262,8 +262,23 @@ def test_default_factory_accepts_directory_backed_h5i_and_still_opens_read_only(
     assert db.closed is True
 
 
-def test_diagnostic_panels_use_prior_session_universe_and_keep_roe_mf_unsupported():
+def test_diagnostic_panels_reuse_calendar_and_preserve_contracts(monkeypatch):
     builder = _require("build_diagnostic_panels")
+    import selector_ic_contract
+
+    calendar_preparations = 0
+    original_calendar_factory = selector_ic_contract.SessionCalendar._from_normalized
+
+    def count_calendar_preparations(cls, sessions):
+        nonlocal calendar_preparations
+        calendar_preparations += 1
+        return original_calendar_factory(sessions)
+
+    monkeypatch.setattr(
+        selector_ic_contract.SessionCalendar,
+        "_from_normalized",
+        classmethod(count_calendar_preparations),
+    )
     sessions = []
     cursor = date(2026, 9, 1)
     while len(sessions) < 42:
@@ -345,6 +360,8 @@ def test_diagnostic_panels_use_prior_session_universe_and_keep_roe_mf_unsupporte
         sessions[signal_index + 19]
     }
     assert source.valuation_cutoffs[0].strftime("%H:%M:%S") == "09:25:00"
+    # One real calendar preparation serves every predecessor and label lookup.
+    assert calendar_preparations == 1
 
 
 def test_diagnostic_panel_rejects_duplicate_calendar_sessions():
