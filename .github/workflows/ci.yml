@@ -99,3 +99,8 @@ jobs:
             tests/test_ic_curve_diagnostic_h5i.py \
             tests/test_ic_curve_diagnostic_cli.py \
             -q -rs
+      - name: Run signal freeze regression with h5i enabled
+        run: |
+          # Core job 会在无 h5i 的环境中运行这些测试；这里补一轮 h5i-enabled
+          # 运行，避免 factor_fusion/target_weighting 的真实分支被环境性假绿掩盖。
+          python -m pytest tests/test_signal_*.py -q -rs
