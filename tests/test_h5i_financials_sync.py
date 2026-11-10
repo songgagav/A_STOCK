@@ -384,3 +384,11 @@ def test_raw_response_deduplication_does_not_trust_a_stale_manifest_hash(tmp_pat
     raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
 
     assert api._raw_evidence_exists(tmp_path, "2026-09-30", rows) is False
+
+
+def test_daily_retry_tasks_use_local_service_with_limited_privileges():
+    installer = (ROOT / "ops" / "install_daily_data_retries.ps1").read_text(encoding="utf-8")
+
+    assert "-UserId 'NT AUTHORITY\\LOCAL SERVICE'" in installer
+    assert "-RunLevel Limited" in installer
+    assert "-UserId 'SYSTEM'" not in installer

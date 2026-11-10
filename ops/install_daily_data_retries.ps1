@@ -14,7 +14,7 @@ function New-DailyTask([string]$Name, [string]$ScriptPath, [datetime[]]$Times, [
   if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "Task script missing: $ScriptPath" }
   $Action = New-ScheduledTaskAction -Execute $PowerShell -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"" -WorkingDirectory $RepoRoot
   $Triggers = @($Times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ })
-  $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $Principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
   $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours $MaxHours)
   Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Triggers -Principal $Principal -Settings $Settings -Description 'A-STOCK idempotent daily H5i auxiliary data refresh; writes data receipts only.' -Force | Out-Null
 }
