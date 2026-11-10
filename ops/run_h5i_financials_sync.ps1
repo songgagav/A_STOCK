@@ -41,7 +41,9 @@ if (Test-Path -LiteralPath $LastReceipt) {
 $PreviousErrorActionPreference = $ErrorActionPreference
 try {
   $ErrorActionPreference = 'Continue'
-  $Output = @(& $Python $Program --as-of $Today --workers 6 --minimum-coverage 1.0 2>&1)
+  # Allow late/unpublished reports to remain pending while appending the
+  # PIT-verified rows for the rest of the universe. Below 99.9%, write nothing.
+  $Output = @(& $Python $Program --as-of $Today --workers 6 --minimum-coverage 0.999 2>&1)
   $Code = $LASTEXITCODE
 } finally {
   $ErrorActionPreference = $PreviousErrorActionPreference
@@ -49,4 +51,3 @@ try {
 Add-Content -LiteralPath $Log -Encoding UTF8 -Value "[$(Get-Date -Format o)] exit=$Code as_of=$Today"
 if ($Output.Count) { Add-Content -LiteralPath $Log -Encoding UTF8 -Value ($Output -join "`n") }
 exit $Code
-
