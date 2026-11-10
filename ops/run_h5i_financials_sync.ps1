@@ -34,8 +34,19 @@ if (Test-Path -LiteralPath $LastReceipt) {
   }
 }
 
-$Output = @(& $Python $Program --as-of $Today --workers 6 --minimum-coverage 1.0 2>&1)
-$Code = $LASTEXITCODE
+# Python providers/progress bars may write harmless diagnostics to stderr and
+# still return exit code 0. PowerShell turns native stderr into error records;
+# with Stop that aborts before the receipt log is written. Capture both streams
+# while Continue is active, then use the process exit code as the result.
+$PreviousErrorActionPreference = $ErrorActionPreference
+try {
+  $ErrorActionPreference = 'Continue'
+  $Output = @(& $Python $Program --as-of $Today --workers 6 --minimum-coverage 1.0 2>&1)
+  $Code = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
 Add-Content -LiteralPath $Log -Encoding UTF8 -Value "[$(Get-Date -Format o)] exit=$Code as_of=$Today"
 if ($Output.Count) { Add-Content -LiteralPath $Log -Encoding UTF8 -Value ($Output -join "`n") }
 exit $Code
+
