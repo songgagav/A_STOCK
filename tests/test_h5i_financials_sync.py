@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -191,6 +192,41 @@ def test_bulk_batch_appends_high_coverage_rows_but_marks_missing_symbols_pending
     assert set(result["rows"]["symbol"]) == {"000001", "600519"}
     assert pd.isna(result["rows"].loc[result["rows"]["symbol"] == "000001", "eps"].iloc[0])
     assert (result["rows"]["ts"] > pd.Timestamp("2026-06-30")).all()
+
+
+def test_scheduled_financial_retry_allows_only_verified_99_9_percent_partial_coverage():
+    api = _api()
+    runner = ROOT / "ops" / "run_h5i_financials_sync.ps1"
+    text = runner.read_text(encoding="utf-8")
+    match = re.search(r"--minimum-coverage\s+([0-9.]+)", text)
+    assert match, "scheduled financial retry must set its own coverage threshold"
+    minimum_coverage = float(match.group(1))
+
+    missing = {"002731", "688613", "688981"}
+    symbols = [f"{100000 + value:06d}" for value in range(5198)] + sorted(missing)
+    available = [symbol for symbol in symbols if symbol not in missing]
+    frame = pd.DataFrame([
+        {
+            "股票代码": symbol,
+            "营业总收入-营业总收入": 100.0,
+            "最新公告日期": "2026-10-30",
+        }
+        for symbol in available
+    ])
+
+    result = api.prepare_bulk_append_batch(
+        frame,
+        universe_symbols=symbols,
+        max_timestamp="2026-06-30",
+        expected_period="2026-09-30",
+        as_of="2026-11-11",
+        minimum_coverage=minimum_coverage,
+    )
+
+    assert result["coverage"] >= 0.999
+    assert result["status"] == "partial_pending"
+    assert result["missing_period_symbols"] == sorted(missing)
+    assert len(result["rows"]) == len(available)
 
 
 def test_bulk_batch_rejects_rows_announced_after_explicit_as_of():
