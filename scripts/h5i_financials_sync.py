@@ -194,7 +194,9 @@ def normalize_em_bulk_frame(
         if column not in work.columns:
             work[column] = None
     work["source"] = SOURCE
-    work = work[H5I_COLUMNS].drop_duplicates(["ts", "symbol"], keep="last")
+    # Preserve duplicate symbol rows so the batch validator can reject them;
+    # choosing an arbitrary provider row here would hide conflicting input.
+    work = work[H5I_COLUMNS]
     work["ts"] = pd.to_datetime(work["ts"]).astype("datetime64[us]")
     for column in FIN_MAP.values():
         work[column] = pd.to_numeric(work[column], errors="coerce").astype("float64")
@@ -394,7 +396,14 @@ def _raw_evidence_exists(
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             raw_meta = manifest.get("artifacts", {}).get("raw_provider_rows.jsonl", {})
-            if int(raw_meta.get("size_bytes", 0)) > 0 and raw_meta.get("sha256") in exact_hashes:
+            artifact_path = manifest_path.parent / "raw_provider_rows.jsonl"
+            if (
+                int(raw_meta.get("size_bytes", 0)) > 0
+                and raw_meta.get("sha256") in exact_hashes
+                and artifact_path.is_file()
+                and artifact_path.stat().st_size == int(raw_meta["size_bytes"])
+                and _sha256(artifact_path) == raw_meta["sha256"]
+            ):
                 return True
         except (OSError, ValueError, TypeError):
             continue

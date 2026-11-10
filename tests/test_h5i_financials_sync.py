@@ -254,6 +254,29 @@ def test_bulk_retry_checks_active_universe_and_appends_only_still_missing_symbol
     assert result["missing_period_symbols"] == []
 
 
+def test_bulk_batch_rejects_duplicate_provider_rows_for_one_symbol():
+    api = _api()
+    row = {
+        "股票代码": "600519",
+        "营业总收入-营业总收入": 100.0,
+        "净利润-净利润": 5.0,
+        "最新公告日期": "2026-10-30",
+    }
+    frame = pd.DataFrame([row, {**row, "净利润-净利润": 6.0}])
+
+    result = api.prepare_bulk_append_batch(
+        frame,
+        universe_symbols=["600519"],
+        max_timestamp="2026-06-30",
+        expected_period="2026-09-30",
+        as_of="2026-11-10",
+    )
+
+    assert result["status"] == "invalid"
+    assert result["rows"].empty
+    assert result["failed_symbols"] == ["600519"]
+
+
 def test_bulk_sync_default_requires_full_universe_coverage():
     api = _api()
     frame = pd.DataFrame([{
@@ -344,3 +367,20 @@ def test_raw_response_deduplication_recognizes_legacy_windows_newline_artifacts(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     assert api._raw_evidence_exists(tmp_path, "2026-09-30", rows) is True
+
+
+def test_raw_response_deduplication_does_not_trust_a_stale_manifest_hash(tmp_path):
+    api = _api()
+    rows = _provider_row()
+    captured = api._persist_run(
+        output_root=tmp_path,
+        expected_period="2026-09-30",
+        as_of="2026-11-10",
+        status="available",
+        details={},
+        raw_rows=rows,
+    )
+    raw_path = Path(captured["bundle_path"]) / "raw_provider_rows.jsonl"
+    raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+
+    assert api._raw_evidence_exists(tmp_path, "2026-09-30", rows) is False
