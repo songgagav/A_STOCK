@@ -26,9 +26,25 @@ $Output = @(& $Python $Program sync --days 2 2>&1)
 $Code = $LASTEXITCODE
 $Text = $Output -join "`n"
 $Result = $null
-try { $Result = $Text | ConvertFrom-Json } catch {}
+foreach ($Match in [regex]::Matches($Text, '(?m)^\s*\{')) {
+  try {
+    $Candidate = $Text.Substring($Match.Index) | ConvertFrom-Json
+    if ($Candidate.ok -eq $true -and $Candidate.table -eq 'margin_daily') {
+      $Result = $Candidate
+      break
+    }
+  } catch {
+    # Native tools can print provider diagnostics before their JSON result.
+  }
+}
 $Missing = $Result.missing_legs
-$Status = if ($Code -ne 0 -or -not $Result) { 'blocked' } elseif ($Missing -and $Missing.PSObject.Properties.Count -gt 0) { 'pending' } else { 'available' }
+$HasMissingLegs = $false
+if ($Missing -is [System.Collections.IDictionary]) {
+  $HasMissingLegs = $Missing.Count -gt 0
+} elseif ($Missing) {
+  $HasMissingLegs = $Missing.PSObject.Properties.Count -gt 0
+}
+$Status = if ($Code -ne 0 -or -not $Result) { 'blocked' } elseif ($HasMissingLegs) { 'pending' } else { 'available' }
 $Now = Get-Date
 $RunId = 'margin-' + $Now.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $Receipt = [ordered]@{
